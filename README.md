@@ -13,7 +13,7 @@ System packages (Debian/Ubuntu names):
 ```bash
 sudo apt install \
   python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 \
-  gir1.2-camel-1.2 gir1.2-edataserver-1.2 \
+  gir1.2-webkit-6.0 gir1.2-camel-1.2 gir1.2-edataserver-1.2 \
   evolution-data-server evolution-ews
 ```
 
@@ -42,6 +42,8 @@ src/post/
   app.py          Adw.Application entry
   window.py       3-pane main window (folders | list | reader)
   probe.py        CLI sanity check
+  reader/
+    html.py       HTML document builder for WebKit
   mail/
     eds.py        MailService + Camel session (EDS backend)
     helpers.py    Folder tree walking, message parsing
@@ -51,12 +53,11 @@ src/post/
 
 - List mail accounts from EDS
 - Browse folder tree (IMAP, Microsoft 365/Graph, EWS — whatever Evolution supports)
-- Message list + plain-text reading pane
+- Message list + HTML reading pane (WebKitGTK; remote images off by default)
 - Account switcher in header bar
 
 ## What comes next
 
-- WebKitGTK HTML rendering
 - Compose / reply / per-account signatures
 - Own account setup assistant (Libadwaita)
 - Conversation threading
@@ -91,5 +92,5 @@ See [COPYING](COPYING) for the full licence text.
 ### Third-party
 
 - **Evolution Data Server / Camel / evolution-ews** — runtime dependencies (LGPL-2.1+); linked dynamically, not bundled in this source tree.
-- **GTK 4, Libadwaita, PyGObject** — LGPL-2.1+ (system libraries).
+- **GTK 4, Libadwaita, WebKitGTK 6, PyGObject** — LGPL-2.1+ (system libraries).
 - Code in `src/post/mail/eds.py` and `src/post/mail/helpers.py` was derived from [EvolutionMCP](https://github.com/affix/EvolutionMCP) (MIT) — see [LICENSES/MIT-EvolutionMCP.txt](LICENSES/MIT-EvolutionMCP.txt).

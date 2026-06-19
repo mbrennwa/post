@@ -128,32 +128,86 @@ def message_info_to_dict(info: Any) -> dict[str, Any]:
     }
 
 
+def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:
+    """Return plain-text and HTML bodies from a Camel.MimeMessage."""
+    bodies: dict[str, str | None] = {"plain": None, "html": None}
+    _walk_mime_parts(mime_msg, bodies)
+    if bodies["plain"] is None and bodies["html"] is None:
+        _email_module_fallback(mime_msg, bodies)
+    return bodies
+
+
 def extract_plain_body(mime_msg: Any) -> str | None:
     """Best-effort plain text from a Camel.MimeMessage."""
+    return extract_message_bodies(mime_msg)["plain"]
+
+
+def _walk_mime_parts(part: Any, bodies: dict[str, str | None]) -> None:
     import gi
 
     gi.require_version("Camel", "1.2")
     from gi.repository import Camel
 
-    content_type = mime_msg.get_content_type()
+    content_type = part.get_content_type()
     if content_type is None:
-        return None
+        return
 
     mime_type = content_type.simple()
-    if mime_type == "text/plain":
-        return _decode_text_part(mime_msg)
     if mime_type.startswith("multipart/"):
-        if isinstance(mime_msg, Camel.Multipart):
-            for i in range(mime_msg.get_number()):
-                child = mime_msg.get_part(i)
-                if child is None:
-                    continue
-                ct = child.get_content_type()
-                if ct and ct.simple() == "text/plain":
-                    text = _decode_text_part(child)
-                    if text:
-                        return text
-    return None
+        if isinstance(part, Camel.Multipart):
+            for i in range(part.get_number()):
+                child = part.get_part(i)
+                if child is not None:
+                    _walk_mime_parts(child, bodies)
+            return
+        wrapper = part.get_content()
+        if wrapper is not None and hasattr(wrapper, "get_number"):
+            for i in range(wrapper.get_number()):
+                child = wrapper.get_part(i)
+                if child is not None:
+                    _walk_mime_parts(child, bodies)
+        return
+
+    if mime_type == "text/plain" and bodies["plain"] is None:
+        bodies["plain"] = _decode_text_part(part)
+    elif mime_type == "text/html" and bodies["html"] is None:
+        bodies["html"] = _decode_text_part(part)
+
+
+def _email_module_fallback(mime_msg: Any, bodies: dict[str, str | None]) -> None:
+    """Parse raw MIME with Python's email module when Camel walking finds nothing."""
+    import email
+    import email.policy
+
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    try:
+        stream = Camel.StreamMem.new()
+        mime_msg.write_to_stream_sync(stream, None)
+        stream.seek(0, 0)
+        raw = stream.get_byte_array()
+        if raw is None:
+            return
+        raw_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
+        msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
+        for part in msg.walk():
+            ct = part.get_content_type()
+            payload = part.get_content()
+            if isinstance(payload, bytes):
+                text = payload.decode("utf-8", errors="replace")
+            elif isinstance(payload, str):
+                text = payload
+            else:
+                continue
+            if ct == "text/plain" and bodies["plain"] is None:
+                bodies["plain"] = text
+            elif ct == "text/html" and bodies["html"] is None:
+                bodies["html"] = text
+    except Exception:
+        pass
 
 
 def _decode_text_part(part: Any) -> str | None:

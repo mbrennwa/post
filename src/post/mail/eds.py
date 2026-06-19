@@ -203,7 +203,7 @@ class MailService:
     def read_message(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict:
-        from .helpers import extract_plain_body
+        from .helpers import extract_message_bodies
 
         store = self.get_store(account_uid)
         folder = store.get_folder_sync(folder_name, 0, None)
@@ -216,7 +216,9 @@ class MailService:
 
         info = folder.get_message_info(message_uid)
         result = message_info_to_dict(info) if info else {"uid": message_uid}
-        result["body_plain"] = extract_plain_body(mime)
+        bodies = extract_message_bodies(mime)
+        result["body_plain"] = bodies["plain"]
+        result["body_html"] = bodies["html"]
         return result
 
     @staticmethod

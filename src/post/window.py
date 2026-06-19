@@ -11,11 +11,13 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
+gi.require_version("WebKit", "6.0")
 
-from gi.repository import Adw, GLib, Gtk
+from gi.repository import Adw, Gtk, WebKit
 
 from post.mail import MailService
 from post.mail.eds import MailAccount
+from post.reader import build_reader_document
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +33,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._current_account: MailAccount | None = None
         self._current_folder: str | None = None
         self._folders: list[dict] = []
+        self._current_body: dict[str, str | None] = {"plain": None, "html": None}
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_content(outer)
@@ -46,6 +49,16 @@ class MainWindow(Adw.ApplicationWindow):
         refresh_btn.set_tooltip_text("Refresh")
         refresh_btn.connect("clicked", self._on_refresh)
         header.pack_end(refresh_btn)
+
+        remote_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        remote_label = Gtk.Label(label="Remote content")
+        remote_label.add_css_class("dim-label")
+        self._remote_switch = Gtk.Switch(active=False)
+        self._remote_switch.set_tooltip_text("Load remote images and linked resources")
+        self._remote_switch.connect("notify::active", self._on_remote_content_changed)
+        remote_box.append(remote_label)
+        remote_box.append(self._remote_switch)
+        header.pack_end(remote_box)
 
         panes = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         panes.set_vexpand(True)
@@ -99,15 +112,13 @@ class MainWindow(Adw.ApplicationWindow):
         self._reader_meta.add_css_class("dim-label")
         reader.append(self._reader_meta)
 
-        reader_scroll = Gtk.ScrolledWindow()
-        reader_scroll.set_vexpand(True)
-        reader_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        self._reader_body = Gtk.TextView()
-        self._reader_body.set_editable(False)
-        self._reader_body.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self._reader_body.add_css_class("monospace")
-        reader_scroll.set_child(self._reader_body)
-        reader.append(reader_scroll)
+        self._web_view = WebKit.WebView()
+        settings = self._web_view.get_settings()
+        settings.set_enable_javascript(False)
+        settings.set_enable_html5_database(False)
+        settings.set_enable_html5_local_storage(False)
+        self._web_view.set_vexpand(True)
+        reader.append(self._web_view)
 
         panes.append(reader)
 
@@ -167,7 +178,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._clear_listbox(self._message_list)
         self._reader_subject.set_label("Select a message")
         self._reader_meta.set_label("")
-        self._reader_body.get_buffer().set_text("")
+        self._current_body = {"plain": None, "html": None}
+        self._show_reader_document()
 
         try:
             self._folders = self._mail.list_folders(account.uid)
@@ -268,5 +280,20 @@ class MainWindow(Adw.ApplicationWindow):
         self._reader_meta.set_label(
             f"From: {msg.get('from', '')}\nDate: {msg.get('date_received') or msg.get('date_sent') or ''}"
         )
-        body = msg.get("body_plain") or "(No plain-text body — HTML rendering comes later.)"
-        self._reader_body.get_buffer().set_text(body)
+        self._current_body = {
+            "plain": msg.get("body_plain"),
+            "html": msg.get("body_html"),
+        }
+        self._show_reader_document()
+
+    def _show_reader_document(self) -> None:
+        document = build_reader_document(
+            body_html=self._current_body.get("html"),
+            body_plain=self._current_body.get("plain"),
+            allow_remote=self._remote_switch.get_active(),
+        )
+        self._web_view.load_html(document, None)
+
+    def _on_remote_content_changed(self, *_args) -> None:
+        if self._current_body.get("html") or self._current_body.get("plain"):
+            self._show_reader_document()
