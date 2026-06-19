@@ -901,58 +901,6 @@ class MainWindow(Adw.ApplicationWindow):
             return f"Flag{suffix}"
         return f"Toggle flag{suffix}"
 
-    def _log_message_click(
-        self, gesture: Gtk.GestureClick, phase: str, *, decision: str | None = None
-    ) -> None:
-        if os.environ.get("POST_DEBUG", "").lower() in ("", "0", "false", "no"):
-            return
-
-        event = gesture.get_current_event()
-        gesture_state = gesture.get_current_event_state()
-        gesture_button = gesture.get_current_button()
-        if event is None:
-            log.info(
-                "message click [%s]: no event gesture_button=%s gesture_state=0x%x%s",
-                phase,
-                gesture_button,
-                int(gesture_state),
-                f" -> {decision}" if decision else "",
-            )
-            return
-
-        event_type = event.get_event_type()
-        event_button = gesture_button
-        event_state = event.get_modifier_state()
-        triggers_menu = Gdk.Event.triggers_context_menu(event)
-        keyboard_state = Gdk.ModifierType(0)
-        display = self.get_display()
-        if display is not None:
-            seat = display.get_default_seat()
-            if seat is not None:
-                keyboard = seat.get_keyboard()
-                if keyboard is not None:
-                    keyboard_state = keyboard.get_modifier_state()
-
-        log.info(
-            "message click [%s]: gesture_button=%s event_button=%s "
-            "event_type=%s gesture_state=0x%x event_state=0x%x "
-            "keyboard_state=0x%x triggers_context_menu=%s ctrl=%s shift=%s%s",
-            phase,
-            gesture_button,
-            event_button,
-            event_type,
-            int(gesture_state),
-            int(event_state),
-            int(keyboard_state),
-            triggers_menu,
-            bool(
-                event_state
-                & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SUPER_MASK)
-            ),
-            bool(event_state & Gdk.ModifierType.SHIFT_MASK),
-            f"{f' -> {decision}' if decision else ''}",
-        )
-
     def _popup_message_menu(
         self, row: Gtk.ListBoxRow, x: float, y: float
     ) -> None:
@@ -998,12 +946,8 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         if Gdk.Event.triggers_context_menu(event):
-            self._log_message_click(gesture, "pressed", decision="open menu")
             self._popup_message_menu(row, x, y)
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-            return
-
-        self._log_message_click(gesture, "pressed", decision="ListBox selection")
 
     def _on_message_menu_toggle_read(self, *_args) -> None:
         self._toggle_message_flag("seen")
