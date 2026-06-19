@@ -57,7 +57,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._context_attachment_index: int | None = None
         self._context_attachment_mime: str | None = None
         self._context_attachment_name: str | None = None
-        self._context_message_row: Gtk.ListBoxRow | None = None
+        self._context_message_rows: list[Gtk.ListBoxRow] = []
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_content(outer)
@@ -122,7 +122,7 @@ class MainWindow(Adw.ApplicationWindow):
         message_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         message_scroll.set_vexpand(True)
         self._message_list = Gtk.ListBox()
-        self._message_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self._message_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
         self._message_list.connect("row-selected", self._on_message_selected)
         message_scroll.set_child(self._message_list)
 
@@ -811,6 +811,41 @@ class MainWindow(Adw.ApplicationWindow):
         flags["seen"] = True
         row.message_flags = flags
 
+    def _message_rows_for_menu(self, row: Gtk.ListBoxRow) -> list[Gtk.ListBoxRow]:
+        selected = self._message_list.get_selected_rows()
+        if row in selected:
+            return selected
+        self._message_list.unselect_all()
+        self._message_list.select_row(row)
+        return [row]
+
+    @staticmethod
+    def _read_menu_label(rows: list[Gtk.ListBoxRow]) -> str:
+        seen_states = [
+            (getattr(row, "message_flags", {}) or {}).get("seen", True) for row in rows
+        ]
+        count = len(rows)
+        suffix = f" ({count})" if count > 1 else ""
+        if all(seen_states):
+            return f"Mark as unread{suffix}"
+        if not any(seen_states):
+            return f"Mark as read{suffix}"
+        return f"Toggle read{suffix}"
+
+    @staticmethod
+    def _flag_menu_label(rows: list[Gtk.ListBoxRow]) -> str:
+        flagged_states = [
+            (getattr(row, "message_flags", {}) or {}).get("flagged", False)
+            for row in rows
+        ]
+        count = len(rows)
+        suffix = f" ({count})" if count > 1 else ""
+        if all(flagged_states):
+            return f"Unflag{suffix}"
+        if not any(flagged_states):
+            return f"Flag{suffix}"
+        return f"Toggle flag{suffix}"
+
     def _on_message_menu_pressed(
         self,
         gesture: Gtk.GestureClick,
@@ -819,19 +854,14 @@ class MainWindow(Adw.ApplicationWindow):
         y: float,
         row: Gtk.ListBoxRow,
     ) -> None:
-        flags = dict(getattr(row, "message_flags", {}) or {})
-        seen = flags.get("seen", True)
-        flagged = flags.get("flagged", False)
+        rows = self._message_rows_for_menu(row)
+        self._context_message_rows = rows
 
         menu = Gio.Menu()
-        menu.append(
-            "Mark as unread" if seen else "Mark as read",
-            "win.message-toggle-read",
-        )
-        menu.append("Unflag" if flagged else "Flag", "win.message-toggle-flag")
+        menu.append(self._read_menu_label(rows), "win.message-toggle-read")
+        menu.append(self._flag_menu_label(rows), "win.message-toggle-flag")
         self._message_popover.set_menu_model(menu)
 
-        self._context_message_row = row
         self._message_popover.set_parent(row)
         rect = Gdk.Rectangle()
         rect.x = int(x)
@@ -848,16 +878,12 @@ class MainWindow(Adw.ApplicationWindow):
         self._toggle_message_flag("flagged")
 
     def _toggle_message_flag(self, flag_name: str) -> None:
-        row = self._context_message_row
-        if (
-            row is None
-            or not self._current_account
-            or not self._current_folder
-        ):
+        rows = list(self._context_message_rows)
+        if not rows or not self._current_account or not self._current_folder:
             return
 
-        uid = getattr(row, "message_uid", None)
-        if not uid:
+        uids = [uid for row in rows if (uid := getattr(row, "message_uid", None))]
+        if not uids:
             return
 
         account_uid = self._current_account.uid
@@ -868,19 +894,19 @@ class MainWindow(Adw.ApplicationWindow):
             result: dict | None = None
             try:
                 if flag_name == "seen":
-                    result = self._mail.toggle_message_seen(
-                        account_uid, folder_name, uid
+                    result = self._mail.toggle_messages_seen(
+                        account_uid, folder_name, uids
                     )
                 else:
-                    result = self._mail.toggle_message_flagged(
-                        account_uid, folder_name, uid
+                    result = self._mail.toggle_messages_flagged(
+                        account_uid, folder_name, uids
                     )
             except Exception as exc:
                 log.exception("Failed to toggle message %s", flag_name)
                 error = exc
             GLib.idle_add(
-                self._on_message_flag_toggled,
-                row,
+                self._on_messages_flag_toggled,
+                rows,
                 flag_name,
                 result,
                 error,
@@ -888,23 +914,32 @@ class MainWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_message_flag_toggled(
+    def _on_messages_flag_toggled(
         self,
-        row: Gtk.ListBoxRow,
+        rows: list[Gtk.ListBoxRow],
         flag_name: str,
         result: dict | None,
         error: Exception | None,
     ) -> bool:
         if error is not None:
-            self._set_status(f"Could not update message: {error}")
+            self._set_status(f"Could not update messages: {error}")
             return False
         if result is None:
             return False
 
-        flags = dict(getattr(row, "message_flags", {}) or {})
-        flags.update(result.get("flags") or {})
-        row.message_flags = flags
-        self._apply_row_flags(row, flags)
+        updates_by_uid = {
+            item["uid"]: item.get("flags") or {}
+            for item in result.get("updates") or []
+            if item.get("uid")
+        }
+        for row in rows:
+            uid = getattr(row, "message_uid", None)
+            if not uid or uid not in updates_by_uid:
+                continue
+            flags = dict(getattr(row, "message_flags", {}) or {})
+            flags.update(updates_by_uid[uid])
+            row.message_flags = flags
+            self._apply_row_flags(row, flags)
 
         if flag_name == "seen" and self._current_account and self._current_folder:
             unread = result.get("folder_unread")
@@ -917,6 +952,9 @@ class MainWindow(Adw.ApplicationWindow):
                     total,
                 )
 
+        count = len(updates_by_uid)
+        if count > 1:
+            self._set_status(f"Updated {count} messages")
         return False
 
     def _apply_row_flags(self, row: Gtk.ListBoxRow, flags: dict) -> None:
@@ -935,6 +973,8 @@ class MainWindow(Adw.ApplicationWindow):
         self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None
     ) -> None:
         if row is None or not self._current_account or not self._current_folder:
+            return
+        if len(self._message_list.get_selected_rows()) != 1:
             return
         uid = getattr(row, "message_uid", None)
         if not uid:

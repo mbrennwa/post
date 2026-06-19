@@ -372,6 +372,22 @@ class MailService:
                 account_uid, folder_name, message_uid
             )
 
+    def toggle_messages_seen(
+        self, account_uid: str, folder_name: str, message_uids: list[str]
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._toggle_messages_seen_unlocked(
+                account_uid, folder_name, message_uids
+            )
+
+    def toggle_messages_flagged(
+        self, account_uid: str, folder_name: str, message_uids: list[str]
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._toggle_messages_flagged_unlocked(
+                account_uid, folder_name, message_uids
+            )
+
     def mark_message_read(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> tuple[int, int]:
@@ -523,6 +539,59 @@ class MailService:
             flag_value,
         )
         return {"flags": {"flagged": new_flagged}}
+
+    def _toggle_messages_seen_unlocked(
+        self, account_uid: str, folder_name: str, message_uids: list[str]
+    ) -> dict[str, Any]:
+        folder = self._open_folder_unlocked(account_uid, folder_name)
+        updates: list[dict[str, Any]] = []
+        for message_uid in message_uids:
+            info = folder.get_message_info(message_uid)
+            if info is None:
+                continue
+            currently_seen = bool(info.get_flags() & Camel.MessageFlags.SEEN)
+            new_seen = not currently_seen
+            flag_value = Camel.MessageFlags.SEEN if new_seen else 0
+            self._apply_message_flags_unlocked(
+                folder,
+                account_uid,
+                folder_name,
+                message_uid,
+                Camel.MessageFlags.SEEN,
+                flag_value,
+            )
+            updates.append({"uid": message_uid, "flags": {"seen": new_seen}})
+        unread = folder.get_unread_message_count()
+        total = folder.get_message_count()
+        self._update_cached_folder_counts(account_uid, folder_name, unread, total)
+        return {
+            "updates": updates,
+            "folder_unread": unread,
+            "folder_total": total,
+        }
+
+    def _toggle_messages_flagged_unlocked(
+        self, account_uid: str, folder_name: str, message_uids: list[str]
+    ) -> dict[str, Any]:
+        folder = self._open_folder_unlocked(account_uid, folder_name)
+        updates: list[dict[str, Any]] = []
+        for message_uid in message_uids:
+            info = folder.get_message_info(message_uid)
+            if info is None:
+                continue
+            currently_flagged = bool(info.get_flags() & Camel.MessageFlags.FLAGGED)
+            new_flagged = not currently_flagged
+            flag_value = Camel.MessageFlags.FLAGGED if new_flagged else 0
+            self._apply_message_flags_unlocked(
+                folder,
+                account_uid,
+                folder_name,
+                message_uid,
+                Camel.MessageFlags.FLAGGED,
+                flag_value,
+            )
+            updates.append({"uid": message_uid, "flags": {"flagged": new_flagged}})
+        return {"updates": updates}
 
     def _open_folder_unlocked(
         self, account_uid: str, folder_name: str
