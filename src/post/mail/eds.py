@@ -28,28 +28,6 @@ log = logging.getLogger(__name__)
 _SKIP_BACKENDS = frozenset({"rss", "vfolder"})
 
 
-class _OAuthDelegate(Camel.Session):
-    """Minimal session without password auth override — used for XOAUTH2 SASL."""
-
-    __gtype_name__ = "PostOAuthDelegate"
-
-    def __init__(self, registry: EDataServer.SourceRegistry, **kwargs):
-        super().__init__(**kwargs)
-        self._registry = registry
-
-    def do_get_oauth2_access_token_sync(self, service, cancellable):
-        source = self._registry.ref_source(service.get_uid())
-        if source is None:
-            return False, "", 0
-        try:
-            ok, token, expires_in = source.get_oauth2_access_token_sync(cancellable)
-            if ok and token:
-                return True, token, expires_in or 0
-        except Exception:
-            log.exception("OAuth2 failed for %s", service.get_uid())
-        return False, "", 0
-
-
 class MailSession(Camel.Session):
     """Camel session: OAuth via ESource, password auth for IMAP."""
 
@@ -64,31 +42,23 @@ class MailSession(Camel.Session):
         super().__init__(**kwargs)
         self._registry = registry
         self._password_prompt = password_prompt
-        self._oauth_delegate: _OAuthDelegate | None = None
 
     def set_password_prompt(self, callback: PasswordPromptCallback | None) -> None:
         self._password_prompt = callback
 
-    def _oauth_session(self) -> _OAuthDelegate:
-        if self._oauth_delegate is None:
-            self._oauth_delegate = _OAuthDelegate(
-                self._registry,
-                user_data_dir=self.get_user_data_dir(),
-                user_cache_dir=self.get_user_cache_dir(),
-                online=True,
-            )
-        return self._oauth_delegate
+    def do_get_filter_driver(self, type, for_folder=None):
+        """Required when Camel parses MIME (e.g. reading messages)."""
+        return Camel.FilterDriver.new(self)
 
     def _credential_source(self, service) -> EDataServer.Source | None:
         """Account ESource for a Camel service (matches Evolution's EMailSession)."""
         return self._registry.ref_source(service.get_uid())
 
     def do_authenticate_sync(self, service, mechanism=None, cancellable=None):
-        """Password auth for IMAP; delegate XOAUTH2 to a plain Camel session."""
+        """Password auth for IMAP; OAuth via do_get_oauth2_access_token_sync."""
         if mechanism == "XOAUTH2":
-            return self._oauth_session().authenticate_sync(
-                service, mechanism, cancellable
-            )
+            result = service.authenticate_sync(mechanism, cancellable)
+            return result == Camel.AuthenticationResult.ACCEPTED
 
         source = self._credential_source(service)
         if source is None:
