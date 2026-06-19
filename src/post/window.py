@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 from collections.abc import Callable
 
@@ -121,9 +122,25 @@ class MainWindow(Adw.ApplicationWindow):
         message_scroll = Gtk.ScrolledWindow()
         message_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         message_scroll.set_vexpand(True)
+        self._message_scroll = message_scroll
         self._message_list = Gtk.ListBox()
+        if sys.platform == "darwin":
+            message_scroll.set_tooltip_text(
+                "⌘-click to multi-select · Shift-click for range · Right-click for menu"
+            )
+        else:
+            message_scroll.set_tooltip_text(
+                "Ctrl+click to multi-select · Shift-click for range · Right-click for menu"
+            )
         self._message_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        self._message_list.set_activate_on_single_click(False)
         self._message_list.connect("row-selected", self._on_message_selected)
+        context_gesture = Gtk.GestureClick()
+        context_gesture.set_button(0)
+        context_gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        context_gesture.connect("pressed", self._on_message_list_pressed)
+        self._message_list.add_controller(context_gesture)
+        self._setup_message_shortcuts()
         message_scroll.set_child(self._message_list)
 
         message_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -250,6 +267,43 @@ class MainWindow(Adw.ApplicationWindow):
         self.add_action(flag_action)
 
         self._message_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
+        self._message_popover.set_parent(self._message_scroll)
+
+    def _setup_message_shortcuts(self) -> None:
+        controller = Gtk.ShortcutController()
+        for accelerator in ("Menu", "<Shift>F10"):
+            trigger = Gtk.ShortcutTrigger.parse_string(accelerator)
+            action = Gtk.CallbackAction.new(self._on_message_context_shortcut)
+            controller.add_shortcut(Gtk.Shortcut.new(trigger, action))
+        self._message_list.add_controller(controller)
+
+    def _on_message_context_shortcut(
+        self,
+        _widget: Gtk.Widget,
+        _args: GLib.Variant | None,
+        _user_data: object,
+    ) -> bool:
+        row = self._message_list.get_selected_row()
+        if row is None:
+            rows = self._message_list.get_selected_rows()
+            row = rows[0] if rows else None
+        if not isinstance(row, Gtk.ListBoxRow):
+            return False
+        allocation = row.get_allocation()
+        self._popup_message_menu(row, allocation.width / 2, allocation.height / 2)
+        return True
+
+    def _ensure_popover_parent(
+        self, popover: Gtk.PopoverMenu, widget: Gtk.Widget
+    ) -> None:
+        current = popover.get_parent()
+        if current is widget:
+            return
+        if current is not None:
+            popover.popdown()
+            if popover.get_parent() is current:
+                popover.unparent()
+        popover.set_parent(widget)
 
     def begin_load(self) -> None:
         """Load accounts and folders after the window is on screen."""
@@ -265,6 +319,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _reload_sidebar(self) -> bool:
         self._clear_reader()
+        self._message_popover.popdown()
         self._clear_listbox(self._message_list)
         self._current_account = None
         self._current_folder = None
@@ -349,7 +404,7 @@ class MainWindow(Adw.ApplicationWindow):
         widget = gesture.get_widget()
         if widget is None:
             return
-        self._attachment_popover.set_parent(widget)
+        self._ensure_popover_parent(self._attachment_popover, widget)
         rect = Gdk.Rectangle()
         rect.x = int(x)
         rect.y = int(y)
@@ -575,8 +630,12 @@ class MainWindow(Adw.ApplicationWindow):
 
     @staticmethod
     def _clear_listbox(listbox: Gtk.ListBox) -> None:
-        while child := listbox.get_first_child():
-            listbox.remove(child)
+        child = listbox.get_first_child()
+        while child is not None:
+            next_child = child.get_next_sibling()
+            if isinstance(child, Gtk.ListBoxRow):
+                listbox.remove(child)
+            child = next_child
 
     def _load_messages(
         self, account_uid: str, folder_name: str, *, offset: int = 0
@@ -592,6 +651,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_has_more = False
             self._load_more_btn.set_visible(False)
             self._set_status(f"Loading {folder_name}…")
+            self._message_popover.popdown()
             self._clear_listbox(self._message_list)
             self._clear_reader()
             self._message_loading_label.set_label(f"Loading {folder_name}…")
@@ -767,11 +827,6 @@ class MainWindow(Adw.ApplicationWindow):
             row.subject_label = subject_label
             row.flag_icon = flag_icon
 
-            menu_gesture = Gtk.GestureClick()
-            menu_gesture.set_button(Gdk.BUTTON_SECONDARY)
-            menu_gesture.connect("pressed", self._on_message_menu_pressed, row)
-            row.add_controller(menu_gesture)
-
             self._message_list.append(row)
 
         if end < len(messages):
@@ -846,13 +901,60 @@ class MainWindow(Adw.ApplicationWindow):
             return f"Flag{suffix}"
         return f"Toggle flag{suffix}"
 
-    def _on_message_menu_pressed(
-        self,
-        gesture: Gtk.GestureClick,
-        _n_press: int,
-        x: float,
-        y: float,
-        row: Gtk.ListBoxRow,
+    def _log_message_click(
+        self, gesture: Gtk.GestureClick, phase: str, *, decision: str | None = None
+    ) -> None:
+        if os.environ.get("POST_DEBUG", "").lower() in ("", "0", "false", "no"):
+            return
+
+        event = gesture.get_current_event()
+        gesture_state = gesture.get_current_event_state()
+        gesture_button = gesture.get_current_button()
+        if event is None:
+            log.info(
+                "message click [%s]: no event gesture_button=%s gesture_state=0x%x%s",
+                phase,
+                gesture_button,
+                int(gesture_state),
+                f" -> {decision}" if decision else "",
+            )
+            return
+
+        event_type = event.get_event_type()
+        event_button = gesture_button
+        event_state = event.get_modifier_state()
+        triggers_menu = Gdk.Event.triggers_context_menu(event)
+        keyboard_state = Gdk.ModifierType(0)
+        display = self.get_display()
+        if display is not None:
+            seat = display.get_default_seat()
+            if seat is not None:
+                keyboard = seat.get_keyboard()
+                if keyboard is not None:
+                    keyboard_state = keyboard.get_modifier_state()
+
+        log.info(
+            "message click [%s]: gesture_button=%s event_button=%s "
+            "event_type=%s gesture_state=0x%x event_state=0x%x "
+            "keyboard_state=0x%x triggers_context_menu=%s ctrl=%s shift=%s%s",
+            phase,
+            gesture_button,
+            event_button,
+            event_type,
+            int(gesture_state),
+            int(event_state),
+            int(keyboard_state),
+            triggers_menu,
+            bool(
+                event_state
+                & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SUPER_MASK)
+            ),
+            bool(event_state & Gdk.ModifierType.SHIFT_MASK),
+            f"{f' -> {decision}' if decision else ''}",
+        )
+
+    def _popup_message_menu(
+        self, row: Gtk.ListBoxRow, x: float, y: float
     ) -> None:
         rows = self._message_rows_for_menu(row)
         self._context_message_rows = rows
@@ -862,14 +964,46 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append(self._flag_menu_label(rows), "win.message-toggle-flag")
         self._message_popover.set_menu_model(menu)
 
-        self._message_popover.set_parent(row)
+        coords = self._message_list.translate_coordinates(
+            self._message_scroll, x, y
+        )
+        if coords is not None:
+            menu_x, menu_y = coords
+        else:
+            menu_x, menu_y = x, y
         rect = Gdk.Rectangle()
-        rect.x = int(x)
-        rect.y = int(y)
+        rect.x = int(menu_x)
+        rect.y = int(menu_y)
         rect.width = 1
         rect.height = 1
         self._message_popover.set_pointing_to(rect)
         self._message_popover.popup()
+
+    def _on_message_list_pressed(
+        self,
+        gesture: Gtk.GestureClick,
+        n_press: int,
+        x: float,
+        y: float,
+    ) -> None:
+        if n_press != 1:
+            return
+
+        row = self._message_list.get_row_at_y(int(y))
+        if not isinstance(row, Gtk.ListBoxRow):
+            return
+
+        event = gesture.get_current_event()
+        if event is None:
+            return
+
+        if Gdk.Event.triggers_context_menu(event):
+            self._log_message_click(gesture, "pressed", decision="open menu")
+            self._popup_message_menu(row, x, y)
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            return
+
+        self._log_message_click(gesture, "pressed", decision="ListBox selection")
 
     def _on_message_menu_toggle_read(self, *_args) -> None:
         self._toggle_message_flag("seen")

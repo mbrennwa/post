@@ -7,4 +7,5 @@ if [[ ! -d .venv ]]; then
   .venv/bin/pip install -e .
 fi
 
+# Debug click events: POST_DEBUG=1 ./run.sh  or  ./run.sh --debug
 exec .venv/bin/post "$@"
