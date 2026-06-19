@@ -5,7 +5,16 @@ from __future__ import annotations
 
 import unittest
 
-from post.mail.helpers import format_message_datetime, format_message_header, paginate_messages, sort_messages_newest_first
+from post.mail.helpers import (
+    format_attachment_size,
+    format_message_datetime,
+    format_message_header,
+    format_message_list_date,
+    message_has_attachments,
+    message_is_unread,
+    paginate_messages,
+    sort_messages_newest_first,
+)
 
 
 class SortMessagesNewestFirstTests(unittest.TestCase):
@@ -74,6 +83,39 @@ class FormatMessageDatetimeTests(unittest.TestCase):
         value = format_message_datetime(1750324800)
         self.assertRegex(value, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
         self.assertNotIn("T", value or "")
+
+
+class MessageFlagTests(unittest.TestCase):
+    def test_unread_when_not_seen(self) -> None:
+        self.assertTrue(message_is_unread({"flags": {"seen": False}}))
+        self.assertFalse(message_is_unread({"flags": {"seen": True}}))
+
+    def test_attachments_flag(self) -> None:
+        self.assertTrue(message_has_attachments({"flags": {"attachments": True}}))
+        self.assertFalse(message_has_attachments({"flags": {"attachments": False}}))
+
+
+class FormatMessageListDateTests(unittest.TestCase):
+    def test_truncates_to_minutes(self) -> None:
+        self.assertEqual(
+            format_message_list_date({"date_received": "2026-06-19 14:30:00"}),
+            "2026-06-19 14:30",
+        )
+
+    def test_falls_back_to_sort_date(self) -> None:
+        value = format_message_list_date({"sort_date": 1750324800})
+        self.assertRegex(value, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+
+
+class FormatAttachmentSizeTests(unittest.TestCase):
+    def test_bytes(self) -> None:
+        self.assertEqual(format_attachment_size(512), "512 B")
+
+    def test_kilobytes(self) -> None:
+        self.assertEqual(format_attachment_size(2048), "2.0 KB")
+
+    def test_unknown(self) -> None:
+        self.assertEqual(format_attachment_size(None), "")
 
 
 class PaginateMessagesTests(unittest.TestCase):

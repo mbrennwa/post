@@ -125,8 +125,29 @@ def message_info_to_dict(info: Any) -> dict[str, Any]:
             "seen": bool(flags & Camel.MessageFlags.SEEN),
             "flagged": bool(flags & Camel.MessageFlags.FLAGGED),
             "deleted": bool(flags & Camel.MessageFlags.DELETED),
+            "attachments": bool(flags & Camel.MessageFlags.ATTACHMENTS),
         },
     }
+
+
+def message_is_unread(msg: dict[str, Any]) -> bool:
+    flags = msg.get("flags") or {}
+    return not flags.get("seen", True)
+
+
+def message_has_attachments(msg: dict[str, Any]) -> bool:
+    flags = msg.get("flags") or {}
+    return bool(flags.get("attachments"))
+
+
+def format_message_list_date(msg: dict[str, Any]) -> str:
+    raw = msg.get("date_received") or msg.get("date_sent")
+    if raw:
+        return raw[:16] if len(raw) >= 16 else raw
+    sort_date = msg.get("sort_date")
+    if sort_date:
+        return datetime.fromtimestamp(sort_date, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    return ""
 
 
 def format_message_header(msg: dict[str, Any]) -> str:
@@ -161,6 +182,15 @@ def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:
     if bodies["plain"] is None and bodies["html"] is None:
         _email_module_fallback(mime_msg, bodies)
     return bodies
+
+
+def extract_attachments(mime_msg: Any) -> list[dict[str, Any]]:
+    """Return attachment metadata from a Camel.MimeMessage."""
+    attachments: list[dict[str, Any]] = []
+    _walk_attachment_parts(mime_msg, attachments)
+    if not attachments:
+        _email_attachment_fallback(mime_msg, attachments)
+    return attachments
 
 
 def extract_plain_body(mime_msg: Any) -> str | None:
@@ -234,6 +264,109 @@ def _email_module_fallback(mime_msg: Any, bodies: dict[str, str | None]) -> None
                 bodies["html"] = text
     except Exception:
         pass
+
+
+def _walk_attachment_parts(part: Any, attachments: list[dict[str, Any]]) -> None:
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    content_type = part.get_content_type()
+    if content_type is None:
+        return
+
+    mime_type = content_type.simple()
+    if mime_type.startswith("multipart/"):
+        if isinstance(part, Camel.Multipart):
+            for i in range(part.get_number()):
+                child = part.get_part(i)
+                if child is not None:
+                    _walk_attachment_parts(child, attachments)
+            return
+        wrapper = part.get_content()
+        if wrapper is not None and hasattr(wrapper, "get_number"):
+            for i in range(wrapper.get_number()):
+                child = wrapper.get_part(i)
+                if child is not None:
+                    _walk_attachment_parts(child, attachments)
+        return
+
+    if not _mime_part_is_attachment(part, mime_type):
+        return
+
+    filename = part.get_filename() if hasattr(part, "get_filename") else None
+    size = part.get_size() if hasattr(part, "get_size") else None
+    attachments.append(
+        {
+            "filename": _safe_str(filename) or "attachment",
+            "mime_type": mime_type,
+            "size": size if isinstance(size, int) else None,
+        }
+    )
+
+
+def _mime_part_is_attachment(part: Any, mime_type: str) -> bool:
+    if hasattr(part, "get_content_disposition"):
+        disposition = part.get_content_disposition()
+        if disposition is not None and disposition.is_attachment():
+            return True
+
+    disposition_name = part.get_disposition() if hasattr(part, "get_disposition") else None
+    if disposition_name and str(disposition_name).lower() == "attachment":
+        return True
+
+    filename = part.get_filename() if hasattr(part, "get_filename") else None
+    if filename and mime_type not in ("text/plain", "text/html"):
+        return True
+
+    return False
+
+
+def _email_attachment_fallback(mime_msg: Any, attachments: list[dict[str, Any]]) -> None:
+    import email
+    import email.policy
+
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    try:
+        stream = Camel.StreamMem.new()
+        mime_msg.write_to_stream_sync(stream, None)
+        stream.seek(0, 0)
+        raw = stream.get_byte_array()
+        if raw is None:
+            return
+        raw_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
+        msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
+        for part in msg.walk():
+            disposition = part.get_content_disposition()
+            filename = part.get_filename()
+            if disposition != "attachment" and not filename:
+                continue
+            if disposition == "inline" and part.get_content_type().startswith("text/"):
+                continue
+            attachments.append(
+                {
+                    "filename": filename or "attachment",
+                    "mime_type": part.get_content_type(),
+                    "size": len(part.get_payload(decode=True) or b""),
+                }
+            )
+    except Exception:
+        pass
+
+
+def format_attachment_size(size: int | None) -> str:
+    if size is None or size < 0:
+        return ""
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
 
 
 def _decode_text_part(part: Any) -> str | None:

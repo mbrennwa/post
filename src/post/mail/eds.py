@@ -346,7 +346,7 @@ class MailService:
     def _read_message_unlocked(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict:
-        from .helpers import extract_message_bodies
+        from .helpers import extract_attachments, extract_message_bodies
 
         store = self._get_store_unlocked(account_uid)
         folder = store.get_folder_sync(folder_name, 0, None)
@@ -362,6 +362,7 @@ class MailService:
         bodies = extract_message_bodies(mime)
         result["body_plain"] = bodies["plain"]
         result["body_html"] = bodies["html"]
+        result["attachments"] = extract_attachments(mime)
         return result
 
     @staticmethod
