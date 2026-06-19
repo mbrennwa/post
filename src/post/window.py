@@ -13,9 +13,8 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("WebKit", "6.0")
-gi.require_version("Gdk", "4.0")
 
-from gi.repository import Adw, Gdk, GLib, Gtk, WebKit
+from gi.repository import Adw, GLib, Gtk, WebKit
 
 from post.credentials import prompt_password_sync
 from post.mail import MailService
@@ -58,7 +57,7 @@ class MainWindow(Adw.ApplicationWindow):
         outer.append(header)
 
         refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
-        refresh_btn.set_tooltip_text("Refresh (R)")
+        refresh_btn.set_tooltip_text("Refresh")
         refresh_btn.connect("clicked", self._on_refresh)
         header.pack_end(refresh_btn)
 
@@ -212,10 +211,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._status = Gtk.Label(label="", xalign=0, margin_start=12, margin_bottom=6)
         self._status.add_css_class("dim-label")
         outer.append(self._status)
-
-        key_controller = Gtk.EventControllerKey()
-        key_controller.connect("key-pressed", self._on_key_pressed)
-        self.add_controller(key_controller)
 
     def begin_load(self) -> None:
         """Load accounts and folders after the window is on screen."""
@@ -534,45 +529,6 @@ class MainWindow(Adw.ApplicationWindow):
             "html": msg.get("body_html"),
         }
         self._show_reader_document()
-
-    def _on_key_pressed(
-        self, _controller: Gtk.EventControllerKey, keyval: int, _keycode: int, state: Gdk.ModifierType
-    ) -> bool:
-        if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK):
-            return False
-
-        if keyval in (Gdk.KEY_j, Gdk.KEY_Down):
-            self._select_relative_message(1)
-            return True
-        if keyval in (Gdk.KEY_k, Gdk.KEY_Up):
-            self._select_relative_message(-1)
-            return True
-        if keyval == Gdk.KEY_r:
-            self._on_refresh()
-            return True
-        return False
-
-    def _select_relative_message(self, delta: int) -> None:
-        if self._message_stack.get_visible_child_name() != "list":
-            return
-
-        row = self._message_list.get_selected_row()
-        if row is None:
-            target = self._message_list.get_first_child() if delta >= 0 else None
-        else:
-            target = row
-            step = 1 if delta > 0 else -1
-            for _ in range(abs(delta)):
-                sibling = (
-                    target.get_next_sibling() if step > 0 else target.get_prev_sibling()
-                )
-                if sibling is None:
-                    break
-                target = sibling
-
-        if target is not None:
-            self._message_list.select_row(target)
-            self._message_list.scroll_to_row(target)
 
     def _show_reader_document(self) -> None:
         document = build_reader_document(
