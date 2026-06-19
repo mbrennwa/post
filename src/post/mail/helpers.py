@@ -186,11 +186,37 @@ def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:
 
 def extract_attachments(mime_msg: Any) -> list[dict[str, Any]]:
     """Return attachment metadata from a Camel.MimeMessage."""
-    attachments: list[dict[str, Any]] = []
-    _walk_attachment_parts(mime_msg, attachments)
-    if not attachments:
-        _email_attachment_fallback(mime_msg, attachments)
+    attachments, _parts = _collect_attachments(mime_msg)
     return attachments
+
+
+def get_attachment_data(mime_msg: Any, index: int) -> tuple[str, bytes]:
+    """Return (filename, raw bytes) for an attachment by index."""
+    attachments, parts = _collect_attachments(mime_msg)
+    if index < 0 or index >= len(attachments):
+        raise ValueError(f"Attachment not found: {index}")
+
+    meta = attachments[index]
+    if meta.get("source") == "email":
+        data = _email_attachment_data_by_index(mime_msg, index)
+    else:
+        data = _decode_attachment_part(parts[index])
+    if not data:
+        raise ValueError(f"Could not decode attachment: {meta.get('filename')}")
+    return meta.get("filename") or "attachment", data
+
+
+def _collect_attachments(mime_msg: Any) -> tuple[list[dict[str, Any]], list[Any]]:
+    attachments: list[dict[str, Any]] = []
+    parts: list[Any] = []
+    _walk_attachment_parts(mime_msg, attachments, parts)
+    if attachments:
+        for index, attachment in enumerate(attachments):
+            attachment["index"] = index
+        return attachments, parts
+
+    _email_collect_attachments(mime_msg, attachments)
+    return attachments, [None] * len(attachments)
 
 
 def extract_plain_body(mime_msg: Any) -> str | None:
@@ -266,11 +292,18 @@ def _email_module_fallback(mime_msg: Any, bodies: dict[str, str | None]) -> None
         pass
 
 
-def _walk_attachment_parts(part: Any, attachments: list[dict[str, Any]]) -> None:
+def _walk_attachment_parts(
+    part: Any,
+    attachments: list[dict[str, Any]],
+    parts: list[Any] | None = None,
+) -> None:
     import gi
 
     gi.require_version("Camel", "1.2")
     from gi.repository import Camel
+
+    if not hasattr(part, "get_content_type"):
+        return
 
     content_type = part.get_content_type()
     if content_type is None:
@@ -282,14 +315,14 @@ def _walk_attachment_parts(part: Any, attachments: list[dict[str, Any]]) -> None
             for i in range(part.get_number()):
                 child = part.get_part(i)
                 if child is not None:
-                    _walk_attachment_parts(child, attachments)
+                    _walk_attachment_parts(child, attachments, parts)
             return
         wrapper = part.get_content()
         if wrapper is not None and hasattr(wrapper, "get_number"):
             for i in range(wrapper.get_number()):
                 child = wrapper.get_part(i)
                 if child is not None:
-                    _walk_attachment_parts(child, attachments)
+                    _walk_attachment_parts(child, attachments, parts)
         return
 
     if not _mime_part_is_attachment(part, mime_type):
@@ -304,13 +337,17 @@ def _walk_attachment_parts(part: Any, attachments: list[dict[str, Any]]) -> None
             "size": size if isinstance(size, int) else None,
         }
     )
+    if parts is not None:
+        parts.append(part)
 
 
 def _mime_part_is_attachment(part: Any, mime_type: str) -> bool:
+    content_type = part.get_content_type() if hasattr(part, "get_content_type") else None
     if hasattr(part, "get_content_disposition"):
         disposition = part.get_content_disposition()
-        if disposition is not None and disposition.is_attachment():
-            return True
+        if disposition is not None and content_type is not None:
+            if disposition.is_attachment(content_type):
+                return True
 
     disposition_name = part.get_disposition() if hasattr(part, "get_disposition") else None
     if disposition_name and str(disposition_name).lower() == "attachment":
@@ -323,7 +360,7 @@ def _mime_part_is_attachment(part: Any, mime_type: str) -> bool:
     return False
 
 
-def _email_attachment_fallback(mime_msg: Any, attachments: list[dict[str, Any]]) -> None:
+def _email_collect_attachments(mime_msg: Any, attachments: list[dict[str, Any]]) -> None:
     import email
     import email.policy
 
@@ -348,15 +385,76 @@ def _email_attachment_fallback(mime_msg: Any, attachments: list[dict[str, Any]])
                 continue
             if disposition == "inline" and part.get_content_type().startswith("text/"):
                 continue
+            payload = part.get_payload(decode=True) or b""
             attachments.append(
                 {
                     "filename": filename or "attachment",
                     "mime_type": part.get_content_type(),
-                    "size": len(part.get_payload(decode=True) or b""),
+                    "size": len(payload),
+                    "source": "email",
+                    "index": len(attachments),
                 }
             )
     except Exception:
         pass
+
+
+def _email_attachment_data_by_index(mime_msg: Any, index: int) -> bytes | None:
+    import email
+    import email.policy
+
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    try:
+        stream = Camel.StreamMem.new()
+        mime_msg.write_to_stream_sync(stream, None)
+        stream.seek(0, 0)
+        raw = stream.get_byte_array()
+        if raw is None:
+            return None
+        raw_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
+        msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
+        collected: list[bytes] = []
+        for part in msg.walk():
+            disposition = part.get_content_disposition()
+            filename = part.get_filename()
+            if disposition != "attachment" and not filename:
+                continue
+            if disposition == "inline" and part.get_content_type().startswith("text/"):
+                continue
+            collected.append(part.get_payload(decode=True) or b"")
+        if 0 <= index < len(collected):
+            return collected[index]
+    except Exception:
+        pass
+    return None
+
+
+def _decode_attachment_part(part: Any) -> bytes | None:
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    try:
+        stream = Camel.StreamMem.new()
+        wrapper = part.get_content()
+        if wrapper is not None:
+            wrapper.decode_to_stream_sync(stream, None)
+        elif hasattr(part, "decode_to_stream_sync"):
+            part.decode_to_stream_sync(stream, None)
+        else:
+            return None
+        stream.seek(0, 0)
+        data = stream.get_byte_array()
+        if data:
+            return bytes(data) if not isinstance(data, bytes) else data
+    except Exception:
+        pass
+    return None
 
 
 def format_attachment_size(size: int | None) -> str:

@@ -343,6 +343,26 @@ class MailService:
         with self._lock:
             return self._read_message_unlocked(account_uid, folder_name, message_uid)
 
+    def read_attachment_data(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        attachment_index: int,
+    ) -> tuple[str, bytes]:
+        with self._lock:
+            return self._read_attachment_data_unlocked(
+                account_uid, folder_name, message_uid, attachment_index
+            )
+
+    def mark_message_read(
+        self, account_uid: str, folder_name: str, message_uid: str
+    ) -> tuple[int, int]:
+        with self._lock:
+            return self._mark_message_read_unlocked(
+                account_uid, folder_name, message_uid
+            )
+
     def _read_message_unlocked(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict:
@@ -353,17 +373,114 @@ class MailService:
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
 
+        info = folder.get_message_info(message_uid)
+        was_unread = info is not None and not (
+            info.get_flags() & Camel.MessageFlags.SEEN
+        )
+
         mime = folder.get_message_sync(message_uid, None)
         if mime is None:
             raise ValueError(f"Message not found: {message_uid}")
 
-        info = folder.get_message_info(message_uid)
         result = message_info_to_dict(info) if info else {"uid": message_uid}
         bodies = extract_message_bodies(mime)
         result["body_plain"] = bodies["plain"]
         result["body_html"] = bodies["html"]
         result["attachments"] = extract_attachments(mime)
+
+        if was_unread:
+            unread, total = self._mark_message_seen_unlocked(
+                folder, account_uid, folder_name, message_uid
+            )
+            result.setdefault("flags", {})["seen"] = True
+            result["folder_unread"] = unread
+            result["folder_total"] = total
+
         return result
+
+    def _read_attachment_data_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        attachment_index: int,
+    ) -> tuple[str, bytes]:
+        from .helpers import get_attachment_data
+
+        store = self._get_store_unlocked(account_uid)
+        folder = store.get_folder_sync(folder_name, 0, None)
+        if folder is None:
+            raise ValueError(f"Folder not found: {folder_name}")
+
+        mime = folder.get_message_sync(message_uid, None)
+        if mime is None:
+            raise ValueError(f"Message not found: {message_uid}")
+
+        return get_attachment_data(mime, attachment_index)
+
+    def _mark_message_read_unlocked(
+        self, account_uid: str, folder_name: str, message_uid: str
+    ) -> tuple[int, int]:
+        store = self._get_store_unlocked(account_uid)
+        folder = store.get_folder_sync(folder_name, 0, None)
+        if folder is None:
+            raise ValueError(f"Folder not found: {folder_name}")
+
+        info = folder.get_message_info(message_uid)
+        if info is None:
+            raise ValueError(f"Message not found: {message_uid}")
+
+        if info.get_flags() & Camel.MessageFlags.SEEN:
+            return folder.get_unread_message_count(), folder.get_message_count()
+
+        return self._mark_message_seen_unlocked(
+            folder, account_uid, folder_name, message_uid
+        )
+
+    def _mark_message_seen_unlocked(
+        self,
+        folder: Camel.Folder,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+    ) -> tuple[int, int]:
+        """Mark a message seen without refreshing the whole folder summary."""
+        folder.set_message_flags(
+            message_uid,
+            Camel.MessageFlags.SEEN,
+            Camel.MessageFlags.SEEN,
+        )
+        self._update_cached_message_flags(
+            account_uid, folder_name, message_uid, seen=True
+        )
+        unread = folder.get_unread_message_count()
+        total = folder.get_message_count()
+        self._update_cached_folder_counts(account_uid, folder_name, unread, total)
+        return unread, total
+
+    def _update_cached_message_flags(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        seen: bool,
+    ) -> None:
+        index = self._folder_indexes.get((account_uid, folder_name))
+        if index is None:
+            return
+        for message in index.messages:
+            if message.get("uid") == message_uid:
+                message.setdefault("flags", {})["seen"] = seen
+                break
+
+    def _update_cached_folder_counts(
+        self, account_uid: str, folder_name: str, unread: int, total: int
+    ) -> None:
+        index = self._folder_indexes.get((account_uid, folder_name))
+        if index is not None:
+            index.unread = unread
+            index.total = total
 
     @staticmethod
     def guess_inbox(folders: list[dict]) -> str | None:

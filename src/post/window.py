@@ -6,15 +6,19 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
+from collections.abc import Callable
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("WebKit", "6.0")
+gi.require_version("Gio", "2.0")
+gi.require_version("Gdk", "4.0")
 
-from gi.repository import Adw, GLib, Gtk, WebKit
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, WebKit
 
 from post.credentials import prompt_password_sync
 from post.mail import MailService
@@ -42,11 +46,16 @@ class MainWindow(Adw.ApplicationWindow):
         self._mail.set_password_prompt(self._prompt_account_password)
         self._current_account: MailAccount | None = None
         self._current_folder: str | None = None
+        self._current_message_uid: str | None = None
         self._current_body: dict[str, str | None] = {"plain": None, "html": None}
         self._messages_load_generation = 0
+        self._message_read_generation = 0
         self._shown_message_count = 0
         self._message_total = -1
         self._message_has_more = False
+        self._context_attachment_index: int | None = None
+        self._context_attachment_mime: str | None = None
+        self._context_attachment_name: str | None = None
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_content(outer)
@@ -212,6 +221,22 @@ class MainWindow(Adw.ApplicationWindow):
         self._status.add_css_class("dim-label")
         outer.append(self._status)
 
+        self._setup_attachment_menu()
+
+    def _setup_attachment_menu(self) -> None:
+        save_action = Gio.SimpleAction.new("attachment-save", None)
+        save_action.connect("activate", self._on_attachment_menu_save)
+        self.add_action(save_action)
+
+        open_with_action = Gio.SimpleAction.new("attachment-open-with", None)
+        open_with_action.connect("activate", self._on_attachment_menu_open_with)
+        self.add_action(open_with_action)
+
+        menu = Gio.Menu()
+        menu.append("Save...", "win.attachment-save")
+        menu.append("Open with…", "win.attachment-open-with")
+        self._attachment_popover = Gtk.PopoverMenu.new_from_model(menu)
+
     def begin_load(self) -> None:
         """Load accounts and folders after the window is on screen."""
         GLib.idle_add(self._reload_sidebar)
@@ -240,6 +265,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _clear_reader(self) -> None:
         self._reader_subject.set_label("Select a message")
         self._reader_meta.set_label("")
+        self._current_message_uid = None
         self._clear_attachments()
         self._current_body = {"plain": None, "html": None}
         self._show_reader_document()
@@ -259,19 +285,273 @@ class MainWindow(Adw.ApplicationWindow):
         self._reader_attachments.append(heading)
 
         for attachment in attachments:
+            index = attachment.get("index", 0)
+            name = attachment.get("filename") or "attachment"
+            mime_type = attachment.get("mime_type")
+            size = format_attachment_size(attachment.get("size"))
+            label_text = f"{name} ({size})" if size else name
+
+            btn = Gtk.Button()
+            btn.add_css_class("flat")
+            btn.set_tooltip_text("Open attachment")
+            btn.connect("clicked", self._on_attachment_clicked, index)
+
+            menu_gesture = Gtk.GestureClick()
+            menu_gesture.set_button(Gdk.BUTTON_SECONDARY)
+            menu_gesture.connect(
+                "pressed",
+                self._on_attachment_menu_pressed,
+                index,
+                mime_type,
+                name,
+            )
+            btn.add_controller(menu_gesture)
+
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             icon = Gtk.Image.new_from_icon_name("mail-attachment-symbolic")
             icon.add_css_class("dim-label")
-            name = attachment.get("filename") or "attachment"
-            size = format_attachment_size(attachment.get("size"))
-            label_text = f"{name} ({size})" if size else name
             label = Gtk.Label(label=label_text, xalign=0, ellipsize=3)
             label.set_hexpand(True)
             row.append(icon)
             row.append(label)
-            self._reader_attachments.append(row)
+            btn.set_child(row)
+            self._reader_attachments.append(btn)
 
         self._reader_attachments.set_visible(True)
+
+    def _on_attachment_menu_pressed(
+        self,
+        gesture: Gtk.GestureClick,
+        _n_press: int,
+        x: float,
+        y: float,
+        index: int,
+        mime_type: str | None,
+        name: str,
+    ) -> None:
+        self._context_attachment_index = index
+        self._context_attachment_mime = mime_type
+        self._context_attachment_name = name
+        widget = gesture.get_widget()
+        if widget is None:
+            return
+        self._attachment_popover.set_parent(widget)
+        rect = Gdk.Rectangle()
+        rect.x = int(x)
+        rect.y = int(y)
+        rect.width = 1
+        rect.height = 1
+        self._attachment_popover.set_pointing_to(rect)
+        self._attachment_popover.popup()
+
+    def _on_attachment_menu_save(self, *_args) -> None:
+        if self._context_attachment_index is None:
+            return
+        self._fetch_attachment(
+            self._context_attachment_index,
+            self._prompt_save_attachment,
+        )
+
+    def _on_attachment_menu_open_with(self, *_args) -> None:
+        if self._context_attachment_index is None:
+            return
+        self._fetch_attachment(
+            self._context_attachment_index,
+            self._prompt_open_with_dialog,
+        )
+
+    def _fetch_attachment(
+        self,
+        attachment_index: int,
+        on_ready: Callable[[str, bytes | None, Exception | None], None],
+    ) -> None:
+        if (
+            not self._current_account
+            or not self._current_folder
+            or not self._current_message_uid
+        ):
+            return
+
+        account_uid = self._current_account.uid
+        folder_name = self._current_folder
+        message_uid = self._current_message_uid
+
+        def worker() -> None:
+            error: Exception | None = None
+            filename = "attachment"
+            data: bytes | None = None
+            try:
+                filename, data = self._mail.read_attachment_data(
+                    account_uid, folder_name, message_uid, attachment_index
+                )
+            except Exception as exc:
+                log.exception("Failed to read attachment")
+                error = exc
+            GLib.idle_add(
+                self._on_attachment_fetched,
+                filename,
+                data,
+                error,
+                on_ready,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_attachment_fetched(
+        self,
+        filename: str,
+        data: bytes | None,
+        error: Exception | None,
+        on_ready: Callable[[str, bytes | None, Exception | None], None],
+    ) -> bool:
+        on_ready(filename, data, error)
+        return False
+
+    def _on_attachment_clicked(self, _button: Gtk.Button, attachment_index: int) -> None:
+        self._fetch_attachment(attachment_index, self._open_attachment_direct)
+
+    def _open_attachment_direct(
+        self,
+        filename: str,
+        data: bytes | None,
+        error: Exception | None,
+    ) -> None:
+        if error is not None:
+            self._set_status(f"Attachment error: {error}")
+            return
+        if data is None:
+            self._set_status("Attachment error: no data")
+            return
+
+        try:
+            path = self._write_temp_attachment(filename, data)
+            file = Gio.File.new_for_path(path)
+            Gio.AppInfo.launch_default_for_uri(file.get_uri(), None)
+        except (OSError, GLib.Error) as exc:
+            self._set_status(f"Could not open attachment: {exc}")
+            return
+
+        self._set_status(f"Opened {os.path.basename(filename)}")
+
+    def _prompt_save_attachment(
+        self,
+        filename: str,
+        data: bytes | None,
+        error: Exception | None,
+    ) -> None:
+        if error is not None:
+            self._set_status(f"Attachment error: {error}")
+            return
+        if data is None:
+            self._set_status("Attachment error: no data")
+            return
+
+        dialog = Gtk.FileDialog(title="Save attachment")
+        dialog.set_initial_name(filename)
+        dialog.save(self, None, self._on_attachment_save_finished, (filename, data))
+
+    def _on_attachment_save_finished(
+        self,
+        dialog: Gtk.FileDialog,
+        result: Gio.AsyncResult,
+        user_data: tuple[str, bytes],
+    ) -> None:
+        filename, data = user_data
+        try:
+            file = dialog.save_finish(result)
+        except GLib.Error as exc:
+            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                return
+            self._set_status(f"Save error: {exc.message}")
+            return
+
+        path = file.get_path()
+        if path is None:
+            self._set_status("Save error: no path")
+            return
+
+        try:
+            with open(path, "wb") as handle:
+                handle.write(data)
+        except OSError as exc:
+            self._set_status(f"Save error: {exc}")
+            return
+
+        self._set_status(f"Saved {os.path.basename(filename)}")
+
+    def _prompt_open_with_dialog(
+        self,
+        filename: str,
+        data: bytes | None,
+        error: Exception | None,
+    ) -> None:
+        if error is not None:
+            self._set_status(f"Attachment error: {error}")
+            return
+        if data is None:
+            self._set_status("Attachment error: no data")
+            return
+
+        try:
+            path = self._write_temp_attachment(filename, data)
+        except OSError as exc:
+            self._set_status(f"Could not open attachment: {exc}")
+            return
+
+        content_type = self._guess_content_type(
+            filename,
+            data,
+            self._context_attachment_mime,
+        )
+        dialog = Gtk.AppChooserDialog.new_for_content_type(
+            self,
+            Gtk.DialogFlags.MODAL,
+            content_type,
+        )
+        dialog.set_heading("Open with")
+        dialog.connect("response", self._on_app_chooser_response, (path, filename))
+        dialog.present()
+
+    def _on_app_chooser_response(
+        self,
+        dialog: Gtk.AppChooserDialog,
+        response: int,
+        user_data: tuple[str, str],
+    ) -> None:
+        path, filename = user_data
+        if response == Gtk.ResponseType.OK:
+            app_info = dialog.get_app_info()
+            if app_info is not None:
+                file = Gio.File.new_for_path(path)
+                try:
+                    app_info.launch_uris([file.get_uri()], None)
+                    self._set_status(f"Opened {os.path.basename(filename)}")
+                except GLib.Error as exc:
+                    self._set_status(f"Could not open attachment: {exc.message}")
+        dialog.destroy()
+
+    @staticmethod
+    def _guess_content_type(filename: str, data: bytes, mime_hint: str | None = None) -> str:
+        if mime_hint:
+            return mime_hint
+        guessed, _certain = Gio.content_type_guess(filename, data)
+        return guessed or "application/octet-stream"
+
+    @staticmethod
+    def _write_temp_attachment(filename: str, data: bytes) -> str:
+        directory = os.path.join(GLib.get_tmp_dir(), "post")
+        os.makedirs(directory, exist_ok=True)
+        basename = os.path.basename(filename.replace("/", "_").replace("\\", "_")) or "attachment"
+        path = os.path.join(directory, basename)
+        if os.path.exists(path):
+            stem, ext = os.path.splitext(basename)
+            counter = 1
+            while os.path.exists(path):
+                path = os.path.join(directory, f"{stem}-{counter}{ext}")
+                counter += 1
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
 
     def _on_refresh(self, *_args) -> None:
         if self._current_account and self._current_folder:
@@ -463,6 +743,7 @@ class MainWindow(Adw.ApplicationWindow):
             row = Gtk.ListBoxRow()
             row.set_child(preview)
             row.message_uid = msg.get("uid")
+            row.subject_label = subject_label
             self._message_list.append(row)
 
         if end < len(messages):
@@ -494,6 +775,11 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             self._set_status(f"{shown} messages in {label} / {folder_name}")
 
+    def _mark_row_read(self, row: Gtk.ListBoxRow) -> None:
+        subject_label = getattr(row, "subject_label", None)
+        if isinstance(subject_label, Gtk.Label):
+            subject_label.remove_css_class("heading")
+
     def _on_message_selected(
         self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None
     ) -> None:
@@ -503,14 +789,44 @@ class MainWindow(Adw.ApplicationWindow):
         if not uid:
             return
 
-        try:
-            msg = self._mail.read_message(
-                self._current_account.uid, self._current_folder, uid
+        account = self._current_account
+        folder_name = self._current_folder
+        self._message_read_generation += 1
+        read_id = self._message_read_generation
+
+        def worker() -> None:
+            error: Exception | None = None
+            msg: dict | None = None
+            try:
+                msg = self._mail.read_message(account.uid, folder_name, uid)
+            except Exception as exc:
+                log.exception("Failed to read message")
+                error = exc
+            GLib.idle_add(
+                self._on_message_read,
+                read_id,
+                row,
+                uid,
+                msg,
+                error,
             )
-        except Exception as exc:
-            log.exception("Failed to read message")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_message_read(
+        self,
+        read_id: int,
+        row: Gtk.ListBoxRow,
+        uid: str,
+        msg: dict | None,
+        error: Exception | None,
+    ) -> bool:
+        if read_id != self._message_read_generation:
+            return False
+
+        if error is not None:
             self._reader_subject.set_label("Could not read message")
-            self._reader_meta.set_label(str(exc))
+            self._reader_meta.set_label(str(error))
             self._clear_attachments()
             self._current_body = {"plain": None, "html": None}
             self._web_view.load_html(
@@ -518,8 +834,22 @@ class MainWindow(Adw.ApplicationWindow):
                 "This message could not be loaded.</body>",
                 None,
             )
-            self._set_status(f"Read error: {exc}")
-            return
+            self._set_status(f"Read error: {error}")
+            return False
+
+        assert msg is not None
+        if not self._current_account or not self._current_folder:
+            return False
+
+        self._current_message_uid = uid
+        if "folder_unread" in msg and "folder_total" in msg:
+            self._sidebar.update_folder_row(
+                self._current_account.uid,
+                self._current_folder,
+                msg["folder_unread"],
+                msg["folder_total"],
+            )
+            self._mark_row_read(row)
 
         self._reader_subject.set_label(msg.get("subject") or "(no subject)")
         self._reader_meta.set_label(format_message_header(msg))
@@ -529,6 +859,7 @@ class MainWindow(Adw.ApplicationWindow):
             "html": msg.get("body_html"),
         }
         self._show_reader_document()
+        return False
 
     def _show_reader_document(self) -> None:
         document = build_reader_document(
