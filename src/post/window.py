@@ -16,6 +16,7 @@ gi.require_version("WebKit", "6.0")
 
 from gi.repository import Adw, GLib, Gtk, WebKit
 
+from post.credentials import prompt_password_sync
 from post.mail import MailService
 from post.mail.eds import MailAccount
 from post.reader import build_reader_document
@@ -30,6 +31,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_default_size(1100, 720)
 
         self._mail = MailService.connect()
+        self._mail.set_password_prompt(self._prompt_account_password)
         self._accounts: list[MailAccount] = []
         self._accounts_by_uid: dict[str, MailAccount] = {}
         self._current_account: MailAccount | None = None
@@ -37,9 +39,13 @@ class MainWindow(Adw.ApplicationWindow):
         self._current_body: dict[str, str | None] = {"plain": None, "html": None}
         self._sidebar_selecting = False
         self._expanded_accounts: dict[str, bool] = {}
+        self._inbox_expander: Gtk.Expander | None = None
+        self._inbox_list: Gtk.ListBox | None = None
+        self._inbox_expanded = True
         self._folder_lists: dict[str, Gtk.ListBox] = {}
         self._messages_load_generation = 0
         self._message_populate_generation = 0
+        self._sidebar_load_generation = 0
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_content(outer)
@@ -152,12 +158,19 @@ class MainWindow(Adw.ApplicationWindow):
         self._status.add_css_class("dim-label")
         outer.append(self._status)
 
-        self._load_sidebar()
+    def begin_load(self) -> None:
+        """Load accounts and folders after the window is on screen."""
+        GLib.idle_add(self._load_sidebar)
 
     def _set_status(self, text: str) -> None:
         self._status.set_label(text)
 
-    def _load_sidebar(self) -> None:
+    def _prompt_account_password(
+        self, account_label: str, _mechanism: str | None
+    ) -> str | None:
+        return prompt_password_sync(self, account_label)
+
+    def _load_sidebar(self) -> bool:
         self._clear_reader()
         self._clear_listbox(self._message_list)
         self._save_expanded_state()
@@ -166,33 +179,100 @@ class MainWindow(Adw.ApplicationWindow):
         self._current_account = None
         self._current_folder = None
 
+        self._sidebar_load_generation += 1
+        load_id = self._sidebar_load_generation
+
         try:
             self._accounts = self._mail.list_accounts()
         except Exception as exc:
             log.exception("Failed to list mail accounts")
             self._set_status(f"Error: {exc}")
-            return
+            return False
 
         if not self._accounts:
             self._set_status(
                 "No mail accounts found. Add one in Evolution or GNOME Online Accounts first."
             )
-            return
+            return False
 
         self._accounts_by_uid = {a.uid: a for a in self._accounts}
 
-        for account in self._accounts:
-            self._sidebar_box.append(self._make_account_section(account))
+        if len(self._accounts) > 1:
+            self._sidebar_box.append(self._make_inbox_section_loading())
 
-        initial_list, initial_row = self._find_initial_folder()
-        if initial_list is not None and initial_row is not None:
-            self._sidebar_selecting = True
-            initial_list.select_row(initial_row)
-            self._sidebar_selecting = False
+        for account in self._accounts:
+            self._sidebar_box.append(self._make_account_section_loading(account))
+            self._start_account_folder_load(load_id, account)
 
         self._set_status(f"{len(self._accounts)} account(s)")
+        return False
+
+    def _start_account_folder_load(self, load_id: int, account: MailAccount) -> None:
+        def worker() -> None:
+            error: Exception | None = None
+            folders: list[dict] | None = None
+            try:
+                folders = self._mail.list_folders(account.uid)
+            except Exception as exc:
+                log.exception("Failed to list folders for %s", account.uid)
+                error = exc
+            GLib.idle_add(
+                self._on_account_folders_loaded,
+                load_id,
+                account.uid,
+                folders,
+                error,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_account_folders_loaded(
+        self,
+        load_id: int,
+        account_uid: str,
+        folders: list[dict] | None,
+        error: Exception | None,
+    ) -> bool:
+        if load_id != self._sidebar_load_generation:
+            return False
+
+        folder_list = self._folder_lists.get(account_uid)
+        if folder_list is None:
+            return False
+
+        self._clear_listbox(folder_list)
+
+        if error is not None:
+            error_label = Gtk.Label(
+                label=f"Could not load folders: {error}",
+                xalign=0,
+                wrap=True,
+            )
+            error_label.add_css_class("dim-label")
+            error_label.set_margin_start(12)
+            error_label.set_margin_end(12)
+            error_label.set_margin_bottom(8)
+            folder_list.append(self._wrap_list_row(error_label))
+            return False
+
+        assert folders is not None
+        for folder in folders:
+            folder_list.append(self._make_folder_row(account_uid, folder))
+
+        self._add_inbox_row(account_uid, folders)
+
+        if self._current_folder is None:
+            initial_list, initial_row = self._find_initial_folder()
+            if initial_list is not None and initial_row is not None:
+                self._sidebar_selecting = True
+                initial_list.select_row(initial_row)
+                self._sidebar_selecting = False
+
+        return False
 
     def _save_expanded_state(self) -> None:
+        if self._inbox_expander is not None:
+            self._inbox_expanded = self._inbox_expander.get_expanded()
         for uid, listbox in self._folder_lists.items():
             expander = listbox.get_parent()
             while expander is not None and not isinstance(expander, Gtk.Expander):
@@ -203,9 +283,24 @@ class MainWindow(Adw.ApplicationWindow):
     def _clear_sidebar(self) -> None:
         while child := self._sidebar_box.get_first_child():
             self._sidebar_box.remove(child)
+        self._inbox_expander = None
+        self._inbox_list = None
+
+    def _all_folder_listboxes(self) -> list[Gtk.ListBox]:
+        lists = list(self._folder_lists.values())
+        if self._inbox_list is not None:
+            lists.append(self._inbox_list)
+        return lists
 
     def _find_initial_folder(self) -> tuple[Gtk.ListBox | None, Gtk.ListBoxRow | None]:
-        """Prefer the first INBOX across accounts, else the first folder."""
+        """Prefer the first inbox in the unified section, else any INBOX, else first folder."""
+        if self._inbox_list is not None:
+            row = self._inbox_list.get_first_child()
+            while row is not None:
+                if getattr(row, "folder_name", None):
+                    return self._inbox_list, row
+                row = row.get_next_sibling()
+
         first: tuple[Gtk.ListBox | None, Gtk.ListBoxRow | None] = (None, None)
         for listbox in self._folder_lists.values():
             row = listbox.get_first_child()
@@ -219,7 +314,76 @@ class MainWindow(Adw.ApplicationWindow):
                 row = row.get_next_sibling()
         return first
 
-    def _make_account_section(self, account: MailAccount) -> Gtk.Expander:
+    def _make_inbox_section_loading(self) -> Gtk.Expander:
+        expander = Gtk.Expander()
+        expander.set_expanded(self._inbox_expanded)
+        expander.connect("notify::expanded", self._on_inbox_expanded)
+        header = Gtk.Label(label="Inbox", xalign=0)
+        header.add_css_class("heading")
+        header.set_margin_top(4)
+        header.set_margin_bottom(4)
+        expander.set_label_widget(header)
+        expander.set_margin_start(6)
+        expander.set_margin_end(6)
+        expander.set_margin_top(4)
+
+        inbox_list = Gtk.ListBox()
+        inbox_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        inbox_list.add_css_class("navigation-sidebar")
+        inbox_list.connect("row-selected", self._on_folder_selected)
+        self._inbox_list = inbox_list
+        self._inbox_expander = expander
+
+        loading = Gtk.Label(label="Loading inboxes…", xalign=0)
+        loading.add_css_class("dim-label")
+        loading.set_margin_start(12)
+        loading.set_margin_end(12)
+        loading.set_margin_bottom(8)
+        inbox_list.append(self._wrap_list_row(loading))
+
+        expander.set_child(inbox_list)
+        return expander
+
+    def _on_inbox_expanded(self, expander: Gtk.Expander, _pspec) -> None:
+        self._inbox_expanded = expander.get_expanded()
+
+    def _add_inbox_row(self, account_uid: str, folders: list[dict]) -> None:
+        if self._inbox_list is None:
+            return
+
+        inbox_name = MailService.guess_inbox(folders)
+        if not inbox_name:
+            return
+
+        inbox_folder = next(
+            (folder for folder in folders if folder.get("full_name") == inbox_name),
+            None,
+        )
+        if inbox_folder is None:
+            return
+
+        first = self._inbox_list.get_first_child()
+        if first is not None and getattr(first, "folder_name", None) is None:
+            self._inbox_list.remove(first)
+
+        self._inbox_list.append(self._make_inbox_row(account_uid, inbox_folder))
+
+    def _make_inbox_row(self, account_uid: str, folder: dict) -> Gtk.ListBoxRow:
+        account = self._accounts_by_uid.get(account_uid)
+        display = self._account_label(account) if account else account_uid
+        unread = folder.get("unread", -1)
+        total = folder.get("total", -1)
+        label_text = self._format_folder_label(display, unread, total)
+
+        label = Gtk.Label(label=label_text, xalign=0, margin_start=12, margin_end=12)
+        row = Gtk.ListBoxRow()
+        row.set_child(label)
+        row.account_uid = account_uid
+        row.folder_name = folder.get("full_name")
+        row.display_name = display
+        return row
+
+    def _make_account_section_loading(self, account: MailAccount) -> Gtk.Expander:
         expander = Gtk.Expander()
         expander.set_expanded(self._expanded_accounts.get(account.uid, True))
         expander.connect("notify::expanded", self._on_account_expanded, account.uid)
@@ -234,21 +398,12 @@ class MainWindow(Adw.ApplicationWindow):
         folder_list.connect("row-selected", self._on_folder_selected)
         self._folder_lists[account.uid] = folder_list
 
-        try:
-            folders = self._mail.list_folders(account.uid)
-        except Exception as exc:
-            log.exception("Failed to list folders for %s", account.uid)
-            error = Gtk.Label(label=f"Could not load folders: {exc}", xalign=0, wrap=True)
-            error.add_css_class("dim-label")
-            error.set_margin_start(12)
-            error.set_margin_end(12)
-            error.set_margin_bottom(8)
-            folder_list.append(self._wrap_list_row(error))
-            expander.set_child(folder_list)
-            return expander
-
-        for folder in folders:
-            folder_list.append(self._make_folder_row(account.uid, folder))
+        loading = Gtk.Label(label="Loading folders…", xalign=0)
+        loading.add_css_class("dim-label")
+        loading.set_margin_start(12)
+        loading.set_margin_end(12)
+        loading.set_margin_bottom(8)
+        folder_list.append(self._wrap_list_row(loading))
 
         expander.set_child(folder_list)
         return expander
@@ -256,39 +411,64 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_account_expanded(self, expander: Gtk.Expander, _pspec, account_uid: str) -> None:
         self._expanded_accounts[account_uid] = expander.get_expanded()
 
+    @staticmethod
+    def _account_label(account: MailAccount) -> str:
+        return account.email or account.name
+
     def _make_account_header(self, account: MailAccount) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        box.set_margin_top(4)
-        box.set_margin_bottom(4)
-
-        name = Gtk.Label(label=account.name, xalign=0)
-        name.add_css_class("heading")
-        box.append(name)
-
-        if account.email:
-            email = Gtk.Label(label=account.email, xalign=0)
-            email.add_css_class("dim-label")
-            email.set_ellipsize(3)
-            box.append(email)
-
-        return box
+        label = Gtk.Label(label=self._account_label(account), xalign=0)
+        label.add_css_class("heading")
+        label.set_ellipsize(3)
+        label.set_margin_top(4)
+        label.set_margin_bottom(4)
+        return label
 
     def _wrap_list_row(self, widget: Gtk.Widget) -> Gtk.ListBoxRow:
         row = Gtk.ListBoxRow()
         row.set_child(widget)
         return row
 
+    @staticmethod
+    def _format_folder_label(display: str, unread: int, total: int) -> str:
+        if unread >= 0 and total >= 0:
+            return f"{display} ({unread}/{total})"
+        if total >= 0:
+            return f"{display} ({total})"
+        if unread >= 0:
+            return f"{display} ({unread})"
+        return display
+
     def _make_folder_row(self, account_uid: str, folder: dict) -> Gtk.ListBoxRow:
         display = folder.get("display_name") or folder.get("full_name") or "?"
         unread = folder.get("unread", -1)
-        label_text = f"{display} ({unread})" if unread >= 0 else display
+        total = folder.get("total", -1)
+        label_text = self._format_folder_label(display, unread, total)
 
         label = Gtk.Label(label=label_text, xalign=0, margin_start=12, margin_end=12)
         row = Gtk.ListBoxRow()
         row.set_child(label)
         row.account_uid = account_uid
         row.folder_name = folder.get("full_name")
+        row.display_name = display
         return row
+
+    def _update_folder_row(
+        self, account_uid: str, folder_name: str, unread: int, total: int
+    ) -> None:
+        for folder_list in self._all_folder_listboxes():
+            row = folder_list.get_first_child()
+            while row is not None:
+                if (
+                    getattr(row, "account_uid", None) == account_uid
+                    and getattr(row, "folder_name", None) == folder_name
+                ):
+                    label = row.get_child()
+                    if isinstance(label, Gtk.Label):
+                        display = getattr(row, "display_name", folder_name)
+                        label.set_label(
+                            self._format_folder_label(display, unread, total)
+                        )
+                row = row.get_next_sibling()
 
     def _clear_reader(self) -> None:
         self._reader_subject.set_label("Select a message")
@@ -314,8 +494,8 @@ class MainWindow(Adw.ApplicationWindow):
         if not account_uid or not folder_name:
             return
 
-        # Keep a single selection across account folder lists.
-        for uid, other in self._folder_lists.items():
+        # Keep a single selection across all folder lists.
+        for other in self._all_folder_listboxes():
             if other is not listbox:
                 other.unselect_all()
 
@@ -346,8 +526,12 @@ class MainWindow(Adw.ApplicationWindow):
         def worker() -> None:
             error: Exception | None = None
             messages: list[dict] | None = None
+            unread = -1
+            total = -1
             try:
-                messages = self._mail.list_messages(account_uid, folder_name)
+                messages, unread, total = self._mail.list_messages_with_stats(
+                    account_uid, folder_name
+                )
             except Exception as exc:
                 log.exception("Failed to list messages")
                 error = exc
@@ -357,6 +541,8 @@ class MainWindow(Adw.ApplicationWindow):
                 account_uid,
                 folder_name,
                 messages,
+                unread,
+                total,
                 error,
             )
 
@@ -368,6 +554,8 @@ class MainWindow(Adw.ApplicationWindow):
         account_uid: str,
         folder_name: str,
         messages: list[dict] | None,
+        unread: int,
+        total: int,
         error: Exception | None,
     ) -> bool:
         if load_id != self._messages_load_generation:
@@ -386,10 +574,13 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_stack.set_visible_child_name("list")
             return False
 
+        self._update_folder_row(account_uid, folder_name, unread, total)
         self._message_stack.set_visible_child_name("list")
         self._message_populate_generation += 1
         populate_id = self._message_populate_generation
-        self._populate_message_rows(populate_id, messages, 0, account, folder_name)
+        self._populate_message_rows(
+            populate_id, messages, 0, account, folder_name, total
+        )
         return False
 
     def _populate_message_rows(
@@ -399,6 +590,7 @@ class MainWindow(Adw.ApplicationWindow):
         offset: int,
         account: MailAccount,
         folder_name: str,
+        total: int = -1,
         batch_size: int = 25,
     ) -> bool:
         if populate_id != self._message_populate_generation:
@@ -436,12 +628,15 @@ class MainWindow(Adw.ApplicationWindow):
                 end,
                 account,
                 folder_name,
+                total,
                 batch_size,
             )
-            self._set_status(f"Loading {folder_name}… ({end}/{len(messages)})")
+            shown = total if total >= 0 else len(messages)
+            self._set_status(f"Loading {folder_name}… ({end}/{shown})")
         else:
             display = account.name
-            self._set_status(f"{len(messages)} messages in {display} / {folder_name}")
+            count = total if total >= 0 else len(messages)
+            self._set_status(f"{count} messages in {display} / {folder_name}")
 
         return False
 

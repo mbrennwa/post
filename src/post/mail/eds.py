@@ -20,6 +20,7 @@ gi.require_version("EDataServer", "1.2")
 from gi.repository import Camel, EDataServer, GLib
 
 from .helpers import message_info_to_dict, walk_folder_info
+from .auth import PasswordPromptCallback, authenticate_service_sync
 
 log = logging.getLogger(__name__)
 
@@ -27,18 +28,88 @@ log = logging.getLogger(__name__)
 _SKIP_BACKENDS = frozenset({"rss", "vfolder"})
 
 
-class MailSession(Camel.Session):
-    """Camel session: OAuth via ESource, default Camel auth for everything else."""
+class _OAuthDelegate(Camel.Session):
+    """Minimal session without password auth override — used for XOAUTH2 SASL."""
 
-    __gtype_name__ = "PostMailSession"
+    __gtype_name__ = "PostOAuthDelegate"
 
     def __init__(self, registry: EDataServer.SourceRegistry, **kwargs):
         super().__init__(**kwargs)
         self._registry = registry
 
+    def do_get_oauth2_access_token_sync(self, service, cancellable):
+        source = self._registry.ref_source(service.get_uid())
+        if source is None:
+            return False, "", 0
+        try:
+            ok, token, expires_in = source.get_oauth2_access_token_sync(cancellable)
+            if ok and token:
+                return True, token, expires_in or 0
+        except Exception:
+            log.exception("OAuth2 failed for %s", service.get_uid())
+        return False, "", 0
+
+
+class MailSession(Camel.Session):
+    """Camel session: OAuth via ESource, password auth for IMAP."""
+
+    __gtype_name__ = "PostMailSession"
+
+    def __init__(
+        self,
+        registry: EDataServer.SourceRegistry,
+        password_prompt: PasswordPromptCallback | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._registry = registry
+        self._password_prompt = password_prompt
+        self._oauth_delegate: _OAuthDelegate | None = None
+
+    def set_password_prompt(self, callback: PasswordPromptCallback | None) -> None:
+        self._password_prompt = callback
+
+    def _oauth_session(self) -> _OAuthDelegate:
+        if self._oauth_delegate is None:
+            self._oauth_delegate = _OAuthDelegate(
+                self._registry,
+                user_data_dir=self.get_user_data_dir(),
+                user_cache_dir=self.get_user_cache_dir(),
+                online=True,
+            )
+        return self._oauth_delegate
+
     def _credential_source(self, service) -> EDataServer.Source | None:
         """Account ESource for a Camel service (matches Evolution's EMailSession)."""
         return self._registry.ref_source(service.get_uid())
+
+    def do_authenticate_sync(self, service, mechanism=None, cancellable=None):
+        """Password auth for IMAP; delegate XOAUTH2 to a plain Camel session."""
+        if mechanism == "XOAUTH2":
+            return self._oauth_session().authenticate_sync(
+                service, mechanism, cancellable
+            )
+
+        source = self._credential_source(service)
+        if source is None:
+            return False
+
+        if authenticate_service_sync(
+            service,
+            source,
+            self._registry,
+            mechanism,
+            cancellable,
+            self._password_prompt,
+        ):
+            return True
+
+        log.warning(
+            "Authentication failed for %s (mechanism=%s)",
+            source.get_display_name(),
+            mechanism,
+        )
+        return False
 
     def do_get_oauth2_access_token_sync(self, service, cancellable):
         """OAuth2 for Gmail, Microsoft 365, etc. (via GOA / ESource)."""
@@ -70,6 +141,7 @@ class MailService:
     _session: Camel.Session | None = field(default=None, init=False)
     _stores: dict[str, Camel.Store] = field(default_factory=dict, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _password_prompt: PasswordPromptCallback | None = field(default=None, init=False)
 
     @classmethod
     def connect(cls) -> MailService:
@@ -80,6 +152,11 @@ class MailService:
                 "Is Evolution Data Server installed and your session running?"
             )
         return cls(registry=registry)
+
+    def set_password_prompt(self, callback: PasswordPromptCallback | None) -> None:
+        self._password_prompt = callback
+        if isinstance(self._session, MailSession):
+            self._session.set_password_prompt(callback)
 
     def list_accounts(self) -> list[MailAccount]:
         accounts: list[MailAccount] = []
@@ -119,6 +196,7 @@ class MailService:
 
         self._session = MailSession(
             self.registry,
+            password_prompt=self._password_prompt,
             user_data_dir=user_data,
             user_cache_dir=user_cache,
             online=True,
@@ -187,21 +265,32 @@ class MailService:
     def list_messages(
         self, account_uid: str, folder_name: str, limit: int = 50
     ) -> list[dict]:
+        messages, _unread, _total = self.list_messages_with_stats(
+            account_uid, folder_name, limit
+        )
+        return messages
+
+    def list_messages_with_stats(
+        self, account_uid: str, folder_name: str, limit: int = 50
+    ) -> tuple[list[dict], int, int]:
         with self._lock:
             return self._list_messages_unlocked(account_uid, folder_name, limit)
 
     def _list_messages_unlocked(
         self, account_uid: str, folder_name: str, limit: int = 50
-    ) -> list[dict]:
+    ) -> tuple[list[dict], int, int]:
         store = self._get_store_unlocked(account_uid)
         folder = store.get_folder_sync(folder_name, 0, None)
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
 
         folder.refresh_info_sync(None)
+        unread = folder.get_unread_message_count()
+        total = folder.get_message_count()
+
         uids = folder.get_uids()
         if uids is None:
-            return []
+            return [], unread, total
 
         uid_list = sorted(
             (str(u) for u in uids),
@@ -214,7 +303,7 @@ class MailService:
             info = folder.get_message_info(uid)
             if info is not None:
                 messages.append(message_info_to_dict(info))
-        return messages
+        return messages, unread, total
 
     def read_message(
         self, account_uid: str, folder_name: str, message_uid: str

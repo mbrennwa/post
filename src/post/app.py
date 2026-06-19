@@ -13,7 +13,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw
+from gi.repository import Adw, GLib
 
 from post.window import MainWindow
 
@@ -29,7 +29,10 @@ def main() -> int:
         win = application.get_active_window()
         if win is None:
             win = MainWindow(application=application)
-        win.present()
+            win.present()
+            win.begin_load()
+        else:
+            win.present()
 
     app.connect("activate", on_activate)
     return app.run(sys.argv)

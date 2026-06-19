@@ -38,7 +38,10 @@ def main() -> int:
         folders = mail.list_folders(account.uid)
     except GLib.Error as exc:
         print(f"  Could not connect: {exc.message}")
-        print("  Tip: check Online Accounts, or open Evolution once to refresh tokens.")
+        print(
+            "  Tip: for OAuth accounts check Online Accounts; "
+            "for IMAP password accounts run Post and enter your password when prompted."
+        )
         return 1
     for folder in folders[:20]:
         print(
