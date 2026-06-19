@@ -30,4 +30,4 @@ You need at least one mail account set up in Evolution or GNOME Settings → Onl
 
 ## License
 
-GPL-3.0-or-later — see [COPYING](COPYING).
+GPL-3.0-or-later — see [LICENSE](LICENSE).

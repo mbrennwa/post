@@ -5,7 +5,7 @@ description = "A simple GNOME mail client — GTK4 UI on Evolution Data Server"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
-license-files = ["COPYING", "LICENSES/*.txt"]
+license-files = ["LICENSE", "LICENSES/*.txt"]
 authors = [{ name = "mbrennwa" }]
 
 [project.scripts]
