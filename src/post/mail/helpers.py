@@ -104,11 +104,13 @@ def message_info_to_dict(info: Any) -> dict[str, Any]:
     date_sent = info.get_date_sent()
     date_recv = info.get_date_received()
     flags = info.get_flags()
+    sort_date = date_recv or date_sent or 0
     return {
         "uid": _safe_str(info.get_uid()),
         "subject": _safe_str(info.get_subject()) or "(no subject)",
         "from": _safe_str(info.get_from()) or "",
         "to": _safe_str(info.get_to()) or "",
+        "sort_date": sort_date,
         "date_sent": (
             datetime.fromtimestamp(date_sent, tz=timezone.utc).isoformat()
             if date_sent
@@ -126,6 +128,18 @@ def message_info_to_dict(info: Any) -> dict[str, Any]:
             "deleted": bool(flags & Camel.MessageFlags.DELETED),
         },
     }
+
+
+def sort_messages_newest_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(messages, key=lambda message: message.get("sort_date") or 0, reverse=True)
+
+
+def paginate_messages(
+    messages: list[dict[str, Any]], offset: int, limit: int
+) -> tuple[list[dict[str, Any]], bool]:
+    page = messages[offset : offset + limit]
+    has_more = offset + len(page) < len(messages)
+    return page, has_more
 
 
 def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:

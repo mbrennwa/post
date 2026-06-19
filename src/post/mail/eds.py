@@ -19,13 +19,27 @@ gi.require_version("EDataServer", "1.2")
 
 from gi.repository import Camel, EDataServer, GLib
 
-from .helpers import message_info_to_dict, walk_folder_info
+from .helpers import (
+    message_info_to_dict,
+    paginate_messages,
+    sort_messages_newest_first,
+    walk_folder_info,
+)
 from .auth import PasswordPromptCallback, authenticate_service_sync
+from .folders import guess_inbox_name
 
 log = logging.getLogger(__name__)
 
 # EDS also lists RSS feeds, search folders, etc. as "Mail Account" sources.
 _SKIP_BACKENDS = frozenset({"rss", "vfolder"})
+DEFAULT_MESSAGE_PAGE_SIZE = 50
+
+
+@dataclass
+class _FolderMessageIndex:
+    messages: list[dict]
+    unread: int
+    total: int
 
 
 class MailSession(Camel.Session):
@@ -102,6 +116,10 @@ class MailAccount:
     email: str | None
     backend: str | None
 
+    @property
+    def display_label(self) -> str:
+        return self.email or self.name
+
 
 @dataclass
 class MailService:
@@ -110,6 +128,9 @@ class MailService:
     registry: EDataServer.SourceRegistry
     _session: Camel.Session | None = field(default=None, init=False)
     _stores: dict[str, Camel.Store] = field(default_factory=dict, init=False)
+    _folder_indexes: dict[tuple[str, str], _FolderMessageIndex] = field(
+        default_factory=dict, init=False
+    )
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _password_prompt: PasswordPromptCallback | None = field(default=None, init=False)
 
@@ -233,22 +254,64 @@ class MailService:
         return accounts[0] if accounts else None
 
     def list_messages(
-        self, account_uid: str, folder_name: str, limit: int = 50
+        self,
+        account_uid: str,
+        folder_name: str,
+        limit: int = DEFAULT_MESSAGE_PAGE_SIZE,
     ) -> list[dict]:
-        messages, _unread, _total = self.list_messages_with_stats(
-            account_uid, folder_name, limit
+        messages, _unread, _total, _has_more = self.list_messages_page(
+            account_uid, folder_name, offset=0, limit=limit
         )
         return messages
 
-    def list_messages_with_stats(
-        self, account_uid: str, folder_name: str, limit: int = 50
-    ) -> tuple[list[dict], int, int]:
+    def list_messages_page(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        offset: int = 0,
+        limit: int = DEFAULT_MESSAGE_PAGE_SIZE,
+    ) -> tuple[list[dict], int, int, bool]:
         with self._lock:
-            return self._list_messages_unlocked(account_uid, folder_name, limit)
+            return self._list_messages_page_unlocked(
+                account_uid, folder_name, offset=offset, limit=limit
+            )
 
-    def _list_messages_unlocked(
-        self, account_uid: str, folder_name: str, limit: int = 50
+    def list_messages_with_stats(
+        self,
+        account_uid: str,
+        folder_name: str,
+        limit: int = DEFAULT_MESSAGE_PAGE_SIZE,
     ) -> tuple[list[dict], int, int]:
+        messages, unread, total, _has_more = self.list_messages_page(
+            account_uid, folder_name, offset=0, limit=limit
+        )
+        return messages, unread, total
+
+    def _list_messages_page_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[dict], int, int, bool]:
+        key = (account_uid, folder_name)
+        if offset == 0:
+            index = self._build_folder_index_unlocked(account_uid, folder_name)
+            self._folder_indexes[key] = index
+        else:
+            index = self._folder_indexes.get(key)
+            if index is None:
+                index = self._build_folder_index_unlocked(account_uid, folder_name)
+                self._folder_indexes[key] = index
+
+        page, has_more = paginate_messages(index.messages, offset, limit)
+        return page, index.unread, index.total, has_more
+
+    def _build_folder_index_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> _FolderMessageIndex:
         store = self._get_store_unlocked(account_uid)
         folder = store.get_folder_sync(folder_name, 0, None)
         if folder is None:
@@ -260,20 +323,19 @@ class MailService:
 
         uids = folder.get_uids()
         if uids is None:
-            return [], unread, total
-
-        uid_list = sorted(
-            (str(u) for u in uids),
-            key=lambda u: int(u) if u.isdigit() else 0,
-            reverse=True,
-        )[:limit]
+            return _FolderMessageIndex(messages=[], unread=unread, total=total)
 
         messages: list[dict] = []
-        for uid in uid_list:
-            info = folder.get_message_info(uid)
+        for uid in uids:
+            info = folder.get_message_info(str(uid))
             if info is not None:
                 messages.append(message_info_to_dict(info))
-        return messages, unread, total
+
+        return _FolderMessageIndex(
+            messages=sort_messages_newest_first(messages),
+            unread=unread,
+            total=total,
+        )
 
     def read_message(
         self, account_uid: str, folder_name: str, message_uid: str
@@ -304,12 +366,4 @@ class MailService:
 
     @staticmethod
     def guess_inbox(folders: list[dict]) -> str | None:
-        for folder in folders:
-            name = (folder.get("full_name") or "").upper()
-            if name in ("INBOX", "INBOX/"):
-                return folder["full_name"]
-        for folder in folders:
-            display = (folder.get("display_name") or "").lower()
-            if display == "inbox":
-                return folder.get("full_name")
-        return folders[0]["full_name"] if folders else None
+        return guess_inbox_name(folders)

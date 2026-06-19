@@ -30,10 +30,10 @@ def main() -> int:
 
     print(f"Found {len(accounts)} account(s):\n")
     for account in accounts:
-        print(f"  • {account.name} <{account.email}> [{account.backend}]")
+        print(f"  • {account.display_label} [{account.backend}]")
 
     account = MailService.pick_default_account(accounts) or accounts[0]
-    print(f"\nFolders for {account.name}:")
+    print(f"\nFolders for {account.display_label}:")
     try:
         folders = mail.list_folders(account.uid)
     except GLib.Error as exc:
