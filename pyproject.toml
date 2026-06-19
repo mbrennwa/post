@@ -1,0 +1,20 @@
+[project]
+name = "post"
+version = "0.1.0"
+description = "A simple GNOME mail client — GTK4 UI on Evolution Data Server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+license-files = ["COPYING", "LICENSES/*.txt"]
+authors = [{ name = "mbrennwa" }]
+
+[project.scripts]
+post = "post.main:main"
+post-probe = "post.probe:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
