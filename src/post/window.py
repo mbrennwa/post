@@ -266,6 +266,14 @@ class MainWindow(Adw.ApplicationWindow):
         flag_action.connect("activate", self._on_message_menu_toggle_flag)
         self.add_action(flag_action)
 
+        archive_action = Gio.SimpleAction.new("message-archive", None)
+        archive_action.connect("activate", self._on_message_menu_archive)
+        self.add_action(archive_action)
+
+        trash_action = Gio.SimpleAction.new("message-move-trash", None)
+        trash_action.connect("activate", self._on_message_menu_move_trash)
+        self.add_action(trash_action)
+
         self._message_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
         self._message_popover.set_parent(self._message_scroll)
 
@@ -770,7 +778,6 @@ class MainWindow(Adw.ApplicationWindow):
         row_offset: int,
         account: MailAccount,
         folder_name: str,
-        *,
         page_offset: int,
         batch_size: int = 25,
     ) -> bool:
@@ -837,8 +844,8 @@ class MainWindow(Adw.ApplicationWindow):
                 end,
                 account,
                 folder_name,
-                page_offset=page_offset,
-                batch_size=batch_size,
+                page_offset,
+                batch_size,
             )
             return False
 
@@ -901,6 +908,12 @@ class MainWindow(Adw.ApplicationWindow):
             return f"Flag{suffix}"
         return f"Toggle flag{suffix}"
 
+    @staticmethod
+    def _count_menu_label(base: str, rows: list[Gtk.ListBoxRow]) -> str:
+        count = len(rows)
+        suffix = f" ({count})" if count > 1 else ""
+        return f"{base}{suffix}"
+
     def _popup_message_menu(
         self, row: Gtk.ListBoxRow, x: float, y: float
     ) -> None:
@@ -910,6 +923,12 @@ class MainWindow(Adw.ApplicationWindow):
         menu = Gio.Menu()
         menu.append(self._read_menu_label(rows), "win.message-toggle-read")
         menu.append(self._flag_menu_label(rows), "win.message-toggle-flag")
+        menu.append(
+            self._count_menu_label("Archive", rows), "win.message-archive"
+        )
+        menu.append(
+            self._count_menu_label("Move to Trash", rows), "win.message-move-trash"
+        )
         self._message_popover.set_menu_model(menu)
 
         coords = self._message_list.translate_coordinates(
@@ -954,6 +973,129 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_message_menu_toggle_flag(self, *_args) -> None:
         self._toggle_message_flag("flagged")
+
+    def _on_message_menu_archive(self, *_args) -> None:
+        self._move_context_messages("archive")
+
+    def _on_message_menu_move_trash(self, *_args) -> None:
+        self._move_context_messages("trash")
+
+    def _move_context_messages(self, destination: str) -> None:
+        rows = list(self._context_message_rows)
+        if not rows or not self._current_account or not self._current_folder:
+            return
+
+        uids = [uid for row in rows if (uid := getattr(row, "message_uid", None))]
+        if not uids:
+            return
+
+        account_uid = self._current_account.uid
+        folder_name = self._current_folder
+        self._message_popover.popdown()
+
+        def worker() -> None:
+            error: Exception | None = None
+            result: dict | None = None
+            try:
+                if destination == "trash":
+                    result = self._mail.move_messages_to_trash(
+                        account_uid, folder_name, uids
+                    )
+                else:
+                    result = self._mail.archive_messages(
+                        account_uid, folder_name, uids
+                    )
+            except Exception as exc:
+                log.exception("Failed to move messages to %s", destination)
+                error = exc
+            GLib.idle_add(
+                self._on_messages_moved,
+                rows,
+                destination,
+                result,
+                error,
+            )
+
+        label = "Trash" if destination == "trash" else "Archive"
+        self._set_status(f"Moving {len(uids)} message(s) to {label}…")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_messages_moved(
+        self,
+        rows: list[Gtk.ListBoxRow],
+        destination: str,
+        result: dict | None,
+        error: Exception | None,
+    ) -> bool:
+        if error is not None:
+            self._set_status(f"Could not move messages: {error}")
+            return False
+        if result is None:
+            return False
+
+        removed_count = 0
+        for row in list(rows):
+            uid = getattr(row, "message_uid", None)
+            if row.get_parent() is self._message_list:
+                self._message_list.remove(row)
+                removed_count += 1
+            if uid == self._current_message_uid:
+                self._clear_reader()
+
+        self._shown_message_count = max(0, self._shown_message_count - removed_count)
+        if self._message_total >= 0:
+            self._message_total = max(0, self._message_total - removed_count)
+
+        if removed_count == 0:
+            self._set_status("Messages moved, but the list could not be updated")
+            return False
+
+        remaining_rows = 0
+        child = self._message_list.get_first_child()
+        while child is not None:
+            if isinstance(child, Gtk.ListBoxRow):
+                remaining_rows += 1
+            child = child.get_next_sibling()
+        if remaining_rows == 0 and self._current_folder:
+            self._message_empty_label.set_label(
+                f"No messages in {self._current_folder}"
+            )
+            self._message_stack.set_visible_child_name("empty")
+
+        if self._current_account and self._current_folder:
+            unread = result.get("source_folder_unread")
+            total = result.get("source_folder_total")
+            if unread is not None and total is not None:
+                self._sidebar.update_folder_row(
+                    self._current_account.uid,
+                    self._current_folder,
+                    unread,
+                    total,
+                )
+
+            dest_folder = result.get("destination_folder")
+            dest_unread = result.get("destination_folder_unread")
+            dest_total = result.get("destination_folder_total")
+            if (
+                dest_folder
+                and dest_unread is not None
+                and dest_total is not None
+            ):
+                self._sidebar.update_folder_row(
+                    self._current_account.uid,
+                    dest_folder,
+                    dest_unread,
+                    dest_total,
+                )
+
+            self._update_message_status(self._current_account, self._current_folder)
+
+        label = "Trash" if destination == "trash" else "Archive"
+        if removed_count > 1:
+            self._set_status(f"Moved {removed_count} messages to {label}")
+        else:
+            self._set_status(f"Moved message to {label}")
+        return False
 
     def _toggle_message_flag(self, flag_name: str) -> None:
         rows = list(self._context_message_rows)

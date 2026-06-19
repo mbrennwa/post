@@ -36,3 +36,31 @@ def find_inbox_folder(folders: list[dict]) -> dict | None:
         (folder for folder in folders if folder.get("full_name") == inbox_name),
         None,
     )
+
+
+def folder_matches_type(folder: dict, folder_type: int, *, type_mask: int) -> bool:
+    flags = int(folder.get("flags") or 0)
+    return (flags & type_mask) == folder_type
+
+
+def find_folder_by_type(
+    folders: list[dict],
+    folder_type: int,
+    *,
+    type_mask: int,
+    name_fallbacks: frozenset[str] | None = None,
+) -> dict | None:
+    for folder in folders:
+        if folder_matches_type(folder, folder_type, type_mask=type_mask):
+            return folder
+
+    if not name_fallbacks:
+        return None
+
+    for folder in folders:
+        display = (folder.get("display_name") or "").strip().lower()
+        full = (folder.get("full_name") or "").strip().lower()
+        base = full.rsplit("/", 1)[-1]
+        if display in name_fallbacks or base in name_fallbacks:
+            return folder
+    return None

@@ -43,11 +43,13 @@ def _folder_field(fi: Any, getter: str, attr: str) -> str | None:
 
 
 def folder_info_to_dict(fi: Any) -> dict[str, Any]:
+    flags = fi.get_flags() if hasattr(fi, "get_flags") else 0
     return {
         "full_name": _folder_field(fi, "get_full_name", "full_name"),
         "display_name": _folder_field(fi, "get_display_name", "display_name"),
         "unread": fi.get_unread() if hasattr(fi, "get_unread") else -1,
         "total": fi.get_total() if hasattr(fi, "get_total") else -1,
+        "flags": int(flags),
     }
 
 
@@ -65,6 +67,7 @@ def _cfi_to_dict(struct: _CamelFolderInfoC) -> dict[str, Any]:
         ),
         "unread": struct.unread,
         "total": struct.total,
+        "flags": int(struct.flags),
     }
 
 

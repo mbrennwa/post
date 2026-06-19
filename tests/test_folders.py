@@ -7,6 +7,7 @@ import unittest
 
 from post.mail.eds import MailAccount
 from post.mail.folders import (
+    find_folder_by_type,
     find_inbox_folder,
     format_folder_label,
     guess_inbox_name,
@@ -55,6 +56,37 @@ class FindInboxFolderTests(unittest.TestCase):
         inbox = {"full_name": "INBOX", "display_name": "Inbox", "unread": 1}
         folders = [{"full_name": "Sent", "display_name": "Sent"}, inbox]
         self.assertEqual(find_inbox_folder(folders), inbox)
+
+
+class FindFolderByTypeTests(unittest.TestCase):
+    TYPE_ARCHIVE = 11264
+    TYPE_MASK = 64512
+
+    def test_matches_folder_type_flag(self) -> None:
+        archive = {
+            "full_name": "Archive",
+            "display_name": "Archive",
+            "flags": self.TYPE_ARCHIVE,
+        }
+        folders = [{"full_name": "INBOX", "display_name": "Inbox", "flags": 1024}, archive]
+        self.assertEqual(
+            find_folder_by_type(
+                folders, self.TYPE_ARCHIVE, type_mask=self.TYPE_MASK
+            ),
+            archive,
+        )
+
+    def test_falls_back_to_display_name(self) -> None:
+        archive = {"full_name": "mail/archive", "display_name": "Archive", "flags": 0}
+        self.assertEqual(
+            find_folder_by_type(
+                folders=[{"full_name": "INBOX", "display_name": "Inbox"}, archive],
+                folder_type=99999,
+                type_mask=self.TYPE_MASK,
+                name_fallbacks=frozenset({"archive"}),
+            ),
+            archive,
+        )
 
 
 class MailAccountDisplayLabelTests(unittest.TestCase):

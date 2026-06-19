@@ -27,7 +27,7 @@ from .helpers import (
     walk_folder_info,
 )
 from .auth import PasswordPromptCallback, authenticate_service_sync
-from .folders import guess_inbox_name
+from .folders import find_folder_by_type, guess_inbox_name
 
 log = logging.getLogger(__name__)
 
@@ -388,6 +388,22 @@ class MailService:
                 account_uid, folder_name, message_uids
             )
 
+    def move_messages_to_trash(
+        self, account_uid: str, folder_name: str, message_uids: list[str]
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._move_messages_to_trash_unlocked(
+                account_uid, folder_name, message_uids
+            )
+
+    def archive_messages(
+        self, account_uid: str, folder_name: str, message_uids: list[str]
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._archive_messages_unlocked(
+                account_uid, folder_name, message_uids
+            )
+
     def mark_message_read(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> tuple[int, int]:
@@ -593,6 +609,102 @@ class MailService:
             updates.append({"uid": message_uid, "flags": {"flagged": new_flagged}})
         return {"updates": updates}
 
+    def _move_messages_to_trash_unlocked(
+        self, account_uid: str, folder_name: str, message_uids: list[str]
+    ) -> dict[str, Any]:
+        store = self._get_store_unlocked(account_uid)
+        trash_folder = store.get_trash_folder_sync(None)
+        if trash_folder is None:
+            folders = self._list_folders_unlocked(account_uid)
+            trash_info = find_folder_by_type(
+                folders,
+                Camel.FolderInfoFlags.TYPE_TRASH,
+                type_mask=Camel.FOLDER_TYPE_MASK,
+                name_fallbacks=frozenset({"trash", "deleted", "bin"}),
+            )
+            if trash_info is None:
+                raise ValueError("Trash folder not found for this account")
+            trash_folder = store.get_folder_sync(trash_info["full_name"], 0, None)
+            if trash_folder is None:
+                raise ValueError("Trash folder not found for this account")
+
+        return self._transfer_messages_unlocked(
+            account_uid, folder_name, message_uids, trash_folder
+        )
+
+    def _archive_messages_unlocked(
+        self, account_uid: str, folder_name: str, message_uids: list[str]
+    ) -> dict[str, Any]:
+        store = self._get_store_unlocked(account_uid)
+        folders = self._list_folders_unlocked(account_uid)
+        archive_info = find_folder_by_type(
+            folders,
+            Camel.FolderInfoFlags.TYPE_ARCHIVE,
+            type_mask=Camel.FOLDER_TYPE_MASK,
+            name_fallbacks=frozenset({"archive", "archives"}),
+        )
+        if archive_info is None:
+            raise ValueError("Archive folder not found for this account")
+
+        archive_folder = store.get_folder_sync(archive_info["full_name"], 0, None)
+        if archive_folder is None:
+            raise ValueError("Archive folder not found for this account")
+
+        return self._transfer_messages_unlocked(
+            account_uid, folder_name, message_uids, archive_folder
+        )
+
+    def _transfer_messages_unlocked(
+        self,
+        account_uid: str,
+        source_folder_name: str,
+        message_uids: list[str],
+        destination_folder: Camel.Folder,
+    ) -> dict[str, Any]:
+        if not message_uids:
+            return {"moved_uids": []}
+
+        source_folder = self._open_folder_unlocked(account_uid, source_folder_name)
+        dest_name = destination_folder.get_full_name()
+        if dest_name and dest_name == source_folder_name:
+            raise ValueError("Messages are already in that folder")
+
+        ok, transferred = source_folder.transfer_messages_to_sync(
+            message_uids, destination_folder, True, None
+        )
+        if not ok:
+            raise RuntimeError("Could not move messages")
+
+        # Camel returns destination UIDs; the UI and cache use source UIDs.
+        moved_uids = list(message_uids)
+        destination_uids = list(transferred) if transferred else []
+        source_folder.refresh_info_sync(None)
+        destination_folder.refresh_info_sync(None)
+
+        source_unread = source_folder.get_unread_message_count()
+        source_total = source_folder.get_message_count()
+        self._remove_messages_from_cache(
+            account_uid, source_folder_name, moved_uids, source_unread, source_total
+        )
+
+        dest_unread = destination_folder.get_unread_message_count()
+        dest_total = destination_folder.get_message_count()
+        if dest_name:
+            self._update_cached_folder_counts(
+                account_uid, dest_name, dest_unread, dest_total
+            )
+
+        return {
+            "moved_uids": moved_uids,
+            "destination_uids": destination_uids,
+            "source_folder": source_folder_name,
+            "source_folder_unread": source_unread,
+            "source_folder_total": source_total,
+            "destination_folder": dest_name,
+            "destination_folder_unread": dest_unread,
+            "destination_folder_total": dest_total,
+        }
+
     def _open_folder_unlocked(
         self, account_uid: str, folder_name: str
     ) -> Camel.Folder:
@@ -655,6 +767,26 @@ class MailService:
         if index is not None:
             index.unread = unread
             index.total = total
+
+    def _remove_messages_from_cache(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+        unread: int,
+        total: int,
+    ) -> None:
+        uid_set = set(message_uids)
+        index = self._folder_indexes.get((account_uid, folder_name))
+        if index is None:
+            return
+        index.messages = [
+            message
+            for message in index.messages
+            if message.get("uid") not in uid_set
+        ]
+        index.unread = unread
+        index.total = total
 
     @staticmethod
     def guess_inbox(folders: list[dict]) -> str | None:
