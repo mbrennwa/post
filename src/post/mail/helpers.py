@@ -135,6 +135,11 @@ def message_is_unread(msg: dict[str, Any]) -> bool:
     return not flags.get("seen", True)
 
 
+def message_is_flagged(msg: dict[str, Any]) -> bool:
+    flags = msg.get("flags") or {}
+    return bool(flags.get("flagged"))
+
+
 def message_has_attachments(msg: dict[str, Any]) -> bool:
     flags = msg.get("flags") or {}
     return bool(flags.get("attachments"))

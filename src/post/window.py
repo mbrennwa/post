@@ -28,6 +28,7 @@ from post.mail.helpers import (
     format_message_header,
     format_message_list_date,
     message_has_attachments,
+    message_is_flagged,
     message_is_unread,
 )
 from post.reader import build_reader_document
@@ -56,6 +57,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._context_attachment_index: int | None = None
         self._context_attachment_mime: str | None = None
         self._context_attachment_name: str | None = None
+        self._context_message_row: Gtk.ListBoxRow | None = None
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_content(outer)
@@ -222,6 +224,7 @@ class MainWindow(Adw.ApplicationWindow):
         outer.append(self._status)
 
         self._setup_attachment_menu()
+        self._setup_message_menu()
 
     def _setup_attachment_menu(self) -> None:
         save_action = Gio.SimpleAction.new("attachment-save", None)
@@ -236,6 +239,17 @@ class MainWindow(Adw.ApplicationWindow):
         menu.append("Save...", "win.attachment-save")
         menu.append("Open with…", "win.attachment-open-with")
         self._attachment_popover = Gtk.PopoverMenu.new_from_model(menu)
+
+    def _setup_message_menu(self) -> None:
+        read_action = Gio.SimpleAction.new("message-toggle-read", None)
+        read_action.connect("activate", self._on_message_menu_toggle_read)
+        self.add_action(read_action)
+
+        flag_action = Gio.SimpleAction.new("message-toggle-flag", None)
+        flag_action.connect("activate", self._on_message_menu_toggle_flag)
+        self.add_action(flag_action)
+
+        self._message_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
 
     def begin_load(self) -> None:
         """Load accounts and folders after the window is on screen."""
@@ -738,12 +752,26 @@ class MainWindow(Adw.ApplicationWindow):
                 attach_icon.add_css_class("dim-label")
                 attach_icon.set_tooltip_text("Has attachments")
                 bottom_row.append(attach_icon)
+
+            flag_icon = Gtk.Image.new_from_icon_name("mail-mark-important-symbolic")
+            flag_icon.add_css_class("dim-label")
+            flag_icon.set_tooltip_text("Flagged")
+            flag_icon.set_visible(message_is_flagged(msg))
+            bottom_row.append(flag_icon)
             preview.append(bottom_row)
 
             row = Gtk.ListBoxRow()
             row.set_child(preview)
             row.message_uid = msg.get("uid")
+            row.message_flags = dict(msg.get("flags") or {})
             row.subject_label = subject_label
+            row.flag_icon = flag_icon
+
+            menu_gesture = Gtk.GestureClick()
+            menu_gesture.set_button(Gdk.BUTTON_SECONDARY)
+            menu_gesture.connect("pressed", self._on_message_menu_pressed, row)
+            row.add_controller(menu_gesture)
+
             self._message_list.append(row)
 
         if end < len(messages):
@@ -779,6 +807,129 @@ class MainWindow(Adw.ApplicationWindow):
         subject_label = getattr(row, "subject_label", None)
         if isinstance(subject_label, Gtk.Label):
             subject_label.remove_css_class("heading")
+        flags = dict(getattr(row, "message_flags", {}) or {})
+        flags["seen"] = True
+        row.message_flags = flags
+
+    def _on_message_menu_pressed(
+        self,
+        gesture: Gtk.GestureClick,
+        _n_press: int,
+        x: float,
+        y: float,
+        row: Gtk.ListBoxRow,
+    ) -> None:
+        flags = dict(getattr(row, "message_flags", {}) or {})
+        seen = flags.get("seen", True)
+        flagged = flags.get("flagged", False)
+
+        menu = Gio.Menu()
+        menu.append(
+            "Mark as unread" if seen else "Mark as read",
+            "win.message-toggle-read",
+        )
+        menu.append("Unflag" if flagged else "Flag", "win.message-toggle-flag")
+        self._message_popover.set_menu_model(menu)
+
+        self._context_message_row = row
+        self._message_popover.set_parent(row)
+        rect = Gdk.Rectangle()
+        rect.x = int(x)
+        rect.y = int(y)
+        rect.width = 1
+        rect.height = 1
+        self._message_popover.set_pointing_to(rect)
+        self._message_popover.popup()
+
+    def _on_message_menu_toggle_read(self, *_args) -> None:
+        self._toggle_message_flag("seen")
+
+    def _on_message_menu_toggle_flag(self, *_args) -> None:
+        self._toggle_message_flag("flagged")
+
+    def _toggle_message_flag(self, flag_name: str) -> None:
+        row = self._context_message_row
+        if (
+            row is None
+            or not self._current_account
+            or not self._current_folder
+        ):
+            return
+
+        uid = getattr(row, "message_uid", None)
+        if not uid:
+            return
+
+        account_uid = self._current_account.uid
+        folder_name = self._current_folder
+
+        def worker() -> None:
+            error: Exception | None = None
+            result: dict | None = None
+            try:
+                if flag_name == "seen":
+                    result = self._mail.toggle_message_seen(
+                        account_uid, folder_name, uid
+                    )
+                else:
+                    result = self._mail.toggle_message_flagged(
+                        account_uid, folder_name, uid
+                    )
+            except Exception as exc:
+                log.exception("Failed to toggle message %s", flag_name)
+                error = exc
+            GLib.idle_add(
+                self._on_message_flag_toggled,
+                row,
+                flag_name,
+                result,
+                error,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_message_flag_toggled(
+        self,
+        row: Gtk.ListBoxRow,
+        flag_name: str,
+        result: dict | None,
+        error: Exception | None,
+    ) -> bool:
+        if error is not None:
+            self._set_status(f"Could not update message: {error}")
+            return False
+        if result is None:
+            return False
+
+        flags = dict(getattr(row, "message_flags", {}) or {})
+        flags.update(result.get("flags") or {})
+        row.message_flags = flags
+        self._apply_row_flags(row, flags)
+
+        if flag_name == "seen" and self._current_account and self._current_folder:
+            unread = result.get("folder_unread")
+            total = result.get("folder_total")
+            if unread is not None and total is not None:
+                self._sidebar.update_folder_row(
+                    self._current_account.uid,
+                    self._current_folder,
+                    unread,
+                    total,
+                )
+
+        return False
+
+    def _apply_row_flags(self, row: Gtk.ListBoxRow, flags: dict) -> None:
+        subject_label = getattr(row, "subject_label", None)
+        if isinstance(subject_label, Gtk.Label):
+            if flags.get("seen", True):
+                subject_label.remove_css_class("heading")
+            else:
+                subject_label.add_css_class("heading")
+
+        flag_icon = getattr(row, "flag_icon", None)
+        if isinstance(flag_icon, Gtk.Image):
+            flag_icon.set_visible(bool(flags.get("flagged")))
 
     def _on_message_selected(
         self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None

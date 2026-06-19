@@ -11,6 +11,7 @@ from post.mail.helpers import (
     format_message_header,
     format_message_list_date,
     message_has_attachments,
+    message_is_flagged,
     message_is_unread,
     paginate_messages,
     sort_messages_newest_first,
@@ -93,6 +94,10 @@ class MessageFlagTests(unittest.TestCase):
     def test_attachments_flag(self) -> None:
         self.assertTrue(message_has_attachments({"flags": {"attachments": True}}))
         self.assertFalse(message_has_attachments({"flags": {"attachments": False}}))
+
+    def test_flagged_flag(self) -> None:
+        self.assertTrue(message_is_flagged({"flags": {"flagged": True}}))
+        self.assertFalse(message_is_flagged({"flags": {"flagged": False}}))
 
 
 class FormatMessageListDateTests(unittest.TestCase):

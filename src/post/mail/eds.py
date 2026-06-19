@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass, field
+from typing import Any
 
 import gi
 
@@ -355,6 +356,22 @@ class MailService:
                 account_uid, folder_name, message_uid, attachment_index
             )
 
+    def toggle_message_seen(
+        self, account_uid: str, folder_name: str, message_uid: str
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._toggle_message_seen_unlocked(
+                account_uid, folder_name, message_uid
+            )
+
+    def toggle_message_flagged(
+        self, account_uid: str, folder_name: str, message_uid: str
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._toggle_message_flagged_unlocked(
+                account_uid, folder_name, message_uid
+            )
+
     def mark_message_read(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> tuple[int, int]:
@@ -445,18 +462,101 @@ class MailService:
         message_uid: str,
     ) -> tuple[int, int]:
         """Mark a message seen without refreshing the whole folder summary."""
-        folder.set_message_flags(
+        self._apply_message_flags_unlocked(
+            folder,
+            account_uid,
+            folder_name,
             message_uid,
             Camel.MessageFlags.SEEN,
             Camel.MessageFlags.SEEN,
-        )
-        self._update_cached_message_flags(
-            account_uid, folder_name, message_uid, seen=True
         )
         unread = folder.get_unread_message_count()
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
         return unread, total
+
+    def _toggle_message_seen_unlocked(
+        self, account_uid: str, folder_name: str, message_uid: str
+    ) -> dict[str, Any]:
+        folder = self._open_folder_unlocked(account_uid, folder_name)
+        info = folder.get_message_info(message_uid)
+        if info is None:
+            raise ValueError(f"Message not found: {message_uid}")
+
+        currently_seen = bool(info.get_flags() & Camel.MessageFlags.SEEN)
+        new_seen = not currently_seen
+        flag_value = Camel.MessageFlags.SEEN if new_seen else 0
+        self._apply_message_flags_unlocked(
+            folder,
+            account_uid,
+            folder_name,
+            message_uid,
+            Camel.MessageFlags.SEEN,
+            flag_value,
+        )
+        unread = folder.get_unread_message_count()
+        total = folder.get_message_count()
+        self._update_cached_folder_counts(account_uid, folder_name, unread, total)
+        return {
+            "flags": {"seen": new_seen},
+            "folder_unread": unread,
+            "folder_total": total,
+        }
+
+    def _toggle_message_flagged_unlocked(
+        self, account_uid: str, folder_name: str, message_uid: str
+    ) -> dict[str, Any]:
+        folder = self._open_folder_unlocked(account_uid, folder_name)
+        info = folder.get_message_info(message_uid)
+        if info is None:
+            raise ValueError(f"Message not found: {message_uid}")
+
+        currently_flagged = bool(info.get_flags() & Camel.MessageFlags.FLAGGED)
+        new_flagged = not currently_flagged
+        flag_value = Camel.MessageFlags.FLAGGED if new_flagged else 0
+        self._apply_message_flags_unlocked(
+            folder,
+            account_uid,
+            folder_name,
+            message_uid,
+            Camel.MessageFlags.FLAGGED,
+            flag_value,
+        )
+        return {"flags": {"flagged": new_flagged}}
+
+    def _open_folder_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> Camel.Folder:
+        store = self._get_store_unlocked(account_uid)
+        folder = store.get_folder_sync(folder_name, 0, None)
+        if folder is None:
+            raise ValueError(f"Folder not found: {folder_name}")
+        return folder
+
+    def _apply_message_flags_unlocked(
+        self,
+        folder: Camel.Folder,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        mask: int,
+        value: int,
+    ) -> None:
+        folder.set_message_flags(message_uid, mask, value)
+        if mask & Camel.MessageFlags.SEEN:
+            self._update_cached_message_flags(
+                account_uid,
+                folder_name,
+                message_uid,
+                seen=bool(value & Camel.MessageFlags.SEEN),
+            )
+        if mask & Camel.MessageFlags.FLAGGED:
+            self._update_cached_message_flags(
+                account_uid,
+                folder_name,
+                message_uid,
+                flagged=bool(value & Camel.MessageFlags.FLAGGED),
+            )
 
     def _update_cached_message_flags(
         self,
@@ -464,14 +564,19 @@ class MailService:
         folder_name: str,
         message_uid: str,
         *,
-        seen: bool,
+        seen: bool | None = None,
+        flagged: bool | None = None,
     ) -> None:
         index = self._folder_indexes.get((account_uid, folder_name))
         if index is None:
             return
         for message in index.messages:
             if message.get("uid") == message_uid:
-                message.setdefault("flags", {})["seen"] = seen
+                flags = message.setdefault("flags", {})
+                if seen is not None:
+                    flags["seen"] = seen
+                if flagged is not None:
+                    flags["flagged"] = flagged
                 break
 
     def _update_cached_folder_counts(
