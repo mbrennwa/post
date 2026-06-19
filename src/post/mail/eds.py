@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 
 import gi
@@ -68,6 +69,7 @@ class MailService:
     registry: EDataServer.SourceRegistry
     _session: Camel.Session | None = field(default=None, init=False)
     _stores: dict[str, Camel.Store] = field(default_factory=dict, init=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     @classmethod
     def connect(cls) -> MailService:
@@ -124,6 +126,10 @@ class MailService:
         return self._session
 
     def get_store(self, account_uid: str) -> Camel.Store:
+        with self._lock:
+            return self._get_store_unlocked(account_uid)
+
+    def _get_store_unlocked(self, account_uid: str) -> Camel.Store:
         if account_uid in self._stores:
             store = self._stores[account_uid]
             if store.get_connection_status() == Camel.ServiceConnectionStatus.CONNECTED:
@@ -156,7 +162,11 @@ class MailService:
         return store
 
     def list_folders(self, account_uid: str) -> list[dict]:
-        store = self.get_store(account_uid)
+        with self._lock:
+            return self._list_folders_unlocked(account_uid)
+
+    def _list_folders_unlocked(self, account_uid: str) -> list[dict]:
+        store = self._get_store_unlocked(account_uid)
         root = store.get_folder_info_sync(
             None, Camel.StoreGetFolderInfoFlags.RECURSIVE, None
         )
@@ -177,7 +187,13 @@ class MailService:
     def list_messages(
         self, account_uid: str, folder_name: str, limit: int = 50
     ) -> list[dict]:
-        store = self.get_store(account_uid)
+        with self._lock:
+            return self._list_messages_unlocked(account_uid, folder_name, limit)
+
+    def _list_messages_unlocked(
+        self, account_uid: str, folder_name: str, limit: int = 50
+    ) -> list[dict]:
+        store = self._get_store_unlocked(account_uid)
         folder = store.get_folder_sync(folder_name, 0, None)
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
@@ -203,9 +219,15 @@ class MailService:
     def read_message(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict:
+        with self._lock:
+            return self._read_message_unlocked(account_uid, folder_name, message_uid)
+
+    def _read_message_unlocked(
+        self, account_uid: str, folder_name: str, message_uid: str
+    ) -> dict:
         from .helpers import extract_message_bodies
 
-        store = self.get_store(account_uid)
+        store = self._get_store_unlocked(account_uid)
         folder = store.get_folder_sync(folder_name, 0, None)
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
