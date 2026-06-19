@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from post.mail.helpers import paginate_messages, sort_messages_newest_first
+from post.mail.helpers import format_message_datetime, format_message_header, paginate_messages, sort_messages_newest_first
 
 
 class SortMessagesNewestFirstTests(unittest.TestCase):
@@ -31,6 +31,49 @@ class SortMessagesNewestFirstTests(unittest.TestCase):
         original = list(messages)
         sort_messages_newest_first(messages)
         self.assertEqual(messages, original)
+
+
+class FormatMessageHeaderTests(unittest.TestCase):
+    def test_includes_to_and_date(self) -> None:
+        header = format_message_header(
+            {
+                "from": "Alice <alice@example.com>",
+                "to": "Bob <bob@example.com>",
+                "cc": "",
+                "date_received": "2026-06-19 14:30:00",
+            }
+        )
+        self.assertEqual(
+            header,
+            "From: Alice <alice@example.com>\n"
+            "To: Bob <bob@example.com>\n"
+            "Date: 2026-06-19 14:30:00",
+        )
+
+    def test_includes_cc_when_present(self) -> None:
+        header = format_message_header(
+            {
+                "from": "Alice",
+                "to": "Bob",
+                "cc": "Carol <carol@example.com>",
+                "date_sent": "2026-06-19 14:30:00",
+            }
+        )
+        self.assertIn("CC: Carol <carol@example.com>", header)
+
+    def test_omits_cc_when_empty(self) -> None:
+        header = format_message_header(
+            {"from": "Alice", "to": "Bob", "cc": "  ", "date_sent": "2026-06-19 14:30:00"}
+        )
+        self.assertNotIn("CC:", header)
+
+
+class FormatMessageDatetimeTests(unittest.TestCase):
+    def test_space_separated(self) -> None:
+        # 2026-06-19 12:00:00 UTC
+        value = format_message_datetime(1750324800)
+        self.assertRegex(value, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        self.assertNotIn("T", value or "")
 
 
 class PaginateMessagesTests(unittest.TestCase):

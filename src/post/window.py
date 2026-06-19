@@ -19,6 +19,7 @@ from gi.repository import Adw, GLib, Gtk, WebKit
 from post.credentials import prompt_password_sync
 from post.mail import MailService
 from post.mail.eds import DEFAULT_MESSAGE_PAGE_SIZE, MailAccount
+from post.mail.helpers import format_message_header
 from post.reader import build_reader_document
 from post.sidebar import MailSidebar
 
@@ -405,9 +406,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         self._reader_subject.set_label(msg.get("subject") or "(no subject)")
-        self._reader_meta.set_label(
-            f"From: {msg.get('from', '')}\nDate: {msg.get('date_received') or msg.get('date_sent') or ''}"
-        )
+        self._reader_meta.set_label(format_message_header(msg))
         self._current_body = {
             "plain": msg.get("body_plain"),
             "html": msg.get("body_html"),

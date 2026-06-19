@@ -95,6 +95,12 @@ def _safe_str(value: Any) -> str | None:
     return str(value)
 
 
+def format_message_datetime(unix_time: float | int | None) -> str | None:
+    if not unix_time:
+        return None
+    return datetime.fromtimestamp(unix_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def message_info_to_dict(info: Any) -> dict[str, Any]:
     import gi
 
@@ -110,17 +116,10 @@ def message_info_to_dict(info: Any) -> dict[str, Any]:
         "subject": _safe_str(info.get_subject()) or "(no subject)",
         "from": _safe_str(info.get_from()) or "",
         "to": _safe_str(info.get_to()) or "",
+        "cc": _safe_str(info.get_cc()) or "",
         "sort_date": sort_date,
-        "date_sent": (
-            datetime.fromtimestamp(date_sent, tz=timezone.utc).isoformat()
-            if date_sent
-            else None
-        ),
-        "date_received": (
-            datetime.fromtimestamp(date_recv, tz=timezone.utc).isoformat()
-            if date_recv
-            else None
-        ),
+        "date_sent": format_message_datetime(date_sent),
+        "date_received": format_message_datetime(date_recv),
         "size": info.get_size(),
         "flags": {
             "seen": bool(flags & Camel.MessageFlags.SEEN),
@@ -128,6 +127,19 @@ def message_info_to_dict(info: Any) -> dict[str, Any]:
             "deleted": bool(flags & Camel.MessageFlags.DELETED),
         },
     }
+
+
+def format_message_header(msg: dict[str, Any]) -> str:
+    lines = [
+        f"From: {msg.get('from', '')}",
+        f"To: {msg.get('to', '')}",
+    ]
+    cc = (msg.get("cc") or "").strip()
+    if cc:
+        lines.append(f"CC: {cc}")
+    date = msg.get("date_received") or msg.get("date_sent") or ""
+    lines.append(f"Date: {date}")
+    return "\n".join(lines)
 
 
 def sort_messages_newest_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
