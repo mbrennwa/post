@@ -125,9 +125,6 @@ class MainWindow(Adw.ApplicationWindow):
         message_scroll.set_vexpand(True)
         self._message_scroll = message_scroll
         self._message_list = Gtk.ListBox()
-        message_scroll.set_tooltip_text(
-            "Ctrl+click to multi-select · Shift-click for range · Right-click for menu"
-        )
         self._message_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
         self._message_list.set_activate_on_single_click(False)
         self._message_list.connect("row-selected", self._on_message_selected)
