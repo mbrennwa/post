@@ -211,13 +211,13 @@ def find_folder_by_type(
     return None
 
 
-_SYSTEM_FOLDER_TYPES: tuple[tuple[int, frozenset[str]], ...] = (
-    (1024, frozenset({"inbox"})),
-    (5120, frozenset({"sent"})),
-    (3072, frozenset({"trash", "deleted", "bin"})),
-    (4096, frozenset({"junk", "spam"})),
-    (12288, frozenset({"drafts", "draft"})),
-    (11264, frozenset({"archive", "archives"})),
+_SYSTEM_FOLDER_TYPES: tuple[int, ...] = (
+    1024,   # TYPE_INBOX
+    5120,   # TYPE_SENT
+    3072,   # TYPE_TRASH
+    4096,   # TYPE_JUNK
+    12288,  # TYPE_DRAFTS
+    11264,  # TYPE_ARCHIVE
 )
 
 
@@ -226,20 +226,15 @@ def is_system_folder(
     *,
     type_mask: int = 64512,
 ) -> bool:
-    """Return True for standard mail folders that must not be renamed or deleted."""
+    """Return True when Camel marks a folder with a special TYPE_* role."""
     if is_post_outbox_folder(folder.get("full_name")):
         return True
     if is_virtual_folder(folder.get("full_name")):
         return True
-    for folder_type, name_fallbacks in _SYSTEM_FOLDER_TYPES:
-        if folder_matches_type(folder, folder_type, type_mask=type_mask):
-            return True
-        display = (folder.get("display_name") or "").strip().lower()
-        full = (folder.get("full_name") or "").strip().lower()
-        base = full.rsplit("/", 1)[-1]
-        if display in name_fallbacks or base in name_fallbacks:
-            return True
-    return False
+    return any(
+        folder_matches_type(folder, folder_type, type_mask=type_mask)
+        for folder_type in _SYSTEM_FOLDER_TYPES
+    )
 
 
 def folder_by_full_name(folders: list[dict], full_name: str | None) -> dict | None:
@@ -289,6 +284,11 @@ def resolve_sidebar_context_menu(
     is_trash = bool(trash_name and folder_name == trash_name)
     folder = folder_by_full_name(folders, folder_name)
     protected = folder is not None and is_system_folder(folder)
+    if not protected and folder_name:
+        for special_name in (inbox_name, trash_name, archive_name):
+            if special_name and folder_name == special_name:
+                protected = True
+                break
     read_count = read_message_count(unread, total)
 
     show_new_folder = is_account and folder_crud_enabled

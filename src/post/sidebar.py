@@ -415,6 +415,17 @@ class MailSidebar:
         menu.append("Refresh", "sidebar.refresh")
         return menu
 
+    def _hide_context_popover(self) -> None:
+        popover = self._context_popover
+        if popover is None:
+            return
+        self._context_popover = None
+        if popover.get_visible():
+            popover.popdown()
+        parent = popover.get_parent()
+        if parent is not None:
+            popover.unparent()
+
     @staticmethod
     def _dialog_parent(widget: Gtk.Widget) -> Gtk.Window | None:
         root = widget.get_root()
@@ -733,13 +744,15 @@ class MailSidebar:
         }
 
         menu = self._build_context_menu_model(state)
-        if self._context_popover is not None:
-            self._context_popover.unparent()
+        self._hide_context_popover()
         self._context_popover = Gtk.PopoverMenu.new_from_model(menu)
-        self._context_popover.set_parent(widget)
+        self._context_popover.set_has_arrow(False)
+        self._context_popover.set_parent(self._widget)
+        origin = widget.translate_coordinates(self._widget, x, y)
+        pop_x, pop_y = origin if origin is not None else (int(x), int(y))
         rect = Gdk.Rectangle()
-        rect.x = int(x)
-        rect.y = int(y)
+        rect.x = int(pop_x)
+        rect.y = int(pop_y)
         rect.width = 1
         rect.height = 1
         self._context_popover.set_pointing_to(rect)
@@ -838,6 +851,7 @@ class MailSidebar:
         )
 
     def _clear(self) -> None:
+        self._hide_context_popover()
         while child := self._sidebar_box.get_first_child():
             self._sidebar_box.remove(child)
         self._folder_lists.clear()

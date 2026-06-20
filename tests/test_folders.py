@@ -17,6 +17,7 @@ from post.mail.folders import (
     format_folder_label,
     guess_inbox_name,
     is_post_outbox_folder,
+    is_system_folder,
     outbox_folder_dict,
     resolve_move_menu_state,
     resolve_sidebar_context_menu,
@@ -342,6 +343,61 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
             folder_crud_enabled=False,
         )
         self.assertFalse(state["show_new_folder"])
+
+
+class IsSystemFolderTests(unittest.TestCase):
+    TYPE_ARCHIVE = 11264
+    TYPE_MASK = 64512
+
+    def test_protects_camel_typed_archive(self) -> None:
+        folder = {"full_name": "Archive", "display_name": "Archive", "flags": 11264}
+        self.assertTrue(
+            is_system_folder(folder, type_mask=self.TYPE_MASK)
+        )
+
+    def test_allows_user_folder_named_archives_without_type(self) -> None:
+        folder = {"full_name": "Archives", "display_name": "Archives", "flags": 0}
+        self.assertFalse(
+            is_system_folder(folder, type_mask=self.TYPE_MASK)
+        )
+
+    def test_sidebar_allows_delete_for_user_archives_folder(self) -> None:
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 1024},
+            {"full_name": "mail/archive", "display_name": "Archive", "flags": 11264},
+            {"full_name": "Archives", "display_name": "Archives", "flags": 0},
+        ]
+        state = resolve_sidebar_context_menu(
+            folders=folders,
+            folder_name="Archives",
+            inbox_name="INBOX",
+            trash_name=None,
+            archive_name="mail/archive",
+            unread=0,
+            total=1,
+            outbox_count=0,
+            folder_crud_enabled=True,
+        )
+        self.assertTrue(state["show_delete"])
+        self.assertTrue(state["show_rename"])
+
+    def test_sidebar_blocks_delete_for_resolved_archive_path(self) -> None:
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 1024},
+            {"full_name": "mail/archive", "display_name": "Archive", "flags": 11264},
+        ]
+        state = resolve_sidebar_context_menu(
+            folders=folders,
+            folder_name="mail/archive",
+            inbox_name="INBOX",
+            trash_name=None,
+            archive_name="mail/archive",
+            unread=0,
+            total=0,
+            outbox_count=0,
+            folder_crud_enabled=True,
+        )
+        self.assertFalse(state["show_delete"])
 
 
 class ValidateFolderDisplayNameTests(unittest.TestCase):
