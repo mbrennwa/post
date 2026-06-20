@@ -310,6 +310,21 @@ class MainWindow(Adw.ApplicationWindow):
         self._reader_attachments.set_visible(False)
         reader.append(self._reader_attachments)
 
+        self._reader_body_stack = Gtk.Stack()
+        self._reader_body_stack.set_vexpand(True)
+        self._reader_body_stack.set_hexpand(True)
+
+        reader_empty_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            halign=Gtk.Align.CENTER,
+            valign=Gtk.Align.CENTER,
+        )
+        reader_empty_label = Gtk.Label(label="No Message Selected")
+        reader_empty_label.add_css_class("dim-label")
+        reader_empty_box.append(reader_empty_label)
+        self._reader_body_stack.add_named(reader_empty_box, "empty")
+
         self._web_view = WebKit.WebView()
         settings = self._web_view.get_settings()
         settings.set_enable_javascript(False)
@@ -317,7 +332,10 @@ class MainWindow(Adw.ApplicationWindow):
         settings.set_enable_html5_local_storage(False)
         self._web_view.connect("decide-policy", self._on_web_view_decide_policy)
         self._web_view.set_vexpand(True)
-        reader.append(self._web_view)
+        self._reader_body_stack.add_named(self._web_view, "content")
+        self._reader_body_stack.set_visible_child_name("empty")
+
+        reader.append(self._reader_body_stack)
 
         style_manager = Adw.StyleManager.get_default()
         style_manager.connect("notify::dark", self._on_app_dark_changed)
@@ -2241,6 +2259,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._current_message = None
             self._set_message_actions_sensitive(False)
             self._current_body = {"plain": None, "html": None}
+            self._reader_body_stack.set_visible_child_name("content")
             error_color = "#aaaaaa" if self._app_prefers_dark() else "#666666"
             self._web_view.load_html(
                 "<body style='font-family:sans-serif;"
@@ -2289,16 +2308,18 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_app_dark_changed(self, *_args) -> None:
         if self._current_message is not None:
             self._show_reader_document()
-        elif not self._reader_subject.get_label():
-            self._show_reader_document()
 
     def _show_reader_document(self) -> None:
+        if self._current_message is None:
+            self._reader_body_stack.set_visible_child_name("empty")
+            return
+
+        self._reader_body_stack.set_visible_child_name("content")
         document = build_reader_document(
             body_html=self._current_body.get("html"),
             body_plain=self._current_body.get("plain"),
             allow_remote=self._load_remote_content,
             dark=self._app_prefers_dark(),
-            no_message_selected=self._current_message is None,
         )
         self._web_view.load_html(document, None)
 

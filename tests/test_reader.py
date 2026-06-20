@@ -90,17 +90,6 @@ class BuildReaderDocumentTests(unittest.TestCase):
         )
         self.assertIn("(No message body)", doc)
 
-    def test_no_message_selected_placeholder(self) -> None:
-        doc = build_reader_document(
-            body_html=None,
-            body_plain=None,
-            allow_remote=False,
-            no_message_selected=True,
-        )
-        self.assertIn("No Message Selected", doc)
-        self.assertIn('class="no-selection"', doc)
-        self.assertNotIn("(No message body)", doc)
-
     def test_reader_uses_light_colors_by_default(self) -> None:
         doc = build_reader_document(
             body_html=None,
