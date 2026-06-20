@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg height="128px" viewBox="0 0 128 128" width="128px" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="16" x2="112" y1="112" y2="16">
+      <stop offset="0" stop-color="#1a5fb4"/>
+      <stop offset="0.5" stop-color="#3584e4"/>
+      <stop offset="1" stop-color="#62a0ea"/>
+    </linearGradient>
+    <linearGradient id="paper" gradientUnits="userSpaceOnUse" x1="40" x2="88" y1="56" y2="56">
+      <stop offset="0" stop-color="#deddda"/>
+      <stop offset="0.5" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#deddda"/>
+    </linearGradient>
+    <linearGradient id="flap" gradientUnits="userSpaceOnUse" x1="24" x2="104" y1="52" y2="52">
+      <stop offset="0" stop-color="#c0bfbc"/>
+      <stop offset="0.5" stop-color="#f6f5f4"/>
+      <stop offset="1" stop-color="#c0bfbc"/>
+    </linearGradient>
+  </defs>
+  <rect fill="url(#bg)" height="112" rx="24" ry="24" width="112" x="8" y="8"/>
+  <path d="m 24 40 h 80 c 4.417969 0 8 3.582031 8 8 v 52 c 0 4.417969 -3.582031 8 -8 8 h -80 c -4.417969 0 -8 -3.582031 -8 -8 v -52 c 0 -4.417969 3.582031 -8 8 -8 z" fill="#f6f5f4"/>
+  <path d="m 24 68 h 80 v 32 c 0 4.417969 -3.582031 8 -8 8 h -64 c -4.417969 0 -8 -3.582031 -8 -8 z" fill="#deddda"/>
+  <path d="m 24 48 c 0 -4.417969 3.582031 -8 8 -8 h 64 c 4.417969 0 8 3.582031 8 8 l -40 28 -40 -28 z" fill="url(#flap)"/>
+  <path d="m 24 48 l 40 28 l 40 -28 c -0.386719 -0.351563 -0.902344 -0.570313 -1.464844 -0.570313 h -76.070312 c -0.5625 0 -1.078125 0.21875 -1.464844 0.570313 z" fill="#ffffff"/>
+  <rect fill="url(#paper)" height="30" rx="3" width="44" x="42" y="62"/>
+  <rect fill="#c0bfbc" height="3" rx="1.5" width="20" x="48" y="68"/>
+  <rect fill="#deddda" height="3" rx="1.5" width="32" x="48" y="74"/>
+  <rect fill="#deddda" height="3" rx="1.5" width="24" x="48" y="80"/>
+  <circle cx="92" cy="44" fill="#e01b24" r="8"/>
+  <circle cx="92" cy="44" fill="#f66151" r="5"/>
+</svg>

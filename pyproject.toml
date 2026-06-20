@@ -18,3 +18,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.data-files]
+"share/applications" = ["data/io.github.mbrennwa.Post.desktop"]
+"share/icons/hicolor/scalable/apps" = [
+  "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg",
+]

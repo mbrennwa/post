@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Post
+GenericName=Email
+Comment=Send and receive email
+Icon=io.github.mbrennwa.Post
+TryExec=post
+Exec=post
+Type=Application
+Terminal=false
+Categories=GNOME;GTK;Network;Email;
+StartupNotify=true

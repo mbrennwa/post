@@ -35,6 +35,7 @@ from post.preferences import get_show_evolution_local
 from .auth import PasswordPromptCallback, authenticate_service_sync
 from .compose import addresses_to_internet_address, build_plain_mime_message
 from .folders import find_folder_by_type, find_trash_folder, guess_inbox_name
+from .search import MessageSearchQuery, message_matches
 
 log = logging.getLogger(__name__)
 
@@ -510,6 +511,40 @@ class MailService:
             account_uid, folder_name, offset=0, limit=limit
         )
         return messages, unread, total
+
+    def search_messages_page(
+        self,
+        account_uid: str,
+        folder_name: str,
+        query: MessageSearchQuery,
+        *,
+        offset: int = 0,
+        limit: int = DEFAULT_MESSAGE_PAGE_SIZE,
+    ) -> tuple[list[dict], int, int, bool]:
+        with self._lock:
+            return self._search_messages_page_unlocked(
+                account_uid, folder_name, query, offset=offset, limit=limit
+            )
+
+    def _search_messages_page_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        query: MessageSearchQuery,
+        *,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[dict], int, int, bool]:
+        key = (account_uid, folder_name)
+        index = self._folder_indexes.get(key)
+        if index is None:
+            index = self._build_folder_index_unlocked(account_uid, folder_name)
+            self._folder_indexes[key] = index
+
+        filtered = [msg for msg in index.messages if message_matches(msg, query)]
+        page, has_more = paginate_messages(filtered, offset, limit)
+        match_count = len(filtered)
+        return page, match_count, match_count, has_more
 
     def _list_messages_page_unlocked(
         self,

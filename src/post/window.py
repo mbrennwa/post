@@ -24,6 +24,7 @@ from post.compose_window import ComposeWindow
 from post.credentials import prompt_password_sync
 from post.mail import MailService
 from post.mail.eds import DEFAULT_MESSAGE_PAGE_SIZE, MailAccount
+from post.mail.search import MessageSearchQuery, parse_search_query
 from post.settings_window import SettingsWindow
 from post.mail.helpers import (
     flag_menu_items,
@@ -87,14 +88,26 @@ class MainWindow(Adw.ApplicationWindow):
         self._load_remote_content = get_load_remote_content()
         self._restore_message_folder: tuple[str, str] | None = None
         self._pending_restore_message_uid: str | None = None
+        self._search_query: MessageSearchQuery | None = None
+        self._search_entry_updating = False
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.set_vexpand(True)
 
         header = Adw.HeaderBar()
-        title = Gtk.Label()
-        title.set_markup("<b>Post</b>")
-        header.set_title_widget(title)
+
+        self._header_search_entry = Gtk.SearchEntry()
+        self._header_search_entry.set_placeholder_text(
+            "from: to: subject: cc: is:unread is:flagged has:attachment"
+        )
+        self._header_search_entry.set_tooltip_text("Select a folder to search")
+        self._header_search_entry.set_hexpand(True)
+        self._header_search_entry.set_sensitive(False)
+        self._header_search_entry.set_search_delay(300)
+        self._header_search_entry.connect("search-changed", self._on_search_changed)
+        self._header_search_entry.connect("activate", self._on_search_activate)
+        self._header_search_entry.connect("stop-search", self._on_search_stopped)
+        header.set_title_widget(self._header_search_entry)
 
         settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
         settings_btn.set_tooltip_text("Settings")
@@ -698,12 +711,90 @@ class MainWindow(Adw.ApplicationWindow):
         self._clear_listbox(self._message_list)
         self._current_account = None
         self._current_folder = None
+        self._search_query = None
+        self._update_search_entry_state()
         self._sidebar.load()
         return False
+
+    def _update_search_entry_state(self) -> None:
+        enabled = (
+            self._current_account is not None and self._current_folder is not None
+        )
+        self._header_search_entry.set_sensitive(enabled)
+        if enabled:
+            self._header_search_entry.set_tooltip_text(
+                "Search this folder with from: to: subject: cc: is:unread "
+                "is:flagged has:attachment"
+            )
+        else:
+            self._header_search_entry.set_tooltip_text("Select a folder to search")
+            self._search_entry_updating = True
+            self._header_search_entry.set_text("")
+            self._search_entry_updating = False
+            self._search_query = None
+
+    def _parse_search_from_entry(self) -> MessageSearchQuery | None:
+        raw = self._header_search_entry.get_text()
+        if not raw.strip():
+            return None
+        return parse_search_query(raw)
+
+    def _on_search_activate(self, _entry: Gtk.SearchEntry) -> None:
+        """Run search immediately when Enter is pressed."""
+        self._apply_search_from_entry()
+
+    def _on_search_changed(self, _entry: Gtk.SearchEntry) -> None:
+        if self._search_entry_updating:
+            return
+        self._apply_search_from_entry()
+
+    def _apply_search_from_entry(self) -> None:
+        if self._search_entry_updating:
+            return
+        if not self._current_account or not self._current_folder:
+            return
+
+        raw = self._header_search_entry.get_text()
+        query = parse_search_query(raw)
+        if query is None:
+            if not raw.strip():
+                if self._search_query is not None:
+                    self._search_query = None
+                    self._load_messages(
+                        self._current_account.uid, self._current_folder, offset=0
+                    )
+            else:
+                self._search_query = None
+                self._set_status(
+                    "Use prefixes: from: to: subject: cc: is:unread "
+                    "is:flagged has:attachment"
+                )
+                self._load_messages(
+                    self._current_account.uid, self._current_folder, offset=0
+                )
+            return
+
+        self._search_query = query
+        self._load_messages(
+            self._current_account.uid, self._current_folder, offset=0
+        )
+
+    def _on_search_stopped(self, _entry: Gtk.SearchEntry) -> None:
+        if self._search_entry_updating:
+            return
+        self._exit_search_mode()
+
+    def _exit_search_mode(self) -> None:
+        self._search_query = None
+        if self._current_account and self._current_folder:
+            self._load_messages(
+                self._current_account.uid, self._current_folder, offset=0
+            )
 
     def _on_folder_selected(self, account: MailAccount, folder_name: str) -> None:
         self._current_account = account
         self._current_folder = folder_name
+        self._update_search_entry_state()
         selection = (account.uid, folder_name)
         sidebar_state = get_sidebar_state()
         saved_folder = sidebar_state.get("active_folder")
@@ -716,6 +807,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._pending_restore_message_uid = None
             if saved_folder != selection:
                 set_active_message_uid(None)
+        self._search_query = self._parse_search_from_entry()
         self._load_messages(account.uid, folder_name)
 
     def _clear_reader(self) -> None:
@@ -1014,6 +1106,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_refresh(self, *_args) -> None:
         if self._current_account and self._current_folder:
+            self._search_query = self._parse_search_from_entry()
             self._load_messages(self._current_account.uid, self._current_folder)
         else:
             GLib.idle_add(self._reload_sidebar)
@@ -1040,11 +1133,19 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_total = -1
             self._message_has_more = False
             self._load_more_btn.set_visible(False)
-            self._set_status(f"Loading {folder_name}…")
+            if self._search_query is not None:
+                self._set_status(f"Searching {folder_name}…")
+            else:
+                self._set_status(f"Loading {folder_name}…")
             self._message_popover.popdown()
             self._clear_listbox(self._message_list)
             self._clear_reader()
-            self._message_loading_label.set_label(f"Loading {folder_name}…")
+            loading_label = (
+                f"Searching {folder_name}…"
+                if self._search_query is not None
+                else f"Loading {folder_name}…"
+            )
+            self._message_loading_label.set_label(loading_label)
             self._message_loading_spinner.start()
             self._message_stack.set_visible_child_name("loading")
         else:
@@ -1052,6 +1153,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._load_more_btn.set_label("Loading…")
 
         load_id = self._messages_load_generation
+        search_query = self._search_query
 
         def worker() -> None:
             error: Exception | None = None
@@ -1060,12 +1162,21 @@ class MainWindow(Adw.ApplicationWindow):
             total = -1
             has_more = False
             try:
-                messages, unread, total, has_more = self._mail.list_messages_page(
-                    account_uid,
-                    folder_name,
-                    offset=offset,
-                    limit=DEFAULT_MESSAGE_PAGE_SIZE,
-                )
+                if search_query is not None:
+                    messages, unread, total, has_more = self._mail.search_messages_page(
+                        account_uid,
+                        folder_name,
+                        search_query,
+                        offset=offset,
+                        limit=DEFAULT_MESSAGE_PAGE_SIZE,
+                    )
+                else:
+                    messages, unread, total, has_more = self._mail.list_messages_page(
+                        account_uid,
+                        folder_name,
+                        offset=offset,
+                        limit=DEFAULT_MESSAGE_PAGE_SIZE,
+                    )
             except Exception as exc:
                 log.exception("Failed to list messages")
                 error = exc
@@ -1129,7 +1240,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_stack.set_visible_child_name("list")
             return False
 
-        if offset == 0:
+        if offset == 0 and not self._search_query:
             self._sidebar.update_folder_row(account_uid, folder_name, unread, total)
 
         self._message_total = total
@@ -1137,7 +1248,10 @@ class MainWindow(Adw.ApplicationWindow):
 
         if offset == 0 and not messages:
             folder_label = folder_name
-            self._message_empty_label.set_label(f"No messages in {folder_label}")
+            if self._search_query is not None:
+                self._message_empty_label.set_label(f"No matches in {folder_label}")
+            else:
+                self._message_empty_label.set_label(f"No messages in {folder_label}")
             self._message_stack.set_visible_child_name("empty")
             self._update_message_status(account, folder_name)
             return False
@@ -1234,7 +1348,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._shown_message_count = page_offset + len(messages)
         self._load_more_btn.set_visible(self._message_has_more)
         self._update_message_status(account, folder_name)
-        self._try_restore_selected_message(account.uid, folder_name)
+        if self._search_query is None:
+            self._try_restore_selected_message(account.uid, folder_name)
         return False
 
     def _find_message_row(self, message_uid: str) -> Gtk.ListBoxRow | None:
@@ -1276,6 +1391,20 @@ class MainWindow(Adw.ApplicationWindow):
         shown = self._shown_message_count
         total = self._message_total
         label = account.display_label
+        if self._search_query is not None:
+            if total == 0:
+                self._set_status(f"No matches in {label} / {folder_name}")
+            elif total >= 0 and shown < total:
+                self._set_status(
+                    f"Showing {shown} of {total} matches in {label} / {folder_name}"
+                )
+            elif total >= 0:
+                self._set_status(f"{total} matches in {label} / {folder_name}")
+            else:
+                self._set_status(
+                    f"{shown} matches in {label} / {folder_name}"
+                )
+            return
         if total >= 0 and shown < total:
             self._set_status(f"Showing {shown} of {total} in {label} / {folder_name}")
         elif total >= 0:
