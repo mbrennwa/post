@@ -15,7 +15,9 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gio", "2.0")
 gi.require_version("Gdk", "4.0")
 
-from gi.repository import Gdk, Gio, GLib, Gtk
+gi.require_version("GObject", "2.0")
+
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
 from post.mail import MailService
 from post.mail.eds import MailAccount
@@ -25,6 +27,12 @@ from post.mail.folders import (
     format_folder_label,
     guess_inbox_name,
     resolve_move_menu_state,
+)
+from post.preferences import (
+    get_sidebar_state,
+    register_inbox_accounts,
+    resolve_inbox_display_order,
+    set_sidebar_state,
 )
 
 log = logging.getLogger(__name__)
@@ -54,10 +62,17 @@ class MailSidebar:
         self._accounts: list[MailAccount] = []
         self._accounts_by_uid: dict[str, MailAccount] = {}
         self._sidebar_selecting = False
-        self._expanded_accounts: dict[str, bool] = {}
+        sidebar_state = get_sidebar_state()
+        self._expanded_accounts: dict[str, bool] = dict(
+            sidebar_state.get("accounts") or {}
+        )
         self._inbox_expander: Gtk.Expander | None = None
         self._inbox_list: Gtk.ListBox | None = None
-        self._inbox_expanded = True
+        self._inbox_expanded = bool(sidebar_state.get("inbox_expanded", True))
+        self._saved_active_folder: tuple[str, str] | None = sidebar_state.get(
+            "active_folder"
+        )
+        self._inbox_order: list[str] = list(sidebar_state.get("inbox_order") or [])
         self._folder_lists: dict[str, Gtk.ListBox] = {}
         self._account_folders: dict[str, list[dict]] = {}
         self._account_inbox_folders: dict[str, str] = {}
@@ -81,7 +96,7 @@ class MailSidebar:
         return self._widget
 
     def load(self) -> None:
-        self._save_expanded_state()
+        self._persist_view_state()
         self._clear()
         self._load_generation += 1
         load_id = self._load_generation
@@ -403,6 +418,15 @@ class MailSidebar:
             if isinstance(expander, Gtk.Expander):
                 self._expanded_accounts[uid] = expander.get_expanded()
 
+    def _persist_view_state(self) -> None:
+        self._save_expanded_state()
+        set_sidebar_state(
+            inbox_expanded=self._inbox_expanded,
+            accounts=self._expanded_accounts,
+            active_folder=self._saved_active_folder,
+            inbox_order=self._inbox_order,
+        )
+
     def _clear(self) -> None:
         while child := self._sidebar_box.get_first_child():
             self._sidebar_box.remove(child)
@@ -419,6 +443,19 @@ class MailSidebar:
         return lists
 
     def _find_initial_folder(self) -> tuple[Gtk.ListBox | None, Gtk.ListBoxRow | None]:
+        saved = self._saved_active_folder
+        if saved is not None:
+            account_uid, folder_name = saved
+            for listbox in self._all_folder_listboxes():
+                row = listbox.get_first_child()
+                while row is not None:
+                    if (
+                        getattr(row, "account_uid", None) == account_uid
+                        and getattr(row, "folder_name", None) == folder_name
+                    ):
+                        return listbox, row
+                    row = row.get_next_sibling()
+
         if self._inbox_list is not None:
             row = self._inbox_list.get_first_child()
             while row is not None:
@@ -456,6 +493,7 @@ class MailSidebar:
         inbox_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         inbox_list.add_css_class("navigation-sidebar")
         inbox_list.connect("row-selected", self._on_folder_row_selected)
+        self._setup_inbox_list_dnd(inbox_list)
         self._inbox_list = inbox_list
         self._inbox_expander = expander
 
@@ -471,6 +509,7 @@ class MailSidebar:
 
     def _on_inbox_expanded(self, expander: Gtk.Expander, _pspec) -> None:
         self._inbox_expanded = expander.get_expanded()
+        self._persist_view_state()
 
     def _add_inbox_row(self, account_uid: str, folders: list[dict]) -> None:
         if self._inbox_list is None:
@@ -497,6 +536,117 @@ class MailSidebar:
         self._inbox_list.append(
             self._make_folder_row(account_uid, inbox_folder, display=display)
         )
+        row = self._inbox_list.get_last_child()
+        if isinstance(row, Gtk.ListBoxRow):
+            self._setup_inbox_row_drag(row)
+        self._sort_inbox_list()
+
+    def _current_inbox_order_from_list(self) -> list[str]:
+        if self._inbox_list is None:
+            return list(self._inbox_order)
+        order: list[str] = []
+        row = self._inbox_list.get_first_child()
+        while row is not None:
+            uid = getattr(row, "account_uid", None)
+            if uid:
+                order.append(uid)
+            row = row.get_next_sibling()
+        return order
+
+    def _resolve_inbox_order(self, present: list[str]) -> list[str]:
+        return resolve_inbox_display_order(self._inbox_order, present)
+
+    def _register_inbox_accounts(self, present: list[str]) -> None:
+        self._inbox_order = register_inbox_accounts(self._inbox_order, present)
+
+    def _sort_inbox_list(self) -> None:
+        if self._inbox_list is None:
+            return
+
+        placeholders: list[Gtk.ListBoxRow] = []
+        rows_by_uid: dict[str, Gtk.ListBoxRow] = {}
+        row = self._inbox_list.get_first_child()
+        while row is not None:
+            next_row = row.get_next_sibling()
+            uid = getattr(row, "account_uid", None)
+            self._inbox_list.remove(row)
+            if uid:
+                rows_by_uid[uid] = row
+            else:
+                placeholders.append(row)
+            row = next_row
+
+        for placeholder in placeholders:
+            self._inbox_list.append(placeholder)
+
+        present = list(rows_by_uid.keys())
+        self._register_inbox_accounts(present)
+        order = self._resolve_inbox_order(present)
+        for uid in order:
+            self._inbox_list.append(rows_by_uid[uid])
+
+    def _move_inbox_row(self, source_uid: str, target_uid: str, *, after: bool) -> None:
+        order = self._current_inbox_order_from_list()
+        if source_uid not in order or target_uid not in order:
+            return
+        order.remove(source_uid)
+        index = order.index(target_uid)
+        if after:
+            index += 1
+        order.insert(index, source_uid)
+        self._inbox_order = order
+        self._sort_inbox_list()
+        self._persist_view_state()
+
+    def _setup_inbox_row_drag(self, row: Gtk.ListBoxRow) -> None:
+        drag_source = Gtk.DragSource()
+        drag_source.set_actions(Gdk.DragAction.MOVE)
+
+        def prepare(_source: Gtk.DragSource, _x: float, _y: float) -> Gdk.ContentProvider | None:
+            account_uid = getattr(row, "account_uid", None)
+            if not account_uid:
+                return None
+            return Gdk.ContentProvider.new_for_value(account_uid)
+
+        drag_source.connect("prepare", prepare)
+        row.add_controller(drag_source)
+
+    def _setup_inbox_list_dnd(self, inbox_list: Gtk.ListBox) -> None:
+        drop_target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+
+        def drop(
+            _target: Gtk.DropTarget,
+            value: object,
+            x: float,
+            y: float,
+        ) -> bool:
+            source_uid = value if isinstance(value, str) else None
+            if not source_uid:
+                return False
+
+            target_row = inbox_list.get_row_at_y(int(y))
+            if target_row is None:
+                order = self._current_inbox_order_from_list()
+                if source_uid not in order:
+                    return False
+                order.remove(source_uid)
+                order.append(source_uid)
+                self._inbox_order = order
+                self._sort_inbox_list()
+                self._persist_view_state()
+                return True
+
+            target_uid = getattr(target_row, "account_uid", None)
+            if not target_uid or target_uid == source_uid:
+                return False
+
+            allocation = target_row.get_allocation()
+            after = y > allocation.y + allocation.height / 2
+            self._move_inbox_row(source_uid, target_uid, after=after)
+            return True
+
+        drop_target.connect("drop", drop)
+        inbox_list.add_controller(drop_target)
 
     def _make_account_section_loading(self, account: MailAccount) -> Gtk.Expander:
         expander = Gtk.Expander()
@@ -525,6 +675,7 @@ class MailSidebar:
 
     def _on_account_expanded(self, expander: Gtk.Expander, _pspec, account_uid: str) -> None:
         self._expanded_accounts[account_uid] = expander.get_expanded()
+        self._persist_view_state()
 
     def _make_account_header(self, account: MailAccount) -> Gtk.Widget:
         label = Gtk.Label(label=account.display_label, xalign=0)
@@ -603,4 +754,6 @@ class MailSidebar:
             return
 
         self._activated_folder = selection
+        self._saved_active_folder = selection
+        self._persist_view_state()
         self._on_folder_selected(account, folder_name)

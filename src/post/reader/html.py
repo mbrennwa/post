@@ -48,7 +48,7 @@ def html_has_blocked_remote_content(body_html: str) -> bool:
     return False
 
 
-_READER_CSS = """
+_READER_CSS_LIGHT = """
 body {
   font-family: system-ui, sans-serif;
   font-size: 14px;
@@ -80,12 +80,45 @@ blockquote {
 }
 """
 
+_READER_CSS_DARK = """
+body {
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  margin: 1rem;
+  overflow-wrap: anywhere;
+  color: #eeeeee;
+  background: #1e1e1e;
+}
+pre.plain-body {
+  white-space: pre-wrap;
+  font-family: inherit;
+}
+img[src=""] {
+  display: none;
+}
+.remote-blocked-notice {
+  color: #aaaaaa;
+  font-size: 12px;
+  margin-bottom: 1rem;
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid #666666;
+}
+a { color: #62a0ea; }
+blockquote {
+  margin: 0.5rem 0;
+  padding-left: 1rem;
+  border-left: 3px solid #555555;
+}
+"""
+
 
 def build_reader_document(
     *,
     body_html: str | None,
     body_plain: str | None,
     allow_remote: bool,
+    dark: bool = False,
 ) -> str:
     """Wrap message content in a safe HTML shell for WebKit."""
     blocked_notice = ""
@@ -120,13 +153,16 @@ def build_reader_document(
             "font-src data:;"
         )
 
+    color_scheme = "dark" if dark else "light"
+    reader_css = _READER_CSS_DARK if dark else _READER_CSS_LIGHT
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="{color_scheme}">
 <meta http-equiv="Content-Security-Policy" content="{csp}">
-<style>{_READER_CSS}</style>
+<style>{reader_css}</style>
 </head>
 <body>
 {blocked_notice}

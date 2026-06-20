@@ -38,7 +38,13 @@ from post.mail.helpers import (
     read_menu_label,
 )
 from post.reader import build_reader_document
-from post.preferences import get_load_remote_content
+from post.preferences import (
+    get_load_remote_content,
+    get_sidebar_state,
+    get_window_state,
+    set_active_message_uid,
+    set_window_state,
+)
 from post.sidebar import MailSidebar
 
 log = logging.getLogger(__name__)
@@ -48,7 +54,16 @@ class MainWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.set_title("Post")
-        self.set_default_size(1100, 720)
+        window_state = get_window_state()
+        self._last_normal_width = int(window_state["width"])
+        self._last_normal_height = int(window_state["height"])
+        self.set_default_size(self._last_normal_width, self._last_normal_height)
+        if window_state.get("maximized"):
+            self.maximize()
+
+        self.connect("close-request", self._on_close_request)
+        self.connect("notify::width", self._on_window_size_changed)
+        self.connect("notify::height", self._on_window_size_changed)
 
         self._mail = MailService.connect()
         self._mail.set_password_prompt(self._prompt_account_password)
@@ -70,6 +85,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._undo_toast: Adw.Toast | None = None
         self._settings_dialog: SettingsWindow | None = None
         self._load_remote_content = get_load_remote_content()
+        self._restore_message_folder: tuple[str, str] | None = None
+        self._pending_restore_message_uid: str | None = None
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.set_vexpand(True)
@@ -258,6 +275,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._web_view.set_vexpand(True)
         reader.append(self._web_view)
 
+        style_manager = Adw.StyleManager.get_default()
+        style_manager.connect("notify::dark", self._on_app_dark_changed)
+
         panes.append(reader)
 
         self._status = Gtk.Label(label="", xalign=0, margin_start=12, margin_bottom=6)
@@ -279,6 +299,35 @@ class MainWindow(Adw.ApplicationWindow):
         self._setup_undo_action()
         self._setup_compose_action()
         self._setup_delete_shortcut()
+
+    def _on_window_size_changed(self, *_args) -> None:
+        if self.is_maximized():
+            return
+        width = self.get_width()
+        height = self.get_height()
+        if width > 0 and height > 0:
+            self._last_normal_width = width
+            self._last_normal_height = height
+
+    def _persist_window_state(self) -> None:
+        if self.is_maximized():
+            width = self._last_normal_width
+            height = self._last_normal_height
+        else:
+            width = self.get_width() or self._last_normal_width
+            height = self.get_height() or self._last_normal_height
+            if width > 0 and height > 0:
+                self._last_normal_width = width
+                self._last_normal_height = height
+        set_window_state(
+            width=width,
+            height=height,
+            maximized=self.is_maximized(),
+        )
+
+    def _on_close_request(self, *_args) -> bool:
+        self._persist_window_state()
+        return False
 
     def _setup_delete_shortcut(self) -> None:
         for widget in (self, self._message_list):
@@ -655,6 +704,18 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_folder_selected(self, account: MailAccount, folder_name: str) -> None:
         self._current_account = account
         self._current_folder = folder_name
+        selection = (account.uid, folder_name)
+        sidebar_state = get_sidebar_state()
+        saved_folder = sidebar_state.get("active_folder")
+        saved_message = sidebar_state.get("active_message_uid")
+        if saved_folder == selection and saved_message:
+            self._restore_message_folder = saved_folder
+            self._pending_restore_message_uid = saved_message
+        else:
+            self._restore_message_folder = selection
+            self._pending_restore_message_uid = None
+            if saved_folder != selection:
+                set_active_message_uid(None)
         self._load_messages(account.uid, folder_name)
 
     def _clear_reader(self) -> None:
@@ -1173,7 +1234,43 @@ class MainWindow(Adw.ApplicationWindow):
         self._shown_message_count = page_offset + len(messages)
         self._load_more_btn.set_visible(self._message_has_more)
         self._update_message_status(account, folder_name)
+        self._try_restore_selected_message(account.uid, folder_name)
         return False
+
+    def _find_message_row(self, message_uid: str) -> Gtk.ListBoxRow | None:
+        child = self._message_list.get_first_child()
+        while child is not None:
+            if (
+                isinstance(child, Gtk.ListBoxRow)
+                and getattr(child, "message_uid", None) == message_uid
+            ):
+                return child
+            child = child.get_next_sibling()
+        return None
+
+    def _try_restore_selected_message(self, account_uid: str, folder_name: str) -> None:
+        uid = self._pending_restore_message_uid
+        if not uid:
+            return
+        if (
+            self._restore_message_folder is not None
+            and (account_uid, folder_name) != self._restore_message_folder
+        ):
+            self._pending_restore_message_uid = None
+            return
+
+        row = self._find_message_row(uid)
+        if row is not None:
+            self._pending_restore_message_uid = None
+            self._message_list.select_row(row)
+            return
+
+        if self._message_has_more:
+            self._load_messages(account_uid, folder_name, offset=self._shown_message_count)
+            return
+
+        self._pending_restore_message_uid = None
+        set_active_message_uid(None)
 
     def _update_message_status(self, account: MailAccount, folder_name: str) -> None:
         shown = self._shown_message_count
@@ -1521,6 +1618,8 @@ class MainWindow(Adw.ApplicationWindow):
                 removed_count += 1
             if uid == self._current_message_uid:
                 self._clear_reader()
+                set_active_message_uid(None)
+                self._restore_message_folder = None
 
         self._shown_message_count = max(0, self._shown_message_count - removed_count)
         if self._message_total >= 0:
@@ -1787,8 +1886,10 @@ class MainWindow(Adw.ApplicationWindow):
             self._current_message = None
             self._set_message_actions_sensitive(False)
             self._current_body = {"plain": None, "html": None}
+            error_color = "#aaaaaa" if self._app_prefers_dark() else "#666666"
             self._web_view.load_html(
-                "<body style='font-family:sans-serif;color:#666;padding:1em'>"
+                "<body style='font-family:sans-serif;"
+                f"color:{error_color};padding:1em'>"
                 "This message could not be loaded.</body>",
                 None,
             )
@@ -1800,6 +1901,11 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         self._current_message_uid = uid
+        set_active_message_uid(uid)
+        self._restore_message_folder = (
+            self._current_account.uid,
+            self._current_folder,
+        )
         if "folder_unread" in msg and "folder_total" in msg:
             self._sidebar.update_folder_row(
                 self._current_account.uid,
@@ -1821,11 +1927,19 @@ class MainWindow(Adw.ApplicationWindow):
         self._show_reader_document()
         return False
 
+    def _app_prefers_dark(self) -> bool:
+        return Adw.StyleManager.get_default().get_dark()
+
+    def _on_app_dark_changed(self, *_args) -> None:
+        if self._current_body.get("html") or self._current_body.get("plain"):
+            self._show_reader_document()
+
     def _show_reader_document(self) -> None:
         document = build_reader_document(
             body_html=self._current_body.get("html"),
             body_plain=self._current_body.get("plain"),
             allow_remote=self._load_remote_content,
+            dark=self._app_prefers_dark(),
         )
         self._web_view.load_html(document, None)
 
