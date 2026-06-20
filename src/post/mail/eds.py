@@ -988,10 +988,17 @@ class MailService:
             raise
 
     def read_message(
-        self, account_uid: str, folder_name: str, message_uid: str
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        mark_seen: bool = True,
     ) -> dict:
         return self._with_mail_op(
-            lambda: self._read_message_unlocked(account_uid, folder_name, message_uid)
+            lambda: self._read_message_unlocked(
+                account_uid, folder_name, message_uid, mark_seen=mark_seen
+            )
         )
 
     def read_attachment_data(
@@ -1112,7 +1119,12 @@ class MailService:
         )
 
     def _read_message_unlocked(
-        self, account_uid: str, folder_name: str, message_uid: str
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        mark_seen: bool = True,
     ) -> dict:
         from .helpers import extract_attachments, extract_message_bodies
 
@@ -1142,7 +1154,7 @@ class MailService:
             if references:
                 result["references"] = references
 
-        if was_unread:
+        if was_unread and mark_seen:
             unread, total = self._mark_message_seen_unlocked(
                 folder, account_uid, folder_name, message_uid
             )

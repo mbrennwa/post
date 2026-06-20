@@ -109,6 +109,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._load_remote_content = get_load_remote_content()
         self._restore_message_folder: tuple[str, str] | None = None
         self._pending_restore_message_uid: str | None = None
+        self._user_message_click_pending = False
         self._search_query: MessageSearchQuery | None = None
         self._search_entry_updating = False
         self._status_hint = ""
@@ -1884,6 +1885,7 @@ class MainWindow(Adw.ApplicationWindow):
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
             return
 
+        self._user_message_click_pending = True
         GLib.idle_add(self._update_message_toolbar)
 
     def _on_message_menu_mark_read(self, *_args) -> None:
@@ -2334,6 +2336,8 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_message_selected(
         self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None
     ) -> None:
+        mark_seen = self._user_message_click_pending
+        self._user_message_click_pending = False
         if row is None or not self._current_account or not self._current_folder:
             return
         if len(self._message_list.get_selected_rows()) != 1:
@@ -2360,7 +2364,12 @@ class MainWindow(Adw.ApplicationWindow):
                         from_label=from_label,
                     )
                 else:
-                    msg = self._mail.read_message(account.uid, folder_name, uid)
+                    msg = self._mail.read_message(
+                        account.uid,
+                        folder_name,
+                        uid,
+                        mark_seen=mark_seen,
+                    )
             except Exception as exc:
                 log.exception("Failed to read message")
                 error = exc

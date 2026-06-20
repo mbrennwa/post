@@ -125,5 +125,42 @@ class PersistFolderFlagsTests(unittest.TestCase):
         store.synchronize_sync.assert_called_once_with(False, None)
 
 
+class ReadMessageTests(unittest.TestCase):
+    @patch.object(MailService, "_mark_message_seen_unlocked")
+    @patch.object(MailService, "_get_store_unlocked")
+    def test_read_message_can_skip_mark_seen(
+        self,
+        get_store_mock: MagicMock,
+        mark_seen_mock: MagicMock,
+    ) -> None:
+        service = MailService(registry=MagicMock())
+        folder = MagicMock()
+        info = MagicMock()
+        info.get_flags.return_value = 0
+        folder.get_message_info.return_value = info
+        mime = MagicMock()
+        mime.get_message_id.return_value = None
+        folder.get_message_sync.return_value = mime
+        store = MagicMock()
+        store.get_folder_sync.return_value = folder
+        get_store_mock.return_value = store
+
+        with patch("post.mail.helpers.message_info_to_dict", return_value={"uid": "42"}):
+            with patch(
+                "post.mail.helpers.extract_message_bodies",
+                return_value={"plain": "Hello", "html": None},
+            ):
+                with patch("post.mail.helpers.extract_attachments", return_value=[]):
+                    result = service._read_message_unlocked(
+                        "account",
+                        "INBOX",
+                        "42",
+                        mark_seen=False,
+                    )
+
+        mark_seen_mock.assert_not_called()
+        self.assertFalse((result.get("flags") or {}).get("seen"))
+
+
 if __name__ == "__main__":
     unittest.main()
