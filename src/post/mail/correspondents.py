@@ -77,6 +77,23 @@ def _matches_prefix(value: str, prefix: str) -> bool:
     return value.casefold().startswith(prefix.casefold())
 
 
+def _email_domain(email: str) -> str:
+    at = email.rfind("@")
+    if at < 0:
+        return ""
+    return email[at + 1 :]
+
+
+def _matches_email_prefix(email: str, prefix: str) -> bool:
+    if _matches_prefix(email, prefix):
+        return True
+    domain = _email_domain(email)
+    if not domain:
+        return False
+    domain_prefix = prefix.lstrip("@")
+    return bool(domain_prefix) and _matches_prefix(domain, domain_prefix)
+
+
 def correspondent_matches_prefix(correspondent: Correspondent, prefix: str) -> bool:
     """Return whether a single correspondent matches a typed prefix."""
     prefix = prefix.strip()
@@ -84,7 +101,7 @@ def correspondent_matches_prefix(correspondent: Correspondent, prefix: str) -> b
         return False
     if correspondent.name and _matches_prefix(correspondent.name, prefix):
         return True
-    if _matches_prefix(correspondent.email, prefix):
+    if _matches_email_prefix(correspondent.email, prefix):
         return True
     return _matches_prefix(correspondent.display, prefix)
 
@@ -107,7 +124,7 @@ def match_correspondents(
     for candidate in candidates:
         if candidate.name and _matches_prefix(candidate.name, prefix):
             name_matches.append(candidate)
-        elif _matches_prefix(candidate.email, prefix):
+        elif _matches_email_prefix(candidate.email, prefix):
             email_matches.append(candidate)
         elif _matches_prefix(candidate.display, prefix):
             display_matches.append(candidate)

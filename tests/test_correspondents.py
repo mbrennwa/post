@@ -113,6 +113,22 @@ class MatchCorrespondentsTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0].email, normalize_email("bob@example.com"))
 
+    def test_match_by_bare_domain_prefix(self) -> None:
+        correspondents = collect_correspondents(
+            [{"from": "공병채 <kong3512@kigam.re.kr>", "to": "", "cc": ""}]
+        )
+        matches = match_correspondents(correspondents, "kigam")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].email, normalize_email("kong3512@kigam.re.kr"))
+
+    def test_match_by_at_domain_prefix(self) -> None:
+        correspondents = collect_correspondents(
+            [{"from": "공병채 <kong3512@kigam.re.kr>", "to": "", "cc": ""}]
+        )
+        matches = match_correspondents(correspondents, "@kigam")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].email, normalize_email("kong3512@kigam.re.kr"))
+
     def test_empty_prefix_returns_empty(self) -> None:
         self.assertEqual(match_correspondents(self.candidates, ""), [])
 
@@ -133,6 +149,12 @@ class CorrespondentMatchesPrefixTests(unittest.TestCase):
             [{"from": "Bob <bob@example.com>", "to": "", "cc": ""}]
         )[0]
         self.assertTrue(correspondent_matches_prefix(correspondent, "bob@ex"))
+
+    def test_matches_domain(self) -> None:
+        correspondent = collect_correspondents(
+            [{"from": "공병채 <kong3512@kigam.re.kr>", "to": "", "cc": ""}]
+        )[0]
+        self.assertTrue(correspondent_matches_prefix(correspondent, "kigam"))
 
 
 class ApplyAddressCompletionTests(unittest.TestCase):
