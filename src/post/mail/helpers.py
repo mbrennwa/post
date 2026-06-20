@@ -141,6 +141,48 @@ def message_is_unread(msg: dict[str, Any]) -> bool:
     return not flags.get("seen", True)
 
 
+def message_menu_count_suffix(count: int) -> str:
+    return f" ({count})" if count > 1 else ""
+
+
+def read_menu_items(seen_states: list[bool]) -> list[str]:
+    """Return read-menu actions to show: ``read``, ``unread``, or both."""
+    if not seen_states:
+        return []
+    items: list[str] = []
+    if not all(seen_states):
+        items.append("read")
+    if any(seen_states):
+        items.append("unread")
+    return items
+
+
+def flag_menu_items(flagged_states: list[bool]) -> list[str]:
+    """Return flag-menu actions to show: ``flag``, ``unflag``, or both."""
+    if not flagged_states:
+        return []
+    items: list[str] = []
+    if not all(flagged_states):
+        items.append("flag")
+    if any(flagged_states):
+        items.append("unflag")
+    return items
+
+
+def read_menu_label(action: str, count: int) -> str:
+    suffix = message_menu_count_suffix(count)
+    if action == "read":
+        return f"Mark as read{suffix}"
+    return f"Mark as unread{suffix}"
+
+
+def flag_menu_label(action: str, count: int) -> str:
+    suffix = message_menu_count_suffix(count)
+    if action == "flag":
+        return f"Flag{suffix}"
+    return f"Unflag{suffix}"
+
+
 def message_is_flagged(msg: dict[str, Any]) -> bool:
     flags = msg.get("flags") or {}
     return bool(flags.get("flagged"))

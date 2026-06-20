@@ -6,6 +6,8 @@ from __future__ import annotations
 import unittest
 
 from post.mail.helpers import (
+    flag_menu_items,
+    flag_menu_label,
     format_attachment_size,
     format_message_datetime,
     format_message_header,
@@ -14,6 +16,8 @@ from post.mail.helpers import (
     message_is_flagged,
     message_is_unread,
     paginate_messages,
+    read_menu_items,
+    read_menu_label,
     sort_messages_newest_first,
 )
 
@@ -98,6 +102,34 @@ class MessageFlagTests(unittest.TestCase):
     def test_flagged_flag(self) -> None:
         self.assertTrue(message_is_flagged({"flags": {"flagged": True}}))
         self.assertFalse(message_is_flagged({"flags": {"flagged": False}}))
+
+
+class MessageMenuItemsTests(unittest.TestCase):
+    def test_read_menu_all_unread(self) -> None:
+        self.assertEqual(read_menu_items([False, False]), ["read"])
+
+    def test_read_menu_all_read(self) -> None:
+        self.assertEqual(read_menu_items([True, True]), ["unread"])
+
+    def test_read_menu_mixed(self) -> None:
+        self.assertEqual(read_menu_items([True, False]), ["read", "unread"])
+
+    def test_flag_menu_all_unflagged(self) -> None:
+        self.assertEqual(flag_menu_items([False, False]), ["flag"])
+
+    def test_flag_menu_all_flagged(self) -> None:
+        self.assertEqual(flag_menu_items([True, True]), ["unflag"])
+
+    def test_flag_menu_mixed(self) -> None:
+        self.assertEqual(flag_menu_items([True, False]), ["flag", "unflag"])
+
+    def test_read_menu_labels_include_count(self) -> None:
+        self.assertEqual(read_menu_label("read", 3), "Mark as read (3)")
+        self.assertEqual(read_menu_label("unread", 1), "Mark as unread")
+
+    def test_flag_menu_labels_include_count(self) -> None:
+        self.assertEqual(flag_menu_label("flag", 2), "Flag (2)")
+        self.assertEqual(flag_menu_label("unflag", 1), "Unflag")
 
 
 class FormatMessageListDateTests(unittest.TestCase):

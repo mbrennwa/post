@@ -26,12 +26,16 @@ from post.mail import MailService
 from post.mail.eds import DEFAULT_MESSAGE_PAGE_SIZE, MailAccount
 from post.settings_window import SettingsWindow
 from post.mail.helpers import (
+    flag_menu_items,
+    flag_menu_label,
     format_attachment_size,
     format_message_header,
     format_message_list_date,
     message_has_attachments,
     message_is_flagged,
     message_is_unread,
+    read_menu_items,
+    read_menu_label,
 )
 from post.reader import build_reader_document
 from post.preferences import get_load_remote_content
@@ -539,13 +543,21 @@ class MainWindow(Adw.ApplicationWindow):
         self._attachment_popover = Gtk.PopoverMenu.new_from_model(menu)
 
     def _setup_message_menu(self) -> None:
-        read_action = Gio.SimpleAction.new("message-toggle-read", None)
-        read_action.connect("activate", self._on_message_menu_toggle_read)
-        self.add_action(read_action)
+        mark_read_action = Gio.SimpleAction.new("message-mark-read", None)
+        mark_read_action.connect("activate", self._on_message_menu_mark_read)
+        self.add_action(mark_read_action)
 
-        flag_action = Gio.SimpleAction.new("message-toggle-flag", None)
-        flag_action.connect("activate", self._on_message_menu_toggle_flag)
+        mark_unread_action = Gio.SimpleAction.new("message-mark-unread", None)
+        mark_unread_action.connect("activate", self._on_message_menu_mark_unread)
+        self.add_action(mark_unread_action)
+
+        flag_action = Gio.SimpleAction.new("message-flag", None)
+        flag_action.connect("activate", self._on_message_menu_flag)
         self.add_action(flag_action)
+
+        unflag_action = Gio.SimpleAction.new("message-unflag", None)
+        unflag_action.connect("activate", self._on_message_menu_unflag)
+        self.add_action(unflag_action)
 
         self._archive_action = Gio.SimpleAction.new("message-archive", None)
         self._archive_action.connect("activate", self._on_message_menu_archive)
@@ -1173,31 +1185,17 @@ class MainWindow(Adw.ApplicationWindow):
         return [row]
 
     @staticmethod
-    def _read_menu_label(rows: list[Gtk.ListBoxRow]) -> str:
-        seen_states = [
+    def _message_seen_states(rows: list[Gtk.ListBoxRow]) -> list[bool]:
+        return [
             (getattr(row, "message_flags", {}) or {}).get("seen", True) for row in rows
         ]
-        count = len(rows)
-        suffix = f" ({count})" if count > 1 else ""
-        if all(seen_states):
-            return f"Mark as unread{suffix}"
-        if not any(seen_states):
-            return f"Mark as read{suffix}"
-        return f"Toggle read{suffix}"
 
     @staticmethod
-    def _flag_menu_label(rows: list[Gtk.ListBoxRow]) -> str:
-        flagged_states = [
+    def _message_flagged_states(rows: list[Gtk.ListBoxRow]) -> list[bool]:
+        return [
             (getattr(row, "message_flags", {}) or {}).get("flagged", False)
             for row in rows
         ]
-        count = len(rows)
-        suffix = f" ({count})" if count > 1 else ""
-        if all(flagged_states):
-            return f"Unflag{suffix}"
-        if not any(flagged_states):
-            return f"Flag{suffix}"
-        return f"Toggle flag{suffix}"
 
     @staticmethod
     def _count_menu_label(base: str, rows: list[Gtk.ListBoxRow]) -> str:
@@ -1224,8 +1222,17 @@ class MainWindow(Adw.ApplicationWindow):
         self._trash_action.set_enabled(can_trash)
 
         menu = Gio.Menu()
-        menu.append(self._read_menu_label(rows), "win.message-toggle-read")
-        menu.append(self._flag_menu_label(rows), "win.message-toggle-flag")
+        count = len(rows)
+        for action in read_menu_items(self._message_seen_states(rows)):
+            menu.append(
+                read_menu_label(action, count),
+                f"win.message-mark-{action}",
+            )
+        for action in flag_menu_items(self._message_flagged_states(rows)):
+            menu.append(
+                flag_menu_label(action, count),
+                f"win.message-{action}",
+            )
         if len(rows) == 1:
             menu.append("Reply", "win.message-reply")
             menu.append("Reply All", "win.message-reply-all")
@@ -1279,11 +1286,17 @@ class MainWindow(Adw.ApplicationWindow):
 
         GLib.idle_add(self._update_message_toolbar)
 
-    def _on_message_menu_toggle_read(self, *_args) -> None:
-        self._toggle_message_flag("seen")
+    def _on_message_menu_mark_read(self, *_args) -> None:
+        self._set_messages_seen(True)
 
-    def _on_message_menu_toggle_flag(self, *_args) -> None:
-        self._toggle_message_flag("flagged")
+    def _on_message_menu_mark_unread(self, *_args) -> None:
+        self._set_messages_seen(False)
+
+    def _on_message_menu_flag(self, *_args) -> None:
+        self._set_messages_flagged(True)
+
+    def _on_message_menu_unflag(self, *_args) -> None:
+        self._set_messages_flagged(False)
 
     def _on_message_menu_archive(self, *_args) -> None:
         self._move_context_messages("archive")
@@ -1573,7 +1586,19 @@ class MainWindow(Adw.ApplicationWindow):
         self._update_message_toolbar()
         return False
 
-    def _toggle_message_flag(self, flag_name: str) -> None:
+    def _set_messages_seen(self, seen: bool) -> None:
+        self._set_message_flags("seen", seen=seen)
+
+    def _set_messages_flagged(self, flagged: bool) -> None:
+        self._set_message_flags("flagged", flagged=flagged)
+
+    def _set_message_flags(
+        self,
+        flag_name: str,
+        *,
+        seen: bool | None = None,
+        flagged: bool | None = None,
+    ) -> None:
         rows = list(self._context_message_rows)
         if not rows or not self._current_account or not self._current_folder:
             return
@@ -1590,15 +1615,17 @@ class MainWindow(Adw.ApplicationWindow):
             result: dict | None = None
             try:
                 if flag_name == "seen":
-                    result = self._mail.toggle_messages_seen(
-                        account_uid, folder_name, uids
+                    assert seen is not None
+                    result = self._mail.set_messages_seen(
+                        account_uid, folder_name, uids, seen=seen
                     )
                 else:
-                    result = self._mail.toggle_messages_flagged(
-                        account_uid, folder_name, uids
+                    assert flagged is not None
+                    result = self._mail.set_messages_flagged(
+                        account_uid, folder_name, uids, flagged=flagged
                     )
             except Exception as exc:
-                log.exception("Failed to toggle message %s", flag_name)
+                log.exception("Failed to update message %s", flag_name)
                 error = exc
             GLib.idle_add(
                 self._on_messages_flag_toggled,
