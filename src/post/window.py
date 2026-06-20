@@ -63,7 +63,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._context_message_rows: list[Gtk.ListBoxRow] = []
         self._pending_move_undo: dict | None = None
         self._undo_toast: Adw.Toast | None = None
-        self._settings_window: SettingsWindow | None = None
+        self._settings_dialog: SettingsWindow | None = None
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.set_vexpand(True)
@@ -332,21 +332,21 @@ class MainWindow(Adw.ApplicationWindow):
         self._open_compose_new()
 
     def _on_settings_clicked(self, *_args) -> None:
-        if self._settings_window is not None:
-            self._settings_window.present()
+        if self._settings_dialog is not None:
+            self._settings_dialog.present(self)
             return
-        window = SettingsWindow(
+        dialog = SettingsWindow(
             parent=self,
             mail=self._mail,
             set_status=self._set_status,
             on_saved=self._reload_sidebar,
         )
-        self._settings_window = window
-        window.connect("destroy", self._on_settings_closed)
-        window.present()
+        self._settings_dialog = dialog
+        dialog.connect("closed", self._on_settings_closed)
+        dialog.present(self)
 
     def _on_settings_closed(self, *_args) -> None:
-        self._settings_window = None
+        self._settings_dialog = None
 
     def _on_reply_action(self, *_args) -> None:
         self._open_compose_reply()

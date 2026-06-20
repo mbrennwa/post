@@ -31,6 +31,7 @@ from .accounts import (
     is_builtin_local_store_empty,
     should_list_local_account,
 )
+from post.preferences import get_show_evolution_local
 from .auth import PasswordPromptCallback, authenticate_service_sync
 from .compose import addresses_to_internet_address, build_plain_mime_message
 from .folders import find_folder_by_type, guess_inbox_name
@@ -189,11 +190,15 @@ class MailService:
 
     def list_accounts(self) -> list[MailAccount]:
         accounts: list[MailAccount] = []
+        evolution_local_pref = get_show_evolution_local()
         hide_empty_builtin_local = is_builtin_local_store_empty(self.registry)
         for source in self.registry.list_enabled("Mail Account"):
             uid = source.get_uid()
-            if uid == BUILTIN_LOCAL_UID and hide_empty_builtin_local:
-                continue
+            if uid == BUILTIN_LOCAL_UID:
+                if evolution_local_pref is False:
+                    continue
+                if evolution_local_pref is None and hide_empty_builtin_local:
+                    continue
             mail_ext = source.get_extension("Mail Account")
             backend = mail_ext.get_backend_name()
             if backend in _SKIP_BACKENDS:
@@ -834,6 +839,12 @@ class MailService:
     def _move_messages_to_trash_unlocked(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
+        account = self.get_account(account_uid)
+        if account.backend == "spool":
+            return self._spool_trash_messages_unlocked(
+                account_uid, folder_name, message_uids
+            )
+
         store = self._get_store_unlocked(account_uid)
         trash_folder = store.get_trash_folder_sync(None)
         if trash_folder is None:
@@ -853,6 +864,44 @@ class MailService:
         return self._transfer_messages_unlocked(
             account_uid, folder_name, message_uids, trash_folder
         )
+
+    def _spool_trash_messages_unlocked(
+        self, account_uid: str, folder_name: str, message_uids: list[str]
+    ) -> dict[str, Any]:
+        """Delete messages from an mbox spool inbox.
+
+        Camel crashes when moving from CamelSpoolStore to VTrashFolder, so spool
+        accounts remove messages via DELETED + expunge instead.
+        """
+        if not message_uids:
+            return {"moved_uids": []}
+
+        source_folder = self._open_folder_unlocked(account_uid, folder_name)
+        deleted_mask = Camel.MessageFlags.DELETED
+        for message_uid in message_uids:
+            source_folder.set_message_flags(
+                message_uid, deleted_mask, deleted_mask
+            )
+        source_folder.expunge_sync(None)
+        source_folder.refresh_info_sync(None)
+
+        moved_uids = list(message_uids)
+        source_unread = source_folder.get_unread_message_count()
+        source_total = source_folder.get_message_count()
+        self._remove_messages_from_cache(
+            account_uid, folder_name, moved_uids, source_unread, source_total
+        )
+
+        return {
+            "moved_uids": moved_uids,
+            "destination_uids": [],
+            "source_folder": folder_name,
+            "source_folder_unread": source_unread,
+            "source_folder_total": source_total,
+            "destination_folder": ".#evolution/Trash",
+            "destination_folder_unread": -1,
+            "destination_folder_total": -1,
+        }
 
     def _archive_messages_unlocked(
         self, account_uid: str, folder_name: str, message_uids: list[str]

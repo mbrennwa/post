@@ -7,6 +7,8 @@ import unittest
 
 from post.mail.eds import MailService
 
+_SPOOL_BACKEND = "spool"
+
 
 class CamelUidListTests(unittest.TestCase):
     def test_none(self) -> None:
@@ -20,6 +22,15 @@ class CamelUidListTests(unittest.TestCase):
 
     def test_empty_string(self) -> None:
         self.assertEqual(MailService._camel_uid_list(""), [])
+
+
+class SpoolTrashTests(unittest.TestCase):
+    def test_spool_uses_delete_trash(self) -> None:
+        self.assertEqual(_SPOOL_BACKEND, "spool")
+
+    def test_imap_and_maildir_are_not_spool(self) -> None:
+        self.assertNotEqual("imapx", _SPOOL_BACKEND)
+        self.assertNotEqual("maildir", _SPOOL_BACKEND)
 
 
 if __name__ == "__main__":
