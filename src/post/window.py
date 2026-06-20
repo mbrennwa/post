@@ -1381,8 +1381,8 @@ class MainWindow(Adw.ApplicationWindow):
             if inbox_folder in (source_folder, dest_folder):
                 self._sidebar.refresh_inbox_counts(account_uid)
 
-            if self._current_folder == source_folder:
-                self._load_messages(account_uid, source_folder)
+            if self._current_folder in (source_folder, dest_folder):
+                self._load_messages(account_uid, self._current_folder)
             elif self._current_account and self._current_folder:
                 self._update_message_status(
                     self._current_account, self._current_folder
