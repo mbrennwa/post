@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import threading
 from collections.abc import Callable
 
@@ -59,9 +58,11 @@ class MainWindow(Adw.ApplicationWindow):
         self._context_attachment_mime: str | None = None
         self._context_attachment_name: str | None = None
         self._context_message_rows: list[Gtk.ListBoxRow] = []
+        self._pending_move_undo: dict | None = None
+        self._undo_toast: Adw.Toast | None = None
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.set_content(outer)
+        outer.set_vexpand(True)
 
         header = Adw.HeaderBar()
         title = Adw.WindowTitle(title="Post", subtitle="Mail")
@@ -124,14 +125,9 @@ class MainWindow(Adw.ApplicationWindow):
         message_scroll.set_vexpand(True)
         self._message_scroll = message_scroll
         self._message_list = Gtk.ListBox()
-        if sys.platform == "darwin":
-            message_scroll.set_tooltip_text(
-                "⌘-click to multi-select · Shift-click for range · Right-click for menu"
-            )
-        else:
-            message_scroll.set_tooltip_text(
-                "Ctrl+click to multi-select · Shift-click for range · Right-click for menu"
-            )
+        message_scroll.set_tooltip_text(
+            "Ctrl+click to multi-select · Shift-click for range · Right-click for menu"
+        )
         self._message_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
         self._message_list.set_activate_on_single_click(False)
         self._message_list.connect("row-selected", self._on_message_selected)
@@ -240,8 +236,28 @@ class MainWindow(Adw.ApplicationWindow):
         self._status.add_css_class("dim-label")
         outer.append(self._status)
 
+        self._toast_overlay = Adw.ToastOverlay()
+        self._toast_overlay.set_vexpand(True)
+        self._toast_overlay.set_hexpand(True)
+        self._toast_overlay.set_child(outer)
+        self.set_content(self._toast_overlay)
+
         self._setup_attachment_menu()
         self._setup_message_menu()
+        self._setup_undo_action()
+
+    def _setup_undo_action(self) -> None:
+        self._undo_move_action = Gio.SimpleAction.new("undo-move", None)
+        self._undo_move_action.set_enabled(False)
+        self._undo_move_action.connect("activate", self._on_undo_move_action)
+        self.add_action(self._undo_move_action)
+
+        application = self.get_application()
+        if application is not None:
+            application.set_accels_for_action("win.undo-move", ["<Control>z"])
+
+    def _on_undo_move_action(self, *_args) -> None:
+        self._trigger_move_undo()
 
     def _setup_attachment_menu(self) -> None:
         save_action = Gio.SimpleAction.new("attachment-save", None)
@@ -266,13 +282,13 @@ class MainWindow(Adw.ApplicationWindow):
         flag_action.connect("activate", self._on_message_menu_toggle_flag)
         self.add_action(flag_action)
 
-        archive_action = Gio.SimpleAction.new("message-archive", None)
-        archive_action.connect("activate", self._on_message_menu_archive)
-        self.add_action(archive_action)
+        self._archive_action = Gio.SimpleAction.new("message-archive", None)
+        self._archive_action.connect("activate", self._on_message_menu_archive)
+        self.add_action(self._archive_action)
 
-        trash_action = Gio.SimpleAction.new("message-move-trash", None)
-        trash_action.connect("activate", self._on_message_menu_move_trash)
-        self.add_action(trash_action)
+        self._trash_action = Gio.SimpleAction.new("message-move-trash", None)
+        self._trash_action.connect("activate", self._on_message_menu_move_trash)
+        self.add_action(self._trash_action)
 
         self._message_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
         self._message_popover.set_parent(self._message_scroll)
@@ -288,8 +304,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_message_context_shortcut(
         self,
         _widget: Gtk.Widget,
-        _args: GLib.Variant | None,
-        _user_data: object,
+        _args: GLib.Variant | None = None,
     ) -> bool:
         row = self._message_list.get_selected_row()
         if row is None:
@@ -920,15 +935,29 @@ class MainWindow(Adw.ApplicationWindow):
         rows = self._message_rows_for_menu(row)
         self._context_message_rows = rows
 
+        can_archive = False
+        can_trash = False
+        if self._current_account and self._current_folder:
+            state = self._sidebar.get_move_menu_state(
+                self._current_account.uid, self._current_folder
+            )
+            can_archive = bool(state.get("can_archive"))
+            can_trash = bool(state.get("can_trash"))
+
+        self._archive_action.set_enabled(can_archive)
+        self._trash_action.set_enabled(can_trash)
+
         menu = Gio.Menu()
         menu.append(self._read_menu_label(rows), "win.message-toggle-read")
         menu.append(self._flag_menu_label(rows), "win.message-toggle-flag")
-        menu.append(
-            self._count_menu_label("Archive", rows), "win.message-archive"
-        )
-        menu.append(
-            self._count_menu_label("Move to Trash", rows), "win.message-move-trash"
-        )
+        if can_archive:
+            menu.append(
+                self._count_menu_label("Archive", rows), "win.message-archive"
+            )
+        if can_trash:
+            menu.append(
+                self._count_menu_label("Move to Trash", rows), "win.message-move-trash"
+            )
         self._message_popover.set_menu_model(menu)
 
         coords = self._message_list.translate_coordinates(
@@ -985,6 +1014,14 @@ class MainWindow(Adw.ApplicationWindow):
         if not rows or not self._current_account or not self._current_folder:
             return
 
+        state = self._sidebar.get_move_menu_state(
+            self._current_account.uid, self._current_folder
+        )
+        if destination == "archive" and not state.get("can_archive"):
+            return
+        if destination == "trash" and not state.get("can_trash"):
+            return
+
         uids = [uid for row in rows if (uid := getattr(row, "message_uid", None))]
         if not uids:
             return
@@ -1018,7 +1055,123 @@ class MainWindow(Adw.ApplicationWindow):
 
         label = "Trash" if destination == "trash" else "Archive"
         self._set_status(f"Moving {len(uids)} message(s) to {label}…")
+        self._clear_move_undo()
         threading.Thread(target=worker, daemon=True).start()
+
+    def _dismiss_undo_toast_only(self) -> None:
+        if self._undo_toast is not None:
+            self._undo_toast.dismiss()
+            self._undo_toast = None
+
+    def _clear_move_undo(self) -> None:
+        self._pending_move_undo = None
+        self._undo_move_action.set_enabled(False)
+        self._dismiss_undo_toast_only()
+
+    def _trigger_move_undo(self) -> bool:
+        undo = self._pending_move_undo
+        if undo is None:
+            return False
+        self._clear_move_undo()
+        self._undo_message_move(undo)
+        return True
+
+    def _register_move_undo(
+        self,
+        label: str,
+        *,
+        account_uid: str,
+        source_folder: str,
+        dest_folder: str,
+        dest_uids: list[str],
+    ) -> None:
+        if not dest_uids:
+            log.warning("Move succeeded but destination UIDs are unknown; undo disabled")
+            return
+
+        self._pending_move_undo = {
+            "account_uid": account_uid,
+            "source_folder": source_folder,
+            "dest_folder": dest_folder,
+            "dest_uids": dest_uids,
+        }
+        self._undo_move_action.set_enabled(True)
+
+        toast = Adw.Toast.new(label)
+        toast.set_button_label("Undo")
+        toast.set_action_name("win.undo-move")
+        toast.set_priority(Adw.ToastPriority.HIGH)
+        toast.set_timeout(10)
+        toast.connect("dismissed", self._on_move_undo_dismissed)
+        self._undo_toast = toast
+        self._toast_overlay.add_toast(toast)
+
+    def _on_move_undo_dismissed(self, _toast: Adw.Toast) -> None:
+        self._undo_toast = None
+
+    def _undo_message_move(self, undo: dict) -> None:
+        def worker() -> None:
+            error: Exception | None = None
+            result: dict | None = None
+            try:
+                result = self._mail.move_messages(
+                    undo["account_uid"],
+                    undo["dest_folder"],
+                    undo["source_folder"],
+                    undo["dest_uids"],
+                )
+            except Exception as exc:
+                log.exception("Failed to undo message move")
+                error = exc
+            GLib.idle_add(self._on_move_undo_finished, undo, result, error)
+
+        self._set_status("Restoring messages…")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_move_undo_finished(
+        self,
+        undo: dict,
+        result: dict | None,
+        error: Exception | None,
+    ) -> bool:
+        if error is not None:
+            self._set_status(f"Undo failed: {error}")
+            return False
+        if result is None:
+            return False
+
+        account_uid = undo["account_uid"]
+        source_folder = undo["source_folder"]
+        dest_folder = undo["dest_folder"]
+
+        if self._current_account and self._current_account.uid == account_uid:
+            source_unread = result.get("source_folder_unread")
+            source_total = result.get("source_folder_total")
+            if source_unread is not None and source_total is not None:
+                self._sidebar.update_folder_row(
+                    account_uid, dest_folder, source_unread, source_total
+                )
+
+            dest_unread = result.get("destination_folder_unread")
+            dest_total = result.get("destination_folder_total")
+            if dest_unread is not None and dest_total is not None:
+                self._sidebar.update_folder_row(
+                    account_uid, source_folder, dest_unread, dest_total
+                )
+
+            inbox_folder = self._sidebar.inbox_folder_for_account(account_uid)
+            if inbox_folder in (source_folder, dest_folder):
+                self._sidebar.refresh_inbox_counts(account_uid)
+
+            if self._current_folder == source_folder:
+                self._load_messages(account_uid, source_folder)
+            elif self._current_account and self._current_folder:
+                self._update_message_status(
+                    self._current_account, self._current_folder
+                )
+
+        self._set_status("Move undone")
+        return False
 
     def _on_messages_moved(
         self,
@@ -1090,11 +1243,37 @@ class MainWindow(Adw.ApplicationWindow):
 
             self._update_message_status(self._current_account, self._current_folder)
 
+            inbox_folder = self._sidebar.inbox_folder_for_account(
+                self._current_account.uid
+            )
+            if inbox_folder and self._current_folder == inbox_folder:
+                self._sidebar.refresh_inbox_counts(self._current_account.uid)
+
         label = "Trash" if destination == "trash" else "Archive"
         if removed_count > 1:
-            self._set_status(f"Moved {removed_count} messages to {label}")
+            status_label = f"Moved {removed_count} messages to {label}"
         else:
-            self._set_status(f"Moved message to {label}")
+            status_label = f"Moved message to {label}"
+
+        dest_folder = result.get("destination_folder")
+        dest_uids = result.get("destination_uids") or []
+        if (
+            self._current_account
+            and self._current_folder
+            and dest_folder
+            and dest_uids
+        ):
+            self._register_move_undo(
+                status_label,
+                account_uid=self._current_account.uid,
+                source_folder=self._current_folder,
+                dest_folder=dest_folder,
+                dest_uids=dest_uids,
+            )
+            self._set_status(f"{status_label}  ·  Ctrl+Z to undo")
+        else:
+            self._clear_move_undo()
+            self._set_status(status_label)
         return False
 
     def _toggle_message_flag(self, flag_name: str) -> None:

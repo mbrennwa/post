@@ -404,6 +404,22 @@ class MailService:
                 account_uid, folder_name, message_uids
             )
 
+    def move_messages(
+        self,
+        account_uid: str,
+        source_folder: str,
+        destination_folder: str,
+        message_uids: list[str],
+    ) -> dict[str, Any]:
+        with self._lock:
+            store = self._get_store_unlocked(account_uid)
+            dest = store.get_folder_sync(destination_folder, 0, None)
+            if dest is None:
+                raise ValueError(f"Folder not found: {destination_folder}")
+            return self._transfer_messages_unlocked(
+                account_uid, source_folder, message_uids, dest
+            )
+
     def mark_message_read(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> tuple[int, int]:
@@ -669,6 +685,10 @@ class MailService:
         if dest_name and dest_name == source_folder_name:
             raise ValueError("Messages are already in that folder")
 
+        source_messages = self._message_dicts_for_uids_unlocked(
+            source_folder, message_uids
+        )
+
         ok, transferred = source_folder.transfer_messages_to_sync(
             message_uids, destination_folder, True, None
         )
@@ -677,15 +697,20 @@ class MailService:
 
         # Camel returns destination UIDs; the UI and cache use source UIDs.
         moved_uids = list(message_uids)
-        destination_uids = list(transferred) if transferred else []
+        destination_uids = self._camel_uid_list(transferred)
         source_folder.refresh_info_sync(None)
         destination_folder.refresh_info_sync(None)
+        if not destination_uids:
+            destination_uids = self._find_moved_uids_in_folder_unlocked(
+                destination_folder, source_messages
+            )
 
         source_unread = source_folder.get_unread_message_count()
         source_total = source_folder.get_message_count()
         self._remove_messages_from_cache(
             account_uid, source_folder_name, moved_uids, source_unread, source_total
         )
+        self._invalidate_folder_index(account_uid, dest_name)
 
         dest_unread = destination_folder.get_unread_message_count()
         dest_total = destination_folder.get_message_count()
@@ -713,6 +738,65 @@ class MailService:
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
         return folder
+
+    @staticmethod
+    def _camel_uid_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value] if value else []
+        try:
+            length = value.get_length()
+            return [str(value.get_nth(index)) for index in range(length)]
+        except (AttributeError, TypeError):
+            pass
+        try:
+            return [str(uid) for uid in value]
+        except TypeError:
+            return [str(value)]
+
+    def _message_dicts_for_uids_unlocked(
+        self, folder: Camel.Folder, message_uids: list[str]
+    ) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        for message_uid in message_uids:
+            info = folder.get_message_info(message_uid)
+            if info is not None:
+                messages.append(message_info_to_dict(info))
+        return messages
+
+    def _find_moved_uids_in_folder_unlocked(
+        self, folder: Camel.Folder, source_messages: list[dict[str, Any]]
+    ) -> list[str]:
+        if not source_messages:
+            return []
+
+        fingerprints = {
+            (
+                message.get("subject") or "",
+                message.get("from") or "",
+                message.get("sort_date") or 0,
+            )
+            for message in source_messages
+        }
+        found: list[str] = []
+        uids = folder.get_uids()
+        if uids is None:
+            return []
+
+        for uid in uids:
+            info = folder.get_message_info(str(uid))
+            if info is None:
+                continue
+            message = message_info_to_dict(info)
+            fingerprint = (
+                message.get("subject") or "",
+                message.get("from") or "",
+                message.get("sort_date") or 0,
+            )
+            if fingerprint in fingerprints:
+                found.append(str(uid))
+        return found
 
     def _apply_message_flags_unlocked(
         self,
@@ -787,6 +871,12 @@ class MailService:
         ]
         index.unread = unread
         index.total = total
+
+    def _invalidate_folder_index(
+        self, account_uid: str, folder_name: str | None
+    ) -> None:
+        if folder_name:
+            self._folder_indexes.pop((account_uid, folder_name), None)
 
     @staticmethod
     def guess_inbox(folders: list[dict]) -> str | None:

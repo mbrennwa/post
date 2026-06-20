@@ -17,7 +17,12 @@ from gi.repository import GLib, Gtk
 
 from post.mail import MailService
 from post.mail.eds import MailAccount
-from post.mail.folders import find_inbox_folder, format_folder_label
+from post.mail.folders import (
+    find_inbox_folder,
+    format_folder_label,
+    guess_inbox_name,
+    resolve_move_menu_state,
+)
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +50,8 @@ class MailSidebar:
         self._inbox_list: Gtk.ListBox | None = None
         self._inbox_expanded = True
         self._folder_lists: dict[str, Gtk.ListBox] = {}
+        self._account_folders: dict[str, list[dict]] = {}
+        self._account_inbox_folders: dict[str, str] = {}
         self._load_generation = 0
         self._needs_initial_selection = False
         self._activated_folder: tuple[str, str] | None = None
@@ -110,6 +117,64 @@ class MailSidebar:
                         label.set_label(format_folder_label(display, unread, total))
                 row = row.get_next_sibling()
 
+    def get_move_menu_state(self, account_uid: str, folder_name: str) -> dict:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        folders = self._account_folders.get(account_uid, [])
+        return resolve_move_menu_state(
+            folders,
+            folder_name,
+            archive_type=Camel.FolderInfoFlags.TYPE_ARCHIVE,
+            trash_type=Camel.FolderInfoFlags.TYPE_TRASH,
+            type_mask=Camel.FOLDER_TYPE_MASK,
+        )
+
+    def inbox_folder_for_account(self, account_uid: str) -> str | None:
+        return self._account_inbox_folders.get(account_uid)
+
+    def refresh_inbox_counts(self, account_uid: str) -> None:
+        """Re-fetch inbox stats and update sidebar rows (incl. unified Inbox)."""
+
+        def worker() -> None:
+            error: Exception | None = None
+            inbox: dict | None = None
+            try:
+                folders = self._mail.list_folders(account_uid)
+                inbox = find_inbox_folder(folders)
+            except Exception as exc:
+                log.exception("Failed to refresh inbox counts for %s", account_uid)
+                error = exc
+            GLib.idle_add(
+                self._on_inbox_counts_refreshed,
+                account_uid,
+                inbox,
+                error,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_inbox_counts_refreshed(
+        self,
+        account_uid: str,
+        inbox: dict | None,
+        error: Exception | None,
+    ) -> bool:
+        if error is not None or inbox is None:
+            return False
+
+        folder_name = inbox.get("full_name")
+        if not folder_name:
+            return False
+
+        self._account_inbox_folders[account_uid] = folder_name
+        unread = inbox.get("unread", -1)
+        total = inbox.get("total", -1)
+        self.update_folder_row(account_uid, folder_name, unread, total)
+        return False
+
     def _start_folder_load(self, load_id: int, account: MailAccount) -> None:
         def worker() -> None:
             error: Exception | None = None
@@ -159,6 +224,7 @@ class MailSidebar:
             return False
 
         assert folders is not None
+        self._account_folders[account_uid] = folders
         for folder in folders:
             folder_list.append(self._make_folder_row(account_uid, folder))
 
@@ -186,6 +252,8 @@ class MailSidebar:
         while child := self._sidebar_box.get_first_child():
             self._sidebar_box.remove(child)
         self._folder_lists.clear()
+        self._account_folders.clear()
+        self._account_inbox_folders.clear()
         self._inbox_expander = None
         self._inbox_list = None
 
@@ -263,6 +331,9 @@ class MailSidebar:
 
         account = self._accounts_by_uid.get(account_uid)
         display = account.display_label if account else account_uid
+        full_name = inbox_folder.get("full_name")
+        if full_name:
+            self._account_inbox_folders[account_uid] = full_name
         self._inbox_list.append(
             self._make_folder_row(account_uid, inbox_folder, display=display)
         )

@@ -11,6 +11,7 @@ from post.mail.folders import (
     find_inbox_folder,
     format_folder_label,
     guess_inbox_name,
+    resolve_move_menu_state,
 )
 
 
@@ -60,6 +61,7 @@ class FindInboxFolderTests(unittest.TestCase):
 
 class FindFolderByTypeTests(unittest.TestCase):
     TYPE_ARCHIVE = 11264
+    TYPE_TRASH = 10240
     TYPE_MASK = 64512
 
     def test_matches_folder_type_flag(self) -> None:
@@ -87,6 +89,58 @@ class FindFolderByTypeTests(unittest.TestCase):
             ),
             archive,
         )
+
+
+class ResolveMoveMenuStateTests(unittest.TestCase):
+    TYPE_ARCHIVE = 11264
+    TYPE_TRASH = 10240
+    TYPE_MASK = 64512
+
+    def test_allows_archive_and_trash_from_inbox(self) -> None:
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 1024},
+            {"full_name": "Archive", "display_name": "Archive", "flags": 11264},
+            {"full_name": "Trash", "display_name": "Trash", "flags": 10240},
+        ]
+        state = resolve_move_menu_state(
+            folders,
+            "INBOX",
+            archive_type=self.TYPE_ARCHIVE,
+            trash_type=self.TYPE_TRASH,
+            type_mask=self.TYPE_MASK,
+        )
+        self.assertTrue(state["can_archive"])
+        self.assertTrue(state["can_trash"])
+
+    def test_disables_archive_when_already_there(self) -> None:
+        folders = [
+            {"full_name": "Archive", "display_name": "Archive", "flags": 11264},
+            {"full_name": "Trash", "display_name": "Trash", "flags": 10240},
+        ]
+        state = resolve_move_menu_state(
+            folders,
+            "Archive",
+            archive_type=self.TYPE_ARCHIVE,
+            trash_type=self.TYPE_TRASH,
+            type_mask=self.TYPE_MASK,
+        )
+        self.assertFalse(state["can_archive"])
+        self.assertTrue(state["can_trash"])
+
+    def test_disables_archive_when_folder_missing(self) -> None:
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 1024},
+            {"full_name": "Trash", "display_name": "Trash", "flags": 10240},
+        ]
+        state = resolve_move_menu_state(
+            folders,
+            "INBOX",
+            archive_type=self.TYPE_ARCHIVE,
+            trash_type=self.TYPE_TRASH,
+            type_mask=self.TYPE_MASK,
+        )
+        self.assertFalse(state["can_archive"])
+        self.assertTrue(state["can_trash"])
 
 
 class MailAccountDisplayLabelTests(unittest.TestCase):

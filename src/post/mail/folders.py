@@ -43,6 +43,37 @@ def folder_matches_type(folder: dict, folder_type: int, *, type_mask: int) -> bo
     return (flags & type_mask) == folder_type
 
 
+def resolve_move_menu_state(
+    folders: list[dict],
+    current_folder: str,
+    *,
+    archive_type: int,
+    trash_type: int,
+    type_mask: int,
+) -> dict[str, str | bool | None]:
+    archive_info = find_folder_by_type(
+        folders,
+        archive_type,
+        type_mask=type_mask,
+        name_fallbacks=frozenset({"archive", "archives"}),
+    )
+    trash_info = find_folder_by_type(
+        folders,
+        trash_type,
+        type_mask=type_mask,
+        name_fallbacks=frozenset({"trash", "deleted", "bin"}),
+    )
+    archive_name = archive_info.get("full_name") if archive_info else None
+    trash_name = trash_info.get("full_name") if trash_info else None
+    return {
+        "archive_folder": archive_name,
+        "trash_folder": trash_name,
+        "inbox_folder": guess_inbox_name(folders),
+        "can_archive": archive_name is not None and current_folder != archive_name,
+        "can_trash": trash_name is not None and current_folder != trash_name,
+    }
+
+
 def find_folder_by_type(
     folders: list[dict],
     folder_type: int,
