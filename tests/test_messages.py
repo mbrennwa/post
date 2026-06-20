@@ -89,6 +89,11 @@ class FormatMessageDatetimeTests(unittest.TestCase):
         self.assertRegex(value, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
         self.assertNotIn("T", value or "")
 
+    def test_invalid_timestamp_returns_none(self) -> None:
+        self.assertIsNone(format_message_datetime(0))
+        self.assertIsNone(format_message_datetime(-1))
+        self.assertIsNone(format_message_datetime(999999999999999))
+
 
 class MessageFlagTests(unittest.TestCase):
     def test_unread_when_not_seen(self) -> None:

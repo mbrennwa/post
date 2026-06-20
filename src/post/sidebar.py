@@ -21,15 +21,17 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
 from post.mail import MailService
 from post.mail.eds import MailAccount
+from post.folder_dialogs import confirm_action, prompt_folder_name, show_error
 from post.mail.folders import (
     POST_OUTBOX_FOLDER,
+    account_supports_folder_crud,
     filter_sidebar_folders,
     find_inbox_folder,
     format_folder_label,
-    guess_inbox_name,
     is_post_outbox_folder,
     outbox_folder_dict,
     resolve_move_menu_state,
+    resolve_sidebar_context_menu,
 )
 from post.mail.send_queue import (
     OFFLINE_FOLDER_MESSAGE,
@@ -51,6 +53,9 @@ SetStatus = Callable[[str], None]
 OnRefreshAccount = Callable[[str], None]
 OnRefreshFolder = Callable[[str, str], None]
 OnAccountsLoaded = Callable[[list[str]], None]
+OnSendOutbox = Callable[[], None]
+OnFolderTreeChanged = Callable[[str, str | None], None]
+OnFolderContentsChanged = Callable[[str, str], None]
 
 
 class MailSidebar:
@@ -63,6 +68,9 @@ class MailSidebar:
         on_refresh_account: OnRefreshAccount | None = None,
         on_refresh_folder: OnRefreshFolder | None = None,
         on_accounts_loaded: OnAccountsLoaded | None = None,
+        on_send_outbox: OnSendOutbox | None = None,
+        on_folder_tree_changed: OnFolderTreeChanged | None = None,
+        on_folder_contents_changed: OnFolderContentsChanged | None = None,
     ) -> None:
         self._mail = mail
         self._on_folder_selected = on_folder_selected
@@ -70,6 +78,9 @@ class MailSidebar:
         self._on_refresh_account = on_refresh_account
         self._on_refresh_folder = on_refresh_folder
         self._on_accounts_loaded = on_accounts_loaded
+        self._on_send_outbox = on_send_outbox
+        self._on_folder_tree_changed = on_folder_tree_changed
+        self._on_folder_contents_changed = on_folder_contents_changed
 
         self._accounts: list[MailAccount] = []
         self._accounts_by_uid: dict[str, MailAccount] = {}
@@ -91,7 +102,9 @@ class MailSidebar:
         self._load_generation = 0
         self._needs_initial_selection = False
         self._activated_folder: tuple[str, str] | None = None
-        self._refresh_target: tuple[str, str | None] | None = None
+        self._context_target: dict | None = None
+        self._context_actions: dict[str, Gio.SimpleAction] = {}
+        self._context_popover: Gtk.PopoverMenu | None = None
 
         self._sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self._sidebar_box.add_css_class("navigation-sidebar")
@@ -101,7 +114,7 @@ class MailSidebar:
         scroll.set_size_request(240, -1)
         scroll.set_child(self._sidebar_box)
         self._widget = scroll
-        self._setup_refresh_menu()
+        self._setup_context_menu()
 
     @property
     def widget(self) -> Gtk.ScrolledWindow:
@@ -153,6 +166,8 @@ class MailSidebar:
                     getattr(row, "account_uid", None) == account_uid
                     and getattr(row, "folder_name", None) == folder_name
                 ):
+                    row.unread = unread
+                    row.total = total
                     label = row.get_child()
                     if isinstance(label, Gtk.Label):
                         display = getattr(row, "display_name", folder_name)
@@ -300,28 +315,356 @@ class MailSidebar:
         self.update_folder_row(account_uid, folder_name, unread, total)
         return False
 
-    def _setup_refresh_menu(self) -> None:
-        action = Gio.SimpleAction.new("refresh", None)
-        action.connect("activate", self._on_refresh_menu_activate)
+    def _setup_context_menu(self) -> None:
+        specs = (
+            ("new-folder", self._on_new_folder_activate),
+            ("new-subfolder", self._on_new_subfolder_activate),
+            ("rename-folder", self._on_rename_folder_activate),
+            ("delete-folder", self._on_delete_folder_activate),
+            ("archive-read", self._on_archive_read_activate),
+            ("send-now", self._on_send_now_activate),
+            ("empty-trash", self._on_empty_trash_activate),
+            ("refresh", self._on_refresh_menu_activate),
+        )
         group = Gio.SimpleActionGroup.new()
-        group.add_action(action)
+        for name, handler in specs:
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", handler)
+            group.add_action(action)
+            self._context_actions[name] = action
         self._widget.insert_action_group("sidebar", group)
 
+    def _context_menu_state(
+        self,
+        account_uid: str,
+        folder_name: str | None,
+        *,
+        unread: int,
+        total: int,
+    ) -> dict[str, bool]:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        folders = self._account_folders.get(account_uid, [])
+        move_state = resolve_move_menu_state(
+            folders,
+            folder_name or "",
+            archive_type=Camel.FolderInfoFlags.TYPE_ARCHIVE,
+            trash_type=Camel.FolderInfoFlags.TYPE_TRASH,
+            type_mask=Camel.FOLDER_TYPE_MASK,
+        )
+        account = self._accounts_by_uid.get(account_uid)
+        return resolve_sidebar_context_menu(
+            folders=folders,
+            folder_name=folder_name,
+            inbox_name=self.inbox_folder_for_account(account_uid),
+            trash_name=move_state.get("trash_folder"),
+            archive_name=move_state.get("archive_folder"),
+            unread=unread,
+            total=total,
+            outbox_count=count_queued_for_account(account_uid),
+            folder_crud_enabled=account_supports_folder_crud(
+                backend=account.backend if account else None
+            ),
+        )
+
+    def _build_context_menu_model(self, state: dict[str, bool]) -> Gio.Menu:
         menu = Gio.Menu()
+        edit_section = Gio.Menu()
+        edit_added = False
+
+        def append_edit(label: str, action: str, key: str) -> None:
+            nonlocal edit_added
+            if not state.get(f"show_{key}"):
+                return
+            self._context_actions[action.split(".")[-1]].set_enabled(
+                bool(state.get(f"enable_{key}"))
+            )
+            edit_section.append(label, action)
+            edit_added = True
+
+        append_edit("New Folder…", "sidebar.new-folder", "new_folder")
+        append_edit("New Sub-folder…", "sidebar.new-subfolder", "new_subfolder")
+        append_edit("Rename…", "sidebar.rename-folder", "rename")
+        append_edit("Delete", "sidebar.delete-folder", "delete")
+        if edit_added:
+            menu.append_section(None, edit_section)
+
+        special_section = Gio.Menu()
+        special_added = False
+
+        def append_special(label: str, action: str, key: str) -> None:
+            nonlocal special_added
+            if not state.get(f"show_{key}"):
+                return
+            self._context_actions[action.split(".")[-1]].set_enabled(
+                bool(state.get(f"enable_{key}"))
+            )
+            special_section.append(label, action)
+            special_added = True
+
+        append_special("Archive All Read", "sidebar.archive-read", "archive_read")
+        append_special("Send Now", "sidebar.send-now", "send_now")
+        append_special("Empty Trash", "sidebar.empty-trash", "empty_trash")
+        if special_added:
+            menu.append_section(None, special_section)
+
+        self._context_actions["refresh"].set_enabled(bool(state.get("enable_refresh")))
         menu.append("Refresh", "sidebar.refresh")
-        self._refresh_popover = Gtk.PopoverMenu.new_from_model(menu)
+        return menu
+
+    @staticmethod
+    def _dialog_parent(widget: Gtk.Widget) -> Gtk.Window | None:
+        root = widget.get_root()
+        return root if isinstance(root, Gtk.Window) else None
 
     def _on_refresh_menu_activate(self, *_args) -> None:
-        if self._refresh_target is None:
+        if self._context_target is None:
             return
-        account_uid, folder_name = self._refresh_target
-        self._refresh_target = None
+        account_uid = self._context_target["account_uid"]
+        folder_name = self._context_target["folder_name"]
         if folder_name is None:
             if self._on_refresh_account is not None:
                 self._on_refresh_account(account_uid)
             return
         if self._on_refresh_folder is not None:
             self._on_refresh_folder(account_uid, folder_name)
+
+    def _on_new_folder_activate(self, *_args) -> None:
+        self._prompt_and_create_folder(parent_folder_name=None)
+
+    def _on_new_subfolder_activate(self, *_args) -> None:
+        if self._context_target is None:
+            return
+        self._prompt_and_create_folder(
+            parent_folder_name=self._context_target["folder_name"]
+        )
+
+    def _prompt_and_create_folder(self, *, parent_folder_name: str | None) -> None:
+        if self._context_target is None:
+            return
+        parent = self._dialog_parent(self._widget)
+        if parent is None:
+            return
+        account_uid = self._context_target["account_uid"]
+        if parent_folder_name is None:
+            heading = "New Folder"
+            body = "Enter a name for the new folder."
+        else:
+            heading = "New Sub-folder"
+            body = "Enter a name for the new sub-folder."
+        name = prompt_folder_name(
+            parent,
+            heading=heading,
+            body=body,
+            confirm_label="Create",
+        )
+        if not name:
+            return
+        self._run_folder_operation(
+            lambda: self._mail.create_folder(account_uid, parent_folder_name, name),
+            success_status=f"Created folder {name}",
+            on_success=lambda _result: self._after_folder_tree_changed(account_uid),
+            error_heading="Could not create folder",
+        )
+
+    def _on_rename_folder_activate(self, *_args) -> None:
+        if self._context_target is None:
+            return
+        parent = self._dialog_parent(self._widget)
+        if parent is None:
+            return
+        account_uid = self._context_target["account_uid"]
+        folder_name = self._context_target["folder_name"]
+        display_name = self._context_target.get("display_name") or folder_name or ""
+        if folder_name and "/" in folder_name:
+            display_name = folder_name.rsplit("/", 1)[-1]
+        name = prompt_folder_name(
+            parent,
+            heading="Rename Folder",
+            body="Enter a new name for this folder.",
+            initial=display_name,
+            confirm_label="Rename",
+        )
+        if not name or not folder_name:
+            return
+        self._run_folder_operation(
+            lambda: self._mail.rename_folder(account_uid, folder_name, name),
+            success_status=f"Renamed folder to {name}",
+            on_success=lambda new_name: self._after_folder_renamed(
+                account_uid, folder_name, new_name
+            ),
+            error_heading="Could not rename folder",
+        )
+
+    def _on_delete_folder_activate(self, *_args) -> None:
+        if self._context_target is None:
+            return
+        parent = self._dialog_parent(self._widget)
+        if parent is None:
+            return
+        account_uid = self._context_target["account_uid"]
+        folder_name = self._context_target["folder_name"]
+        display_name = self._context_target.get("display_name") or folder_name or "folder"
+        if not folder_name:
+            return
+        if not confirm_action(
+            parent,
+            heading="Delete Folder?",
+            body=f"Delete “{display_name}” and all messages it contains?",
+            confirm_label="Delete",
+            destructive=True,
+        ):
+            return
+        self._run_folder_operation(
+            lambda: self._mail.delete_folder(account_uid, folder_name) or folder_name,
+            success_status=f"Deleted folder {display_name}",
+            on_success=lambda _result: self._after_folder_deleted(account_uid, folder_name),
+            error_heading="Could not delete folder",
+        )
+
+    def _on_archive_read_activate(self, *_args) -> None:
+        if self._context_target is None:
+            return
+        parent = self._dialog_parent(self._widget)
+        if parent is None:
+            return
+        account_uid = self._context_target["account_uid"]
+        folder_name = self._context_target["folder_name"]
+        read_count = int(self._context_target.get("read_count") or 0)
+        if not folder_name or read_count <= 0:
+            return
+        noun = "message" if read_count == 1 else "messages"
+        if not confirm_action(
+            parent,
+            heading="Archive Read Messages?",
+            body=f"Archive {read_count} read {noun} from this inbox?",
+            confirm_label="Archive",
+        ):
+            return
+        self._run_folder_operation(
+            lambda: self._mail.archive_read_messages(account_uid, folder_name),
+            success_status=f"Archived {read_count} read {noun}",
+            on_success=lambda _result: self._after_folder_contents_changed(
+                account_uid, folder_name
+            ),
+            error_heading="Could not archive messages",
+        )
+
+    def _on_send_now_activate(self, *_args) -> None:
+        if self._on_send_outbox is not None:
+            self._on_send_outbox()
+
+    def _on_empty_trash_activate(self, *_args) -> None:
+        if self._context_target is None:
+            return
+        parent = self._dialog_parent(self._widget)
+        if parent is None:
+            return
+        account_uid = self._context_target["account_uid"]
+        folder_name = self._context_target["folder_name"]
+        total = int(self._context_target.get("total") or 0)
+        if not folder_name or total <= 0:
+            return
+        noun = "message" if total == 1 else "messages"
+        if not confirm_action(
+            parent,
+            heading="Empty Trash?",
+            body=f"Permanently delete {total} {noun} from Trash?",
+            confirm_label="Empty Trash",
+            destructive=True,
+        ):
+            return
+        self._run_folder_operation(
+            lambda: self._mail.empty_folder(account_uid, folder_name),
+            success_status=f"Emptied Trash ({total} {noun} deleted)",
+            on_success=lambda _result: self._after_folder_contents_changed(
+                account_uid, folder_name
+            ),
+            error_heading="Could not empty Trash",
+        )
+
+    def _run_folder_operation(
+        self,
+        operation: Callable[[], object],
+        *,
+        success_status: str,
+        on_success: Callable[[object], None],
+        error_heading: str,
+    ) -> None:
+        def worker() -> None:
+            error: Exception | None = None
+            result: object | None = None
+            try:
+                result = operation()
+            except Exception as exc:
+                log_mail_error(log, error_heading, exc)
+                error = exc
+            GLib.idle_add(
+                self._on_folder_operation_finished,
+                result,
+                error,
+                success_status,
+                on_success,
+                error_heading,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_folder_operation_finished(
+        self,
+        result: object | None,
+        error: Exception | None,
+        success_status: str,
+        on_success: Callable[[object], None],
+        error_heading: str,
+    ) -> bool:
+        if error is not None:
+            parent = self._dialog_parent(self._widget)
+            if parent is not None:
+                show_error(parent, error_heading, str(error))
+            else:
+                self._set_status(f"{error_heading}: {error}")
+            return False
+        self._set_status(success_status)
+        if result is not None:
+            on_success(result)
+        else:
+            on_success(None)
+        return False
+
+    def _after_folder_tree_changed(
+        self, account_uid: str, *, removed_folder: str | None = None
+    ) -> None:
+        self.reload_account(account_uid)
+        if self._on_folder_tree_changed is not None:
+            self._on_folder_tree_changed(account_uid, removed_folder)
+
+    def _after_folder_renamed(
+        self, account_uid: str, old_name: str, new_name: object
+    ) -> None:
+        if not isinstance(new_name, str):
+            self._after_folder_tree_changed(account_uid)
+            return
+        if self._saved_active_folder == (account_uid, old_name):
+            self._saved_active_folder = (account_uid, new_name)
+            self._activated_folder = (account_uid, new_name)
+        self._after_folder_tree_changed(account_uid)
+
+    def _after_folder_deleted(self, account_uid: str, folder_name: str) -> None:
+        if self._saved_active_folder == (account_uid, folder_name):
+            self._saved_active_folder = None
+            self._activated_folder = None
+        self._after_folder_tree_changed(account_uid, removed_folder=folder_name)
+
+    def _after_folder_contents_changed(
+        self, account_uid: str, folder_name: str
+    ) -> None:
+        self.refresh_folder_row(account_uid, folder_name)
+        if self._on_folder_contents_changed is not None:
+            self._on_folder_contents_changed(account_uid, folder_name)
 
     def _attach_refresh_menu(
         self,
@@ -349,6 +692,10 @@ class MailSidebar:
         y: float,
         account_uid: str,
         folder_name: str | None,
+        *,
+        unread: int = -1,
+        total: int = -1,
+        display_name: str | None = None,
     ) -> None:
         if n_press != 1:
             return
@@ -356,29 +703,48 @@ class MailSidebar:
         if event is None or not Gdk.Event.triggers_context_menu(event):
             return
 
-        self._refresh_target = (account_uid, folder_name)
         widget = gesture.get_widget()
         if widget is None:
             return
-        self._ensure_refresh_popover_parent(widget)
+
+        row = widget.get_ancestor(Gtk.ListBoxRow)
+        if isinstance(row, Gtk.ListBoxRow):
+            unread = int(getattr(row, "unread", unread))
+            total = int(getattr(row, "total", total))
+            display_name = getattr(row, "display_name", display_name)
+
+        if is_post_outbox_folder(folder_name):
+            total = count_queued_for_account(account_uid)
+            unread = 0
+
+        state = self._context_menu_state(
+            account_uid,
+            folder_name,
+            unread=unread,
+            total=total,
+        )
+        self._context_target = {
+            "account_uid": account_uid,
+            "folder_name": folder_name,
+            "display_name": display_name,
+            "unread": unread,
+            "total": total,
+            "read_count": state.get("read_count", 0),
+        }
+
+        menu = self._build_context_menu_model(state)
+        if self._context_popover is not None:
+            self._context_popover.unparent()
+        self._context_popover = Gtk.PopoverMenu.new_from_model(menu)
+        self._context_popover.set_parent(widget)
         rect = Gdk.Rectangle()
         rect.x = int(x)
         rect.y = int(y)
         rect.width = 1
         rect.height = 1
-        self._refresh_popover.set_pointing_to(rect)
-        self._refresh_popover.popup()
+        self._context_popover.set_pointing_to(rect)
+        self._context_popover.popup()
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-
-    def _ensure_refresh_popover_parent(self, widget: Gtk.Widget) -> None:
-        current = self._refresh_popover.get_parent()
-        if current is widget:
-            return
-        if current is not None:
-            self._refresh_popover.popdown()
-            if self._refresh_popover.get_parent() is current:
-                self._refresh_popover.unparent()
-        self._refresh_popover.set_parent(widget)
 
     def _start_folder_load(self, load_id: int, account: MailAccount) -> None:
         def worker() -> None:
@@ -755,6 +1121,8 @@ class MailSidebar:
         row.account_uid = account_uid
         row.folder_name = folder.get("full_name")
         row.display_name = display
+        row.unread = unread
+        row.total = total
         if row.folder_name:
             self._attach_refresh_menu(
                 row,

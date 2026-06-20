@@ -24,6 +24,7 @@ from gi.repository import Camel, EDataServer, GLib, Gio
 
 from .helpers import (
     message_info_to_dict,
+    message_is_unread,
     paginate_messages,
     sort_messages_newest_first,
     walk_folder_info,
@@ -63,6 +64,7 @@ from .folders import (
     folder_name_from_uri,
     guess_inbox_name,
     is_virtual_folder,
+    validate_folder_display_name,
 )
 from .search import MessageSearchQuery, message_matches
 
@@ -814,6 +816,147 @@ class MailService:
         with self._lock:
             return self._get_folder_stats_unlocked(account_uid, folder_name)
 
+    def create_folder(
+        self,
+        account_uid: str,
+        parent_folder_name: str | None,
+        display_name: str,
+    ) -> str:
+        with self._lock:
+            return self._create_folder_unlocked(
+                account_uid, parent_folder_name, display_name
+            )
+
+    def rename_folder(
+        self, account_uid: str, folder_name: str, new_display_name: str
+    ) -> str:
+        with self._lock:
+            return self._rename_folder_unlocked(
+                account_uid, folder_name, new_display_name
+            )
+
+    def delete_folder(self, account_uid: str, folder_name: str) -> None:
+        with self._lock:
+            self._delete_folder_unlocked(account_uid, folder_name)
+
+    def empty_folder(self, account_uid: str, folder_name: str) -> dict[str, Any]:
+        with self._lock:
+            return self._empty_folder_unlocked(account_uid, folder_name)
+
+    def archive_read_messages(
+        self, account_uid: str, folder_name: str
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._archive_read_messages_unlocked(account_uid, folder_name)
+
+    def _create_folder_unlocked(
+        self,
+        account_uid: str,
+        parent_folder_name: str | None,
+        display_name: str,
+    ) -> str:
+        account = self.get_account(account_uid)
+        if account.backend == "spool":
+            raise ValueError("Folder creation is not supported for spool accounts")
+        cleaned = validate_folder_display_name(display_name)
+        store = self._get_store_unlocked(account_uid)
+        info = store.create_folder_sync(parent_folder_name, cleaned, None)
+        if info is None:
+            raise RuntimeError("Could not create folder")
+        full_name = info.get_full_name() if hasattr(info, "get_full_name") else cleaned
+        if not full_name:
+            full_name = (
+                f"{parent_folder_name}/{cleaned}"
+                if parent_folder_name
+                else cleaned
+            )
+        self._invalidate_account_folder_tree(account_uid)
+        return str(full_name)
+
+    def _rename_folder_unlocked(
+        self, account_uid: str, folder_name: str, new_display_name: str
+    ) -> str:
+        account = self.get_account(account_uid)
+        if account.backend == "spool":
+            raise ValueError("Folder rename is not supported for spool accounts")
+        cleaned = validate_folder_display_name(new_display_name)
+        if folder_name == cleaned or folder_name.endswith(f"/{cleaned}"):
+            return folder_name
+        parent = folder_name.rsplit("/", 1)[0] if "/" in folder_name else None
+        new_full_name = f"{parent}/{cleaned}" if parent else cleaned
+        store = self._get_store_unlocked(account_uid)
+        result = store.rename_folder_sync(folder_name, new_full_name, None)
+        if result is None:
+            raise RuntimeError("Could not rename folder")
+        self._invalidate_account_folder_tree(account_uid, folder_name, new_full_name)
+        return new_full_name
+
+    def _delete_folder_unlocked(self, account_uid: str, folder_name: str) -> None:
+        account = self.get_account(account_uid)
+        if account.backend == "spool":
+            raise ValueError("Folder deletion is not supported for spool accounts")
+        store = self._get_store_unlocked(account_uid)
+        if not store.delete_folder_sync(folder_name, None):
+            raise RuntimeError("Could not delete folder")
+        self._invalidate_account_folder_tree(account_uid, folder_name)
+
+    def _empty_folder_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> dict[str, Any]:
+        folder = self._require_folder_unlocked(account_uid, folder_name)
+        uids = self._camel_uid_list(folder.get_uids())
+        deleted = Camel.MessageFlags.DELETED
+        batch_size = 50
+        for offset in range(0, len(uids), batch_size):
+            batch = uids[offset : offset + batch_size]
+            for message_uid in batch:
+                folder.set_message_flags(message_uid, deleted, deleted)
+            if batch:
+                folder.expunge_sync(None)
+        folder.refresh_info_sync(None)
+        self._invalidate_folder_index(account_uid, folder_name)
+        unread = folder.get_unread_message_count()
+        total = folder.get_message_count()
+        self._update_cached_folder_counts(account_uid, folder_name, unread, total)
+        return {
+            "removed_count": len(uids),
+            "folder_unread": unread,
+            "folder_total": total,
+        }
+
+    def _archive_read_messages_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> dict[str, Any]:
+        index = self._build_folder_index_unlocked(account_uid, folder_name)
+        read_uids = [
+            message["uid"]
+            for message in index.messages
+            if message.get("uid") and not message_is_unread(message)
+        ]
+        if not read_uids:
+            return {
+                "archived_count": 0,
+                "source_folder_unread": index.unread,
+                "source_folder_total": index.total,
+            }
+        result = self._archive_messages_unlocked(
+            account_uid, folder_name, read_uids
+        )
+        result["archived_count"] = len(read_uids)
+        return result
+
+    def _invalidate_account_folder_tree(
+        self,
+        account_uid: str,
+        *old_folder_names: str,
+    ) -> None:
+        for key in list(self._folder_indexes):
+            if key[0] == account_uid:
+                self._folder_indexes.pop(key, None)
+        for old_name in old_folder_names:
+            self._folder_indexes.pop((account_uid, old_name), None)
+        self._correspondent_indexes.pop(account_uid, None)
+
     def _get_folder_stats_unlocked(
         self, account_uid: str, folder_name: str
     ) -> tuple[int, int]:
@@ -969,8 +1112,17 @@ class MailService:
             messages: list[dict] = []
             for uid in uids:
                 info = folder.get_message_info(str(uid))
-                if info is not None:
+                if info is None:
+                    continue
+                try:
                     messages.append(message_info_to_dict(info))
+                except (OSError, OverflowError, ValueError):
+                    log.debug(
+                        "Skipping message %r in %r due to invalid metadata",
+                        uid,
+                        folder_name,
+                        exc_info=True,
+                    )
 
             return _FolderMessageIndex(
                 messages=sort_messages_newest_first(messages),

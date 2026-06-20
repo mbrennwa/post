@@ -19,6 +19,8 @@ from post.mail.folders import (
     is_post_outbox_folder,
     outbox_folder_dict,
     resolve_move_menu_state,
+    resolve_sidebar_context_menu,
+    validate_folder_display_name,
 )
 
 
@@ -209,6 +211,150 @@ class FindTrashFolderTests(unittest.TestCase):
             type_mask=self.TYPE_MASK,
         )
         self.assertEqual(state["trash_folder"], "Trash")
+
+
+class ResolveSidebarContextMenuTests(unittest.TestCase):
+    def _folders(self) -> list[dict]:
+        return [
+            {
+                "full_name": "INBOX",
+                "display_name": "Inbox",
+                "flags": 1024,
+                "unread": 2,
+                "total": 5,
+            },
+            {
+                "full_name": "Archive",
+                "display_name": "Archive",
+                "flags": 11264,
+                "unread": 0,
+                "total": 0,
+            },
+            {
+                "full_name": "Trash",
+                "display_name": "Trash",
+                "flags": 10240,
+                "unread": 0,
+                "total": 3,
+            },
+        ]
+
+    def test_inbox_archive_read_visible_only_with_archive(self) -> None:
+        folders = self._folders()
+        with_archive = resolve_sidebar_context_menu(
+            folders=folders,
+            folder_name="INBOX",
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=2,
+            total=5,
+            outbox_count=0,
+            folder_crud_enabled=True,
+        )
+        self.assertTrue(with_archive["show_archive_read"])
+        self.assertTrue(with_archive["enable_archive_read"])
+
+        without_archive = resolve_sidebar_context_menu(
+            folders=folders,
+            folder_name="INBOX",
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name=None,
+            unread=2,
+            total=5,
+            outbox_count=0,
+            folder_crud_enabled=True,
+        )
+        self.assertFalse(without_archive["show_archive_read"])
+
+    def test_inbox_archive_read_disabled_without_read_messages(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=self._folders(),
+            folder_name="INBOX",
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=5,
+            total=5,
+            outbox_count=0,
+            folder_crud_enabled=True,
+        )
+        self.assertTrue(state["show_archive_read"])
+        self.assertFalse(state["enable_archive_read"])
+
+    def test_outbox_send_now_enabled_with_queue(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=[],
+            folder_name=POST_OUTBOX_FOLDER,
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=0,
+            total=2,
+            outbox_count=2,
+            folder_crud_enabled=True,
+        )
+        self.assertTrue(state["show_send_now"])
+        self.assertTrue(state["enable_send_now"])
+        self.assertFalse(state["show_new_subfolder"])
+
+    def test_outbox_send_now_disabled_when_empty(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=[],
+            folder_name=POST_OUTBOX_FOLDER,
+            inbox_name="INBOX",
+            trash_name=None,
+            archive_name=None,
+            unread=0,
+            total=0,
+            outbox_count=0,
+            folder_crud_enabled=True,
+        )
+        self.assertTrue(state["show_send_now"])
+        self.assertFalse(state["enable_send_now"])
+
+    def test_trash_empty_enabled_with_messages(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=self._folders(),
+            folder_name="Trash",
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=0,
+            total=3,
+            outbox_count=0,
+            folder_crud_enabled=True,
+        )
+        self.assertTrue(state["show_empty_trash"])
+        self.assertTrue(state["enable_empty_trash"])
+
+    def test_account_new_folder_hidden_for_spool(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=[],
+            folder_name=None,
+            inbox_name=None,
+            trash_name=None,
+            archive_name=None,
+            unread=-1,
+            total=-1,
+            outbox_count=0,
+            folder_crud_enabled=False,
+        )
+        self.assertFalse(state["show_new_folder"])
+
+
+class ValidateFolderDisplayNameTests(unittest.TestCase):
+    def test_rejects_empty(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_folder_display_name("   ")
+
+    def test_rejects_slashes(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_folder_display_name("a/b")
+
+    def test_strips_whitespace(self) -> None:
+        self.assertEqual(validate_folder_display_name("  Work  "), "Work")
 
 
 class FilterSidebarFoldersTests(unittest.TestCase):

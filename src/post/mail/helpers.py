@@ -98,10 +98,32 @@ def _safe_str(value: Any) -> str | None:
     return str(value)
 
 
-def format_message_datetime(unix_time: float | int | None) -> str | None:
-    if not unix_time:
+def _valid_unix_timestamp(unix_time: float | int | None) -> float | None:
+    """Return unix seconds when in a sane range, otherwise None."""
+    if unix_time is None:
         return None
-    return datetime.fromtimestamp(unix_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        value = float(unix_time)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    # Reject values outside roughly 1970–2100; Camel can return garbage.
+    if value > 4102444800:
+        return None
+    return value
+
+
+def format_message_datetime(unix_time: float | int | None) -> str | None:
+    value = _valid_unix_timestamp(unix_time)
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def message_info_to_dict(info: Any) -> dict[str, Any]:
@@ -113,7 +135,11 @@ def message_info_to_dict(info: Any) -> dict[str, Any]:
     date_sent = info.get_date_sent()
     date_recv = info.get_date_received()
     flags = info.get_flags()
-    sort_date = date_recv or date_sent or 0
+    sort_date = (
+        _valid_unix_timestamp(date_recv)
+        or _valid_unix_timestamp(date_sent)
+        or 0
+    )
     return {
         "uid": _safe_str(info.get_uid()),
         "subject": _safe_str(info.get_subject()) or "(no subject)",
@@ -198,8 +224,14 @@ def format_message_list_date(msg: dict[str, Any]) -> str:
     if raw:
         return raw[:16] if len(raw) >= 16 else raw
     sort_date = msg.get("sort_date")
-    if sort_date:
-        return datetime.fromtimestamp(sort_date, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    valid_sort = _valid_unix_timestamp(sort_date)
+    if valid_sort is not None:
+        try:
+            return datetime.fromtimestamp(valid_sort, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+        except (OSError, OverflowError, ValueError):
+            return ""
     return ""
 
 

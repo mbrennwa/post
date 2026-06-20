@@ -177,6 +177,9 @@ class MainWindow(Adw.ApplicationWindow):
             set_status=self._set_status,
             on_refresh_account=self._on_sidebar_refresh_account,
             on_refresh_folder=self._on_sidebar_refresh_folder,
+            on_send_outbox=self._on_sidebar_send_outbox,
+            on_folder_tree_changed=self._on_sidebar_folder_tree_changed,
+            on_folder_contents_changed=self._on_sidebar_folder_contents_changed,
         )
         panes.append(self._sidebar.widget)
 
@@ -779,6 +782,33 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_sidebar_refresh_folder(self, account_uid: str, folder_name: str) -> None:
         self._sidebar.refresh_folder_row(account_uid, folder_name)
+        if (
+            self._current_account
+            and self._current_folder
+            and self._current_account.uid == account_uid
+            and self._current_folder == folder_name
+        ):
+            self._load_messages(account_uid, folder_name)
+
+    def _on_sidebar_send_outbox(self) -> None:
+        self._flush_send_queue_idle()
+
+    def _on_sidebar_folder_tree_changed(
+        self, account_uid: str, removed_folder: str | None
+    ) -> None:
+        if (
+            removed_folder
+            and self._current_account
+            and self._current_account.uid == account_uid
+            and self._current_folder == removed_folder
+        ):
+            inbox_name = self._sidebar.inbox_folder_for_account(account_uid)
+            if inbox_name and self._current_account:
+                self._on_folder_selected(self._current_account, inbox_name)
+
+    def _on_sidebar_folder_contents_changed(
+        self, account_uid: str, folder_name: str
+    ) -> None:
         if (
             self._current_account
             and self._current_folder

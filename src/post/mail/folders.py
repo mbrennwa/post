@@ -209,3 +209,126 @@ def find_folder_by_type(
         if display in name_fallbacks or base in name_fallbacks:
             return folder
     return None
+
+
+_SYSTEM_FOLDER_TYPES: tuple[tuple[int, frozenset[str]], ...] = (
+    (1024, frozenset({"inbox"})),
+    (5120, frozenset({"sent"})),
+    (3072, frozenset({"trash", "deleted", "bin"})),
+    (4096, frozenset({"junk", "spam"})),
+    (12288, frozenset({"drafts", "draft"})),
+    (11264, frozenset({"archive", "archives"})),
+)
+
+
+def is_system_folder(
+    folder: dict,
+    *,
+    type_mask: int = 64512,
+) -> bool:
+    """Return True for standard mail folders that must not be renamed or deleted."""
+    if is_post_outbox_folder(folder.get("full_name")):
+        return True
+    if is_virtual_folder(folder.get("full_name")):
+        return True
+    for folder_type, name_fallbacks in _SYSTEM_FOLDER_TYPES:
+        if folder_matches_type(folder, folder_type, type_mask=type_mask):
+            return True
+        display = (folder.get("display_name") or "").strip().lower()
+        full = (folder.get("full_name") or "").strip().lower()
+        base = full.rsplit("/", 1)[-1]
+        if display in name_fallbacks or base in name_fallbacks:
+            return True
+    return False
+
+
+def folder_by_full_name(folders: list[dict], full_name: str | None) -> dict | None:
+    if not full_name:
+        return None
+    return next(
+        (folder for folder in folders if folder.get("full_name") == full_name),
+        None,
+    )
+
+
+def validate_folder_display_name(name: str) -> str:
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError("Folder name cannot be empty")
+    if "/" in cleaned or "\\" in cleaned:
+        raise ValueError("Folder name cannot contain slashes")
+    return cleaned
+
+
+def read_message_count(unread: int, total: int) -> int:
+    if unread < 0 or total < 0:
+        return 0
+    return max(0, total - unread)
+
+
+def account_supports_folder_crud(*, backend: str | None) -> bool:
+    return backend != "spool"
+
+
+def resolve_sidebar_context_menu(
+    *,
+    folders: list[dict],
+    folder_name: str | None,
+    inbox_name: str | None,
+    trash_name: str | None,
+    archive_name: str | None,
+    unread: int,
+    total: int,
+    outbox_count: int,
+    folder_crud_enabled: bool,
+) -> dict[str, bool]:
+    """Return show/enabled flags for sidebar folder context menu actions."""
+    is_account = folder_name is None
+    is_outbox = is_post_outbox_folder(folder_name)
+    is_inbox = bool(inbox_name and folder_name == inbox_name)
+    is_trash = bool(trash_name and folder_name == trash_name)
+    folder = folder_by_full_name(folders, folder_name)
+    protected = folder is not None and is_system_folder(folder)
+    read_count = read_message_count(unread, total)
+
+    show_new_folder = is_account and folder_crud_enabled
+    show_new_subfolder = (
+        not is_account
+        and not is_outbox
+        and folder_crud_enabled
+        and folder is not None
+        and not is_virtual_folder(folder_name)
+    )
+    show_rename = (
+        not is_account
+        and not is_outbox
+        and folder_crud_enabled
+        and folder is not None
+        and not protected
+    )
+    show_delete = show_rename
+    show_archive_read = is_inbox and archive_name is not None
+    show_send_now = is_outbox
+    show_empty_trash = is_trash
+    show_refresh = True
+
+    return {
+        "show_new_folder": show_new_folder,
+        "enable_new_folder": show_new_folder,
+        "show_new_subfolder": show_new_subfolder,
+        "enable_new_subfolder": show_new_subfolder,
+        "show_rename": show_rename,
+        "enable_rename": show_rename,
+        "show_delete": show_delete,
+        "enable_delete": show_delete,
+        "show_archive_read": show_archive_read,
+        "enable_archive_read": show_archive_read and read_count > 0,
+        "show_send_now": show_send_now,
+        "enable_send_now": show_send_now and outbox_count > 0,
+        "show_empty_trash": show_empty_trash,
+        "enable_empty_trash": show_empty_trash and total > 0,
+        "show_refresh": show_refresh,
+        "enable_refresh": True,
+        "read_count": read_count,
+        "archive_folder": archive_name,
+    }
