@@ -32,6 +32,8 @@ log = logging.getLogger(__name__)
 ComposeMode = Literal["new", "reply"]
 SetStatus = Callable[[str], None]
 
+_LABEL_WIDTH = 72
+
 
 class ComposeWindow(Adw.Window):
     def __init__(
@@ -56,26 +58,22 @@ class ComposeWindow(Adw.Window):
         self.set_title(title)
         self.set_default_size(720, 560)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.set_content(outer)
-
         header = Adw.HeaderBar()
-        header.set_show_end_title_buttons(True)
-        outer.append(header)
+        header.set_show_end_title_buttons(False)
+        header.set_title_widget(Gtk.Label(label=title))
+
+        cancel_btn = Gtk.Button(label="Cancel")
+        cancel_btn.connect("clicked", self._on_cancel_clicked)
+        header.pack_start(cancel_btn)
 
         self._send_btn = Gtk.Button(label="Send")
         self._send_btn.add_css_class("suggested-action")
         self._send_btn.connect("clicked", self._on_send_clicked)
         header.pack_end(self._send_btn)
 
-        cancel_btn = Gtk.Button(label="Cancel")
-        cancel_btn.connect("clicked", self._on_cancel_clicked)
-        header.pack_start(cancel_btn)
-
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_vexpand(True)
-        outer.append(scrolled)
 
         form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         form.set_margin_start(18)
@@ -89,30 +87,36 @@ class ComposeWindow(Adw.Window):
         self._error_label.set_visible(False)
         form.append(self._error_label)
 
-        form.append(self._labeled_row("From", Gtk.Label(label=account.from_label, xalign=0)))
+        form.append(
+            self._labeled_row("From", Gtk.Label(label=account.from_label, xalign=0, wrap=True))
+        )
 
         self._to_entry = Gtk.Entry()
         self._to_entry.set_placeholder_text("recipient@example.com")
         form.append(self._labeled_row("To", self._to_entry))
 
-        self._extra_revealer = Gtk.Revealer()
-        self._extra_revealer.set_reveal_child(False)
-        self._extra_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
-        extra_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self._cc_entry = Gtk.Entry()
         self._cc_entry.set_placeholder_text("Optional")
-        extra_box.append(self._labeled_row("Cc", self._cc_entry))
+        self._cc_entry.set_hexpand(True)
+
+        self._bcc_toggle_btn = Gtk.Button(label="Show Bcc")
+        self._bcc_toggle_btn.add_css_class("flat")
+        self._bcc_toggle_btn.connect("clicked", self._on_toggle_bcc)
+
+        self._cc_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self._cc_row.append(self._field_label("Cc"))
+        self._cc_row.append(self._cc_entry)
+        self._cc_row.append(self._bcc_toggle_btn)
+        form.append(self._cc_row)
+
         self._bcc_entry = Gtk.Entry()
         self._bcc_entry.set_placeholder_text("Optional")
-        extra_box.append(self._labeled_row("Bcc", self._bcc_entry))
-        self._extra_revealer.set_child(extra_box)
-        form.append(self._extra_revealer)
-
-        show_extra_btn = Gtk.Button(label="Cc / Bcc")
-        show_extra_btn.add_css_class("flat")
-        show_extra_btn.set_halign(Gtk.Align.START)
-        show_extra_btn.connect("clicked", self._on_toggle_extra)
-        form.append(show_extra_btn)
+        self._bcc_entry.set_hexpand(True)
+        self._bcc_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self._bcc_row.append(self._field_label("Bcc"))
+        self._bcc_row.append(self._bcc_entry)
+        self._bcc_row.set_visible(False)
+        form.append(self._bcc_row)
 
         self._subject_entry = Gtk.Entry()
         form.append(self._labeled_row("Subject", self._subject_entry))
@@ -130,16 +134,36 @@ class ComposeWindow(Adw.Window):
         self._body_view.set_bottom_margin(8)
         body_scroll.set_child(self._body_view)
         body_frame.set_child(body_scroll)
-        form.append(self._labeled_row("Body", body_frame))
+        body_frame.set_vexpand(True)
+        form.append(body_frame)
+
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(header)
+        toolbar_view.set_content(scrolled)
+        self.set_content(toolbar_view)
 
         self._prefill_fields()
 
-    @staticmethod
-    def _labeled_row(label: str, widget: Gtk.Widget) -> Gtk.Box:
-        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        heading = Gtk.Label(label=label, xalign=0)
-        heading.add_css_class("heading")
-        row.append(heading)
+    @classmethod
+    def _field_label(cls, text: str) -> Gtk.Label:
+        label = Gtk.Label(label=text, xalign=1)
+        label.set_size_request(_LABEL_WIDTH, -1)
+        label.set_halign(Gtk.Align.END)
+        label.set_valign(Gtk.Align.CENTER)
+        if text:
+            label.add_css_class("heading")
+        return label
+
+    @classmethod
+    def _labeled_row(cls, label: str, widget: Gtk.Widget) -> Gtk.Box:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        row.append(cls._field_label(label))
+        if isinstance(widget, Gtk.Entry):
+            widget.set_hexpand(True)
+        elif isinstance(widget, Gtk.Label):
+            widget.set_hexpand(True)
+            widget.set_halign(Gtk.Align.START)
+            widget.set_valign(Gtk.Align.CENTER)
         row.append(widget)
         return row
 
@@ -160,10 +184,17 @@ class ComposeWindow(Adw.Window):
         else:
             self._body_view.get_buffer().set_text("")
 
-    def _on_toggle_extra(self, button: Gtk.Button) -> None:
-        reveal = not self._extra_revealer.get_reveal_child()
-        self._extra_revealer.set_reveal_child(reveal)
-        button.set_label("Hide Cc / Bcc" if reveal else "Cc / Bcc")
+    def _on_toggle_bcc(self, button: Gtk.Button) -> None:
+        reveal = not self._bcc_row.get_visible()
+        self._bcc_row.set_visible(reveal)
+        if reveal:
+            button.set_label("Hide Bcc")
+            self._cc_row.remove(button)
+            self._bcc_row.append(button)
+        else:
+            button.set_label("Show Bcc")
+            self._bcc_row.remove(button)
+            self._cc_row.append(button)
 
     def _on_cancel_clicked(self, *_args) -> None:
         self.close()

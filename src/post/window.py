@@ -75,7 +75,7 @@ class MainWindow(Adw.ApplicationWindow):
         compose_btn.set_label("New Message")
         compose_btn.set_tooltip_text("New Message")
         compose_btn.connect("clicked", self._on_compose_new_clicked)
-        header.pack_start(compose_btn)
+        header.pack_end(compose_btn)
 
         refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
         refresh_btn.set_tooltip_text("Refresh")
@@ -211,9 +211,6 @@ class MainWindow(Adw.ApplicationWindow):
         reader.set_margin_bottom(12)
 
         reader_toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        new_message_btn = Gtk.Button(label="New Message")
-        new_message_btn.connect("clicked", self._on_compose_new_clicked)
-        reader_toolbar.append(new_message_btn)
         self._reply_btn = Gtk.Button(label="Reply")
         self._reply_btn.set_sensitive(False)
         self._reply_btn.connect("clicked", self._on_reply_clicked)
