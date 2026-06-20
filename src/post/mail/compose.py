@@ -73,6 +73,127 @@ def build_reply_subject(subject: str) -> str:
     return f"Re: {subject}"
 
 
+def build_forward_subject(subject: str) -> str:
+    subject = (subject or "").strip() or "(no subject)"
+    lowered = subject.lower()
+    if lowered.startswith("fwd:") or lowered.startswith("fw:"):
+        return subject
+    return f"Fwd: {subject}"
+
+
+def quote_plain_forward(original: dict[str, Any], body_plain: str | None) -> str:
+    from .helpers import format_message_header
+
+    header = format_message_header(original)
+    text = (body_plain or "").strip() or "(no message body)"
+    return f"\n\n---------- Forwarded message ---------\n{header}\n\n{text}\n"
+
+
+def normalize_email(address: str) -> str:
+    """Return a lowercase bare email address for comparison."""
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    address = (address or "").strip()
+    if not address:
+        return ""
+
+    container = Camel.InternetAddress.new()
+    container.unformat(address)
+    if container.length() > 0:
+        ok, _name, bare = container.get(0)
+        if ok and bare:
+            return bare.lower()
+
+    match = re.search(r"<([^>]+)>", address)
+    if match:
+        return match.group(1).strip().lower()
+    return address.lower()
+
+
+def parse_address_header(text: str) -> list[str]:
+    """Parse a To/Cc header into formatted address strings (empty if blank)."""
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    addresses: list[str] = []
+    for part in _ADDRESS_SPLIT.split(text):
+        part = part.strip()
+        if not part:
+            continue
+        container = Camel.InternetAddress.new()
+        container.unformat(part)
+        if container.length() == 0:
+            if "@" in part:
+                addresses.append(part)
+            continue
+        for index in range(container.length()):
+            ok, name, bare = container.get(index)
+            if not ok or not bare or "@" not in bare:
+                continue
+            if name:
+                addresses.append(f"{name} <{bare}>")
+            else:
+                addresses.append(bare)
+    return addresses
+
+
+def format_address_list(addresses: list[str]) -> str:
+    return ", ".join(addresses)
+
+
+def build_reply_all_recipients(
+    original: dict[str, Any],
+    *,
+    own_addresses: set[str],
+) -> tuple[list[str], list[str]]:
+    """Return To and Cc lists for reply-all, excluding the sender's own addresses."""
+    own = {normalize_email(item) for item in own_addresses if item}
+
+    def is_own(address: str) -> bool:
+        return normalize_email(address) in own
+
+    def add_unique(
+        target: list[str], seen: set[str], address: str
+    ) -> None:
+        email = normalize_email(address)
+        if not email or email in seen or is_own(address):
+            return
+        seen.add(email)
+        target.append(address)
+
+    seen: set[str] = set()
+    to_addrs: list[str] = []
+
+    try:
+        from_addr = extract_reply_address(original.get("from", ""))
+    except ValueError:
+        from_addr = ""
+
+    if from_addr:
+        add_unique(to_addrs, seen, from_addr)
+
+    for address in parse_address_header(original.get("to", "")):
+        add_unique(to_addrs, seen, address)
+
+    cc_addrs: list[str] = []
+    for address in parse_address_header(original.get("cc", "")):
+        add_unique(cc_addrs, seen, address)
+
+    if not to_addrs:
+        raise ValueError("No recipients for reply-all")
+
+    return to_addrs, cc_addrs
+
+
 def extract_reply_address(from_header: str) -> str:
     """Return a single address suitable for the To field when replying."""
     import gi

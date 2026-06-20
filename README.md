@@ -17,13 +17,19 @@
 - Open attachments from the reading pane (right-click to save or open with…)
 - Clear empty-folder and error states when loading fails
 - Context menu: mark read/unread, flag, archive, move to trash (with undo)
-- Compose plain-text **New Message** and **Reply** (Ctrl+N); send via account SMTP
+- Compose plain-text **New Message** (Ctrl+N), **Reply**, **Reply All** (Ctrl+Shift+R), and **Forward**; send via account SMTP
 - **Settings** (gear icon) — configure local mail from a system spool file or Maildir folder
 
 ## Planned
 
-- Save draft, HTML compose, attachments, reply-all, forward
-- Conversation threading
+Compose & organization roadmap ([milestone](https://github.com/mbrennwa/post/milestone/1)):
+
+1. ~~[Reply-all](https://github.com/mbrennwa/post/issues/20)~~
+2. ~~[Forward](https://github.com/mbrennwa/post/issues/25)~~
+3. [Save draft](https://github.com/mbrennwa/post/issues/8)
+4. [Compose attachments](https://github.com/mbrennwa/post/issues/23)
+5. [HTML compose](https://github.com/mbrennwa/post/issues/24)
+6. [Conversation threading](https://github.com/mbrennwa/post/issues/26)
 
 ## Run
 

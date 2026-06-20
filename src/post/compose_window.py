@@ -19,17 +19,22 @@ from gi.repository import Adw, GLib, Gtk
 
 from post.mail import MailService
 from post.mail.compose import (
+    build_forward_subject,
+    build_reply_all_recipients,
     build_reply_references,
     build_reply_subject,
     extract_reply_address,
+    format_address_list,
+    normalize_email,
     parse_address_list,
+    quote_plain_forward,
     quote_plain_reply,
 )
 from post.mail.eds import MailAccount
 
 log = logging.getLogger(__name__)
 
-ComposeMode = Literal["new", "reply"]
+ComposeMode = Literal["new", "reply", "reply-all", "forward"]
 SetStatus = Callable[[str], None]
 
 _LABEL_WIDTH = 72
@@ -57,7 +62,14 @@ class ComposeWindow(Adw.Window):
             raise ValueError("No mail account configured for sending")
         self._account = account if account.can_send else self._send_accounts[0]
 
-        title = "Reply" if mode == "reply" else "New Message"
+        if mode == "reply-all":
+            title = "Reply All"
+        elif mode == "reply":
+            title = "Reply"
+        elif mode == "forward":
+            title = "Forward"
+        else:
+            title = "New Message"
         self.set_title(title)
         self.set_default_size(720, 560)
 
@@ -185,16 +197,44 @@ class ComposeWindow(Adw.Window):
             return self._account
         return self._send_accounts[index]
 
+    def _own_addresses(self) -> set[str]:
+        account = self._selected_account()
+        own: set[str] = set()
+        for raw in (account.from_address, account.email):
+            if raw:
+                own.add(normalize_email(raw))
+        return own
+
     def _prefill_fields(self) -> None:
-        if self._mode == "reply" and self._reply_to is not None:
+        if self._mode in ("reply", "reply-all") and self._reply_to is not None:
             try:
-                self._to_entry.set_text(extract_reply_address(self._reply_to.get("from", "")))
+                if self._mode == "reply-all":
+                    to_addrs, cc_addrs = build_reply_all_recipients(
+                        self._reply_to,
+                        own_addresses=self._own_addresses(),
+                    )
+                    self._to_entry.set_text(format_address_list(to_addrs))
+                    if cc_addrs:
+                        self._cc_entry.set_text(format_address_list(cc_addrs))
+                else:
+                    self._to_entry.set_text(
+                        extract_reply_address(self._reply_to.get("from", ""))
+                    )
             except ValueError as exc:
                 self._show_error(str(exc))
             self._subject_entry.set_text(
                 build_reply_subject(self._reply_to.get("subject") or "")
             )
             body = quote_plain_reply(
+                self._reply_to,
+                self._reply_to.get("body_plain"),
+            )
+            self._body_view.get_buffer().set_text(body)
+        elif self._mode == "forward" and self._reply_to is not None:
+            self._subject_entry.set_text(
+                build_forward_subject(self._reply_to.get("subject") or "")
+            )
+            body = quote_plain_forward(
                 self._reply_to,
                 self._reply_to.get("body_plain"),
             )
@@ -241,7 +281,7 @@ class ComposeWindow(Adw.Window):
 
         in_reply_to = None
         references = None
-        if self._mode == "reply" and self._reply_to is not None:
+        if self._mode in ("reply", "reply-all") and self._reply_to is not None:
             in_reply_to = self._reply_to.get("message_id")
             references = build_reply_references(
                 in_reply_to,
