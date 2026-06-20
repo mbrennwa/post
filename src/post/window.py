@@ -50,10 +50,20 @@ from post.sidebar import MailSidebar
 
 log = logging.getLogger(__name__)
 
+_MESSAGE_LIST_CSS = """
+.message-unread-dot {
+  min-width: 10px;
+  min-height: 10px;
+  border-radius: 999px;
+  background-color: @accent_bg_color;
+}
+"""
+
 
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._install_message_list_style()
         self.set_title("Post")
         window_state = get_window_state()
         self._last_normal_width = int(window_state["width"])
@@ -334,6 +344,32 @@ class MainWindow(Adw.ApplicationWindow):
         self._setup_compose_action()
         self._setup_delete_shortcut()
         self._setup_search_shortcuts()
+
+    def _install_message_list_style(self) -> None:
+        provider = Gtk.CssProvider()
+        provider.load_from_string(_MESSAGE_LIST_CSS)
+        display = Gdk.Display.get_default()
+        if display is not None:
+            Gtk.StyleContext.add_provider_for_display(
+                display,
+                provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+
+    @staticmethod
+    def _make_unread_dot(*, visible: bool) -> Gtk.Box:
+        dot = Gtk.Box()
+        dot.add_css_class("message-unread-dot")
+        dot.set_halign(Gtk.Align.CENTER)
+        dot.set_valign(Gtk.Align.CENTER)
+        dot.set_visible(visible)
+        return dot
+
+    @staticmethod
+    def _set_row_unread_indicator(row: Gtk.ListBoxRow, unread: bool) -> None:
+        dot = getattr(row, "unread_dot", None)
+        if isinstance(dot, Gtk.Widget):
+            dot.set_visible(unread)
 
     def _on_window_size_changed(self, *_args) -> None:
         if self.is_maximized():
@@ -1374,8 +1410,21 @@ class MainWindow(Adw.ApplicationWindow):
         for msg in messages[row_offset:end]:
             subject = msg.get("subject") or "(no subject)"
             sender = msg.get("from") or ""
+            unread = message_is_unread(msg)
+
+            outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            outer.set_margin_start(8)
+            outer.set_margin_end(0)
+
+            dot_column = Gtk.Box()
+            dot_column.set_size_request(16, -1)
+            dot_column.set_valign(Gtk.Align.CENTER)
+            unread_dot = self._make_unread_dot(visible=unread)
+            dot_column.append(unread_dot)
+            outer.append(dot_column)
+
             preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            preview.set_margin_start(12)
+            preview.set_margin_start(4)
             preview.set_margin_end(12)
             preview.set_margin_top(8)
             preview.set_margin_bottom(8)
@@ -1383,8 +1432,6 @@ class MainWindow(Adw.ApplicationWindow):
             top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             subject_label = Gtk.Label(label=subject, xalign=0, wrap=True)
             subject_label.set_hexpand(True)
-            if message_is_unread(msg):
-                subject_label.add_css_class("heading")
             top_row.append(subject_label)
 
             date_text = format_message_list_date(msg)
@@ -1412,12 +1459,14 @@ class MainWindow(Adw.ApplicationWindow):
             flag_icon.set_visible(message_is_flagged(msg))
             bottom_row.append(flag_icon)
             preview.append(bottom_row)
+            outer.append(preview)
 
             row = Gtk.ListBoxRow()
-            row.set_child(preview)
+            row.set_child(outer)
             row.message_uid = msg.get("uid")
             row.message_flags = dict(msg.get("flags") or {})
             row.subject_label = subject_label
+            row.unread_dot = unread_dot
             row.flag_icon = flag_icon
 
             self._message_list.append(row)
@@ -1503,9 +1552,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._set_status(f"{shown} messages in {label} / {folder_name}")
 
     def _mark_row_read(self, row: Gtk.ListBoxRow) -> None:
-        subject_label = getattr(row, "subject_label", None)
-        if isinstance(subject_label, Gtk.Label):
-            subject_label.remove_css_class("heading")
+        self._set_row_unread_indicator(row, False)
         flags = dict(getattr(row, "message_flags", {}) or {})
         flags["seen"] = True
         row.message_flags = flags
@@ -2017,12 +2064,7 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _apply_row_flags(self, row: Gtk.ListBoxRow, flags: dict) -> None:
-        subject_label = getattr(row, "subject_label", None)
-        if isinstance(subject_label, Gtk.Label):
-            if flags.get("seen", True):
-                subject_label.remove_css_class("heading")
-            else:
-                subject_label.add_css_class("heading")
+        self._set_row_unread_indicator(row, not flags.get("seen", True))
 
         flag_icon = getattr(row, "flag_icon", None)
         if isinstance(flag_icon, Gtk.Image):
