@@ -90,6 +90,18 @@ class BuildReaderDocumentTests(unittest.TestCase):
         )
         self.assertIn("(No message body)", doc)
 
+    def test_html_email_uses_light_reader_colors(self) -> None:
+        """HTML mail should render on a light canvas even in a dark GTK theme."""
+        doc = build_reader_document(
+            body_html='<div style="background:#ffffff"><p>Hello</p></div>',
+            body_plain=None,
+            allow_remote=False,
+        )
+        self.assertIn('name="color-scheme" content="light"', doc)
+        self.assertIn("color: #1e1e1e", doc)
+        self.assertIn("background: #ffffff", doc)
+        self.assertNotIn("prefers-color-scheme: dark", doc)
+
 
 if __name__ == "__main__":
     unittest.main()

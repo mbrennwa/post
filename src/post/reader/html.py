@@ -55,12 +55,8 @@ body {
   line-height: 1.5;
   margin: 1rem;
   overflow-wrap: anywhere;
-}
-@media (prefers-color-scheme: light) {
-  body { color: #1e1e1e; background: #ffffff; }
-}
-@media (prefers-color-scheme: dark) {
-  body { color: #eeeeee; background: #1e1e1e; }
+  color: #1e1e1e;
+  background: #ffffff;
 }
 pre.plain-body {
   white-space: pre-wrap;
@@ -128,7 +124,7 @@ def build_reader_document(
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="color-scheme" content="light dark">
+<meta name="color-scheme" content="light">
 <meta http-equiv="Content-Security-Policy" content="{csp}">
 <style>{_READER_CSS}</style>
 </head>
