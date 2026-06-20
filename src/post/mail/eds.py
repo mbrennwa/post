@@ -450,6 +450,23 @@ class MailService:
             walk_folder_info(root, folders)
         return [f for f in folders if f.get("full_name")]
 
+    def get_folder_stats(
+        self, account_uid: str, folder_name: str
+    ) -> tuple[int, int]:
+        """Return live (unread, total) counts by opening the folder."""
+        with self._lock:
+            return self._get_folder_stats_unlocked(account_uid, folder_name)
+
+    def _get_folder_stats_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> tuple[int, int]:
+        store = self._get_store_unlocked(account_uid)
+        folder = store.get_folder_sync(folder_name, 0, None)
+        if folder is None:
+            raise ValueError(f"Folder not found: {folder_name}")
+        folder.refresh_info_sync(None)
+        return folder.get_unread_message_count(), folder.get_message_count()
+
     @staticmethod
     def pick_default_account(accounts: list[MailAccount]) -> MailAccount | None:
         preferred = ("microsoft365", "ews", "imapx", "imap", "pop3")

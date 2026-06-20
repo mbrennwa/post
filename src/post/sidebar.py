@@ -149,41 +149,51 @@ class MailSidebar:
 
     def refresh_inbox_counts(self, account_uid: str) -> None:
         """Re-fetch inbox stats and update sidebar rows (incl. unified Inbox)."""
+        inbox_name = self._inbox_folder_name(account_uid)
+        if not inbox_name:
+            return
 
         def worker() -> None:
             error: Exception | None = None
-            inbox: dict | None = None
+            unread = -1
+            total = -1
             try:
-                folders = self._mail.list_folders(account_uid)
-                inbox = find_inbox_folder(folders)
+                unread, total = self._mail.get_folder_stats(account_uid, inbox_name)
             except Exception as exc:
                 log.exception("Failed to refresh inbox counts for %s", account_uid)
                 error = exc
             GLib.idle_add(
                 self._on_inbox_counts_refreshed,
                 account_uid,
-                inbox,
+                inbox_name,
+                unread,
+                total,
                 error,
             )
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _inbox_folder_name(self, account_uid: str) -> str | None:
+        inbox_name = self._account_inbox_folders.get(account_uid)
+        if inbox_name:
+            return inbox_name
+        inbox = find_inbox_folder(self._account_folders.get(account_uid, []))
+        if inbox is None:
+            return None
+        return inbox.get("full_name")
+
     def _on_inbox_counts_refreshed(
         self,
         account_uid: str,
-        inbox: dict | None,
+        folder_name: str,
+        unread: int,
+        total: int,
         error: Exception | None,
     ) -> bool:
-        if error is not None or inbox is None:
-            return False
-
-        folder_name = inbox.get("full_name")
-        if not folder_name:
+        if error is not None:
             return False
 
         self._account_inbox_folders[account_uid] = folder_name
-        unread = inbox.get("unread", -1)
-        total = inbox.get("total", -1)
         self.update_folder_row(account_uid, folder_name, unread, total)
         return False
 
@@ -205,17 +215,10 @@ class MailSidebar:
     def refresh_folder_row(self, account_uid: str, folder_name: str) -> None:
         def worker() -> None:
             error: Exception | None = None
-            folder: dict | None = None
+            unread = -1
+            total = -1
             try:
-                folders = self._mail.list_folders(account_uid)
-                folder = next(
-                    (
-                        item
-                        for item in folders
-                        if item.get("full_name") == folder_name
-                    ),
-                    None,
-                )
+                unread, total = self._mail.get_folder_stats(account_uid, folder_name)
             except Exception as exc:
                 log.exception(
                     "Failed to refresh folder %s/%s", account_uid, folder_name
@@ -225,7 +228,8 @@ class MailSidebar:
                 self._on_folder_row_refreshed,
                 account_uid,
                 folder_name,
-                folder,
+                unread,
+                total,
                 error,
             )
 
@@ -235,13 +239,12 @@ class MailSidebar:
         self,
         account_uid: str,
         folder_name: str,
-        folder: dict | None,
+        unread: int,
+        total: int,
         error: Exception | None,
     ) -> bool:
-        if error is not None or folder is None:
+        if error is not None:
             return False
-        unread = folder.get("unread", -1)
-        total = folder.get("total", -1)
         self.update_folder_row(account_uid, folder_name, unread, total)
         return False
 
@@ -380,6 +383,7 @@ class MailSidebar:
             folder_list.append(self._make_folder_row(account_uid, folder))
 
         self._add_inbox_row(account_uid, folders)
+        self.refresh_inbox_counts(account_uid)
 
         if self._needs_initial_selection:
             initial_list, initial_row = self._find_initial_folder()
