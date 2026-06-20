@@ -7,8 +7,10 @@ import unittest
 
 from post.mail.eds import MailAccount
 from post.mail.folders import (
+    filter_sidebar_folders,
     find_folder_by_type,
     find_inbox_folder,
+    find_trash_folder,
     format_folder_label,
     guess_inbox_name,
     resolve_move_menu_state,
@@ -141,6 +143,51 @@ class ResolveMoveMenuStateTests(unittest.TestCase):
         )
         self.assertFalse(state["can_archive"])
         self.assertTrue(state["can_trash"])
+
+
+class FindTrashFolderTests(unittest.TestCase):
+    TYPE_TRASH = 3072
+    TYPE_MASK = 64512
+
+    def test_prefers_real_trash_over_virtual(self) -> None:
+        folders = [
+            {"full_name": "Trash", "display_name": "Trash", "flags": 24},
+            {"full_name": ".#evolution/Trash", "display_name": "Trash", "flags": 3314},
+        ]
+        trash = find_trash_folder(
+            folders,
+            trash_type=self.TYPE_TRASH,
+            type_mask=self.TYPE_MASK,
+        )
+        self.assertEqual(trash, folders[0])
+
+    def test_resolve_move_menu_uses_real_trash(self) -> None:
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 1024},
+            {"full_name": "Trash", "display_name": "Trash", "flags": 24},
+            {"full_name": ".#evolution/Trash", "display_name": "Trash", "flags": 3314},
+        ]
+        state = resolve_move_menu_state(
+            folders,
+            "INBOX",
+            archive_type=11264,
+            trash_type=self.TYPE_TRASH,
+            type_mask=self.TYPE_MASK,
+        )
+        self.assertEqual(state["trash_folder"], "Trash")
+
+
+class FilterSidebarFoldersTests(unittest.TestCase):
+    def test_hides_virtual_trash_when_real_trash_exists(self) -> None:
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox"},
+            {"full_name": "Trash", "display_name": "Trash"},
+            {"full_name": ".#evolution/Trash", "display_name": "Trash"},
+        ]
+        filtered = filter_sidebar_folders(folders)
+        names = [folder["full_name"] for folder in filtered]
+        self.assertIn("Trash", names)
+        self.assertNotIn(".#evolution/Trash", names)
 
 
 class MailAccountDisplayLabelTests(unittest.TestCase):

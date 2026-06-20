@@ -34,7 +34,7 @@ from .accounts import (
 from post.preferences import get_show_evolution_local
 from .auth import PasswordPromptCallback, authenticate_service_sync
 from .compose import addresses_to_internet_address, build_plain_mime_message
-from .folders import find_folder_by_type, guess_inbox_name
+from .folders import find_folder_by_type, find_trash_folder, guess_inbox_name
 
 log = logging.getLogger(__name__)
 
@@ -846,20 +846,17 @@ class MailService:
             )
 
         store = self._get_store_unlocked(account_uid)
-        trash_folder = store.get_trash_folder_sync(None)
+        folders = self._list_folders_unlocked(account_uid)
+        trash_info = find_trash_folder(
+            folders,
+            trash_type=Camel.FolderInfoFlags.TYPE_TRASH,
+            type_mask=Camel.FOLDER_TYPE_MASK,
+        )
+        if trash_info is None:
+            raise ValueError("Trash folder not found for this account")
+        trash_folder = store.get_folder_sync(trash_info["full_name"], 0, None)
         if trash_folder is None:
-            folders = self._list_folders_unlocked(account_uid)
-            trash_info = find_folder_by_type(
-                folders,
-                Camel.FolderInfoFlags.TYPE_TRASH,
-                type_mask=Camel.FOLDER_TYPE_MASK,
-                name_fallbacks=frozenset({"trash", "deleted", "bin"}),
-            )
-            if trash_info is None:
-                raise ValueError("Trash folder not found for this account")
-            trash_folder = store.get_folder_sync(trash_info["full_name"], 0, None)
-            if trash_folder is None:
-                raise ValueError("Trash folder not found for this account")
+            raise ValueError("Trash folder not found for this account")
 
         return self._transfer_messages_unlocked(
             account_uid, folder_name, message_uids, trash_folder
@@ -950,6 +947,8 @@ class MailService:
         if not ok:
             raise RuntimeError("Could not move messages")
 
+        self._commit_folder_transfer_unlocked(source_folder, destination_folder)
+
         # Camel returns destination UIDs; the UI and cache use source UIDs.
         moved_uids = list(message_uids)
         destination_uids = self._camel_uid_list(transferred)
@@ -993,6 +992,16 @@ class MailService:
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
         return folder
+
+    @staticmethod
+    def _commit_folder_transfer_unlocked(
+        source_folder: Camel.Folder,
+        destination_folder: Camel.Folder,
+    ) -> None:
+        """Push a folder transfer to the mail store (required for IMAP)."""
+        if not source_folder.synchronize_sync(True, None):
+            raise RuntimeError("Could not synchronize source folder after move")
+        destination_folder.synchronize_sync(False, None)
 
     @staticmethod
     def _camel_uid_list(value: Any) -> list[str]:

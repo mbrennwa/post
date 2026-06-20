@@ -18,6 +18,7 @@ from gi.repository import GLib, Gtk
 from post.mail import MailService
 from post.mail.eds import MailAccount
 from post.mail.folders import (
+    filter_sidebar_folders,
     find_inbox_folder,
     format_folder_label,
     guess_inbox_name,
@@ -225,6 +226,7 @@ class MailSidebar:
             return False
 
         assert folders is not None
+        folders = filter_sidebar_folders(folders)
         self._account_folders[account_uid] = folders
         for folder in folders:
             folder_list.append(self._make_folder_row(account_uid, folder))

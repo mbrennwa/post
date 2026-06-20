@@ -43,6 +43,77 @@ def folder_matches_type(folder: dict, folder_type: int, *, type_mask: int) -> bo
     return (flags & type_mask) == folder_type
 
 
+def is_virtual_folder(full_name: str | None) -> bool:
+    return bool(full_name and full_name.startswith(".#evolution/"))
+
+
+def find_trash_folder(
+    folders: list[dict],
+    *,
+    trash_type: int,
+    type_mask: int,
+) -> dict | None:
+    """Return the best trash folder, preferring real IMAP folders over virtual ones."""
+    name_fallbacks = frozenset({"trash", "deleted", "bin"})
+    real: list[dict] = []
+    virtual: list[dict] = []
+
+    for folder in folders:
+        full_name = folder.get("full_name") or ""
+        display = (folder.get("display_name") or "").strip().lower()
+        base = full_name.rsplit("/", 1)[-1].lower()
+        matches = (
+            folder_matches_type(folder, trash_type, type_mask=type_mask)
+            or display in name_fallbacks
+            or base in name_fallbacks
+        )
+        if not matches:
+            continue
+        if is_virtual_folder(full_name):
+            virtual.append(folder)
+        else:
+            real.append(folder)
+
+    if real:
+        for folder in real:
+            if folder_matches_type(folder, trash_type, type_mask=type_mask):
+                return folder
+        return real[0]
+
+    if virtual:
+        return virtual[0]
+
+    return find_folder_by_type(
+        folders,
+        trash_type,
+        type_mask=type_mask,
+        name_fallbacks=name_fallbacks,
+    )
+
+
+def filter_sidebar_folders(folders: list[dict]) -> list[dict]:
+    """Hide empty Camel virtual folders when a real folder exists."""
+    hidden: set[str] = set()
+    for label in ("trash", "junk"):
+        real_exists = any(
+            (folder.get("display_name") or "").strip().lower() == label
+            and not is_virtual_folder(folder.get("full_name"))
+            for folder in folders
+        )
+        if not real_exists:
+            continue
+        for folder in folders:
+            full_name = folder.get("full_name") or ""
+            if (
+                is_virtual_folder(full_name)
+                and (folder.get("display_name") or "").strip().lower() == label
+            ):
+                hidden.add(full_name)
+    if not hidden:
+        return folders
+    return [folder for folder in folders if folder.get("full_name") not in hidden]
+
+
 def resolve_move_menu_state(
     folders: list[dict],
     current_folder: str,
@@ -57,11 +128,10 @@ def resolve_move_menu_state(
         type_mask=type_mask,
         name_fallbacks=frozenset({"archive", "archives"}),
     )
-    trash_info = find_folder_by_type(
+    trash_info = find_trash_folder(
         folders,
-        trash_type,
+        trash_type=trash_type,
         type_mask=type_mask,
-        name_fallbacks=frozenset({"trash", "deleted", "bin"}),
     )
     archive_name = archive_info.get("full_name") if archive_info else None
     trash_name = trash_info.get("full_name") if trash_info else None
