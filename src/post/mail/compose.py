@@ -238,6 +238,47 @@ def build_reply_references(message_id: str | None, references: str | None = None
     return message_id
 
 
+def format_signature_block(signature: str) -> str:
+    """Return a plain-text signature block with the conventional delimiter."""
+    text = signature.strip("\n")
+    if not text:
+        return ""
+    return f"-- \n{text}"
+
+
+def compose_body_with_signature(
+    *,
+    mode: str,
+    quoted_body: str,
+    signature: str | None,
+) -> str:
+    """Build the initial compose body for a mode, inserting a signature when set."""
+    block = format_signature_block(signature or "")
+    if not block:
+        return quoted_body if mode != "new" else ""
+
+    if mode == "new":
+        return f"\n\n{block}"
+    if mode in ("reply", "reply-all"):
+        quoted = quoted_body.lstrip("\n")
+        return f"\n\n{block}\n\n{quoted}"
+    return quoted_body
+
+
+def body_is_unedited_signature_template(body: str, signatures: list[str]) -> bool:
+    """True when the body is empty or still matches an auto-inserted signature."""
+    if not body.strip():
+        return True
+    for signature in signatures:
+        if body == compose_body_with_signature(
+            mode="new",
+            quoted_body="",
+            signature=signature,
+        ):
+            return True
+    return False
+
+
 def build_plain_mime_message(
     *,
     from_name: str | None,

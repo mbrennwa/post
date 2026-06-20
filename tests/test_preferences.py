@@ -10,12 +10,15 @@ import unittest
 from unittest import mock
 
 from post.preferences import (
+    get_account_signature,
+    get_account_signatures,
     get_load_remote_content,
     get_show_evolution_local,
     get_sidebar_state,
     get_window_state,
     register_inbox_accounts,
     resolve_inbox_display_order,
+    set_account_signature,
     set_active_message_uid,
     set_load_remote_content,
     set_show_evolution_local,
@@ -159,6 +162,23 @@ class PreferencesTests(unittest.TestCase):
             register_inbox_accounts(["acct-2"], ["acct-1", "acct-2"]),
             ["acct-2", "acct-1"],
         )
+
+    def test_account_signatures_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "preferences.json")
+            with mock.patch("post.preferences._PREF_PATH", path):
+                self.assertEqual(get_account_signature("acct-1"), "")
+                set_account_signature("acct-1", "Alice\nExample Corp")
+                self.assertEqual(
+                    get_account_signature("acct-1"),
+                    "Alice\nExample Corp",
+                )
+                self.assertEqual(
+                    get_account_signatures(),
+                    {"acct-1": "Alice\nExample Corp"},
+                )
+                set_account_signature("acct-1", "")
+                self.assertEqual(get_account_signatures(), {})
 
 
 if __name__ == "__main__":

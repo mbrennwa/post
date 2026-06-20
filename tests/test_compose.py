@@ -201,5 +201,57 @@ class BuildReplyReferencesTests(unittest.TestCase):
         )
 
 
+class SignatureComposeTests(unittest.TestCase):
+    def test_format_signature_block(self) -> None:
+        from post.mail.compose import compose_body_with_signature, format_signature_block
+
+        self.assertEqual(format_signature_block(""), "")
+        self.assertEqual(
+            format_signature_block("Alice\nExample Corp"),
+            "-- \nAlice\nExample Corp",
+        )
+
+    def test_new_message_body(self) -> None:
+        from post.mail.compose import compose_body_with_signature
+
+        self.assertEqual(
+            compose_body_with_signature(
+                mode="new",
+                quoted_body="",
+                signature="Alice",
+            ),
+            "\n\n-- \nAlice",
+        )
+        self.assertEqual(
+            compose_body_with_signature(mode="new", quoted_body="", signature=""),
+            "",
+        )
+
+    def test_reply_inserts_signature_before_quote(self) -> None:
+        from post.mail.compose import compose_body_with_signature
+
+        quoted = "\n\nOn today, a@b.com wrote:\n> hi\n"
+        body = compose_body_with_signature(
+            mode="reply",
+            quoted_body=quoted,
+            signature="Alice",
+        )
+        self.assertTrue(body.startswith("\n\n-- \nAlice\n\n"))
+        self.assertTrue(body.endswith("> hi\n"))
+
+    def test_forward_keeps_quote_without_signature(self) -> None:
+        from post.mail.compose import compose_body_with_signature
+
+        quoted = "---------- Forwarded message ---------\nHello"
+        self.assertEqual(
+            compose_body_with_signature(
+                mode="forward",
+                quoted_body=quoted,
+                signature="Alice",
+            ),
+            quoted,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

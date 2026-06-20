@@ -227,3 +227,35 @@ def register_inbox_accounts(saved: list[str], present: list[str]) -> list[str]:
         if uid not in updated:
             updated.append(uid)
     return updated
+
+
+def get_account_signatures() -> dict[str, str]:
+    """Return per-account compose signatures keyed by account UID."""
+    raw = _load_raw().get("account_signatures")
+    if not isinstance(raw, dict):
+        return {}
+    signatures: dict[str, str] = {}
+    for uid, text in raw.items():
+        if isinstance(uid, str) and isinstance(text, str):
+            signatures[uid] = text
+    return signatures
+
+
+def get_account_signature(account_uid: str) -> str:
+    return get_account_signatures().get(account_uid, "")
+
+
+def set_account_signature(account_uid: str, signature: str) -> None:
+    data = _load_raw()
+    signatures_raw = data.get("account_signatures")
+    signatures: dict[str, str] = {}
+    if isinstance(signatures_raw, dict):
+        for uid, text in signatures_raw.items():
+            if isinstance(uid, str) and isinstance(text, str):
+                signatures[uid] = text
+    if signature:
+        signatures[account_uid] = signature
+    else:
+        signatures.pop(account_uid, None)
+    data["account_signatures"] = signatures
+    _save_raw(data)

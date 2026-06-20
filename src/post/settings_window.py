@@ -29,8 +29,10 @@ from post.mail.accounts import (
     validate_local_mail_config,
 )
 from post.preferences import (
+    get_account_signature,
     get_load_remote_content,
     get_show_evolution_local,
+    set_account_signature,
     set_load_remote_content,
     set_show_evolution_local,
 )
@@ -68,6 +70,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         self.add(self._build_composing_page())
         self.add(self._build_local_mail_page())
         self._loading_settings = False
+        self.connect("closed", self._on_signature_dialog_closed)
 
     def _build_reading_page(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage()
@@ -95,9 +98,110 @@ class SettingsDialog(Adw.PreferencesDialog):
         page.set_icon_name("mail-message-new-symbolic")
 
         group = Adw.PreferencesGroup()
-        group.set_description("Compose options will appear here.")
+        group.set_title("Signatures")
+        group.set_description(
+            "Plain-text signatures added when composing from each account"
+        )
+
+        self._signature_accounts = self._mail.list_sendable_accounts()
+        self._signature_account_uid: str | None = None
+        self._signature_loading = False
+
+        if not self._signature_accounts:
+            empty_row = Adw.ActionRow(title="No sendable accounts")
+            empty_row.set_subtitle(
+                "Configure a mail account with outgoing mail to set signatures"
+            )
+            group.add(empty_row)
+            page.add(group)
+            self._signature_buffer = None
+            self._signature_view = None
+            self._signature_account_row = None
+            return page
+
+        labels = [account.from_label for account in self._signature_accounts]
+        self._signature_account_row = Adw.ComboRow(title="Account")
+        self._signature_account_row.set_model(Gtk.StringList.new(labels))
+        self._signature_account_row.set_selected(0)
+        self._signature_account_row.connect(
+            "notify::selected", self._on_signature_account_changed
+        )
+        group.add(self._signature_account_row)
+
+        editor_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        editor_box.set_margin_start(12)
+        editor_box.set_margin_end(12)
+        editor_box.set_margin_top(6)
+        editor_box.set_margin_bottom(12)
+
+        editor_label = Gtk.Label(
+            label="Signature",
+            xalign=0,
+        )
+        editor_label.add_css_class("heading")
+        editor_box.append(editor_label)
+
+        editor_frame = Gtk.Frame()
+        editor_frame.add_css_class("view")
+        editor_scroll = Gtk.ScrolledWindow()
+        editor_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        editor_scroll.set_min_content_height(120)
+        self._signature_view = Gtk.TextView()
+        self._signature_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self._signature_view.set_left_margin(8)
+        self._signature_view.set_right_margin(8)
+        self._signature_view.set_top_margin(8)
+        self._signature_view.set_bottom_margin(8)
+        editor_scroll.set_child(self._signature_view)
+        editor_frame.set_child(editor_scroll)
+        editor_box.append(editor_frame)
+
+        group.add(editor_box)
         page.add(group)
+
+        self._signature_buffer = self._signature_view.get_buffer()
+        self._signature_buffer.connect("changed", self._on_signature_buffer_changed)
+        self._load_signature_for_selected_account()
         return page
+
+    def _selected_signature_account_uid(self) -> str | None:
+        if self._signature_account_row is None:
+            return None
+        index = self._signature_account_row.get_selected()
+        if index == Gtk.INVALID_LIST_POSITION:
+            return None
+        return self._signature_accounts[index].uid
+
+    def _load_signature_for_selected_account(self) -> None:
+        if self._signature_buffer is None:
+            return
+        self._signature_loading = True
+        uid = self._selected_signature_account_uid()
+        self._signature_account_uid = uid
+        text = get_account_signature(uid) if uid else ""
+        self._signature_buffer.set_text(text)
+        self._signature_loading = False
+
+    def _persist_current_signature(self) -> None:
+        if self._signature_buffer is None or self._signature_account_uid is None:
+            return
+        start, end = self._signature_buffer.get_bounds()
+        text = self._signature_buffer.get_text(start, end, False)
+        set_account_signature(self._signature_account_uid, text)
+
+    def _on_signature_account_changed(self, *_args) -> None:
+        if self._signature_loading:
+            return
+        self._persist_current_signature()
+        self._load_signature_for_selected_account()
+
+    def _on_signature_buffer_changed(self, *_args) -> None:
+        if self._signature_loading:
+            return
+        self._persist_current_signature()
+
+    def _on_signature_dialog_closed(self, *_args) -> None:
+        self._persist_current_signature()
 
     def _build_local_mail_page(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage()

@@ -19,10 +19,12 @@ from gi.repository import Adw, GLib, Gtk
 
 from post.mail import MailService
 from post.mail.compose import (
+    body_is_unedited_signature_template,
     build_forward_subject,
     build_reply_all_recipients,
     build_reply_references,
     build_reply_subject,
+    compose_body_with_signature,
     extract_reply_address,
     format_address_list,
     normalize_email,
@@ -37,6 +39,7 @@ from post.mail.correspondents import (
     match_correspondents,
 )
 from post.mail.eds import MailAccount
+from post.preferences import get_account_signature, get_account_signatures
 
 log = logging.getLogger(__name__)
 
@@ -181,6 +184,17 @@ class ComposeWindow(Adw.Window):
 
         self._prefill_fields()
         self._load_correspondents()
+        GLib.idle_add(self._set_initial_focus)
+
+    def _set_initial_focus(self) -> bool:
+        if self._mode == "new":
+            self._to_entry.grab_focus()
+            return False
+        if self._mode in ("reply", "reply-all"):
+            self._body_view.grab_focus()
+            buffer = self._body_view.get_buffer()
+            buffer.place_cursor(buffer.get_start_iter())
+        return False
 
     def _setup_address_completion(self, entry: Gtk.Entry) -> None:
         completion = Gtk.EntryCompletion()
@@ -245,6 +259,24 @@ class ComposeWindow(Adw.Window):
 
     def _on_from_account_changed(self, *_args) -> None:
         self._load_correspondents()
+        if self._mode == "new":
+            self._refresh_signature_for_account(self._selected_account())
+
+    def _known_signatures(self) -> list[str]:
+        return list(get_account_signatures().values())
+
+    def _refresh_signature_for_account(self, account: MailAccount) -> None:
+        buffer = self._body_view.get_buffer()
+        start, end = buffer.get_bounds()
+        current = buffer.get_text(start, end, False)
+        if not body_is_unedited_signature_template(current, self._known_signatures()):
+            return
+        body = compose_body_with_signature(
+            mode="new",
+            quoted_body="",
+            signature=get_account_signature(account.uid),
+        )
+        buffer.set_text(body)
 
     def _load_correspondents(self) -> None:
         account = self._selected_account()
@@ -326,6 +358,8 @@ class ComposeWindow(Adw.Window):
         return own
 
     def _prefill_fields(self) -> None:
+        account = self._selected_account()
+        signature = get_account_signature(account.uid)
         if self._mode in ("reply", "reply-all") and self._reply_to is not None:
             try:
                 if self._mode == "reply-all":
@@ -345,22 +379,37 @@ class ComposeWindow(Adw.Window):
             self._subject_entry.set_text(
                 build_reply_subject(self._reply_to.get("subject") or "")
             )
-            body = quote_plain_reply(
+            quoted = quote_plain_reply(
                 self._reply_to,
                 self._reply_to.get("body_plain"),
+            )
+            body = compose_body_with_signature(
+                mode=self._mode,
+                quoted_body=quoted,
+                signature=signature,
             )
             self._body_view.get_buffer().set_text(body)
         elif self._mode == "forward" and self._reply_to is not None:
             self._subject_entry.set_text(
                 build_forward_subject(self._reply_to.get("subject") or "")
             )
-            body = quote_plain_forward(
+            quoted = quote_plain_forward(
                 self._reply_to,
                 self._reply_to.get("body_plain"),
             )
+            body = compose_body_with_signature(
+                mode=self._mode,
+                quoted_body=quoted,
+                signature=signature,
+            )
             self._body_view.get_buffer().set_text(body)
         else:
-            self._body_view.get_buffer().set_text("")
+            body = compose_body_with_signature(
+                mode="new",
+                quoted_body="",
+                signature=signature,
+            )
+            self._body_view.get_buffer().set_text(body)
 
     def _on_toggle_bcc(self, button: Gtk.Button) -> None:
         reveal = not self._bcc_row.get_visible()
