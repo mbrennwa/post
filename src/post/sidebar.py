@@ -41,6 +41,7 @@ OnFolderSelected = Callable[[MailAccount, str], None]
 SetStatus = Callable[[str], None]
 OnRefreshAccount = Callable[[str], None]
 OnRefreshFolder = Callable[[str, str], None]
+OnAccountsLoaded = Callable[[list[str]], None]
 
 
 class MailSidebar:
@@ -52,12 +53,14 @@ class MailSidebar:
         set_status: SetStatus,
         on_refresh_account: OnRefreshAccount | None = None,
         on_refresh_folder: OnRefreshFolder | None = None,
+        on_accounts_loaded: OnAccountsLoaded | None = None,
     ) -> None:
         self._mail = mail
         self._on_folder_selected = on_folder_selected
         self._set_status = set_status
         self._on_refresh_account = on_refresh_account
         self._on_refresh_folder = on_refresh_folder
+        self._on_accounts_loaded = on_accounts_loaded
 
         self._accounts: list[MailAccount] = []
         self._accounts_by_uid: dict[str, MailAccount] = {}
@@ -118,6 +121,9 @@ class MailSidebar:
             return
 
         self._accounts_by_uid = {a.uid: a for a in self._accounts}
+
+        if self._on_accounts_loaded is not None:
+            self._on_accounts_loaded([account.uid for account in self._accounts])
 
         if len(self._accounts) > 1:
             self._sidebar_box.append(self._make_inbox_section_loading())

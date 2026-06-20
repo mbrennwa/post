@@ -47,6 +47,21 @@ def is_virtual_folder(full_name: str | None) -> bool:
     return bool(full_name and full_name.startswith(".#evolution/"))
 
 
+# Camel.FolderInfoFlags (avoid importing Camel in headless helpers).
+_FOLDER_NOSELECT = 1
+_FOLDER_VIRTUAL = 32
+
+
+def folder_can_contain_messages(folder: dict) -> bool:
+    """False for virtual or IMAP NOSELECT folders that cannot hold messages."""
+    if is_virtual_folder(folder.get("full_name")):
+        return False
+    flags = int(folder.get("flags") or 0)
+    if flags & (_FOLDER_NOSELECT | _FOLDER_VIRTUAL):
+        return False
+    return True
+
+
 def find_trash_folder(
     folders: list[dict],
     *,

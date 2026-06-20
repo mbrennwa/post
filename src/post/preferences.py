@@ -61,6 +61,19 @@ def set_load_remote_content(value: bool) -> None:
     _save_raw(data)
 
 
+def get_auto_sync() -> bool:
+    value = _load_raw().get("auto_sync")
+    if value is None:
+        return True
+    return bool(value)
+
+
+def set_auto_sync(value: bool) -> None:
+    data = _load_raw()
+    data["auto_sync"] = value
+    _save_raw(data)
+
+
 def set_show_evolution_local(value: bool) -> None:
     data = _load_raw()
     data["show_evolution_local"] = value

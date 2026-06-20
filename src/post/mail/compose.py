@@ -11,6 +11,15 @@ from typing import Any
 _ADDRESS_SPLIT = re.compile(r",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)")
 
 
+def bare_address_is_valid(address: str) -> bool:
+    """Return True when address has non-empty local and domain parts."""
+    address = (address or "").strip()
+    if "@" not in address:
+        return False
+    local, domain = address.rsplit("@", 1)
+    return bool(local.strip() and domain.strip())
+
+
 def parse_address_list(text: str) -> list[str]:
     """Parse a comma-separated To/Cc/Bcc field into address strings."""
     import gi
@@ -35,8 +44,8 @@ def parse_address_list(text: str) -> list[str]:
             ok, name, address = container.get(index)
             if not ok or not address:
                 continue
-            if "@" not in address:
-                raise ValueError(f"Invalid address: {part}")
+            if not bare_address_is_valid(address):
+                raise ValueError(f'The address "{part}" is not valid.')
             if name:
                 addresses.append(f"{name} <{address}>")
             else:

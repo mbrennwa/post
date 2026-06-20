@@ -22,7 +22,9 @@ from gi.repository import EDataServer
 log = logging.getLogger(__name__)
 
 POST_LOCAL_ACCOUNT_UID = "post-local-mail"
+POST_LOCAL_TRANSPORT_UID = "post-local-sendmail"
 BUILTIN_LOCAL_UID = "local"
+EDS_LOCAL_DISPLAY_NAME = "Evolution Data Server"
 LOCAL_BACKENDS = frozenset({"spool", "maildir"})
 
 LocalMailType = Literal["spool", "maildir"]
@@ -87,7 +89,7 @@ def is_spool_empty(path: str) -> bool:
 
 
 def is_builtin_local_store_empty(registry: EDataServer.SourceRegistry) -> bool:
-    """True when EDS built-in 'On This Computer' maildir has no messages."""
+    """True when EDS built-in local Maildir account has no messages."""
     try:
         source = registry.ref_builtin_mail_account()
     except Exception:
@@ -212,13 +214,39 @@ def _atomic_write(path: str, content: str) -> None:
             os.unlink(tmp_path)
 
 
+def _transport_uid() -> str:
+    return POST_LOCAL_TRANSPORT_UID
+
+
+def _render_transport_source() -> str:
+    return f"""[Data Source]
+DisplayName=Local SMTP
+Enabled=true
+Parent={POST_LOCAL_ACCOUNT_UID}
+
+[Mail Transport]
+BackendName=smtp
+
+[Authentication]
+Host=127.0.0.1
+Port=25
+User=
+Method=
+RememberPassword=false
+ProxyUid=system-proxy
+
+[Security]
+Method=none
+"""
+
+
 def _render_identity_source(from_name: str, from_address: str) -> str:
     name = from_name.replace("\n", " ").strip()
     address = from_address.replace("\n", " ").strip()
     return f"""[Data Source]
 DisplayName={name or "Local mail"}
 Enabled=true
-Parent=
+Parent={POST_LOCAL_ACCOUNT_UID}
 
 [Mail Identity]
 Address={address}
@@ -227,6 +255,9 @@ Name={name}
 Organization=
 ReplyTo=
 SignatureUid=none
+
+[Mail Submission]
+TransportUid={_transport_uid()}
 """
 
 
@@ -267,6 +298,7 @@ def _write_local_sources(config: LocalMailConfig) -> None:
     sources_dir = evolution_sources_dir()
     identity_path = os.path.join(sources_dir, f"{_identity_uid()}.source")
     account_path = os.path.join(sources_dir, f"{POST_LOCAL_ACCOUNT_UID}.source")
+    transport_path = os.path.join(sources_dir, f"{POST_LOCAL_TRANSPORT_UID}.source")
     _atomic_write(
         identity_path,
         _render_identity_source(config.from_name, config.from_address),
@@ -279,6 +311,7 @@ def _write_local_sources(config: LocalMailConfig) -> None:
             path=config.path,
         ),
     )
+    _atomic_write(transport_path, _render_transport_source())
 
 
 def _sync_backend_path(
@@ -318,19 +351,88 @@ def _fresh_registry_with_source(
     raise RuntimeError(f"Mail source “{uid}” was not loaded after save")
 
 
+def _fresh_registry_with_local_sources(
+    *, attempts: int = 20
+) -> tuple[EDataServer.SourceRegistry, EDataServer.Source, EDataServer.Source]:
+    last_registry: EDataServer.SourceRegistry | None = None
+    for _ in range(attempts):
+        last_registry = EDataServer.SourceRegistry.new_sync(None)
+        if last_registry is None:
+            time.sleep(0.05)
+            continue
+        source = last_registry.ref_source(POST_LOCAL_ACCOUNT_UID)
+        identity = last_registry.ref_source(_identity_uid())
+        transport = last_registry.ref_source(_transport_uid())
+        if (
+            source is not None
+            and identity is not None
+            and transport is not None
+            and identity.has_extension("Mail Submission")
+        ):
+            return last_registry, source, identity
+        time.sleep(0.05)
+    raise RuntimeError("Local mail sources were not loaded after save")
+
+
+def _local_identity_submission_uid(
+    registry: EDataServer.SourceRegistry,
+) -> str | None:
+    identity = registry.ref_source(_identity_uid())
+    if identity is None or not identity.has_extension("Mail Submission"):
+        return None
+    submission = identity.get_extension("Mail Submission")
+    return submission.get_transport_uid() or None
+
+
+def _sync_identity_submission(
+    registry: EDataServer.SourceRegistry,
+    identity: EDataServer.Source,
+) -> None:
+    if not identity.has_extension("Mail Submission"):
+        raise RuntimeError("Local mail identity is missing a Mail Submission extension")
+    submission = identity.get_extension("Mail Submission")
+    submission.set_transport_uid(_transport_uid())
+    registry.commit_source_sync(identity, None)
+
+
+def _local_transport_is_configured(
+    registry: EDataServer.SourceRegistry,
+) -> bool:
+    transport = registry.ref_source(_transport_uid())
+    if transport is None or not transport.has_extension("Mail Transport"):
+        return False
+    backend = transport.get_extension("Mail Transport").get_backend_name()
+    return backend == "smtp"
+
+
+def ensure_post_local_mail_transport(
+    registry: EDataServer.SourceRegistry,
+) -> None:
+    """Ensure enabled system mail has a local SMTP transport configured."""
+    config = read_local_mail_config(registry)
+    if config is None or not config.enabled:
+        return
+
+    submission_uid = _local_identity_submission_uid(registry)
+    if (
+        not _local_transport_is_configured(registry)
+        or submission_uid != _transport_uid()
+    ):
+        apply_local_mail_config(config)
+
+
 def apply_local_mail_config(config: LocalMailConfig) -> None:
     """Create or update the Post-managed local mail account in EDS."""
     _write_local_sources(config)
 
-    fresh, source = _fresh_registry_with_source(POST_LOCAL_ACCOUNT_UID)
-    identity = fresh.ref_source(_identity_uid())
+    fresh, source, identity = _fresh_registry_with_local_sources()
     if identity is None:
         raise RuntimeError("Local mail identity was not loaded after save")
 
     ident_ext = identity.get_extension("Mail Identity")
     ident_ext.set_name(config.from_name.strip())
     ident_ext.set_address(config.from_address.strip())
-    fresh.commit_source_sync(identity, None)
+    _sync_identity_submission(fresh, identity)
 
     source.set_display_name("Local mail")
     source.set_enabled(config.enabled)
@@ -350,15 +452,15 @@ def validate_local_mail_config(config: LocalMailConfig) -> str | None:
 
     path = config.path.strip()
     if not path:
-        return "Choose a mail spool file or Maildir folder."
+        return "Choose a mail file or folder."
 
     if config.mail_type == "maildir":
         if not os.path.isdir(path):
-            return f"Maildir folder does not exist: {path}"
+            return f"Mail folder does not exist: {path}"
     elif not os.path.isfile(path):
         parent = os.path.dirname(path) or "/"
         if not os.path.isdir(parent):
-            return f"Spool directory does not exist: {parent}"
+            return f"Folder for the mail file does not exist: {parent}"
 
     if not config.from_address.strip():
         return "Enter a From address for local mail."

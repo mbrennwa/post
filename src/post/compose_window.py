@@ -39,6 +39,7 @@ from post.mail.correspondents import (
     match_correspondents,
 )
 from post.mail.eds import MailAccount
+from post.mail.send_errors import user_send_error_message
 from post.preferences import get_account_signature, get_account_signatures
 
 log = logging.getLogger(__name__)
@@ -67,9 +68,12 @@ class ComposeWindow(Adw.Window):
         self._reply_to = reply_to
         self._sending = False
         self._send_accounts = mail.list_sendable_accounts()
-        if not self._send_accounts:
+        if not self._send_accounts and not (account.from_address or account.email):
             raise ValueError("No mail account configured for sending")
-        self._account = account if account.can_send else self._send_accounts[0]
+        self._from_accounts = MailService.compose_from_accounts(
+            self._send_accounts, account
+        )
+        self._account = account
 
         if mode == "reply-all":
             title = "Reply All"
@@ -111,14 +115,14 @@ class ComposeWindow(Adw.Window):
         self._error_label.set_visible(False)
         form.append(self._error_label)
 
-        from_labels = [send_account.from_label for send_account in self._send_accounts]
+        from_labels = [from_account.from_label for from_account in self._from_accounts]
         self._from_dropdown = Gtk.DropDown.new_from_strings(from_labels)
         self._from_dropdown.set_hexpand(True)
-        for index, send_account in enumerate(self._send_accounts):
-            if send_account.uid == self._account.uid:
+        for index, from_account in enumerate(self._from_accounts):
+            if from_account.uid == self._account.uid:
                 self._from_dropdown.set_selected(index)
                 break
-        if len(self._send_accounts) == 1:
+        if len(self._from_accounts) == 1:
             self._from_dropdown.set_sensitive(False)
         self._from_dropdown.connect("notify::selected", self._on_from_account_changed)
         form.append(self._labeled_row("From", self._from_dropdown))
@@ -290,9 +294,11 @@ class ComposeWindow(Adw.Window):
         def worker() -> None:
             try:
                 correspondents = self._mail.get_correspondents(account_uid)
-            except Exception:
-                log.exception(
-                    "Failed to load correspondents for account %s", account_uid
+            except Exception as exc:
+                log.debug(
+                    "Could not load address suggestions for account %s: %s",
+                    account_uid,
+                    exc,
                 )
                 correspondents = []
             GLib.idle_add(
@@ -347,7 +353,7 @@ class ComposeWindow(Adw.Window):
         index = self._from_dropdown.get_selected()
         if index == Gtk.INVALID_LIST_POSITION:
             return self._account
-        return self._send_accounts[index]
+        return self._from_accounts[index]
 
     def _own_addresses(self) -> set[str]:
         account = self._selected_account()
@@ -439,6 +445,10 @@ class ComposeWindow(Adw.Window):
             self._show_error(str(exc))
             return
 
+        if not to_addrs:
+            self._show_error("Add a recipient in the To field.")
+            return
+
         subject = self._subject_entry.get_text().strip()
         if not subject:
             self._show_error("Subject is required")
@@ -457,11 +467,15 @@ class ComposeWindow(Adw.Window):
                 self._reply_to.get("references"),
             )
 
+        account = self._selected_account()
+        if not account.can_send:
+            self._show_error("This account has no mail transport configured")
+            return
+
         self._sending = True
         self._send_btn.set_sensitive(False)
         self._set_status("Sending message…")
 
-        account = self._selected_account()
         account_uid = account.uid
 
         def worker() -> None:
@@ -478,7 +492,7 @@ class ComposeWindow(Adw.Window):
                     references=references,
                 )
             except Exception as exc:
-                log.exception("Failed to send message")
+                log.warning("Send failed: %s", user_send_error_message(exc))
                 error = exc
             GLib.idle_add(
                 self._on_send_finished,
@@ -491,8 +505,9 @@ class ComposeWindow(Adw.Window):
         self._sending = False
         self._send_btn.set_sensitive(True)
         if error is not None:
-            self._show_error(str(error))
-            self._set_status(f"Send failed: {error}")
+            message = user_send_error_message(error)
+            self._show_error(message)
+            self._set_status("Send failed")
             return False
         self._set_status("Message sent")
         self.close()

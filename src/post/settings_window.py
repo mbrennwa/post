@@ -20,6 +20,7 @@ from gi.repository import Adw, GLib, Gio, Gtk
 
 from post.mail import MailService
 from post.mail.accounts import (
+    EDS_LOCAL_DISPLAY_NAME,
     LocalMailConfig,
     apply_local_mail_config,
     default_local_mail_config,
@@ -30,9 +31,11 @@ from post.mail.accounts import (
 )
 from post.preferences import (
     get_account_signature,
+    get_auto_sync,
     get_load_remote_content,
     get_show_evolution_local,
     set_account_signature,
+    set_auto_sync,
     set_load_remote_content,
     set_show_evolution_local,
 )
@@ -42,6 +45,7 @@ log = logging.getLogger(__name__)
 SetStatus = Callable[[str], None]
 OnSaved = Callable[[], None]
 OnLoadRemoteContentChanged = Callable[[bool], None]
+OnAutoSyncChanged = Callable[[bool], None]
 
 
 class SettingsDialog(Adw.PreferencesDialog):
@@ -53,6 +57,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         set_status: SetStatus,
         on_saved: OnSaved,
         on_load_remote_content_changed: OnLoadRemoteContentChanged | None = None,
+        on_auto_sync_changed: OnAutoSyncChanged | None = None,
     ) -> None:
         super().__init__()
         self._parent = parent
@@ -60,8 +65,10 @@ class SettingsDialog(Adw.PreferencesDialog):
         self._set_status = set_status
         self._on_saved = on_saved
         self._remote_content_changed_callback = on_load_remote_content_changed
+        self._auto_sync_changed_callback = on_auto_sync_changed
         self._saving = False
         self._loading_settings = True
+        self._local_mail_save_id: int | None = None
 
         existing = read_local_mail_config(mail.registry)
         self._config = existing or default_local_mail_config()
@@ -89,6 +96,14 @@ class SettingsDialog(Adw.PreferencesDialog):
             "notify::active", self._on_remote_content_row_changed
         )
         group.add(self._remote_content_row)
+
+        self._auto_sync_row = Adw.SwitchRow(title="Auto sync")
+        self._auto_sync_row.set_subtitle(
+            "Check for new mail and server-side changes"
+        )
+        self._auto_sync_row.set_active(get_auto_sync())
+        self._auto_sync_row.connect("notify::active", self._on_auto_sync_row_changed)
+        group.add(self._auto_sync_row)
         page.add(group)
         return page
 
@@ -208,14 +223,51 @@ class SettingsDialog(Adw.PreferencesDialog):
         page.set_title("Local Mail")
         page.set_icon_name("computer-symbolic")
 
+        spool_group = Adw.PreferencesGroup()
+        spool_group.set_title("System mail")
+        spool_group.set_description("Mail file or folder")
+
+        self._enable_row = Adw.SwitchRow(title="Enable system mail")
+        self._enable_row.set_active(self._config.enabled)
+        self._enable_row.connect("notify::active", self._on_system_mail_changed)
+        spool_group.add(self._enable_row)
+
+        self._type_row = Adw.ComboRow(title="Storage")
+        types = Gtk.StringList.new(["Single mail file", "Folder of messages"])
+        self._type_row.set_model(types)
+        self._type_row.set_selected(0 if self._config.mail_type == "spool" else 1)
+        self._type_row.connect("notify::selected", self._on_system_mail_changed)
+        spool_group.add(self._type_row)
+
+        self._path_entry = Adw.EntryRow(title="Path")
+        self._path_entry.set_text(self._config.path)
+        self._path_entry.connect("changed", self._on_system_mail_entry_changed)
+        self._path_entry.connect("apply", self._on_system_mail_apply)
+        browse_btn = Gtk.Button(label="Browse…")
+        browse_btn.connect("clicked", self._on_browse_clicked)
+        self._path_entry.add_suffix(browse_btn)
+        spool_group.add(self._path_entry)
+
+        self._name_row = Adw.EntryRow(title="From name")
+        self._name_row.set_text(self._config.from_name)
+        self._name_row.connect("changed", self._on_system_mail_entry_changed)
+        self._name_row.connect("apply", self._on_system_mail_apply)
+        spool_group.add(self._name_row)
+
+        self._address_row = Adw.EntryRow(title="From address")
+        self._address_row.set_text(self._config.from_address)
+        self._address_row.connect("changed", self._on_system_mail_entry_changed)
+        self._address_row.connect("apply", self._on_system_mail_apply)
+        spool_group.add(self._address_row)
+        page.add(spool_group)
+
         evolution_group = Adw.PreferencesGroup()
-        evolution_group.set_title("On This Computer")
+        evolution_group.set_title(EDS_LOCAL_DISPLAY_NAME)
         evolution_group.set_description(
-            "Evolution’s built-in local mail store (Maildir under "
-            "~/.local/share/evolution/mail/local)"
+            "Local mail at ~/.local/share/evolution/mail/local"
         )
 
-        self._evolution_local_row = Adw.SwitchRow(title="Show in Post")
+        self._evolution_local_row = Adw.SwitchRow(title="Enable Evolution Data Server")
         pref = get_show_evolution_local()
         if pref is None:
             self._evolution_local_row.set_active(
@@ -229,50 +281,6 @@ class SettingsDialog(Adw.PreferencesDialog):
         evolution_group.add(self._evolution_local_row)
         page.add(evolution_group)
 
-        spool_group = Adw.PreferencesGroup()
-        spool_group.set_title("System mail")
-        spool_group.set_description(
-            "Spool file or Maildir used by mutt, fetchmail, or similar tools"
-        )
-
-        self._enable_row = Adw.SwitchRow(title="Enable system local mail")
-        self._enable_row.set_active(self._config.enabled)
-        spool_group.add(self._enable_row)
-
-        self._type_row = Adw.ComboRow(title="Storage type")
-        types = Gtk.StringList.new(["Spool file (mbox)", "Maildir folder"])
-        self._type_row.set_model(types)
-        self._type_row.set_selected(0 if self._config.mail_type == "spool" else 1)
-        spool_group.add(self._type_row)
-
-        self._path_entry = Adw.EntryRow(title="Path")
-        self._path_entry.set_text(self._config.path)
-        browse_btn = Gtk.Button(label="Browse…")
-        browse_btn.connect("clicked", self._on_browse_clicked)
-        self._path_entry.add_suffix(browse_btn)
-        spool_group.add(self._path_entry)
-        page.add(spool_group)
-
-        identity_group = Adw.PreferencesGroup()
-        identity_group.set_title("Identity")
-        identity_group.set_description("Used when composing from this account")
-
-        self._name_row = Adw.EntryRow(title="From name")
-        self._name_row.set_text(self._config.from_name)
-        identity_group.add(self._name_row)
-
-        self._address_row = Adw.EntryRow(title="From address")
-        self._address_row.set_text(self._config.from_address)
-        identity_group.add(self._address_row)
-        page.add(identity_group)
-
-        actions_group = Adw.PreferencesGroup()
-        save_row = Adw.ActionRow(title="Save settings")
-        save_row.set_activatable(True)
-        save_row.connect("activated", self._on_save_clicked)
-        actions_group.add(save_row)
-        page.add(actions_group)
-
         self._type_row.connect("notify::selected", self._on_type_changed)
         self._on_type_changed()
         return page
@@ -280,12 +288,43 @@ class SettingsDialog(Adw.PreferencesDialog):
     def _on_type_changed(self, *_args) -> None:
         is_spool = self._type_row.get_selected() == 0
         subtitle = (
-            "Mbox spool file (e.g. /var/spool/mail/$USER)"
+            "All messages in one file (e.g. /var/spool/mail/yourname)"
             if is_spool
-            else "Maildir folder (contains cur/, new/, tmp/)"
+            else "Each message stored as its own file in a folder"
         )
         self._path_entry.set_title("Path")
         self._type_row.set_subtitle(subtitle)
+
+    def _on_system_mail_changed(self, *_args) -> None:
+        if self._loading_settings:
+            return
+        self._save_local_mail_config()
+
+    def _on_system_mail_entry_changed(self, *_args) -> None:
+        if self._loading_settings:
+            return
+        self._schedule_local_mail_save()
+
+    def _on_system_mail_apply(self, *_args) -> None:
+        if self._loading_settings:
+            return
+        self._cancel_local_mail_save()
+        self._save_local_mail_config()
+
+    def _schedule_local_mail_save(self) -> None:
+        self._cancel_local_mail_save()
+
+        def fire() -> bool:
+            self._local_mail_save_id = None
+            self._save_local_mail_config()
+            return False
+
+        self._local_mail_save_id = GLib.timeout_add(500, fire)
+
+    def _cancel_local_mail_save(self) -> None:
+        if self._local_mail_save_id is not None:
+            GLib.source_remove(self._local_mail_save_id)
+            self._local_mail_save_id = None
 
     def _on_evolution_local_changed(self, *_args) -> None:
         if self._loading_settings:
@@ -300,6 +339,14 @@ class SettingsDialog(Adw.PreferencesDialog):
         set_load_remote_content(enabled)
         if self._remote_content_changed_callback is not None:
             self._remote_content_changed_callback(enabled)
+
+    def _on_auto_sync_row_changed(self, *_args) -> None:
+        if self._loading_settings:
+            return
+        enabled = self._auto_sync_row.get_active()
+        set_auto_sync(enabled)
+        if self._auto_sync_changed_callback is not None:
+            self._auto_sync_changed_callback(enabled)
 
     def _current_config(self) -> LocalMailConfig:
         return LocalMailConfig(
@@ -342,7 +389,7 @@ class SettingsDialog(Adw.PreferencesDialog):
     def _on_browse_clicked(self, _button: Gtk.Button) -> None:
         is_spool = self._type_row.get_selected() == 0
         dialog = Gtk.FileDialog(
-            title="Choose spool file" if is_spool else "Choose Maildir folder"
+            title="Choose mail file" if is_spool else "Choose mail folder"
         )
         self._configure_file_dialog_start(
             dialog, self._browse_start_path(for_spool=is_spool), pick_file=is_spool
@@ -358,6 +405,7 @@ class SettingsDialog(Adw.PreferencesDialog):
             path = file.get_path()
             if path:
                 self._path_entry.set_text(path)
+                self._save_local_mail_config()
 
         def on_folder_selected(_dialog: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
             try:
@@ -369,18 +417,18 @@ class SettingsDialog(Adw.PreferencesDialog):
             path = file.get_path()
             if path:
                 self._path_entry.set_text(path)
+                self._save_local_mail_config()
 
         if is_spool:
             dialog.open(self._parent, None, on_selected)
         else:
             dialog.select_folder(self._parent, None, on_folder_selected)
 
-    def _on_save_clicked(self, *_args) -> None:
-        if self._saving:
+    def _save_local_mail_config(self) -> None:
+        if self._loading_settings or self._saving:
             return
 
         config = self._current_config()
-        show_evolution_local = self._evolution_local_row.get_active()
         if config.enabled:
             error = validate_local_mail_config(config)
             if error:
@@ -388,37 +436,29 @@ class SettingsDialog(Adw.PreferencesDialog):
                 return
 
         self._saving = True
-        self.set_can_close(False)
         self._set_status("Saving settings…")
 
         def worker() -> None:
             save_error: Exception | None = None
             try:
-                set_show_evolution_local(show_evolution_local)
                 apply_local_mail_config(config)
                 self._mail.reload_registry()
             except Exception as exc:
-                log.exception("Failed to save settings")
+                log.exception("Failed to save system mail settings")
                 save_error = exc
-            GLib.idle_add(self._on_save_finished, save_error, show_evolution_local)
+            GLib.idle_add(self._on_local_mail_save_finished, save_error)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_save_finished(
-        self, error: Exception | None, show_evolution_local: bool
-    ) -> bool:
+    def _on_local_mail_save_finished(self, error: Exception | None) -> bool:
         self._saving = False
-        self.set_can_close(True)
         if error is not None:
-            set_show_evolution_local(show_evolution_local)
-            self._on_saved()
             self._show_error(str(error))
             self._set_status(f"Could not save system mail settings: {error}")
             return False
 
         self._set_status("Settings saved")
         self._on_saved()
-        self.force_close()
         return False
 
     def _show_error(self, message: str) -> None:

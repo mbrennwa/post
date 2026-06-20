@@ -17,8 +17,9 @@ import gi
 
 gi.require_version("Camel", "1.2")
 gi.require_version("EDataServer", "1.2")
+gi.require_version("Gio", "2.0")
 
-from gi.repository import Camel, EDataServer, GLib
+from gi.repository import Camel, EDataServer, GLib, Gio
 
 from .helpers import (
     message_info_to_dict,
@@ -28,14 +29,26 @@ from .helpers import (
 )
 from .accounts import (
     BUILTIN_LOCAL_UID,
+    EDS_LOCAL_DISPLAY_NAME,
+    POST_LOCAL_ACCOUNT_UID,
+    ensure_post_local_mail_transport,
     is_builtin_local_store_empty,
+    read_local_mail_config,
     should_list_local_account,
 )
+from .local_delivery import all_recipients_local, can_deliver_locally, deliver_local_message
+from .send_errors import SYSTEM_MAIL_EXTERNAL_RECIPIENTS, SendError, user_send_error_message
 from post.preferences import get_show_evolution_local
 from .auth import PasswordPromptCallback, authenticate_service_sync
 from .compose import addresses_to_internet_address, build_plain_mime_message, normalize_email
 from .correspondents import Correspondent, collect_correspondents
-from .folders import find_folder_by_type, find_trash_folder, guess_inbox_name, is_virtual_folder
+from .folders import (
+    find_folder_by_type,
+    find_trash_folder,
+    folder_can_contain_messages,
+    guess_inbox_name,
+    is_virtual_folder,
+)
 from .search import MessageSearchQuery, message_matches
 
 log = logging.getLogger(__name__)
@@ -46,6 +59,7 @@ _MAX_CORRESPONDENTS = 500
 # EDS also lists RSS feeds, search folders, etc. as "Mail Account" sources.
 _SKIP_BACKENDS = frozenset({"rss", "vfolder"})
 DEFAULT_MESSAGE_PAGE_SIZE = 50
+_SEND_TIMEOUT_SECONDS = 30
 
 
 @dataclass
@@ -135,6 +149,8 @@ class MailAccount:
 
     @property
     def display_label(self) -> str:
+        if self.uid == BUILTIN_LOCAL_UID:
+            return EDS_LOCAL_DISPLAY_NAME
         return self.email or self.name
 
     @property
@@ -174,6 +190,13 @@ class MailService:
                 "Could not connect to evolution-source-registry. "
                 "Is Evolution Data Server installed and your session running?"
             )
+        ensure_post_local_mail_transport(registry)
+        registry = EDataServer.SourceRegistry.new_sync(None)
+        if registry is None:
+            raise RuntimeError(
+                "Could not reconnect to evolution-source-registry after "
+                "configuring local mail transport."
+            )
         return cls(registry=registry)
 
     def set_password_prompt(self, callback: PasswordPromptCallback | None) -> None:
@@ -190,6 +213,12 @@ class MailService:
             self._correspondent_indexes.clear()
             self._accounts_by_uid.clear()
             self._session = None
+            registry = EDataServer.SourceRegistry.new_sync(None)
+            if registry is None:
+                raise RuntimeError(
+                    "Could not reconnect to evolution-source-registry."
+                )
+            ensure_post_local_mail_transport(registry)
             registry = EDataServer.SourceRegistry.new_sync(None)
             if registry is None:
                 raise RuntimeError(
@@ -258,6 +287,19 @@ class MailService:
     def list_sendable_accounts(self) -> list[MailAccount]:
         return [account for account in self.list_accounts() if account.can_send]
 
+    @staticmethod
+    def compose_from_accounts(
+        sendable: list[MailAccount], preferred: MailAccount | None
+    ) -> list[MailAccount]:
+        """Return From accounts for compose, keeping the selected account first."""
+        if preferred is None:
+            return sendable
+        if preferred.uid in {account.uid for account in sendable}:
+            return sendable
+        if preferred.from_address or preferred.email:
+            return [preferred, *sendable]
+        return sendable
+
     def get_account(self, account_uid: str) -> MailAccount:
         with self._lock:
             account = self._accounts_by_uid.get(account_uid)
@@ -289,6 +331,14 @@ class MailService:
     def get_store(self, account_uid: str) -> Camel.Store:
         with self._lock:
             return self._get_store_unlocked(account_uid)
+
+    def get_store_for_sync(self, account_uid: str) -> Camel.Store:
+        """Return a connected store for sync signal wiring."""
+        return self.get_store(account_uid)
+
+    def invalidate_folder_index(self, account_uid: str, folder_name: str) -> None:
+        with self._lock:
+            self._invalidate_folder_index(account_uid, folder_name)
 
     def _get_store_unlocked(self, account_uid: str) -> Camel.Store:
         if account_uid in self._stores:
@@ -322,11 +372,22 @@ class MailService:
         self._stores[account_uid] = store
         return store
 
-    def _get_transport_unlocked(self, account_uid: str) -> Camel.Transport:
+    def _get_transport_unlocked(
+        self,
+        account_uid: str,
+        cancellable: Gio.Cancellable | None = None,
+    ) -> Camel.Transport:
         account = self.get_account(account_uid)
         transport_uid = account.transport_uid
         if not transport_uid:
             raise ValueError("No mail transport configured for this account")
+
+        transport_source = self.registry.ref_source(transport_uid)
+        if transport_source is None:
+            raise ValueError(f"Unknown mail transport: {transport_uid}")
+
+        mail_transport = transport_source.get_extension("Mail Transport")
+        expected_backend = mail_transport.get_backend_name()
 
         if transport_uid in self._transports:
             transport = self._transports[transport_uid]
@@ -337,13 +398,8 @@ class MailService:
                 return transport
             del self._transports[transport_uid]
 
-        transport_source = self.registry.ref_source(transport_uid)
-        if transport_source is None:
-            raise ValueError(f"Unknown mail transport: {transport_uid}")
-
         session = self._ensure_session()
-        mail_transport = transport_source.get_extension("Mail Transport")
-        backend = mail_transport.get_backend_name()
+        backend = expected_backend
 
         service = session.ref_service(transport_uid)
         if service is None:
@@ -359,9 +415,9 @@ class MailService:
         if hasattr(Camel, "OfflineTransport") and isinstance(
             transport, Camel.OfflineTransport
         ):
-            transport.set_online_sync(True, None)
+            transport.set_online_sync(True, cancellable)
         else:
-            transport.connect_sync(None)
+            transport.connect_sync(cancellable)
 
         self._transports[transport_uid] = transport
         return transport
@@ -430,20 +486,59 @@ class MailService:
         if recipients.length() == 0:
             raise ValueError("At least one recipient is required")
 
-        transport = self._get_transport_unlocked(account_uid)
+        if account_uid == POST_LOCAL_ACCOUNT_UID:
+            local_config = read_local_mail_config(self.registry)
+            if local_config is not None and local_config.enabled:
+                if can_deliver_locally(
+                    local_config,
+                    to=to,
+                    cc=cc,
+                    bcc=bcc,
+                ):
+                    deliver_local_message(
+                        local_config,
+                        message,
+                        envelope_from=from_address,
+                    )
+                    self._stores.pop(account_uid, None)
+                    for key in list(self._folder_indexes):
+                        if key[0] == account_uid:
+                            self._folder_indexes.pop(key, None)
+                    self._correspondent_indexes.pop(account_uid, None)
+                    return
+                if not all_recipients_local(
+                    to=to,
+                    cc=cc,
+                    bcc=bcc,
+                    local_address=local_config.from_address,
+                ):
+                    raise SendError(SYSTEM_MAIL_EXTERNAL_RECIPIENTS)
+
+        cancellable = Gio.Cancellable()
+        timer = threading.Timer(_SEND_TIMEOUT_SECONDS, cancellable.cancel)
+        timer.start()
+        transport: Camel.Transport | None = None
+        ok = False
         try:
+            transport = self._get_transport_unlocked(account_uid, cancellable)
             ok, _user_stop = transport.send_to_sync(
-                message, sender, recipients, None
+                message, sender, recipients, cancellable
             )
+        except GLib.Error as exc:
+            if cancellable.is_cancelled():
+                raise SendError(user_send_error_message(TimeoutError())) from exc
+            raise SendError(user_send_error_message(exc)) from exc
         finally:
-            try:
-                transport.disconnect_sync(True, None)
-            except Exception:
-                log.exception("Failed to disconnect transport after send")
+            timer.cancel()
+            if transport is not None:
+                try:
+                    transport.disconnect_sync(True, cancellable)
+                except Exception:
+                    log.debug("Failed to disconnect transport after send", exc_info=True)
             self._transports.pop(account.transport_uid or "", None)
 
         if not ok:
-            raise RuntimeError("Could not send message")
+            raise SendError(user_send_error_message(RuntimeError("Could not send message")))
 
     def get_correspondents(self, account_uid: str) -> list[Correspondent]:
         with self._lock:
@@ -466,9 +561,9 @@ class MailService:
         folders = self._list_folders_unlocked(account_uid)
         messages: list[dict] = []
         for folder in folders:
-            full_name = folder.get("full_name")
-            if is_virtual_folder(full_name):
+            if not folder_can_contain_messages(folder):
                 continue
+            full_name = folder.get("full_name")
             index = self._build_folder_index_unlocked(account_uid, full_name)
             messages.extend(index.messages)
 
@@ -606,33 +701,61 @@ class MailService:
         page, has_more = paginate_messages(index.messages, offset, limit)
         return page, index.unread, index.total, has_more
 
+    def _is_missing_folder_error(self, exc: GLib.Error) -> bool:
+        return exc.matches(Camel.store_error_quark(), Camel.StoreError.NO_FOLDER)
+
+    def _open_folder_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> Camel.Folder | None:
+        store = self._get_store_unlocked(account_uid)
+        try:
+            return store.get_folder_sync(folder_name, 0, None)
+        except GLib.Error as exc:
+            if self._is_missing_folder_error(exc):
+                log.debug(
+                    "Skipping unavailable folder %r for account %s",
+                    folder_name,
+                    account_uid,
+                )
+                return None
+            raise
+
     def _build_folder_index_unlocked(
         self, account_uid: str, folder_name: str
     ) -> _FolderMessageIndex:
-        store = self._get_store_unlocked(account_uid)
-        folder = store.get_folder_sync(folder_name, 0, None)
+        folder = self._open_folder_unlocked(account_uid, folder_name)
         if folder is None:
-            raise ValueError(f"Folder not found: {folder_name}")
+            return _FolderMessageIndex(messages=[], unread=0, total=0)
 
-        folder.refresh_info_sync(None)
-        unread = folder.get_unread_message_count()
-        total = folder.get_message_count()
+        try:
+            folder.refresh_info_sync(None)
+            unread = folder.get_unread_message_count()
+            total = folder.get_message_count()
 
-        uids = folder.get_uids()
-        if uids is None:
-            return _FolderMessageIndex(messages=[], unread=unread, total=total)
+            uids = folder.get_uids()
+            if uids is None:
+                return _FolderMessageIndex(messages=[], unread=unread, total=total)
 
-        messages: list[dict] = []
-        for uid in uids:
-            info = folder.get_message_info(str(uid))
-            if info is not None:
-                messages.append(message_info_to_dict(info))
+            messages: list[dict] = []
+            for uid in uids:
+                info = folder.get_message_info(str(uid))
+                if info is not None:
+                    messages.append(message_info_to_dict(info))
 
-        return _FolderMessageIndex(
-            messages=sort_messages_newest_first(messages),
-            unread=unread,
-            total=total,
-        )
+            return _FolderMessageIndex(
+                messages=sort_messages_newest_first(messages),
+                unread=unread,
+                total=total,
+            )
+        except GLib.Error as exc:
+            if self._is_missing_folder_error(exc):
+                log.debug(
+                    "Skipping unavailable folder %r for account %s",
+                    folder_name,
+                    account_uid,
+                )
+                return _FolderMessageIndex(messages=[], unread=0, total=0)
+            raise
 
     def read_message(
         self, account_uid: str, folder_name: str, message_uid: str

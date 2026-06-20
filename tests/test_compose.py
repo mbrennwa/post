@@ -43,6 +43,14 @@ class ParseAddressListTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_address_list("not-an-address")
 
+    def test_missing_local_part_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not valid"):
+            parse_address_list("@xyz")
+
+    def test_missing_domain_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not valid"):
+            parse_address_list("user@")
+
 
 class BuildReplySubjectTests(unittest.TestCase):
     def test_adds_re_prefix(self) -> None:

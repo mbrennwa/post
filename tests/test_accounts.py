@@ -10,6 +10,7 @@ from unittest import mock
 
 from post.mail.accounts import (
     BUILTIN_LOCAL_UID,
+    EDS_LOCAL_DISPLAY_NAME,
     LocalMailConfig,
     POST_LOCAL_ACCOUNT_UID,
     _render_account_source,
@@ -21,6 +22,7 @@ from post.mail.accounts import (
     should_list_local_account,
     validate_local_mail_config,
 )
+from post.mail.eds import MailAccount, MailService
 
 
 class MaildirEmptyTests(unittest.TestCase):
@@ -119,7 +121,7 @@ class ValidateLocalMailConfigTests(unittest.TestCase):
         )
         error = validate_local_mail_config(config)
         self.assertIsNotNone(error)
-        self.assertIn("Maildir", error or "")
+        self.assertIn("Mail folder", error or "")
 
 
 class SourceTemplateTests(unittest.TestCase):
@@ -127,6 +129,19 @@ class SourceTemplateTests(unittest.TestCase):
         text = _render_identity_source("Alice", "alice@example.com")
         self.assertIn("Address=alice@example.com", text)
         self.assertIn("Name=Alice", text)
+
+    def test_identity_source_links_local_transport(self) -> None:
+        text = _render_identity_source("Alice", "alice@localhost")
+        self.assertIn("[Mail Submission]", text)
+        self.assertIn("TransportUid=post-local-sendmail", text)
+
+    def test_transport_source_uses_local_smtp(self) -> None:
+        from post.mail.accounts import _render_transport_source
+
+        text = _render_transport_source()
+        self.assertIn("BackendName=smtp", text)
+        self.assertIn("Host=127.0.0.1", text)
+        self.assertIn("Port=25", text)
 
     def test_account_source_uses_post_uid(self) -> None:
         text = _render_account_source(
@@ -162,6 +177,52 @@ class DefaultConfigTests(unittest.TestCase):
 class BuiltinLocalUidTests(unittest.TestCase):
     def test_builtin_uid_constant(self) -> None:
         self.assertEqual(BUILTIN_LOCAL_UID, "local")
+
+    def test_display_label_uses_eds_name(self) -> None:
+        account = MailAccount(
+            uid=BUILTIN_LOCAL_UID,
+            name="On This Computer",
+            email=None,
+            backend="maildir",
+        )
+        self.assertEqual(account.display_label, EDS_LOCAL_DISPLAY_NAME)
+
+
+class ComposeFromAccountsTests(unittest.TestCase):
+    def test_includes_selected_non_sendable_account_first(self) -> None:
+        local = MailAccount(
+            uid=POST_LOCAL_ACCOUNT_UID,
+            name="Local mail",
+            email="user@localhost",
+            backend="spool",
+            from_name="User",
+            from_address="user@localhost",
+        )
+        remote = MailAccount(
+            uid="imap-1",
+            name="Remote",
+            email="remote@example.com",
+            backend="imap",
+            transport_uid="transport-1",
+            from_address="remote@example.com",
+        )
+        sendable = [remote]
+        result = MailService.compose_from_accounts(sendable, local)
+        self.assertEqual(result[0].uid, POST_LOCAL_ACCOUNT_UID)
+        self.assertEqual(len(result), 2)
+
+    def test_keeps_sendable_list_when_selected_account_can_send(self) -> None:
+        remote = MailAccount(
+            uid="imap-1",
+            name="Remote",
+            email="remote@example.com",
+            backend="imap",
+            transport_uid="transport-1",
+            from_address="remote@example.com",
+        )
+        sendable = [remote]
+        result = MailService.compose_from_accounts(sendable, remote)
+        self.assertIs(result, sendable)
 
 
 class ShouldListLocalAccountTests(unittest.TestCase):

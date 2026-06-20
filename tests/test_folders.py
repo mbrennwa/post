@@ -11,6 +11,7 @@ from post.mail.folders import (
     find_folder_by_type,
     find_inbox_folder,
     find_trash_folder,
+    folder_can_contain_messages,
     format_folder_label,
     guess_inbox_name,
     resolve_move_menu_state,
@@ -52,6 +53,20 @@ class GuessInboxTests(unittest.TestCase):
 
     def test_empty(self) -> None:
         self.assertIsNone(guess_inbox_name([]))
+
+
+class FolderCanContainMessagesTests(unittest.TestCase):
+    def test_noselect_folder_is_skipped(self) -> None:
+        folder = {"full_name": "[GoogleMail]", "flags": 1}
+        self.assertFalse(folder_can_contain_messages(folder))
+
+    def test_virtual_folder_is_skipped(self) -> None:
+        folder = {"full_name": ".#evolution/trash", "flags": 0}
+        self.assertFalse(folder_can_contain_messages(folder))
+
+    def test_regular_inbox_is_included(self) -> None:
+        folder = {"full_name": "INBOX", "flags": 1024}
+        self.assertTrue(folder_can_contain_messages(folder))
 
 
 class FindInboxFolderTests(unittest.TestCase):
