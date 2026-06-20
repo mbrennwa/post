@@ -72,6 +72,18 @@ img[src=""] {
   padding: 0.5rem 0.75rem;
   border-left: 3px solid #888;
 }
+body.no-selection {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.no-selection-placeholder {
+  color: #888888;
+  font-size: 18px;
+  margin: 0;
+}
 a { color: #3584e4; }
 blockquote {
   margin: 0.5rem 0;
@@ -104,6 +116,18 @@ img[src=""] {
   padding: 0.5rem 0.75rem;
   border-left: 3px solid #666666;
 }
+body.no-selection {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.no-selection-placeholder {
+  color: #777777;
+  font-size: 18px;
+  margin: 0;
+}
 a { color: #62a0ea; }
 blockquote {
   margin: 0.5rem 0;
@@ -119,10 +143,15 @@ def build_reader_document(
     body_plain: str | None,
     allow_remote: bool,
     dark: bool = False,
+    no_message_selected: bool = False,
 ) -> str:
     """Wrap message content in a safe HTML shell for WebKit."""
     blocked_notice = ""
-    if body_html:
+    body_class = ""
+    if no_message_selected:
+        content = '<p class="no-selection-placeholder">No Message Selected</p>'
+        body_class = ' class="no-selection"'
+    elif body_html:
         content = body_html
         if not allow_remote:
             has_remote = html_has_blocked_remote_content(content)
@@ -164,7 +193,7 @@ def build_reader_document(
 <meta http-equiv="Content-Security-Policy" content="{csp}">
 <style>{reader_css}</style>
 </head>
-<body>
+<body{body_class}>
 {blocked_notice}
 {content}
 </body>

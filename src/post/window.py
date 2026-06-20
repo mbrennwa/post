@@ -266,7 +266,7 @@ class MainWindow(Adw.ApplicationWindow):
         reader.set_margin_bottom(12)
 
         self._reader_subject = Gtk.Label(
-            label="Select a message",
+            label="",
             xalign=0,
             wrap=True,
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
@@ -275,6 +275,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._reader_subject.set_width_chars(1)
         self._reader_subject.set_hexpand(True)
         self._reader_subject.set_halign(Gtk.Align.FILL)
+        self._reader_subject.set_visible(False)
 
         header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header_row.set_hexpand(True)
@@ -899,7 +900,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._load_messages(account.uid, folder_name)
 
     def _clear_reader(self) -> None:
-        self._reader_subject.set_label("Select a message")
+        self._reader_subject.set_label("")
+        self._reader_subject.set_visible(False)
         self._reader_meta.set_label("")
         self._current_message_uid = None
         self._current_message = None
@@ -2098,6 +2100,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         if error is not None:
             self._reader_subject.set_label("Could not read message")
+            self._reader_subject.set_visible(True)
             self._reader_meta.set_label(str(error))
             self._clear_attachments()
             self._current_message = None
@@ -2133,6 +2136,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._mark_row_read(row)
 
         self._reader_subject.set_label(msg.get("subject") or "(no subject)")
+        self._reader_subject.set_visible(True)
         self._reader_meta.set_label(format_message_header(msg))
         self._current_message = msg
         self._set_message_actions_sensitive(True)
@@ -2148,7 +2152,9 @@ class MainWindow(Adw.ApplicationWindow):
         return Adw.StyleManager.get_default().get_dark()
 
     def _on_app_dark_changed(self, *_args) -> None:
-        if self._current_body.get("html") or self._current_body.get("plain"):
+        if self._current_message is not None:
+            self._show_reader_document()
+        elif not self._reader_subject.get_label():
             self._show_reader_document()
 
     def _show_reader_document(self) -> None:
@@ -2157,6 +2163,7 @@ class MainWindow(Adw.ApplicationWindow):
             body_plain=self._current_body.get("plain"),
             allow_remote=self._load_remote_content,
             dark=self._app_prefers_dark(),
+            no_message_selected=self._current_message is None,
         )
         self._web_view.load_html(document, None)
 

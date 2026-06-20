@@ -15,13 +15,20 @@ install_desktop_integration() {
   local icon_src="$ROOT/data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg"
   local icon_installed="$dest/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg"
   local icon_dir="$dest/icons/hicolor/scalable/apps"
+  local action_icon_src="$ROOT/data/icons/hicolor/scalable/actions/mail-archive-symbolic.svg"
+  local action_icon_installed="$dest/icons/hicolor/scalable/actions/mail-archive-symbolic.svg"
+  local action_icon_dir="$dest/icons/hicolor/scalable/actions"
 
-  mkdir -p "$dest/applications" "$icon_dir"
+  mkdir -p "$dest/applications" "$icon_dir" "$action_icon_dir"
 
   local icon_changed=0
   if [[ ! -f "$icon_installed" ]] || ! cmp -s "$icon_src" "$icon_installed"; then
     icon_changed=1
     cp -f "$icon_src" "$icon_installed"
+  fi
+  if [[ ! -f "$action_icon_installed" ]] || ! cmp -s "$action_icon_src" "$action_icon_installed"; then
+    icon_changed=1
+    cp -f "$action_icon_src" "$action_icon_installed"
   fi
 
   cat >"$desktop_file" <<EOF
@@ -39,28 +46,30 @@ StartupNotify=true
 EOF
   chmod 644 "$desktop_file"
 
-  if [[ ! -f "$dest/icons/hicolor/index.theme" ]]; then
-    cat >"$dest/icons/hicolor/index.theme" <<'EOF'
+  cat >"$dest/icons/hicolor/index.theme" <<'EOF'
 [Icon Theme]
 Name=Hicolor
 Comment=Fallback icon theme
-Directories=scalable/apps
+Directories=scalable/apps,scalable/actions
 
 [scalable/apps]
 Size=256
 Type=Scalable
 MinSize=1
 MaxSize=512
-EOF
-  fi
 
+[scalable/actions]
+Size=256
+Type=Scalable
+MinSize=1
+MaxSize=512
+EOF
+
+  rm -f "$dest/icons/hicolor/icon-theme.cache"
+  gtk-update-icon-cache -f "$dest/icons/hicolor" 2>/dev/null || true
+  update-desktop-database "$dest/applications" 2>/dev/null || true
   if (( icon_changed )); then
-    rm -f "$dest/icons/hicolor/icon-theme.cache"
-    gtk-update-icon-cache -f "$dest/icons/hicolor" 2>/dev/null || true
-    update-desktop-database "$dest/applications" 2>/dev/null || true
     echo "post: icon updated — restart GNOME Shell if the launcher still shows the old icon" >&2
-  else
-    update-desktop-database "$dest/applications" 2>/dev/null || true
   fi
 }
 
