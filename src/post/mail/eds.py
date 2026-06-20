@@ -33,8 +33,9 @@ from .accounts import (
 )
 from post.preferences import get_show_evolution_local
 from .auth import PasswordPromptCallback, authenticate_service_sync
-from .compose import addresses_to_internet_address, build_plain_mime_message
-from .folders import find_folder_by_type, find_trash_folder, guess_inbox_name
+from .compose import addresses_to_internet_address, build_plain_mime_message, normalize_email
+from .correspondents import Correspondent, collect_correspondents
+from .folders import find_folder_by_type, find_trash_folder, guess_inbox_name, is_virtual_folder
 from .search import MessageSearchQuery, message_matches
 
 log = logging.getLogger(__name__)
@@ -156,6 +157,9 @@ class MailService:
     _folder_indexes: dict[tuple[str, str], _FolderMessageIndex] = field(
         default_factory=dict, init=False
     )
+    _correspondent_indexes: dict[str, list[Correspondent]] = field(
+        default_factory=dict, init=False
+    )
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _password_prompt: PasswordPromptCallback | None = field(default=None, init=False)
 
@@ -180,6 +184,7 @@ class MailService:
             self._stores.clear()
             self._transports.clear()
             self._folder_indexes.clear()
+            self._correspondent_indexes.clear()
             self._accounts_by_uid.clear()
             self._session = None
             registry = EDataServer.SourceRegistry.new_sync(None)
@@ -436,6 +441,36 @@ class MailService:
 
         if not ok:
             raise RuntimeError("Could not send message")
+
+    def get_correspondents(self, account_uid: str) -> list[Correspondent]:
+        with self._lock:
+            cached = self._correspondent_indexes.get(account_uid)
+            if cached is not None:
+                return cached
+            correspondents = self._build_correspondents_index_unlocked(account_uid)
+            self._correspondent_indexes[account_uid] = correspondents
+            return correspondents
+
+    def _build_correspondents_index_unlocked(
+        self, account_uid: str
+    ) -> list[Correspondent]:
+        account = self.get_account(account_uid)
+        exclude_emails: set[str] = set()
+        for raw in (account.from_address, account.email):
+            if raw:
+                exclude_emails.add(normalize_email(raw))
+
+        folders = self._list_folders_unlocked(account_uid)
+        messages: list[dict] = []
+        for folder in folders:
+            full_name = folder.get("full_name")
+            if is_virtual_folder(full_name):
+                continue
+            index = self._build_folder_index_unlocked(account_uid, full_name)
+            messages.extend(index.messages)
+
+        messages.sort(key=lambda message: message.get("sort_date") or 0, reverse=True)
+        return collect_correspondents(messages, exclude_emails=exclude_emails)
 
     def list_folders(self, account_uid: str) -> list[dict]:
         with self._lock:
@@ -1286,6 +1321,7 @@ class MailService:
     ) -> None:
         if folder_name:
             self._folder_indexes.pop((account_uid, folder_name), None)
+            self._correspondent_indexes.pop(account_uid, None)
 
     @staticmethod
     def guess_inbox(folders: list[dict]) -> str | None:

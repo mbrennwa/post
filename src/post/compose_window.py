@@ -30,6 +30,12 @@ from post.mail.compose import (
     quote_plain_forward,
     quote_plain_reply,
 )
+from post.mail.correspondents import (
+    Correspondent,
+    apply_address_completion,
+    current_address_token,
+    match_correspondents,
+)
 from post.mail.eds import MailAccount
 
 log = logging.getLogger(__name__)
@@ -111,11 +117,17 @@ class ComposeWindow(Adw.Window):
                 break
         if len(self._send_accounts) == 1:
             self._from_dropdown.set_sensitive(False)
+        self._from_dropdown.connect("notify::selected", self._on_from_account_changed)
         form.append(self._labeled_row("From", self._from_dropdown))
+
+        self._correspondents: list[Correspondent] = []
+        self._correspondents_generation = 0
+        self._completion_model = Gtk.ListStore(str)
 
         self._to_entry = Gtk.Entry()
         self._to_entry.set_placeholder_text("recipient@example.com")
         form.append(self._labeled_row("To", self._to_entry))
+        self._setup_address_completion(self._to_entry)
 
         self._cc_entry = Gtk.Entry()
         self._cc_entry.set_placeholder_text("Optional")
@@ -130,6 +142,7 @@ class ComposeWindow(Adw.Window):
         self._cc_row.append(self._cc_entry)
         self._cc_row.append(self._bcc_toggle_btn)
         form.append(self._cc_row)
+        self._setup_address_completion(self._cc_entry)
 
         self._bcc_entry = Gtk.Entry()
         self._bcc_entry.set_placeholder_text("Optional")
@@ -139,6 +152,7 @@ class ComposeWindow(Adw.Window):
         self._bcc_row.append(self._bcc_entry)
         self._bcc_row.set_visible(False)
         form.append(self._bcc_row)
+        self._setup_address_completion(self._bcc_entry)
 
         self._subject_entry = Gtk.Entry()
         form.append(self._labeled_row("Subject", self._subject_entry))
@@ -165,6 +179,72 @@ class ComposeWindow(Adw.Window):
         self.set_content(toolbar_view)
 
         self._prefill_fields()
+        self._load_correspondents()
+
+    def _setup_address_completion(self, entry: Gtk.Entry) -> None:
+        completion = Gtk.EntryCompletion()
+        completion.set_model(self._completion_model)
+        completion.set_text_column(0)
+        completion.set_minimum_key_length(1)
+        completion.set_popup_completion(True)
+
+        def match_func(completion, key, tree_iter, _user_data) -> bool:
+            token = current_address_token(key)
+            if not token:
+                return False
+            model = completion.get_model()
+            display = model.get_value(tree_iter, 0)
+            matches = match_correspondents(self._correspondents, token, limit=100)
+            return any(match.display == display for match in matches)
+
+        completion.set_match_func(match_func, None)
+
+        def on_match_selected(completion, model, tree_iter, entry) -> bool:
+            display = model.get_value(tree_iter, 0)
+            entry.set_text(apply_address_completion(entry.get_text(), display))
+            entry.set_position(-1)
+            return True
+
+        completion.connect("match-selected", on_match_selected, entry)
+        entry.set_completion(completion)
+
+    def _on_from_account_changed(self, *_args) -> None:
+        self._load_correspondents()
+
+    def _load_correspondents(self) -> None:
+        account = self._selected_account()
+        generation = self._correspondents_generation + 1
+        self._correspondents_generation = generation
+        account_uid = account.uid
+
+        def worker() -> None:
+            try:
+                correspondents = self._mail.get_correspondents(account_uid)
+            except Exception:
+                log.exception(
+                    "Failed to load correspondents for account %s", account_uid
+                )
+                correspondents = []
+            GLib.idle_add(
+                self._on_correspondents_loaded,
+                generation,
+                correspondents,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_correspondents_loaded(
+        self,
+        generation: int,
+        correspondents: list[Correspondent],
+    ) -> bool:
+        if generation != self._correspondents_generation:
+            return False
+        self._correspondents = correspondents
+        self._completion_model.clear()
+        for correspondent in correspondents:
+            self._completion_model.append([correspondent.display])
+        return False
 
     @classmethod
     def _field_label(cls, text: str) -> Gtk.Label:
