@@ -161,6 +161,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._message_stack = Gtk.Stack()
         self._message_stack.set_size_request(320, -1)
+        self._message_stack.set_hexpand(False)
         self._message_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self._message_stack.set_transition_duration(150)
 
@@ -271,20 +272,27 @@ class MainWindow(Adw.ApplicationWindow):
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
         )
         self._reader_subject.add_css_class("title-2")
+        self._reader_subject.set_width_chars(1)
         self._reader_subject.set_hexpand(True)
-        self._reader_subject.set_halign(Gtk.Align.START)
+        self._reader_subject.set_halign(Gtk.Align.FILL)
 
         header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header_row.set_hexpand(True)
-        header_row.append(self._reader_subject)
+        subject_box = Gtk.Box()
+        subject_box.set_hexpand(True)
+        subject_box.append(self._reader_subject)
+        header_row.append(subject_box)
         message_actions = self._build_message_action_buttons()
         message_actions.set_valign(Gtk.Align.START)
         message_actions.set_halign(Gtk.Align.END)
         header_row.append(message_actions)
         reader.append(header_row)
 
-        self._reader_meta = Gtk.Label(label="", xalign=0, wrap=True)
+        self._reader_meta = Gtk.Label(label="", xalign=0, wrap=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
         self._reader_meta.add_css_class("dim-label")
+        self._reader_meta.set_width_chars(1)
+        self._reader_meta.set_hexpand(True)
+        self._reader_meta.set_halign(Gtk.Align.FILL)
         reader.append(self._reader_meta)
 
         self._reader_attachments = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
