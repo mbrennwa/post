@@ -98,7 +98,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._header_search_entry = Gtk.SearchEntry()
         self._header_search_entry.set_placeholder_text(
-            "from: to: subject: cc: is:unread is:flagged has:attachment"
+            "Search messages…  from: to: subject: cc: is:unread is:flagged has:attachment"
         )
         self._header_search_entry.set_tooltip_text("Select a folder to search")
         self._header_search_entry.set_hexpand(True)
@@ -312,6 +312,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._setup_undo_action()
         self._setup_compose_action()
         self._setup_delete_shortcut()
+        self._setup_search_shortcuts()
 
     def _on_window_size_changed(self, *_args) -> None:
         if self.is_maximized():
@@ -379,6 +380,82 @@ class MainWindow(Adw.ApplicationWindow):
         if not state.get("can_trash"):
             return False
         self._move_selected_messages("trash")
+        return True
+
+    def _setup_search_shortcuts(self) -> None:
+        focus_action = Gio.SimpleAction.new("focus-search", None)
+        focus_action.connect("activate", self._on_focus_search_action)
+        self.add_action(focus_action)
+
+        application = self.get_application()
+        if application is not None:
+            application.set_accels_for_action("win.focus-search", ["<Control>f"])
+
+        controller = Gtk.EventControllerKey()
+        controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        controller.connect("key-pressed", self._on_type_to_search_key_pressed)
+        self.add_controller(controller)
+
+    def _focus_search_entry(self, *, select_all: bool = False) -> bool:
+        if not self._header_search_entry.get_sensitive():
+            return False
+        self._header_search_entry.grab_focus()
+        if select_all:
+            self._header_search_entry.select_region(0, -1)
+        return True
+
+    def _on_focus_search_action(self, *_args) -> None:
+        self._focus_search_entry(select_all=True)
+
+    @staticmethod
+    def _typing_targets_search(
+        keyval: int, state: Gdk.ModifierType, focus: Gtk.Widget | None
+    ) -> str | None:
+        if state & (
+            Gdk.ModifierType.CONTROL_MASK
+            | Gdk.ModifierType.ALT_MASK
+            | Gdk.ModifierType.SUPER_MASK
+            | Gdk.ModifierType.META_MASK
+        ):
+            return None
+        if isinstance(focus, Gtk.Editable):
+            return None
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_Escape, Gdk.KEY_Tab):
+            return None
+        if keyval == Gdk.KEY_space:
+            return " "
+        unicode_char = Gdk.keyval_to_unicode(keyval)
+        if unicode_char == 0 or not chr(unicode_char).isprintable():
+            return None
+        return chr(unicode_char)
+
+    def _on_type_to_search_key_pressed(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        state: Gdk.ModifierType,
+    ) -> bool:
+        focus = self.get_focus()
+        if focus is self._header_search_entry:
+            return False
+        if not self._header_search_entry.get_sensitive():
+            return False
+        if self._message_list.get_selected_rows():
+            return False
+
+        char = self._typing_targets_search(keyval, state, focus)
+        if char is None:
+            return False
+
+        if not self._focus_search_entry():
+            return False
+
+        self._search_entry_updating = True
+        self._header_search_entry.set_text(char)
+        self._search_entry_updating = False
+        self._header_search_entry.set_position(-1)
+        self._apply_search_from_entry()
         return True
 
     def _build_message_action_buttons(self) -> Gtk.Widget:
@@ -723,8 +800,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._header_search_entry.set_sensitive(enabled)
         if enabled:
             self._header_search_entry.set_tooltip_text(
-                "Search this folder with from: to: subject: cc: is:unread "
-                "is:flagged has:attachment"
+                "Search this folder. Plain text matches subject, from, to, and cc. "
+                "Use from: to: subject: cc: is:unread is:flagged has:attachment "
+                "to narrow results."
             )
         else:
             self._header_search_entry.set_tooltip_text("Select a folder to search")
@@ -757,18 +835,8 @@ class MainWindow(Adw.ApplicationWindow):
         raw = self._header_search_entry.get_text()
         query = parse_search_query(raw)
         if query is None:
-            if not raw.strip():
-                if self._search_query is not None:
-                    self._search_query = None
-                    self._load_messages(
-                        self._current_account.uid, self._current_folder, offset=0
-                    )
-            else:
+            if self._search_query is not None:
                 self._search_query = None
-                self._set_status(
-                    "Use prefixes: from: to: subject: cc: is:unread "
-                    "is:flagged has:attachment"
-                )
                 self._load_messages(
                     self._current_account.uid, self._current_folder, offset=0
                 )

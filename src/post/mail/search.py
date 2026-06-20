@@ -1,11 +1,12 @@
 # Copyright (C) 2026 mbrennwa
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Prefix-only message search for the current folder."""
+"""Message search for the current folder."""
 
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,8 @@ _BOOLEAN_FIELDS: dict[str, str] = {
     "is:flagged": "flagged",
     "has:attachment": "attachment",
 }
+
+_DEFAULT_TEXT_FIELDS = ("subject", "from", "to", "cc")
 
 # Optional whitespace after ":" so "subject: Auburn" works like "subject:Auburn".
 _QUERY_PATTERN = re.compile(
@@ -42,18 +45,34 @@ class MessageSearchQuery:
     terms: tuple[SearchTerm, ...]
 
 
+def _tokenize_free_text(text: str) -> list[str]:
+    try:
+        return [token for token in shlex.split(text, posix=True) if token]
+    except ValueError:
+        return re.findall(r'"[^"]*"|\S+', text)
+
+
+def _strip_quotes(token: str) -> str:
+    if len(token) >= 2 and token[0] == '"' and token[-1] == '"':
+        return token[1:-1]
+    return token
+
+
 def parse_search_query(raw: str) -> MessageSearchQuery | None:
-    """Parse a prefix-only search string. Returns None if empty or no valid terms."""
+    """Parse a search string. Bare words match subject/from/to/cc; prefixes narrow fields."""
     text = raw.strip()
     if not text:
         return None
 
     terms: list[SearchTerm] = []
+    spans: list[tuple[int, int]] = []
+
     for match in _QUERY_PATTERN.finditer(text):
         boolean = match.group("boolean")
         if boolean is not None:
             field = _BOOLEAN_FIELDS[boolean.lower()]
             terms.append(SearchTerm(field=field, value=None))
+            spans.append(match.span())
             continue
 
         header = match.group("header")
@@ -66,6 +85,22 @@ def parse_search_query(raw: str) -> MessageSearchQuery | None:
         if not value:
             continue
         terms.append(SearchTerm(field=header.lower(), value=value))
+        spans.append(match.span())
+
+    remainder_parts: list[str] = []
+    last = 0
+    for start, end in sorted(spans):
+        if start > last:
+            remainder_parts.append(text[last:start])
+        last = max(last, end)
+    if last < len(text):
+        remainder_parts.append(text[last:])
+    remainder = " ".join(part.strip() for part in remainder_parts if part.strip())
+
+    for token in _tokenize_free_text(remainder):
+        value = _strip_quotes(token).strip()
+        if value:
+            terms.append(SearchTerm(field="text", value=value))
 
     if not terms:
         return None
@@ -77,6 +112,14 @@ def _header_matches(msg: dict[str, Any], field: str, needle: str) -> bool:
     return needle.lower() in haystack
 
 
+def _text_matches(msg: dict[str, Any], needle: str) -> bool:
+    lower = needle.lower()
+    for field in _DEFAULT_TEXT_FIELDS:
+        if lower in (msg.get(field) or "").lower():
+            return True
+    return False
+
+
 def _term_matches(msg: dict[str, Any], term: SearchTerm) -> bool:
     flags = msg.get("flags") or {}
 
@@ -86,6 +129,9 @@ def _term_matches(msg: dict[str, Any], term: SearchTerm) -> bool:
         return bool(flags.get("flagged"))
     if term.field == "attachment":
         return bool(flags.get("attachments"))
+    if term.field == "text":
+        assert term.value is not None
+        return _text_matches(msg, term.value)
 
     assert term.value is not None
     return _header_matches(msg, term.field, term.value)

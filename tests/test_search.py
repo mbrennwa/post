@@ -41,11 +41,26 @@ class ParseSearchQueryTests(unittest.TestCase):
         self.assertIsNone(parse_search_query(""))
         self.assertIsNone(parse_search_query("   "))
 
-    def test_bare_words_returns_none(self) -> None:
-        self.assertIsNone(parse_search_query("hello world"))
+    def test_bare_words_match_text_terms(self) -> None:
+        query = parse_search_query("hello world")
+        assert query is not None
+        self.assertEqual(
+            query.terms,
+            (
+                SearchTerm(field="text", value="hello"),
+                SearchTerm(field="text", value="world"),
+            ),
+        )
 
-    def test_unknown_prefix_returns_none(self) -> None:
-        self.assertIsNone(parse_search_query("foo:bar"))
+    def test_bare_word_single(self) -> None:
+        query = parse_search_query("Auburn")
+        assert query is not None
+        self.assertEqual(query.terms, (SearchTerm(field="text", value="Auburn"),))
+
+    def test_unknown_prefix_becomes_text(self) -> None:
+        query = parse_search_query("foo:bar")
+        assert query is not None
+        self.assertEqual(query.terms, (SearchTerm(field="text", value="foo:bar"),))
 
     def test_from_prefix(self) -> None:
         query = parse_search_query("from:alice")
@@ -115,6 +130,17 @@ class ParseSearchQueryTests(unittest.TestCase):
             ),
         )
 
+    def test_mixed_text_and_prefix(self) -> None:
+        query = parse_search_query("Auburn from:alice")
+        assert query is not None
+        self.assertEqual(
+            set(query.terms),
+            {
+                SearchTerm(field="text", value="Auburn"),
+                SearchTerm(field="from", value="alice"),
+            },
+        )
+
 
 class MessageMatchesTests(unittest.TestCase):
     def test_from_match(self) -> None:
@@ -163,6 +189,30 @@ class MessageMatchesTests(unittest.TestCase):
         )
         self.assertFalse(
             message_matches(_msg(from_addr="alice@x.com", subject="hello"), query)
+        )
+
+    def test_text_matches_any_default_field(self) -> None:
+        query = MessageSearchQuery(terms=(SearchTerm(field="text", value="Auburn"),))
+        self.assertTrue(message_matches(_msg(subject="Fwd: miniREUDI for Auburn"), query))
+        self.assertTrue(message_matches(_msg(from_addr="Auburn <a@b.com>"), query))
+        self.assertFalse(message_matches(_msg(subject="H2 Deconvolution"), query))
+
+    def test_text_and_prefix_combined(self) -> None:
+        query = MessageSearchQuery(
+            terms=(
+                SearchTerm(field="text", value="Auburn"),
+                SearchTerm(field="from", value="alice"),
+            )
+        )
+        self.assertTrue(
+            message_matches(
+                _msg(from_addr="Alice <alice@x.com>", subject="Auburn news"), query
+            )
+        )
+        self.assertFalse(
+            message_matches(
+                _msg(from_addr="Bob <bob@x.com>", subject="Auburn news"), query
+            )
         )
 
 
