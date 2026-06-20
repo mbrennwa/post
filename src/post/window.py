@@ -75,14 +75,26 @@ class MainWindow(Adw.ApplicationWindow):
         outer.set_vexpand(True)
 
         header = Adw.HeaderBar()
-        header.set_title_widget(Gtk.Label(label="Post"))
+        title = Gtk.Label()
+        title.set_markup("<b>Post</b>")
+        header.set_title_widget(title)
 
-        compose_btn = Gtk.Button()
-        compose_btn.set_icon_name("mail-message-new-symbolic")
-        compose_btn.set_label("New Message")
-        compose_btn.set_tooltip_text("New Message")
+        compose_btn = Gtk.Button(icon_name="mail-message-new-symbolic")
+        compose_btn.set_tooltip_text("New Message (Ctrl+N)")
         compose_btn.connect("clicked", self._on_compose_new_clicked)
         header.pack_start(compose_btn)
+
+        self._header_archive_btn = Gtk.Button(icon_name="mail-archive-symbolic")
+        self._header_archive_btn.set_tooltip_text("Archive")
+        self._header_archive_btn.set_sensitive(False)
+        self._header_archive_btn.connect("clicked", self._on_header_archive_clicked)
+        header.pack_start(self._header_archive_btn)
+
+        self._header_trash_btn = Gtk.Button(icon_name="user-trash-symbolic")
+        self._header_trash_btn.set_tooltip_text("Move to Trash")
+        self._header_trash_btn.set_sensitive(False)
+        self._header_trash_btn.connect("clicked", self._on_header_trash_clicked)
+        header.pack_start(self._header_trash_btn)
 
         settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
         settings_btn.set_tooltip_text("Settings")
@@ -370,6 +382,12 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_compose_new_clicked(self, *_args) -> None:
         self._open_compose_new()
+
+    def _on_header_trash_clicked(self, *_args) -> None:
+        self._move_selected_messages("trash")
+
+    def _on_header_archive_clicked(self, *_args) -> None:
+        self._move_selected_messages("archive")
 
     def _on_settings_clicked(self, *_args) -> None:
         if self._settings_dialog is not None:
@@ -1701,6 +1719,19 @@ class MainWindow(Adw.ApplicationWindow):
         rows = self._message_list.get_selected_rows()
         if len(rows) != 1:
             self._set_message_actions_sensitive(False)
+
+        has_selection = bool(rows)
+        can_archive = False
+        can_trash = False
+        if has_selection and self._current_account and self._current_folder:
+            state = self._sidebar.get_move_menu_state(
+                self._current_account.uid, self._current_folder
+            )
+            can_archive = bool(state.get("can_archive"))
+            can_trash = bool(state.get("can_trash"))
+
+        self._header_archive_btn.set_sensitive(can_archive)
+        self._header_trash_btn.set_sensitive(can_trash)
         return False
 
     def _on_message_selected(
