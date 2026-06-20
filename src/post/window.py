@@ -24,13 +24,17 @@ from post.compose_window import ComposeWindow
 from post.credentials import prompt_password_sync
 from post.mail import MailService
 from post.mail.eds import DEFAULT_MESSAGE_PAGE_SIZE, MailAccount
+from post.mail.folders import POST_OUTBOX_FOLDER, is_post_outbox_folder
 from post.mail.search import MessageSearchQuery, parse_search_query
 from post.mail.send_queue import (
     OFFLINE_MAIL_MESSAGE,
     is_network_unavailable_error,
+    list_queued_messages_page,
     list_queued_outbound_messages,
     log_mail_error,
     offline_status_text,
+    read_queued_message,
+    remove_queued_outbound_message,
 )
 from post.settings_window import SettingsWindow
 from post.mail.helpers import (
@@ -407,7 +411,7 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._on_send_queue_flushed, sent)
 
     def _on_send_queue_flushed(self, sent: int) -> bool:
-        self._refresh_status_display()
+        self._on_outbox_changed()
         if sent <= 0:
             return False
         if sent == 1:
@@ -415,6 +419,15 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             self._set_status(f"Sent {sent} queued messages")
         return False
+
+    def _on_outbox_changed(self) -> None:
+        self._sidebar.refresh_outbox_rows()
+        self._refresh_status_display()
+        if (
+            self._current_account
+            and is_post_outbox_folder(self._current_folder)
+        ):
+            self._load_messages(self._current_account.uid, POST_OUTBOX_FOLDER)
 
     def _install_message_list_style(self) -> None:
         provider = Gtk.CssProvider()
@@ -877,6 +890,7 @@ class MainWindow(Adw.ApplicationWindow):
             mail=self._mail,
             account=account,
             set_status=self._set_status,
+            on_outbox_changed=self._on_outbox_changed,
             mode=mode,  # type: ignore[arg-type]
             reply_to=reply_to,
         )
@@ -1013,7 +1027,9 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _update_search_entry_state(self) -> None:
         enabled = (
-            self._current_account is not None and self._current_folder is not None
+            self._current_account is not None
+            and self._current_folder is not None
+            and not is_post_outbox_folder(self._current_folder)
         )
         self._header_search_entry.set_sensitive(enabled)
         if enabled:
@@ -1420,17 +1436,20 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_total = -1
             self._message_has_more = False
             self._load_more_btn.set_visible(False)
+            display_folder = (
+                "Outbox" if is_post_outbox_folder(folder_name) else folder_name
+            )
             if self._search_query is not None:
-                self._set_status(f"Searching {folder_name}…")
+                self._set_status(f"Searching {display_folder}…")
             else:
-                self._set_status(f"Loading {folder_name}…")
+                self._set_status(f"Loading {display_folder}…")
             self._message_popover.popdown()
             self._clear_listbox(self._message_list)
             self._clear_reader()
             loading_label = (
-                f"Searching {folder_name}…"
+                f"Searching {display_folder}…"
                 if self._search_query is not None
-                else f"Loading {folder_name}…"
+                else f"Loading {display_folder}…"
             )
             self._message_loading_label.set_label(loading_label)
             self._message_loading_spinner.start()
@@ -1441,6 +1460,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         load_id = self._messages_load_generation
         search_query = self._search_query
+        viewing_outbox = is_post_outbox_folder(folder_name)
+        from_label = account.email or account.display_label
 
         def worker() -> None:
             error: Exception | None = None
@@ -1449,7 +1470,14 @@ class MainWindow(Adw.ApplicationWindow):
             total = -1
             has_more = False
             try:
-                if search_query is not None:
+                if viewing_outbox:
+                    messages, unread, total, has_more = list_queued_messages_page(
+                        account_uid,
+                        from_label=from_label,
+                        offset=offset,
+                        limit=DEFAULT_MESSAGE_PAGE_SIZE,
+                    )
+                elif search_query is not None:
                     messages, unread, total, has_more = self._mail.search_messages_page(
                         account_uid,
                         folder_name,
@@ -1532,14 +1560,19 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         if offset == 0 and not self._search_query:
-            self._sidebar.update_folder_row(account_uid, folder_name, unread, total)
+            if is_post_outbox_folder(folder_name):
+                self._sidebar.refresh_outbox_row(account_uid)
+            else:
+                self._sidebar.update_folder_row(account_uid, folder_name, unread, total)
 
         self._message_total = total
         self._message_has_more = has_more
 
         if offset == 0 and not messages:
-            folder_label = folder_name
-            if self._search_query is not None:
+            folder_label = "Outbox" if is_post_outbox_folder(folder_name) else folder_name
+            if is_post_outbox_folder(folder_name):
+                self._message_empty_label.set_label("No queued messages")
+            elif self._search_query is not None:
                 self._message_empty_label.set_label(f"No matches in {folder_label}")
             else:
                 self._message_empty_label.set_label(f"No messages in {folder_label}")
@@ -1574,7 +1607,10 @@ class MainWindow(Adw.ApplicationWindow):
         end = min(row_offset + batch_size, len(messages))
         for msg in messages[row_offset:end]:
             subject = msg.get("subject") or "(no subject)"
-            sender = msg.get("from") or ""
+            if is_post_outbox_folder(folder_name):
+                sender = msg.get("preview_to") or msg.get("to") or ""
+            else:
+                sender = msg.get("from") or ""
             unread = message_is_unread(msg)
 
             outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -1695,6 +1731,18 @@ class MainWindow(Adw.ApplicationWindow):
         shown = self._shown_message_count
         total = self._message_total
         label = account.display_label
+        if is_post_outbox_folder(folder_name):
+            if total == 0:
+                self._set_status(f"No queued messages for {label}")
+            elif total >= 0 and shown < total:
+                self._set_status(
+                    f"Showing {shown} of {total} queued for {label}"
+                )
+            elif total >= 0:
+                self._set_status(f"{total} queued for {label}")
+            else:
+                self._set_status(f"{shown} queued for {label}")
+            return
         if self._search_query is not None:
             if total == 0:
                 self._set_status(f"No matches in {label} / {folder_name}")
@@ -1769,19 +1817,21 @@ class MainWindow(Adw.ApplicationWindow):
 
         menu = Gio.Menu()
         count = len(rows)
-        for action in read_menu_items(self._message_seen_states(rows)):
-            menu.append(
-                read_menu_label(action, count),
-                f"win.message-mark-{action}",
-            )
-        for action in flag_menu_items(self._message_flagged_states(rows)):
-            menu.append(
-                flag_menu_label(action, count),
-                f"win.message-{action}",
-            )
-        if len(rows) == 1:
-            menu.append("Reply", "win.message-reply")
-            menu.append("Reply All", "win.message-reply-all")
+        viewing_outbox = is_post_outbox_folder(self._current_folder or "")
+        if not viewing_outbox:
+            for action in read_menu_items(self._message_seen_states(rows)):
+                menu.append(
+                    read_menu_label(action, count),
+                    f"win.message-mark-{action}",
+                )
+            for action in flag_menu_items(self._message_flagged_states(rows)):
+                menu.append(
+                    flag_menu_label(action, count),
+                    f"win.message-{action}",
+                )
+            if len(rows) == 1:
+                menu.append("Reply", "win.message-reply")
+                menu.append("Reply All", "win.message-reply-all")
         if can_archive:
             menu.append(
                 self._count_menu_label("Archive", rows), "win.message-archive"
@@ -1865,6 +1915,18 @@ class MainWindow(Adw.ApplicationWindow):
     def _move_context_messages(self, destination: str) -> None:
         self._move_messages(destination, list(self._context_message_rows))
 
+    def _delete_queued_messages(self, queue_ids: list[str]) -> None:
+        if not self._current_account:
+            return
+        for queue_id in queue_ids:
+            remove_queued_outbound_message(queue_id)
+        count = len(queue_ids)
+        if count == 1:
+            self._set_status("Removed 1 queued message")
+        else:
+            self._set_status(f"Removed {count} queued messages")
+        self._on_outbox_changed()
+
     def _move_messages(self, destination: str, rows: list[Gtk.ListBoxRow]) -> None:
         if not rows or not self._current_account or not self._current_folder:
             return
@@ -1884,6 +1946,10 @@ class MainWindow(Adw.ApplicationWindow):
         account_uid = self._current_account.uid
         folder_name = self._current_folder
         self._message_popover.popdown()
+
+        if is_post_outbox_folder(folder_name) and destination == "trash":
+            self._delete_queued_messages(uids)
+            return
 
         def worker() -> None:
             error: Exception | None = None
@@ -2285,12 +2351,21 @@ class MainWindow(Adw.ApplicationWindow):
         folder_name = self._current_folder
         self._message_read_generation += 1
         read_id = self._message_read_generation
+        viewing_outbox = is_post_outbox_folder(folder_name)
+        from_label = account.email or account.display_label
 
         def worker() -> None:
             error: Exception | None = None
             msg: dict | None = None
             try:
-                msg = self._mail.read_message(account.uid, folder_name, uid)
+                if viewing_outbox:
+                    msg = read_queued_message(
+                        uid,
+                        account_uid=account.uid,
+                        from_label=from_label,
+                    )
+                else:
+                    msg = self._mail.read_message(account.uid, folder_name, uid)
             except Exception as exc:
                 log.exception("Failed to read message")
                 error = exc

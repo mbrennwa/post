@@ -56,6 +56,22 @@ def folder_name_from_uri(uri: str | None) -> str | None:
     return uri or None
 
 
+POST_OUTBOX_FOLDER = ".post/Outbox"
+
+
+def is_post_outbox_folder(full_name: str | None) -> bool:
+    return full_name == POST_OUTBOX_FOLDER
+
+
+def outbox_folder_dict(total: int) -> dict:
+    return {
+        "full_name": POST_OUTBOX_FOLDER,
+        "display_name": "Outbox",
+        "unread": 0,
+        "total": total,
+    }
+
+
 def is_virtual_folder(full_name: str | None) -> bool:
     return bool(full_name and full_name.startswith(".#evolution/"))
 

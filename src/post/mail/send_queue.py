@@ -12,7 +12,10 @@ import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any
+
+from .helpers import paginate_messages
 
 import gi
 
@@ -175,3 +178,100 @@ def remove_queued_outbound_message(queue_id: str) -> None:
         os.unlink(path)
     except FileNotFoundError:
         pass
+
+
+def count_queued_for_account(account_uid: str) -> int:
+    return sum(
+        1
+        for _, message in list_queued_outbound_messages()
+        if message.account_uid == account_uid
+    )
+
+
+def list_queued_for_account(
+    account_uid: str,
+) -> list[tuple[str, QueuedOutboundMessage]]:
+    queued = [
+        (queue_id, message)
+        for queue_id, message in list_queued_outbound_messages()
+        if message.account_uid == account_uid
+    ]
+    queued.sort(key=lambda item: item[1].queued_at, reverse=True)
+    return queued
+
+
+def _format_address_field(addrs: list[str] | None) -> str:
+    if not addrs:
+        return ""
+    return ", ".join(addrs)
+
+
+def _preview_to_text(to_text: str) -> str:
+    if len(to_text) <= 60:
+        return to_text
+    return to_text[:57] + "..."
+
+
+def queued_to_list_dict(
+    queue_id: str,
+    message: QueuedOutboundMessage,
+    *,
+    from_label: str,
+) -> dict[str, Any]:
+    to_text = _format_address_field(message.to)
+    return {
+        "uid": queue_id,
+        "subject": message.subject or "(No subject)",
+        "from": from_label,
+        "to": to_text,
+        "preview_to": _preview_to_text(to_text),
+        "sort_date": message.queued_at,
+        "flags": {"seen": True},
+    }
+
+
+def read_queued_message(
+    queue_id: str,
+    *,
+    account_uid: str,
+    from_label: str,
+) -> dict[str, Any]:
+    path = os.path.join(outbox_dir(), f"{queue_id}.json")
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("Invalid queued message")
+    message = QueuedOutboundMessage.from_dict(data)
+    if message.account_uid != account_uid:
+        raise ValueError("Queued message belongs to another account")
+    queued_at = datetime.fromtimestamp(message.queued_at, tz=timezone.utc)
+    date_str = queued_at.strftime("%Y-%m-%d %H:%M")
+    return {
+        "uid": queue_id,
+        "subject": message.subject or "(No subject)",
+        "from": from_label,
+        "to": _format_address_field(message.to),
+        "cc": _format_address_field(message.cc),
+        "bcc": _format_address_field(message.bcc),
+        "date_sent": date_str,
+        "body_plain": message.body or "",
+        "body_html": None,
+        "flags": {"seen": True, "queued": True},
+    }
+
+
+def list_queued_messages_page(
+    account_uid: str,
+    *,
+    from_label: str,
+    offset: int = 0,
+    limit: int = 50,
+) -> tuple[list[dict[str, Any]], int, int, bool]:
+    items = list_queued_for_account(account_uid)
+    total = len(items)
+    messages = [
+        queued_to_list_dict(queue_id, message, from_label=from_label)
+        for queue_id, message in items
+    ]
+    page, has_more = paginate_messages(messages, offset, limit)
+    return page, 0, total, has_more

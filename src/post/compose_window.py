@@ -58,12 +58,14 @@ class ComposeWindow(Adw.Window):
         mail: MailService,
         account: MailAccount,
         set_status: SetStatus,
+        on_outbox_changed: Callable[[], None] | None = None,
         mode: ComposeMode = "new",
         reply_to: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(transient_for=parent, modal=False)
         self._mail = mail
         self._set_status = set_status
+        self._on_outbox_changed = on_outbox_changed
         self._mode = mode
         self._reply_to = reply_to
         self._sending = False
@@ -538,6 +540,8 @@ class ComposeWindow(Adw.Window):
                     references=references,
                 )
             except SendQueued as exc:
+                if self._on_outbox_changed is not None:
+                    GLib.idle_add(self._on_outbox_changed)
                 GLib.idle_add(self._on_send_finished, None, exc.user_message)
                 return
             except Exception as exc:

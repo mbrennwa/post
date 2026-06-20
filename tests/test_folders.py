@@ -7,6 +7,7 @@ import unittest
 
 from post.mail.eds import MailAccount
 from post.mail.folders import (
+    POST_OUTBOX_FOLDER,
     filter_sidebar_folders,
     find_folder_by_type,
     find_inbox_folder,
@@ -15,6 +16,8 @@ from post.mail.folders import (
     folder_name_from_uri,
     format_folder_label,
     guess_inbox_name,
+    is_post_outbox_folder,
+    outbox_folder_dict,
     resolve_move_menu_state,
 )
 
@@ -250,6 +253,19 @@ class MailAccountDisplayLabelTests(unittest.TestCase):
         )
         self.assertTrue(ready.can_send)
         self.assertFalse(missing_transport.can_send)
+
+
+class PostOutboxFolderTests(unittest.TestCase):
+    def test_sentinel_folder(self) -> None:
+        self.assertEqual(POST_OUTBOX_FOLDER, ".post/Outbox")
+        self.assertTrue(is_post_outbox_folder(POST_OUTBOX_FOLDER))
+        self.assertFalse(is_post_outbox_folder("INBOX"))
+
+    def test_outbox_folder_dict(self) -> None:
+        folder = outbox_folder_dict(3)
+        self.assertEqual(folder["full_name"], POST_OUTBOX_FOLDER)
+        self.assertEqual(folder["display_name"], "Outbox")
+        self.assertEqual(folder["total"], 3)
 
 
 if __name__ == "__main__":

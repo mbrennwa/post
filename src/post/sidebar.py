@@ -22,14 +22,18 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 from post.mail import MailService
 from post.mail.eds import MailAccount
 from post.mail.folders import (
+    POST_OUTBOX_FOLDER,
     filter_sidebar_folders,
     find_inbox_folder,
     format_folder_label,
     guess_inbox_name,
+    is_post_outbox_folder,
+    outbox_folder_dict,
     resolve_move_menu_state,
 )
 from post.mail.send_queue import (
     OFFLINE_FOLDER_MESSAGE,
+    count_queued_for_account,
     is_network_unavailable_error,
     log_mail_error,
 )
@@ -156,6 +160,14 @@ class MailSidebar:
                 row = row.get_next_sibling()
 
     def get_move_menu_state(self, account_uid: str, folder_name: str) -> dict:
+        if is_post_outbox_folder(folder_name):
+            return {
+                "archive_folder": None,
+                "trash_folder": None,
+                "inbox_folder": self.inbox_folder_for_account(account_uid),
+                "can_archive": False,
+                "can_trash": True,
+            }
         import gi
 
         gi.require_version("Camel", "1.2")
@@ -169,6 +181,14 @@ class MailSidebar:
             trash_type=Camel.FolderInfoFlags.TYPE_TRASH,
             type_mask=Camel.FOLDER_TYPE_MASK,
         )
+
+    def refresh_outbox_row(self, account_uid: str) -> None:
+        count = count_queued_for_account(account_uid)
+        self.update_folder_row(account_uid, POST_OUTBOX_FOLDER, 0, count)
+
+    def refresh_outbox_rows(self) -> None:
+        for account_uid in self._folder_lists:
+            self.refresh_outbox_row(account_uid)
 
     def inbox_folder_for_account(self, account_uid: str) -> str | None:
         return self._account_inbox_folders.get(account_uid)
@@ -239,6 +259,10 @@ class MailSidebar:
         self._start_folder_load(self._load_generation, account)
 
     def refresh_folder_row(self, account_uid: str, folder_name: str) -> None:
+        if is_post_outbox_folder(folder_name):
+            self.refresh_outbox_row(account_uid)
+            return
+
         def worker() -> None:
             error: Exception | None = None
             unread = -1
@@ -407,6 +431,7 @@ class MailSidebar:
             error_label.set_margin_end(12)
             error_label.set_margin_bottom(8)
             folder_list.append(self._wrap_list_row(error_label))
+            self._add_outbox_row(account_uid)
             return False
 
         assert folders is not None
@@ -415,6 +440,7 @@ class MailSidebar:
         for folder in folders:
             folder_list.append(self._make_folder_row(account_uid, folder))
 
+        self._add_outbox_row(account_uid)
         self._add_inbox_row(account_uid, folders)
         self.refresh_inbox_counts(account_uid)
 
@@ -736,6 +762,19 @@ class MailSidebar:
                 folder_name=row.folder_name,
             )
         return row
+
+    def _add_outbox_row(self, account_uid: str) -> None:
+        folder_list = self._folder_lists.get(account_uid)
+        if folder_list is None:
+            return
+        count = count_queued_for_account(account_uid)
+        folder_list.append(
+            self._make_folder_row(
+                account_uid,
+                outbox_folder_dict(count),
+                display="Outbox",
+            )
+        )
 
     @staticmethod
     def _clear_listbox(listbox: Gtk.ListBox) -> None:
