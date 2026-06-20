@@ -12,8 +12,10 @@ from collections.abc import Callable
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Gio", "2.0")
+gi.require_version("Gdk", "4.0")
 
-from gi.repository import GLib, Gtk
+from gi.repository import Gdk, Gio, GLib, Gtk
 
 from post.mail import MailService
 from post.mail.eds import MailAccount
@@ -29,6 +31,8 @@ log = logging.getLogger(__name__)
 
 OnFolderSelected = Callable[[MailAccount, str], None]
 SetStatus = Callable[[str], None]
+OnRefreshAccount = Callable[[str], None]
+OnRefreshFolder = Callable[[str, str], None]
 
 
 class MailSidebar:
@@ -38,10 +42,14 @@ class MailSidebar:
         *,
         on_folder_selected: OnFolderSelected,
         set_status: SetStatus,
+        on_refresh_account: OnRefreshAccount | None = None,
+        on_refresh_folder: OnRefreshFolder | None = None,
     ) -> None:
         self._mail = mail
         self._on_folder_selected = on_folder_selected
         self._set_status = set_status
+        self._on_refresh_account = on_refresh_account
+        self._on_refresh_folder = on_refresh_folder
 
         self._accounts: list[MailAccount] = []
         self._accounts_by_uid: dict[str, MailAccount] = {}
@@ -56,6 +64,7 @@ class MailSidebar:
         self._load_generation = 0
         self._needs_initial_selection = False
         self._activated_folder: tuple[str, str] | None = None
+        self._refresh_target: tuple[str, str | None] | None = None
 
         self._sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self._sidebar_box.add_css_class("navigation-sidebar")
@@ -65,6 +74,7 @@ class MailSidebar:
         scroll.set_size_request(240, -1)
         scroll.set_child(self._sidebar_box)
         self._widget = scroll
+        self._setup_refresh_menu()
 
     @property
     def widget(self) -> Gtk.ScrolledWindow:
@@ -176,6 +186,144 @@ class MailSidebar:
         total = inbox.get("total", -1)
         self.update_folder_row(account_uid, folder_name, unread, total)
         return False
+
+    def reload_account(self, account_uid: str) -> None:
+        account = self._accounts_by_uid.get(account_uid)
+        folder_list = self._folder_lists.get(account_uid)
+        if account is None or folder_list is None:
+            return
+
+        self._clear_listbox(folder_list)
+        loading = Gtk.Label(label="Loading folders…", xalign=0)
+        loading.add_css_class("dim-label")
+        loading.set_margin_start(12)
+        loading.set_margin_end(12)
+        loading.set_margin_bottom(8)
+        folder_list.append(self._wrap_list_row(loading))
+        self._start_folder_load(self._load_generation, account)
+
+    def refresh_folder_row(self, account_uid: str, folder_name: str) -> None:
+        def worker() -> None:
+            error: Exception | None = None
+            folder: dict | None = None
+            try:
+                folders = self._mail.list_folders(account_uid)
+                folder = next(
+                    (
+                        item
+                        for item in folders
+                        if item.get("full_name") == folder_name
+                    ),
+                    None,
+                )
+            except Exception as exc:
+                log.exception(
+                    "Failed to refresh folder %s/%s", account_uid, folder_name
+                )
+                error = exc
+            GLib.idle_add(
+                self._on_folder_row_refreshed,
+                account_uid,
+                folder_name,
+                folder,
+                error,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_folder_row_refreshed(
+        self,
+        account_uid: str,
+        folder_name: str,
+        folder: dict | None,
+        error: Exception | None,
+    ) -> bool:
+        if error is not None or folder is None:
+            return False
+        unread = folder.get("unread", -1)
+        total = folder.get("total", -1)
+        self.update_folder_row(account_uid, folder_name, unread, total)
+        return False
+
+    def _setup_refresh_menu(self) -> None:
+        action = Gio.SimpleAction.new("refresh", None)
+        action.connect("activate", self._on_refresh_menu_activate)
+        group = Gio.SimpleActionGroup.new()
+        group.add_action(action)
+        self._widget.insert_action_group("sidebar", group)
+
+        menu = Gio.Menu()
+        menu.append("Refresh", "sidebar.refresh")
+        self._refresh_popover = Gtk.PopoverMenu.new_from_model(menu)
+
+    def _on_refresh_menu_activate(self, *_args) -> None:
+        if self._refresh_target is None:
+            return
+        account_uid, folder_name = self._refresh_target
+        self._refresh_target = None
+        if folder_name is None:
+            if self._on_refresh_account is not None:
+                self._on_refresh_account(account_uid)
+            return
+        if self._on_refresh_folder is not None:
+            self._on_refresh_folder(account_uid, folder_name)
+
+    def _attach_refresh_menu(
+        self,
+        widget: Gtk.Widget,
+        *,
+        account_uid: str,
+        folder_name: str | None,
+    ) -> None:
+        gesture = Gtk.GestureClick()
+        gesture.set_button(0)
+        gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        gesture.connect(
+            "pressed",
+            self._on_sidebar_context_pressed,
+            account_uid,
+            folder_name,
+        )
+        widget.add_controller(gesture)
+
+    def _on_sidebar_context_pressed(
+        self,
+        gesture: Gtk.GestureClick,
+        n_press: int,
+        x: float,
+        y: float,
+        account_uid: str,
+        folder_name: str | None,
+    ) -> None:
+        if n_press != 1:
+            return
+        event = gesture.get_current_event()
+        if event is None or not Gdk.Event.triggers_context_menu(event):
+            return
+
+        self._refresh_target = (account_uid, folder_name)
+        widget = gesture.get_widget()
+        if widget is None:
+            return
+        self._ensure_refresh_popover_parent(widget)
+        rect = Gdk.Rectangle()
+        rect.x = int(x)
+        rect.y = int(y)
+        rect.width = 1
+        rect.height = 1
+        self._refresh_popover.set_pointing_to(rect)
+        self._refresh_popover.popup()
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _ensure_refresh_popover_parent(self, widget: Gtk.Widget) -> None:
+        current = self._refresh_popover.get_parent()
+        if current is widget:
+            return
+        if current is not None:
+            self._refresh_popover.popdown()
+            if self._refresh_popover.get_parent() is current:
+                self._refresh_popover.unparent()
+        self._refresh_popover.set_parent(widget)
 
     def _start_folder_load(self, load_id: int, account: MailAccount) -> None:
         def worker() -> None:
@@ -328,9 +476,14 @@ class MailSidebar:
         if inbox_folder is None:
             return
 
-        first = self._inbox_list.get_first_child()
-        if first is not None and getattr(first, "folder_name", None) is None:
-            self._inbox_list.remove(first)
+        row = self._inbox_list.get_first_child()
+        while row is not None:
+            next_row = row.get_next_sibling()
+            if getattr(row, "account_uid", None) == account_uid or (
+                getattr(row, "folder_name", None) is None
+            ):
+                self._inbox_list.remove(row)
+            row = next_row
 
         account = self._accounts_by_uid.get(account_uid)
         display = account.display_label if account else account_uid
@@ -375,6 +528,7 @@ class MailSidebar:
         label.set_ellipsize(3)
         label.set_margin_top(4)
         label.set_margin_bottom(4)
+        self._attach_refresh_menu(label, account_uid=account.uid, folder_name=None)
         return label
 
     @staticmethod
@@ -402,6 +556,12 @@ class MailSidebar:
         row.account_uid = account_uid
         row.folder_name = folder.get("full_name")
         row.display_name = display
+        if row.folder_name:
+            self._attach_refresh_menu(
+                row,
+                account_uid=account_uid,
+                folder_name=row.folder_name,
+            )
         return row
 
     @staticmethod

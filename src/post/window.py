@@ -34,6 +34,7 @@ from post.mail.helpers import (
     message_is_unread,
 )
 from post.reader import build_reader_document
+from post.preferences import get_load_remote_content
 from post.sidebar import MailSidebar
 
 log = logging.getLogger(__name__)
@@ -64,40 +65,25 @@ class MainWindow(Adw.ApplicationWindow):
         self._pending_move_undo: dict | None = None
         self._undo_toast: Adw.Toast | None = None
         self._settings_dialog: SettingsWindow | None = None
+        self._load_remote_content = get_load_remote_content()
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.set_vexpand(True)
 
         header = Adw.HeaderBar()
-        title = Adw.WindowTitle(title="Post", subtitle="Mail")
-        header.set_title_widget(title)
-
-        settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
-        settings_btn.set_tooltip_text("Settings")
-        settings_btn.connect("clicked", self._on_settings_clicked)
-        header.pack_end(settings_btn)
+        header.set_title_widget(Gtk.Label(label="Post"))
 
         compose_btn = Gtk.Button()
         compose_btn.set_icon_name("mail-message-new-symbolic")
         compose_btn.set_label("New Message")
         compose_btn.set_tooltip_text("New Message")
         compose_btn.connect("clicked", self._on_compose_new_clicked)
-        header.pack_end(compose_btn)
+        header.pack_start(compose_btn)
 
-        refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
-        refresh_btn.set_tooltip_text("Refresh")
-        refresh_btn.connect("clicked", self._on_refresh)
-        header.pack_end(refresh_btn)
-
-        remote_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        remote_label = Gtk.Label(label="Remote content")
-        remote_label.add_css_class("dim-label")
-        self._remote_switch = Gtk.Switch(active=False)
-        self._remote_switch.set_tooltip_text("Load remote images and linked resources")
-        self._remote_switch.connect("notify::active", self._on_remote_content_changed)
-        remote_box.append(remote_label)
-        remote_box.append(self._remote_switch)
-        header.pack_end(remote_box)
+        settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
+        settings_btn.set_tooltip_text("Settings")
+        settings_btn.connect("clicked", self._on_settings_clicked)
+        header.pack_end(settings_btn)
 
         panes = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         panes.set_vexpand(True)
@@ -107,6 +93,8 @@ class MainWindow(Adw.ApplicationWindow):
             self._mail,
             on_folder_selected=self._on_folder_selected,
             set_status=self._set_status,
+            on_refresh_account=self._on_sidebar_refresh_account,
+            on_refresh_folder=self._on_sidebar_refresh_folder,
         )
         panes.append(self._sidebar.widget)
 
@@ -388,6 +376,7 @@ class MainWindow(Adw.ApplicationWindow):
             mail=self._mail,
             set_status=self._set_status,
             on_saved=self._reload_sidebar,
+            on_load_remote_content_changed=self._on_load_remote_content_changed,
         )
         self._settings_dialog = dialog
         dialog.connect("closed", self._on_settings_closed)
@@ -395,6 +384,24 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_settings_closed(self, *_args) -> None:
         self._settings_dialog = None
+
+    def _on_sidebar_refresh_account(self, account_uid: str) -> None:
+        self._sidebar.reload_account(account_uid)
+
+    def _on_sidebar_refresh_folder(self, account_uid: str, folder_name: str) -> None:
+        self._sidebar.refresh_folder_row(account_uid, folder_name)
+        if (
+            self._current_account
+            and self._current_folder
+            and self._current_account.uid == account_uid
+            and self._current_folder == folder_name
+        ):
+            self._load_messages(account_uid, folder_name)
+
+    def _on_load_remote_content_changed(self, enabled: bool) -> None:
+        self._load_remote_content = enabled
+        if self._current_body.get("html") or self._current_body.get("plain"):
+            self._show_reader_document()
 
     def _on_reply_action(self, *_args) -> None:
         self._open_compose_on_message("reply")
@@ -1760,7 +1767,7 @@ class MainWindow(Adw.ApplicationWindow):
         document = build_reader_document(
             body_html=self._current_body.get("html"),
             body_plain=self._current_body.get("plain"),
-            allow_remote=self._remote_switch.get_active(),
+            allow_remote=self._load_remote_content,
         )
         self._web_view.load_html(document, None)
 
@@ -1812,7 +1819,3 @@ class MainWindow(Adw.ApplicationWindow):
         self._open_uri_externally(uri)
         decision.ignore()
         return True
-
-    def _on_remote_content_changed(self, *_args) -> None:
-        if self._current_body.get("html") or self._current_body.get("plain"):
-            self._show_reader_document()

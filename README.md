@@ -11,7 +11,7 @@
 
 - Browse folders and read messages (paginated)
 - Multiple accounts with a unified Inbox view
-- HTML messages with remote images off by default
+- HTML messages with remote images off by default (enable in Settings → Reading)
 - Unread indicators, dates, and attachment hints in the message list
 - Mark messages as read when opened; folder counts update
 - Open attachments from the reading pane (right-click to save or open with…)

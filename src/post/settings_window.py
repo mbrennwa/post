@@ -28,12 +28,18 @@ from post.mail.accounts import (
     read_local_mail_config,
     validate_local_mail_config,
 )
-from post.preferences import get_show_evolution_local, set_show_evolution_local
+from post.preferences import (
+    get_load_remote_content,
+    get_show_evolution_local,
+    set_load_remote_content,
+    set_show_evolution_local,
+)
 
 log = logging.getLogger(__name__)
 
 SetStatus = Callable[[str], None]
 OnSaved = Callable[[], None]
+OnLoadRemoteContentChanged = Callable[[bool], None]
 
 
 class SettingsDialog(Adw.PreferencesDialog):
@@ -44,21 +50,44 @@ class SettingsDialog(Adw.PreferencesDialog):
         mail: MailService,
         set_status: SetStatus,
         on_saved: OnSaved,
+        on_load_remote_content_changed: OnLoadRemoteContentChanged | None = None,
     ) -> None:
         super().__init__()
         self._parent = parent
         self._mail = mail
         self._set_status = set_status
         self._on_saved = on_saved
+        self._remote_content_changed_callback = on_load_remote_content_changed
         self._saving = False
         self._loading_settings = True
 
         existing = read_local_mail_config(mail.registry)
         self._config = existing or default_local_mail_config()
 
+        self.add(self._build_reading_page())
         self.add(self._build_composing_page())
         self.add(self._build_local_mail_page())
         self._loading_settings = False
+
+    def _build_reading_page(self) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage()
+        page.set_title("Reading")
+        page.set_icon_name("mail-read-symbolic")
+
+        group = Adw.PreferencesGroup()
+        group.set_title("Message display")
+
+        self._remote_content_row = Adw.SwitchRow(title="Load remote content")
+        self._remote_content_row.set_subtitle(
+            "Show remote images and linked resources in HTML messages"
+        )
+        self._remote_content_row.set_active(get_load_remote_content())
+        self._remote_content_row.connect(
+            "notify::active", self._on_remote_content_row_changed
+        )
+        group.add(self._remote_content_row)
+        page.add(group)
+        return page
 
     def _build_composing_page(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage()
@@ -159,6 +188,14 @@ class SettingsDialog(Adw.PreferencesDialog):
             return
         set_show_evolution_local(self._evolution_local_row.get_active())
         self._on_saved()
+
+    def _on_remote_content_row_changed(self, *_args) -> None:
+        if self._loading_settings:
+            return
+        enabled = self._remote_content_row.get_active()
+        set_load_remote_content(enabled)
+        if self._remote_content_changed_callback is not None:
+            self._remote_content_changed_callback(enabled)
 
     def _current_config(self) -> LocalMailConfig:
         return LocalMailConfig(

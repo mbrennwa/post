@@ -34,6 +34,16 @@ def get_show_evolution_local() -> bool | None:
     return bool(value)
 
 
+def get_load_remote_content() -> bool:
+    return bool(_load_raw().get("load_remote_content"))
+
+
+def set_load_remote_content(value: bool) -> None:
+    data = _load_raw()
+    data["load_remote_content"] = value
+    _save_raw(data)
+
+
 def set_show_evolution_local(value: bool) -> None:
     data = _load_raw()
     data["show_evolution_local"] = value

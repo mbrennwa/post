@@ -102,7 +102,7 @@ def build_reader_document(
             if has_remote:
                 blocked_notice = (
                     '<p class="remote-blocked-notice">'
-                    "Remote images are hidden. Turn on “Load remote content” to show them."
+                    "Remote images are hidden. Enable “Load remote content” in Settings to show them."
                     "</p>"
                 )
     elif body_plain:
