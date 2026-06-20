@@ -481,6 +481,10 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
     def _on_close_request(self, *_args) -> bool:
+        try:
+            self._mail.shutdown_sync()
+        except Exception:
+            log.exception("Failed to flush mail changes on exit")
         self._persist_window_state()
         return False
 
@@ -2226,32 +2230,23 @@ class MainWindow(Adw.ApplicationWindow):
         account_uid = self._current_account.uid
         folder_name = self._current_folder
 
-        def worker() -> None:
-            error: Exception | None = None
-            result: dict | None = None
-            try:
-                if flag_name == "seen":
-                    assert seen is not None
-                    result = self._mail.set_messages_seen(
-                        account_uid, folder_name, uids, seen=seen
-                    )
-                else:
-                    assert flagged is not None
-                    result = self._mail.set_messages_flagged(
-                        account_uid, folder_name, uids, flagged=flagged
-                    )
-            except Exception as exc:
-                log.exception("Failed to update message %s", flag_name)
-                error = exc
-            GLib.idle_add(
-                self._on_messages_flag_toggled,
-                rows,
-                flag_name,
-                result,
-                error,
-            )
-
-        threading.Thread(target=worker, daemon=True).start()
+        error: Exception | None = None
+        result: dict | None = None
+        try:
+            if flag_name == "seen":
+                assert seen is not None
+                result = self._mail.set_messages_seen(
+                    account_uid, folder_name, uids, seen=seen
+                )
+            else:
+                assert flagged is not None
+                result = self._mail.set_messages_flagged(
+                    account_uid, folder_name, uids, flagged=flagged
+                )
+        except Exception as exc:
+            log.exception("Failed to update message %s", flag_name)
+            error = exc
+        self._on_messages_flag_toggled(rows, flag_name, result, error)
 
     def _on_messages_flag_toggled(
         self,
@@ -2427,6 +2422,7 @@ class MainWindow(Adw.ApplicationWindow):
                 msg["folder_unread"],
                 msg["folder_total"],
             )
+        if (msg.get("flags") or {}).get("seen"):
             self._mark_row_read(row)
 
         self._reader_subject.set_label(msg.get("subject") or "(no subject)")

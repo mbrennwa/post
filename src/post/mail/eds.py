@@ -10,8 +10,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import gi
 
@@ -195,6 +196,56 @@ class MailService:
     )
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _password_prompt: PasswordPromptCallback | None = field(default=None, init=False)
+    _pending_mail_ops: int = field(default=0, init=False)
+    _pending_mail_ops_cond: threading.Condition = field(
+        default_factory=threading.Condition, init=False, repr=False
+    )
+
+    def _enter_mail_op(self) -> None:
+        with self._pending_mail_ops_cond:
+            self._pending_mail_ops += 1
+
+    def _leave_mail_op(self) -> None:
+        with self._pending_mail_ops_cond:
+            self._pending_mail_ops -= 1
+            if self._pending_mail_ops == 0:
+                self._pending_mail_ops_cond.notify_all()
+
+    def _with_mail_op(self, operation: Callable[[], Any]) -> Any:
+        self._enter_mail_op()
+        try:
+            with self._lock:
+                return operation()
+        finally:
+            self._leave_mail_op()
+
+    def wait_for_pending_mail_ops(self, timeout: float = 10.0) -> None:
+        deadline = time.monotonic() + timeout
+        with self._pending_mail_ops_cond:
+            while self._pending_mail_ops > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.warning(
+                        "Timed out waiting for %d pending mail operation(s)",
+                        self._pending_mail_ops,
+                    )
+                    return
+                self._pending_mail_ops_cond.wait(timeout=remaining)
+
+    def shutdown_sync(self) -> None:
+        """Wait for in-flight mail work and flush stores before exit."""
+        self.wait_for_pending_mail_ops()
+        with self._lock:
+            for store in self._stores.values():
+                if (
+                    store.get_connection_status()
+                    != Camel.ServiceConnectionStatus.CONNECTED
+                ):
+                    continue
+                try:
+                    store.synchronize_sync(False, None)
+                except GLib.Error:
+                    log.exception("Failed to flush mail store on shutdown")
 
     @classmethod
     def connect(cls) -> MailService:
@@ -360,6 +411,7 @@ class MailService:
             if store.get_connection_status() == Camel.ServiceConnectionStatus.CONNECTED:
                 if isinstance(store, Camel.OfflineStore) and not store.get_online():
                     store.set_online_sync(True, None)
+                self._configure_store_settings_unlocked(store)
                 return store
             del self._stores[account_uid]
 
@@ -383,8 +435,18 @@ class MailService:
         else:
             store.connect_sync(None)
 
+        self._configure_store_settings_unlocked(store)
         self._stores[account_uid] = store
         return store
+
+    @staticmethod
+    def _configure_store_settings_unlocked(store: Camel.Store) -> None:
+        settings = store.ref_settings()
+        if settings is None:
+            return
+        set_interval = getattr(settings, "set_store_changes_interval", None)
+        if callable(set_interval):
+            set_interval(0)
 
     def _get_transport_unlocked(
         self,
@@ -880,6 +942,14 @@ class MailService:
                 return None
             raise
 
+    def _require_folder_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> Camel.Folder:
+        folder = self._open_folder_unlocked(account_uid, folder_name)
+        if folder is None:
+            raise ValueError(f"Folder not found: {folder_name}")
+        return folder
+
     def _build_folder_index_unlocked(
         self, account_uid: str, folder_name: str
     ) -> _FolderMessageIndex:
@@ -920,8 +990,9 @@ class MailService:
     def read_message(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict:
-        with self._lock:
-            return self._read_message_unlocked(account_uid, folder_name, message_uid)
+        return self._with_mail_op(
+            lambda: self._read_message_unlocked(account_uid, folder_name, message_uid)
+        )
 
     def read_attachment_data(
         self,
@@ -938,18 +1009,20 @@ class MailService:
     def toggle_message_seen(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
-        with self._lock:
-            return self._toggle_message_seen_unlocked(
+        return self._with_mail_op(
+            lambda: self._toggle_message_seen_unlocked(
                 account_uid, folder_name, message_uid
             )
+        )
 
     def toggle_message_flagged(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
-        with self._lock:
-            return self._toggle_message_flagged_unlocked(
+        return self._with_mail_op(
+            lambda: self._toggle_message_flagged_unlocked(
                 account_uid, folder_name, message_uid
             )
+        )
 
     def set_messages_seen(
         self,
@@ -959,10 +1032,11 @@ class MailService:
         *,
         seen: bool,
     ) -> dict[str, Any]:
-        with self._lock:
-            return self._set_messages_seen_unlocked(
+        return self._with_mail_op(
+            lambda: self._set_messages_seen_unlocked(
                 account_uid, folder_name, message_uids, seen=seen
             )
+        )
 
     def set_messages_flagged(
         self,
@@ -972,26 +1046,29 @@ class MailService:
         *,
         flagged: bool,
     ) -> dict[str, Any]:
-        with self._lock:
-            return self._set_messages_flagged_unlocked(
+        return self._with_mail_op(
+            lambda: self._set_messages_flagged_unlocked(
                 account_uid, folder_name, message_uids, flagged=flagged
             )
+        )
 
     def toggle_messages_seen(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
-        with self._lock:
-            return self._toggle_messages_seen_unlocked(
+        return self._with_mail_op(
+            lambda: self._toggle_messages_seen_unlocked(
                 account_uid, folder_name, message_uids
             )
+        )
 
     def toggle_messages_flagged(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
-        with self._lock:
-            return self._toggle_messages_flagged_unlocked(
+        return self._with_mail_op(
+            lambda: self._toggle_messages_flagged_unlocked(
                 account_uid, folder_name, message_uids
             )
+        )
 
     def move_messages_to_trash(
         self, account_uid: str, folder_name: str, message_uids: list[str]
@@ -1028,10 +1105,11 @@ class MailService:
     def mark_message_read(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> tuple[int, int]:
-        with self._lock:
-            return self._mark_message_read_unlocked(
+        return self._with_mail_op(
+            lambda: self._mark_message_read_unlocked(
                 account_uid, folder_name, message_uid
             )
+        )
 
     def _read_message_unlocked(
         self, account_uid: str, folder_name: str, message_uid: str
@@ -1121,7 +1199,7 @@ class MailService:
         message_uid: str,
     ) -> tuple[int, int]:
         """Mark a message seen without refreshing the whole folder summary."""
-        self._apply_message_flags_unlocked(
+        changed = self._apply_message_flags_unlocked(
             folder,
             account_uid,
             folder_name,
@@ -1132,12 +1210,16 @@ class MailService:
         unread = folder.get_unread_message_count()
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
+        if changed:
+            self._persist_message_flag_changes_unlocked(
+                account_uid, folder, [message_uid]
+            )
         return unread, total
 
     def _toggle_message_seen_unlocked(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
-        folder = self._open_folder_unlocked(account_uid, folder_name)
+        folder = self._require_folder_unlocked(account_uid, folder_name)
         info = folder.get_message_info(message_uid)
         if info is None:
             raise ValueError(f"Message not found: {message_uid}")
@@ -1145,7 +1227,7 @@ class MailService:
         currently_seen = bool(info.get_flags() & Camel.MessageFlags.SEEN)
         new_seen = not currently_seen
         flag_value = Camel.MessageFlags.SEEN if new_seen else 0
-        self._apply_message_flags_unlocked(
+        changed = self._apply_message_flags_unlocked(
             folder,
             account_uid,
             folder_name,
@@ -1156,6 +1238,10 @@ class MailService:
         unread = folder.get_unread_message_count()
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
+        if changed:
+            self._persist_message_flag_changes_unlocked(
+                account_uid, folder, [message_uid]
+            )
         return {
             "flags": {"seen": new_seen},
             "folder_unread": unread,
@@ -1165,7 +1251,7 @@ class MailService:
     def _toggle_message_flagged_unlocked(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
-        folder = self._open_folder_unlocked(account_uid, folder_name)
+        folder = self._require_folder_unlocked(account_uid, folder_name)
         info = folder.get_message_info(message_uid)
         if info is None:
             raise ValueError(f"Message not found: {message_uid}")
@@ -1173,7 +1259,7 @@ class MailService:
         currently_flagged = bool(info.get_flags() & Camel.MessageFlags.FLAGGED)
         new_flagged = not currently_flagged
         flag_value = Camel.MessageFlags.FLAGGED if new_flagged else 0
-        self._apply_message_flags_unlocked(
+        changed = self._apply_message_flags_unlocked(
             folder,
             account_uid,
             folder_name,
@@ -1181,6 +1267,10 @@ class MailService:
             Camel.MessageFlags.FLAGGED,
             flag_value,
         )
+        if changed:
+            self._persist_message_flag_changes_unlocked(
+                account_uid, folder, [message_uid]
+            )
         return {"flags": {"flagged": new_flagged}}
 
     def _set_messages_seen_unlocked(
@@ -1191,8 +1281,9 @@ class MailService:
         *,
         seen: bool,
     ) -> dict[str, Any]:
-        folder = self._open_folder_unlocked(account_uid, folder_name)
+        folder = self._require_folder_unlocked(account_uid, folder_name)
         updates: list[dict[str, Any]] = []
+        changed_uids: list[str] = []
         for message_uid in message_uids:
             info = folder.get_message_info(message_uid)
             if info is None:
@@ -1202,15 +1293,20 @@ class MailService:
                 updates.append({"uid": message_uid, "flags": {"seen": seen}})
                 continue
             flag_value = Camel.MessageFlags.SEEN if seen else 0
-            self._apply_message_flags_unlocked(
+            if self._apply_message_flags_unlocked(
                 folder,
                 account_uid,
                 folder_name,
                 message_uid,
                 Camel.MessageFlags.SEEN,
                 flag_value,
-            )
+            ):
+                changed_uids.append(message_uid)
             updates.append({"uid": message_uid, "flags": {"seen": seen}})
+        if changed_uids:
+            self._persist_message_flag_changes_unlocked(
+                account_uid, folder, changed_uids
+            )
         unread = folder.get_unread_message_count()
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
@@ -1228,8 +1324,9 @@ class MailService:
         *,
         flagged: bool,
     ) -> dict[str, Any]:
-        folder = self._open_folder_unlocked(account_uid, folder_name)
+        folder = self._require_folder_unlocked(account_uid, folder_name)
         updates: list[dict[str, Any]] = []
+        changed_uids: list[str] = []
         for message_uid in message_uids:
             info = folder.get_message_info(message_uid)
             if info is None:
@@ -1239,22 +1336,28 @@ class MailService:
                 updates.append({"uid": message_uid, "flags": {"flagged": flagged}})
                 continue
             flag_value = Camel.MessageFlags.FLAGGED if flagged else 0
-            self._apply_message_flags_unlocked(
+            if self._apply_message_flags_unlocked(
                 folder,
                 account_uid,
                 folder_name,
                 message_uid,
                 Camel.MessageFlags.FLAGGED,
                 flag_value,
-            )
+            ):
+                changed_uids.append(message_uid)
             updates.append({"uid": message_uid, "flags": {"flagged": flagged}})
+        if changed_uids:
+            self._persist_message_flag_changes_unlocked(
+                account_uid, folder, changed_uids
+            )
         return {"updates": updates}
 
     def _toggle_messages_seen_unlocked(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
-        folder = self._open_folder_unlocked(account_uid, folder_name)
+        folder = self._require_folder_unlocked(account_uid, folder_name)
         updates: list[dict[str, Any]] = []
+        changed_uids: list[str] = []
         for message_uid in message_uids:
             info = folder.get_message_info(message_uid)
             if info is None:
@@ -1262,15 +1365,20 @@ class MailService:
             currently_seen = bool(info.get_flags() & Camel.MessageFlags.SEEN)
             new_seen = not currently_seen
             flag_value = Camel.MessageFlags.SEEN if new_seen else 0
-            self._apply_message_flags_unlocked(
+            if self._apply_message_flags_unlocked(
                 folder,
                 account_uid,
                 folder_name,
                 message_uid,
                 Camel.MessageFlags.SEEN,
                 flag_value,
-            )
+            ):
+                changed_uids.append(message_uid)
             updates.append({"uid": message_uid, "flags": {"seen": new_seen}})
+        if changed_uids:
+            self._persist_message_flag_changes_unlocked(
+                account_uid, folder, changed_uids
+            )
         unread = folder.get_unread_message_count()
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
@@ -1283,8 +1391,9 @@ class MailService:
     def _toggle_messages_flagged_unlocked(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
-        folder = self._open_folder_unlocked(account_uid, folder_name)
+        folder = self._require_folder_unlocked(account_uid, folder_name)
         updates: list[dict[str, Any]] = []
+        changed_uids: list[str] = []
         for message_uid in message_uids:
             info = folder.get_message_info(message_uid)
             if info is None:
@@ -1292,15 +1401,20 @@ class MailService:
             currently_flagged = bool(info.get_flags() & Camel.MessageFlags.FLAGGED)
             new_flagged = not currently_flagged
             flag_value = Camel.MessageFlags.FLAGGED if new_flagged else 0
-            self._apply_message_flags_unlocked(
+            if self._apply_message_flags_unlocked(
                 folder,
                 account_uid,
                 folder_name,
                 message_uid,
                 Camel.MessageFlags.FLAGGED,
                 flag_value,
-            )
+            ):
+                changed_uids.append(message_uid)
             updates.append({"uid": message_uid, "flags": {"flagged": new_flagged}})
+        if changed_uids:
+            self._persist_message_flag_changes_unlocked(
+                account_uid, folder, changed_uids
+            )
         return {"updates": updates}
 
     def _move_messages_to_trash_unlocked(
@@ -1451,14 +1565,44 @@ class MailService:
             "destination_folder_total": dest_total,
         }
 
-    def _open_folder_unlocked(
-        self, account_uid: str, folder_name: str
-    ) -> Camel.Folder:
+    def _persist_message_flag_changes_unlocked(
+        self,
+        account_uid: str,
+        folder: Camel.Folder,
+        message_uids: list[str],
+    ) -> None:
+        if not message_uids:
+            return
         store = self._get_store_unlocked(account_uid)
-        folder = store.get_folder_sync(folder_name, 0, None)
-        if folder is None:
-            raise ValueError(f"Folder not found: {folder_name}")
-        return folder
+        self._persist_folder_flags_unlocked(store, folder, message_uids)
+
+    @staticmethod
+    def _persist_folder_flags_unlocked(
+        store: Camel.Store,
+        folder: Camel.Folder,
+        message_uids: list[str],
+    ) -> None:
+        """Save folder summary and push flag changes to the mail store."""
+        summary = folder.get_folder_summary()
+        if summary is not None:
+            summary.touch()
+            if not summary.save():
+                raise RuntimeError("Could not save folder summary after flag change")
+
+        for message_uid in message_uids:
+            if not folder.synchronize_message_sync(message_uid, None):
+                raise RuntimeError(
+                    f"Could not synchronize message {message_uid} after flag change"
+                )
+
+        if not folder.synchronize_sync(False, None):
+            raise RuntimeError("Could not synchronize folder after flag change")
+
+        if (
+            store.get_connection_status() == Camel.ServiceConnectionStatus.CONNECTED
+            and not store.synchronize_sync(False, None)
+        ):
+            raise RuntimeError("Could not synchronize mail store after flag change")
 
     @staticmethod
     def _commit_folder_transfer_unlocked(
@@ -1537,8 +1681,23 @@ class MailService:
         message_uid: str,
         mask: int,
         value: int,
-    ) -> None:
-        folder.set_message_flags(message_uid, mask, value)
+    ) -> bool:
+        info = folder.get_message_info(message_uid)
+        if info is None:
+            return False
+
+        current = info.get_flags() & mask
+        target = value & mask
+        if current == target:
+            return False
+
+        if not folder.set_message_flags(message_uid, mask, value):
+            return False
+
+        info = folder.get_message_info(message_uid)
+        if info is not None:
+            info.set_folder_flagged(True)
+
         if mask & Camel.MessageFlags.SEEN:
             self._update_cached_message_flags(
                 account_uid,
@@ -1553,6 +1712,7 @@ class MailService:
                 message_uid,
                 flagged=bool(value & Camel.MessageFlags.FLAGGED),
             )
+        return True
 
     def _update_cached_message_flags(
         self,
