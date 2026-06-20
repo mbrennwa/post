@@ -26,6 +26,7 @@ from .helpers import (
     sort_messages_newest_first,
     walk_folder_info,
 )
+from .accounts import BUILTIN_LOCAL_UID, is_builtin_local_store_empty
 from .auth import PasswordPromptCallback, authenticate_service_sync
 from .compose import addresses_to_internet_address, build_plain_mime_message
 from .folders import find_folder_by_type, guess_inbox_name
@@ -167,9 +168,28 @@ class MailService:
         if isinstance(self._session, MailSession):
             self._session.set_password_prompt(callback)
 
+    def reload_registry(self) -> None:
+        """Reconnect to EDS and drop cached Camel services (after account changes)."""
+        with self._lock:
+            self._stores.clear()
+            self._transports.clear()
+            self._folder_indexes.clear()
+            self._accounts_by_uid.clear()
+            self._session = None
+            registry = EDataServer.SourceRegistry.new_sync(None)
+            if registry is None:
+                raise RuntimeError(
+                    "Could not reconnect to evolution-source-registry."
+                )
+            self.registry = registry
+
     def list_accounts(self) -> list[MailAccount]:
         accounts: list[MailAccount] = []
+        hide_empty_builtin_local = is_builtin_local_store_empty(self.registry)
         for source in self.registry.list_enabled("Mail Account"):
+            uid = source.get_uid()
+            if uid == BUILTIN_LOCAL_UID and hide_empty_builtin_local:
+                continue
             mail_ext = source.get_extension("Mail Account")
             backend = mail_ext.get_backend_name()
             if backend in _SKIP_BACKENDS:
@@ -202,7 +222,15 @@ class MailService:
                 )
             )
 
-        order = {"microsoft365": 0, "ews": 1, "imapx": 2, "imap": 3, "pop3": 4}
+        order = {
+            "microsoft365": 0,
+            "ews": 1,
+            "imapx": 2,
+            "imap": 3,
+            "pop3": 4,
+            "spool": 5,
+            "maildir": 6,
+        }
         accounts.sort(key=lambda a: (order.get(a.backend or "", 99), a.name))
         self._accounts_by_uid = {account.uid: account for account in accounts}
         return accounts

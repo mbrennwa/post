@@ -5,7 +5,7 @@
 - **Your accounts, one place** — work across multiple mail accounts without clutter
 - **Read mail comfortably** — folders, message list, and a clean reading pane
 - **Native and lightweight** — a focused mail client, not a full personal information manager
-- **Uses what you already have** — picks up accounts configured in Evolution or GNOME Online Accounts
+- **Uses what you already have** — picks up online accounts from GNOME Online Accounts; optional local spool or Maildir in Settings
 
 ## Today
 
@@ -18,11 +18,11 @@
 - Clear empty-folder and error states when loading fails
 - Context menu: mark read/unread, flag, archive, move to trash (with undo)
 - Compose plain-text **New Message** and **Reply** (Ctrl+N); send via account SMTP
+- **Settings** (gear icon) — configure local mail from a system spool file or Maildir folder
 
 ## Planned
 
 - Save draft, HTML compose, attachments, reply-all, forward
-- Own account setup
 - Conversation threading
 
 ## Run
@@ -31,7 +31,7 @@
 ./run.sh
 ```
 
-You need at least one mail account set up in Evolution or GNOME Settings → Online Accounts.
+You need at least one mail account: add one in **Settings → Online Accounts**, or enable **local mail** in Post’s Settings (gear icon in the header).
 
 ## License
 

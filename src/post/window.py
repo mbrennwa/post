@@ -24,6 +24,7 @@ from post.compose_window import ComposeWindow
 from post.credentials import prompt_password_sync
 from post.mail import MailService
 from post.mail.eds import DEFAULT_MESSAGE_PAGE_SIZE, MailAccount
+from post.settings_window import SettingsWindow
 from post.mail.helpers import (
     format_attachment_size,
     format_message_header,
@@ -62,6 +63,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._context_message_rows: list[Gtk.ListBoxRow] = []
         self._pending_move_undo: dict | None = None
         self._undo_toast: Adw.Toast | None = None
+        self._settings_window: SettingsWindow | None = None
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.set_vexpand(True)
@@ -69,6 +71,11 @@ class MainWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         title = Adw.WindowTitle(title="Post", subtitle="Mail")
         header.set_title_widget(title)
+
+        settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
+        settings_btn.set_tooltip_text("Settings")
+        settings_btn.connect("clicked", self._on_settings_clicked)
+        header.pack_end(settings_btn)
 
         compose_btn = Gtk.Button()
         compose_btn.set_icon_name("mail-message-new-symbolic")
@@ -323,6 +330,23 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_compose_new_clicked(self, *_args) -> None:
         self._open_compose_new()
+
+    def _on_settings_clicked(self, *_args) -> None:
+        if self._settings_window is not None:
+            self._settings_window.present()
+            return
+        window = SettingsWindow(
+            parent=self,
+            mail=self._mail,
+            set_status=self._set_status,
+            on_saved=self._reload_sidebar,
+        )
+        self._settings_window = window
+        window.connect("destroy", self._on_settings_closed)
+        window.present()
+
+    def _on_settings_closed(self, *_args) -> None:
+        self._settings_window = None
 
     def _on_reply_action(self, *_args) -> None:
         self._open_compose_reply()

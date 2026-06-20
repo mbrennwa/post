@@ -86,7 +86,8 @@ class MailSidebar:
 
         if not self._accounts:
             self._set_status(
-                "No mail accounts found. Add one in Evolution or GNOME Online Accounts first."
+                "No mail accounts found. Add one in Settings → Online Accounts, "
+                "or configure local mail in Post Settings."
             )
             return
 
