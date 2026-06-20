@@ -224,6 +224,7 @@ class MainWindow(Adw.ApplicationWindow):
         settings.set_enable_javascript(False)
         settings.set_enable_html5_database(False)
         settings.set_enable_html5_local_storage(False)
+        self._web_view.connect("decide-policy", self._on_web_view_decide_policy)
         self._web_view.set_vexpand(True)
         reader.append(self._web_view)
 
@@ -1455,6 +1456,55 @@ class MainWindow(Adw.ApplicationWindow):
             allow_remote=self._remote_switch.get_active(),
         )
         self._web_view.load_html(document, None)
+
+    @staticmethod
+    def _uri_opens_externally(uri: str) -> bool:
+        lower = uri.lower()
+        return lower.startswith(("http://", "https://", "mailto:"))
+
+    def _open_uri_externally(self, uri: str) -> None:
+        try:
+            Gio.AppInfo.launch_default_for_uri(uri, None)
+        except GLib.Error as exc:
+            self._set_status(f"Could not open link: {exc.message}")
+
+    def _on_web_view_decide_policy(
+        self,
+        _web_view: WebKit.WebView,
+        decision: WebKit.NavigationPolicyDecision,
+        decision_type: WebKit.PolicyDecisionType,
+    ) -> bool:
+        if decision_type not in (
+            WebKit.PolicyDecisionType.NAVIGATION_ACTION,
+            WebKit.PolicyDecisionType.NEW_WINDOW_ACTION,
+        ):
+            return False
+
+        navigation = decision.get_navigation_action()
+        if navigation is None:
+            return False
+
+        if decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
+            nav_type = navigation.get_navigation_type()
+            if nav_type not in (
+                WebKit.NavigationType.LINK_CLICKED,
+                WebKit.NavigationType.FORM_SUBMITTED,
+                WebKit.NavigationType.FORM_RESUBMITTED,
+            ):
+                return False
+
+        request = navigation.get_request()
+        if request is None:
+            return False
+
+        uri = request.get_uri()
+        if not uri or not self._uri_opens_externally(uri):
+            decision.ignore()
+            return True
+
+        self._open_uri_externally(uri)
+        decision.ignore()
+        return True
 
     def _on_remote_content_changed(self, *_args) -> None:
         if self._current_body.get("html") or self._current_body.get("plain"):

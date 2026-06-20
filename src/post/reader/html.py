@@ -17,6 +17,36 @@ _EXTERNAL_BG = re.compile(
     r"url\(\s*['\"]?https?://[^)'\"]+['\"]?\s*\)",
     re.IGNORECASE,
 )
+_REMOTE_IMG_TAG = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+_REMOTE_IMG_SRC = re.compile(
+    r"""\ssrc\s*=\s*(?:("https?://[^"]*"|'https?://[^']*'|https?://[^\s>"']+))""",
+    re.IGNORECASE,
+)
+
+
+def _remote_img_tag_is_notifiable(tag: str) -> bool:
+    """Ignore tracking pixels and other intentionally hidden images."""
+    lower = tag.lower()
+    if "display:none" in lower or "display: none" in lower:
+        return False
+    if re.search(r'\bhidden(?:=(?:["\']?true["\']?)?|\b)', lower):
+        return False
+    width = re.search(r"""\bwidth=(["\']?)(\d+)\1""", tag, re.IGNORECASE)
+    height = re.search(r"""\bheight=(["\']?)(\d+)\1""", tag, re.IGNORECASE)
+    if width and height and int(width.group(2)) <= 1 and int(height.group(2)) <= 1:
+        return False
+    return True
+
+
+def html_has_blocked_remote_content(body_html: str) -> bool:
+    """Return True if HTML contains remote <img> tags the user may want to load."""
+    for tag in _REMOTE_IMG_TAG.findall(body_html):
+        if not _REMOTE_IMG_SRC.search(tag):
+            continue
+        if _remote_img_tag_is_notifiable(tag):
+            return True
+    return False
+
 
 _READER_CSS = """
 body {
@@ -66,13 +96,15 @@ def build_reader_document(
     if body_html:
         content = body_html
         if not allow_remote:
+            has_remote = html_has_blocked_remote_content(content)
             content = _EXTERNAL_IMG.sub(r'\1""', content)
             content = _EXTERNAL_BG.sub("url(none)", content)
-            blocked_notice = (
-                '<p class="remote-blocked-notice">'
-                "Remote images are hidden. Turn on “Load remote content” to show them."
-                "</p>"
-            )
+            if has_remote:
+                blocked_notice = (
+                    '<p class="remote-blocked-notice">'
+                    "Remote images are hidden. Turn on “Load remote content” to show them."
+                    "</p>"
+                )
     elif body_plain:
         content = f'<pre class="plain-body">{html.escape(body_plain)}</pre>'
     else:
