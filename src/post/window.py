@@ -25,6 +25,13 @@ from post.credentials import prompt_password_sync
 from post.mail import MailService
 from post.mail.eds import DEFAULT_MESSAGE_PAGE_SIZE, MailAccount
 from post.mail.search import MessageSearchQuery, parse_search_query
+from post.mail.send_queue import (
+    OFFLINE_MAIL_MESSAGE,
+    is_network_unavailable_error,
+    list_queued_outbound_messages,
+    log_mail_error,
+    offline_status_text,
+)
 from post.settings_window import SettingsWindow
 from post.mail.helpers import (
     flag_menu_items,
@@ -100,6 +107,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._pending_restore_message_uid: str | None = None
         self._search_query: MessageSearchQuery | None = None
         self._search_entry_updating = False
+        self._status_hint = ""
+        self._network_available = Gio.NetworkMonitor.get_default().get_network_available()
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.set_vexpand(True)
@@ -362,6 +371,50 @@ class MainWindow(Adw.ApplicationWindow):
         self._setup_compose_action()
         self._setup_delete_shortcut()
         self._setup_search_shortcuts()
+        self._setup_send_queue_flush()
+
+    def _setup_send_queue_flush(self) -> None:
+        monitor = Gio.NetworkMonitor.get_default()
+        monitor.connect("notify::network-available", self._on_network_available_changed)
+        self._refresh_status_display()
+        GLib.idle_add(self._flush_send_queue_idle)
+
+    def _on_network_available_changed(self, monitor: Gio.NetworkMonitor, *_args) -> None:
+        online = monitor.get_network_available()
+        if online == self._network_available:
+            return
+        self._network_available = online
+        self._refresh_status_display()
+        if online:
+            self._flush_send_queue_idle()
+            if self._current_account and self._current_folder:
+                self._load_messages(self._current_account.uid, self._current_folder)
+            else:
+                GLib.idle_add(self._reload_sidebar)
+
+    def _flush_send_queue_idle(self) -> bool:
+        threading.Thread(target=self._flush_send_queue_worker, daemon=True).start()
+        return False
+
+    def _flush_send_queue_worker(self) -> None:
+        try:
+            sent = self._mail.flush_send_queue()
+        except Exception:
+            log.exception("Failed to flush outbound send queue")
+            return
+        if sent <= 0:
+            return
+        GLib.idle_add(self._on_send_queue_flushed, sent)
+
+    def _on_send_queue_flushed(self, sent: int) -> bool:
+        self._refresh_status_display()
+        if sent <= 0:
+            return False
+        if sent == 1:
+            self._set_status("Sent 1 queued message")
+        else:
+            self._set_status(f"Sent {sent} queued messages")
+        return False
 
     def _install_message_list_style(self) -> None:
         provider = Gtk.CssProvider()
@@ -932,7 +985,15 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._reload_sidebar)
 
     def _set_status(self, text: str) -> None:
-        self._status.set_label(text)
+        self._status_hint = text
+        self._refresh_status_display()
+
+    def _refresh_status_display(self) -> None:
+        if not self._network_available:
+            queued = len(list_queued_outbound_messages())
+            self._status.set_label(offline_status_text(queued_count=queued))
+            return
+        self._status.set_label(self._status_hint)
 
     def _prompt_account_password(
         self, account_label: str, _mechanism: str | None
@@ -1404,7 +1465,7 @@ class MainWindow(Adw.ApplicationWindow):
                         limit=DEFAULT_MESSAGE_PAGE_SIZE,
                     )
             except Exception as exc:
-                log.exception("Failed to list messages")
+                log_mail_error(log, "Failed to list messages", exc)
                 error = exc
             GLib.idle_add(
                 self._on_messages_loaded,
@@ -1454,9 +1515,13 @@ class MainWindow(Adw.ApplicationWindow):
         self._load_more_btn.set_label("Load more")
 
         if error is not None:
-            self._message_error_label.set_label(str(error))
-            self._message_stack.set_visible_child_name("error")
-            self._set_status(f"Could not load {folder_name}")
+            if is_network_unavailable_error(error):
+                self._message_empty_label.set_label(OFFLINE_MAIL_MESSAGE)
+                self._message_stack.set_visible_child_name("empty")
+            else:
+                self._message_error_label.set_label(str(error))
+                self._message_stack.set_visible_child_name("error")
+                self._set_status(f"Could not load {folder_name}")
             self._load_more_btn.set_visible(False)
             return False
 

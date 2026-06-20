@@ -28,6 +28,11 @@ from post.mail.folders import (
     guess_inbox_name,
     resolve_move_menu_state,
 )
+from post.mail.send_queue import (
+    OFFLINE_FOLDER_MESSAGE,
+    is_network_unavailable_error,
+    log_mail_error,
+)
 from post.preferences import (
     get_sidebar_state,
     register_inbox_accounts,
@@ -181,7 +186,7 @@ class MailSidebar:
             try:
                 unread, total = self._mail.get_folder_stats(account_uid, inbox_name)
             except Exception as exc:
-                log.exception("Failed to refresh inbox counts for %s", account_uid)
+                log_mail_error(log, f"Failed to refresh inbox counts for {account_uid}", exc)
                 error = exc
             GLib.idle_add(
                 self._on_inbox_counts_refreshed,
@@ -241,8 +246,10 @@ class MailSidebar:
             try:
                 unread, total = self._mail.get_folder_stats(account_uid, folder_name)
             except Exception as exc:
-                log.exception(
-                    "Failed to refresh folder %s/%s", account_uid, folder_name
+                log_mail_error(
+                    log,
+                    f"Failed to refresh folder {account_uid}/{folder_name}",
+                    exc,
                 )
                 error = exc
             GLib.idle_add(
@@ -356,7 +363,7 @@ class MailSidebar:
             try:
                 folders = self._mail.list_folders(account.uid)
             except Exception as exc:
-                log.exception("Failed to list folders for %s", account.uid)
+                log_mail_error(log, f"Failed to list folders for {account.uid}", exc)
                 error = exc
             GLib.idle_add(
                 self._on_folders_loaded,
@@ -385,8 +392,13 @@ class MailSidebar:
         self._clear_listbox(folder_list)
 
         if error is not None:
+            label_text = (
+                OFFLINE_FOLDER_MESSAGE
+                if is_network_unavailable_error(error)
+                else f"Could not load folders: {error}"
+            )
             error_label = Gtk.Label(
-                label=f"Could not load folders: {error}",
+                label=label_text,
                 xalign=0,
                 wrap=True,
             )

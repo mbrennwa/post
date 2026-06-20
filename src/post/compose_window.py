@@ -39,7 +39,7 @@ from post.mail.correspondents import (
     match_correspondents,
 )
 from post.mail.eds import MailAccount
-from post.mail.send_errors import user_send_error_message
+from post.mail.send_errors import SendQueued, user_send_error_message
 from post.preferences import get_account_signature, get_account_signatures
 
 log = logging.getLogger(__name__)
@@ -537,17 +537,31 @@ class ComposeWindow(Adw.Window):
                     in_reply_to=in_reply_to,
                     references=references,
                 )
+            except SendQueued as exc:
+                GLib.idle_add(self._on_send_finished, None, exc.user_message)
+                return
             except Exception as exc:
                 log.warning("Send failed: %s", user_send_error_message(exc))
                 error = exc
+                GLib.idle_add(
+                    self._on_send_finished,
+                    error,
+                    None,
+                )
+                return
             GLib.idle_add(
                 self._on_send_finished,
                 error,
+                None,
             )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_send_finished(self, error: Exception | None) -> bool:
+    def _on_send_finished(
+        self,
+        error: Exception | None,
+        success_status: str | None = None,
+    ) -> bool:
         self._sending = False
         self._send_btn.set_sensitive(True)
         if error is not None:
@@ -555,7 +569,7 @@ class ComposeWindow(Adw.Window):
             self._show_error(message)
             self._set_status("Send failed")
             return False
-        self._set_status("Message sent")
+        self._set_status(success_status or "Message sent")
         self.close()
         return False
 

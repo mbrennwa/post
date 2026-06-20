@@ -43,6 +43,19 @@ def folder_matches_type(folder: dict, folder_type: int, *, type_mask: int) -> bo
     return (flags & type_mask) == folder_type
 
 
+def folder_name_from_uri(uri: str | None) -> str | None:
+    """Return a Camel folder full name from an EDS folder:// URI."""
+    if not uri:
+        return None
+    uri = uri.strip()
+    if uri.startswith("folder://local/"):
+        return uri.removeprefix("folder://local/")
+    if uri.startswith("folder://"):
+        parts = uri.split("/", 3)
+        return parts[3] if len(parts) > 3 else None
+    return uri or None
+
+
 def is_virtual_folder(full_name: str | None) -> bool:
     return bool(full_name and full_name.startswith(".#evolution/"))
 

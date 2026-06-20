@@ -12,6 +12,7 @@ from post.mail.folders import (
     find_inbox_folder,
     find_trash_folder,
     folder_can_contain_messages,
+    folder_name_from_uri,
     format_folder_label,
     guess_inbox_name,
     resolve_move_menu_state,
@@ -67,6 +68,21 @@ class FolderCanContainMessagesTests(unittest.TestCase):
     def test_regular_inbox_is_included(self) -> None:
         folder = {"full_name": "INBOX", "flags": 1024}
         self.assertTrue(folder_can_contain_messages(folder))
+
+
+class FolderNameFromUriTests(unittest.TestCase):
+    def test_local_sent_folder(self) -> None:
+        self.assertEqual(folder_name_from_uri("folder://local/Sent"), "Sent")
+
+    def test_gmail_sent_folder(self) -> None:
+        self.assertEqual(
+            folder_name_from_uri("folder://local/[Gmail]/Sent Mail"),
+            "[Gmail]/Sent Mail",
+        )
+
+    def test_empty(self) -> None:
+        self.assertIsNone(folder_name_from_uri(None))
+        self.assertIsNone(folder_name_from_uri(""))
 
 
 class FindInboxFolderTests(unittest.TestCase):

@@ -19,6 +19,7 @@ gi.require_version("GObject", "2.0")
 from gi.repository import Camel, GLib, GObject
 
 from .eds import MailService
+from .send_queue import is_network_unavailable_error, log_mail_error
 
 log = logging.getLogger(__name__)
 
@@ -114,9 +115,11 @@ class MailSyncWatcher:
                     inbox_name = self._mail.guess_inbox(folders)
                     if account_uid == current_account_uid and current_folder_name:
                         current_name = current_folder_name
-                except Exception:
-                    log.exception(
-                        "Could not prepare sync watch for account %s", account_uid
+                except Exception as exc:
+                    log_mail_error(
+                        log,
+                        f"Could not prepare sync watch for account {account_uid}",
+                        exc,
                     )
                     continue
                 setups.append((account_uid, store, inbox_name, current_name))
@@ -202,11 +205,11 @@ class MailSyncWatcher:
                 continue
             try:
                 folder = watch.store.get_folder_sync(folder_name, 0, None)
-            except Exception:
-                log.exception(
-                    "Could not open folder %s/%s for sync watch",
-                    watch.account_uid,
-                    folder_name,
+            except Exception as exc:
+                log_mail_error(
+                    log,
+                    f"Could not open folder {watch.account_uid}/{folder_name} for sync watch",
+                    exc,
                 )
                 continue
             if folder is None:

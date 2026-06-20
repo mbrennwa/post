@@ -56,3 +56,9 @@ class SendErrorMessageTests(unittest.TestCase):
             user_send_error_message(exc),
             "Add a recipient in the To field.",
         )
+
+    def test_send_queued_message(self) -> None:
+        from post.mail.send_errors import MESSAGE_QUEUED, SendQueued
+
+        exc = SendQueued(MESSAGE_QUEUED)
+        self.assertEqual(user_send_error_message(exc), MESSAGE_QUEUED)

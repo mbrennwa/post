@@ -55,6 +55,14 @@ _GENERIC_SEND_FAILED = (
     "The message could not be sent. Check your account settings and try again."
 )
 
+MESSAGE_QUEUED = (
+    "Message queued for sending when you're back online."
+)
+
+
+class SendQueued(SendError):
+    """Send was deferred because the network is unavailable."""
+
 
 def _raw_error_text(exc: BaseException) -> str:
     if isinstance(exc, SendError):
@@ -79,6 +87,8 @@ def _is_localhost_refused(text: str) -> bool:
 
 def user_send_error_message(exc: BaseException) -> str:
     """Return a short, user-friendly explanation for a send failure."""
+    if isinstance(exc, SendQueued):
+        return exc.user_message
     if isinstance(exc, SendError):
         return exc.user_message
 

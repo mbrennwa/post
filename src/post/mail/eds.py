@@ -37,7 +37,20 @@ from .accounts import (
     should_list_local_account,
 )
 from .local_delivery import all_recipients_local, can_deliver_locally, deliver_local_message
-from .send_errors import SYSTEM_MAIL_EXTERNAL_RECIPIENTS, SendError, user_send_error_message
+from .send_errors import (
+    MESSAGE_QUEUED,
+    SYSTEM_MAIL_EXTERNAL_RECIPIENTS,
+    SendError,
+    SendQueued,
+    user_send_error_message,
+)
+from .send_queue import (
+    QueuedOutboundMessage,
+    enqueue_outbound_message,
+    is_queueable_network_error,
+    list_queued_outbound_messages,
+    remove_queued_outbound_message,
+)
 from post.preferences import get_show_evolution_local
 from .auth import PasswordPromptCallback, authenticate_service_sync
 from .compose import addresses_to_internet_address, build_plain_mime_message, normalize_email
@@ -46,6 +59,7 @@ from .folders import (
     find_folder_by_type,
     find_trash_folder,
     folder_can_contain_messages,
+    folder_name_from_uri,
     guess_inbox_name,
     is_virtual_folder,
 )
@@ -422,6 +436,11 @@ class MailService:
         self._transports[transport_uid] = transport
         return transport
 
+    def flush_send_queue(self) -> int:
+        """Try to send messages queued while offline. Returns count sent."""
+        with self._lock:
+            return self._flush_send_queue_unlocked()
+
     def send_message(
         self,
         account_uid: str,
@@ -444,6 +463,7 @@ class MailService:
                 body=body,
                 in_reply_to=in_reply_to,
                 references=references,
+                from_queue=False,
             )
 
     def _send_message_unlocked(
@@ -457,6 +477,7 @@ class MailService:
         body: str,
         in_reply_to: str | None,
         references: str | None,
+        from_queue: bool = False,
     ) -> None:
         account = self.get_account(account_uid)
         from_address = account.from_address or account.email
@@ -505,6 +526,7 @@ class MailService:
                         if key[0] == account_uid:
                             self._folder_indexes.pop(key, None)
                     self._correspondent_indexes.pop(account_uid, None)
+                    self._append_to_sent_folder_unlocked(account_uid, message)
                     return
                 if not all_recipients_local(
                     to=to,
@@ -525,6 +547,21 @@ class MailService:
                 message, sender, recipients, cancellable
             )
         except GLib.Error as exc:
+            network_exc: BaseException = (
+                TimeoutError() if cancellable.is_cancelled() else exc
+            )
+            if not from_queue and is_queueable_network_error(network_exc):
+                self._queue_outbound_message_unlocked(
+                    account_uid=account_uid,
+                    to=to,
+                    cc=cc,
+                    bcc=bcc,
+                    subject=subject,
+                    body=body,
+                    in_reply_to=in_reply_to,
+                    references=references,
+                )
+                raise SendQueued(MESSAGE_QUEUED) from exc
             if cancellable.is_cancelled():
                 raise SendError(user_send_error_message(TimeoutError())) from exc
             raise SendError(user_send_error_message(exc)) from exc
@@ -539,6 +576,129 @@ class MailService:
 
         if not ok:
             raise SendError(user_send_error_message(RuntimeError("Could not send message")))
+
+        self._append_to_sent_folder_unlocked(account_uid, message)
+
+    def _queue_outbound_message_unlocked(
+        self,
+        *,
+        account_uid: str,
+        to: list[str],
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str,
+        body: str,
+        in_reply_to: str | None,
+        references: str | None,
+    ) -> None:
+        enqueue_outbound_message(
+            QueuedOutboundMessage(
+                account_uid=account_uid,
+                to=to,
+                cc=cc,
+                bcc=bcc,
+                subject=subject,
+                body=body,
+                in_reply_to=in_reply_to,
+                references=references,
+            )
+        )
+
+    def _flush_send_queue_unlocked(self) -> int:
+        sent = 0
+        for queue_id, queued in list_queued_outbound_messages():
+            try:
+                self._send_message_unlocked(
+                    queued.account_uid,
+                    to=queued.to,
+                    cc=queued.cc,
+                    bcc=queued.bcc,
+                    subject=queued.subject,
+                    body=queued.body,
+                    in_reply_to=queued.in_reply_to,
+                    references=queued.references,
+                    from_queue=True,
+                )
+            except SendQueued:
+                break
+            except SendError as exc:
+                log.warning(
+                    "Queued message %s was not sent: %s",
+                    queue_id,
+                    exc.user_message,
+                )
+                break
+            except Exception:
+                log.exception("Failed to send queued message %s", queue_id)
+                break
+            else:
+                remove_queued_outbound_message(queue_id)
+                sent += 1
+        return sent
+
+    def _sent_folder_name_unlocked(self, account_uid: str) -> str | None:
+        account = self.get_account(account_uid)
+        if not account.identity_uid:
+            return None
+
+        identity = self.registry.ref_source(account.identity_uid)
+        if identity is None or not identity.has_extension("Mail Submission"):
+            return None
+
+        submission = identity.get_extension("Mail Submission")
+        if not submission.get_use_sent_folder():
+            return None
+
+        folder_name = folder_name_from_uri(submission.get_sent_folder())
+        if folder_name:
+            return folder_name
+
+        folders = self._list_folders_unlocked(account_uid)
+        sent_info = find_folder_by_type(
+            folders,
+            Camel.FolderInfoFlags.TYPE_OUTBOX,
+            type_mask=Camel.FOLDER_TYPE_MASK,
+            name_fallbacks=frozenset({"sent", "sent mail", "sent messages"}),
+        )
+        if sent_info is None:
+            return None
+        return sent_info.get("full_name")
+
+    def _append_to_sent_folder_unlocked(
+        self, account_uid: str, message: Camel.MimeMessage
+    ) -> None:
+        folder_name = self._sent_folder_name_unlocked(account_uid)
+        if not folder_name:
+            return
+
+        folder = self._open_folder_unlocked(account_uid, folder_name)
+        if folder is None:
+            log.warning(
+                "Sent folder %r is not available for account %s",
+                folder_name,
+                account_uid,
+            )
+            return
+
+        try:
+            ok, _uid = folder.append_message_sync(message, None, None)
+        except GLib.Error as exc:
+            log.warning(
+                "Failed to save a copy to Sent folder %r: %s",
+                folder_name,
+                exc.message,
+            )
+            return
+
+        if not ok:
+            log.warning("Could not append message to Sent folder %r", folder_name)
+            return
+
+        try:
+            folder.refresh_info_sync(None)
+        except GLib.Error:
+            log.debug("Failed to refresh Sent folder after append", exc_info=True)
+        self._invalidate_folder_index(account_uid, folder_name)
 
     def get_correspondents(self, account_uid: str) -> list[Correspondent]:
         with self._lock:
