@@ -516,8 +516,27 @@ class MainWindow(Adw.ApplicationWindow):
         return True
 
     def _build_message_action_buttons(self) -> Gtk.Widget:
-        group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        group.add_css_class("linked")
+        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        flag_group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        flag_group.add_css_class("linked")
+
+        self._read_toggle_btn = self._make_message_action_button(
+            "mail-read-symbolic",
+            "Mark as read",
+            self._on_read_toggle_clicked,
+        )
+        self._flag_toggle_btn = self._make_message_action_button(
+            "mail-mark-important-symbolic",
+            "Flag",
+            self._on_flag_toggle_clicked,
+        )
+        flag_group.append(self._read_toggle_btn)
+        flag_group.append(self._flag_toggle_btn)
+        outer.append(flag_group)
+
+        reply_group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        reply_group.add_css_class("linked")
 
         self._reply_btn = self._make_message_action_button(
             "mail-reply-sender-symbolic",
@@ -534,10 +553,11 @@ class MainWindow(Adw.ApplicationWindow):
             "Forward",
             self._on_forward_clicked,
         )
-        group.append(self._reply_btn)
-        group.append(self._reply_all_btn)
-        group.append(self._forward_btn)
-        return group
+        reply_group.append(self._reply_btn)
+        reply_group.append(self._reply_all_btn)
+        reply_group.append(self._forward_btn)
+        outer.append(reply_group)
+        return outer
 
     @staticmethod
     def _make_message_action_button(
@@ -551,9 +571,71 @@ class MainWindow(Adw.ApplicationWindow):
         return button
 
     def _set_message_actions_sensitive(self, sensitive: bool) -> None:
+        self._read_toggle_btn.set_sensitive(sensitive)
+        self._flag_toggle_btn.set_sensitive(sensitive)
         self._reply_btn.set_sensitive(sensitive)
         self._reply_all_btn.set_sensitive(sensitive)
         self._forward_btn.set_sensitive(sensitive)
+        if sensitive:
+            self._update_reader_toggle_buttons()
+
+    def _reader_message_flags(self) -> dict:
+        if self._current_message_uid is None:
+            return {}
+        row = self._find_message_row(self._current_message_uid)
+        if row is not None:
+            return dict(getattr(row, "message_flags", {}) or {})
+        if self._current_message is not None:
+            return dict(self._current_message.get("flags") or {})
+        return {}
+
+    def _update_reader_toggle_buttons(self) -> None:
+        flags = self._reader_message_flags()
+        seen = flags.get("seen", True)
+        flagged = flags.get("flagged", False)
+
+        if seen:
+            self._read_toggle_btn.set_icon_name("mail-unread-symbolic")
+            self._read_toggle_btn.set_tooltip_text("Mark as unread")
+        else:
+            self._read_toggle_btn.set_icon_name("mail-read-symbolic")
+            self._read_toggle_btn.set_tooltip_text("Mark as read")
+
+        if flagged:
+            self._flag_toggle_btn.add_css_class("warning")
+            self._flag_toggle_btn.set_tooltip_text("Unflag")
+        else:
+            self._flag_toggle_btn.remove_css_class("warning")
+            self._flag_toggle_btn.set_tooltip_text("Flag")
+
+    def _reader_action_row(self) -> Gtk.ListBoxRow | None:
+        if self._current_message_uid is None:
+            return None
+        rows = self._message_list.get_selected_rows()
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        if getattr(row, "message_uid", None) != self._current_message_uid:
+            return None
+        return row
+
+    def _on_read_toggle_clicked(self, *_args) -> None:
+        row = self._reader_action_row()
+        if row is None:
+            return
+        flags = dict(getattr(row, "message_flags", {}) or {})
+        self._set_message_flags("seen", seen=not flags.get("seen", True), rows=[row])
+
+    def _on_flag_toggle_clicked(self, *_args) -> None:
+        row = self._reader_action_row()
+        if row is None:
+            return
+        flags = dict(getattr(row, "message_flags", {}) or {})
+        self._set_message_flags(
+            "flagged",
+            flagged=not flags.get("flagged", False),
+            rows=[row],
+        )
 
     def _setup_compose_action(self) -> None:
         compose_action = Gio.SimpleAction.new("compose-new", None)
@@ -1981,8 +2063,10 @@ class MainWindow(Adw.ApplicationWindow):
         *,
         seen: bool | None = None,
         flagged: bool | None = None,
+        rows: list[Gtk.ListBoxRow] | None = None,
     ) -> None:
-        rows = list(self._context_message_rows)
+        if rows is None:
+            rows = list(self._context_message_rows)
         if not rows or not self._current_account or not self._current_folder:
             return
 
@@ -2046,6 +2130,11 @@ class MainWindow(Adw.ApplicationWindow):
             flags.update(updates_by_uid[uid])
             row.message_flags = flags
             self._apply_row_flags(row, flags)
+            if uid == self._current_message_uid and self._current_message is not None:
+                self._current_message["flags"] = dict(flags)
+
+        if self._current_message_uid in updates_by_uid:
+            self._update_reader_toggle_buttons()
 
         if flag_name == "seen" and self._current_account and self._current_folder:
             unread = result.get("folder_unread")
@@ -2077,8 +2166,12 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _update_message_toolbar(self) -> bool:
         rows = self._message_list.get_selected_rows()
-        if len(rows) != 1:
-            self._set_message_actions_sensitive(False)
+        can_use_reader_actions = (
+            len(rows) == 1
+            and self._current_message_uid is not None
+            and getattr(rows[0], "message_uid", None) == self._current_message_uid
+        )
+        self._set_message_actions_sensitive(can_use_reader_actions)
 
         has_selection = bool(rows)
         can_archive = False
