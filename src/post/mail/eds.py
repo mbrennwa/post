@@ -27,6 +27,7 @@ from .helpers import (
     walk_folder_info,
 )
 from .auth import PasswordPromptCallback, authenticate_service_sync
+from .compose import addresses_to_internet_address, build_plain_mime_message
 from .folders import find_folder_by_type, guess_inbox_name
 
 log = logging.getLogger(__name__)
@@ -116,10 +117,20 @@ class MailAccount:
     name: str
     email: str | None
     backend: str | None
+    identity_uid: str | None = None
+    from_name: str | None = None
+    from_address: str | None = None
+    transport_uid: str | None = None
 
     @property
     def display_label(self) -> str:
         return self.email or self.name
+
+    @property
+    def from_label(self) -> str:
+        if self.from_name and self.from_address:
+            return f"{self.from_name} <{self.from_address}>"
+        return self.from_address or self.email or self.name
 
 
 @dataclass
@@ -129,6 +140,8 @@ class MailService:
     registry: EDataServer.SourceRegistry
     _session: Camel.Session | None = field(default=None, init=False)
     _stores: dict[str, Camel.Store] = field(default_factory=dict, init=False)
+    _transports: dict[str, Camel.Transport] = field(default_factory=dict, init=False)
+    _accounts_by_uid: dict[str, MailAccount] = field(default_factory=dict, init=False)
     _folder_indexes: dict[tuple[str, str], _FolderMessageIndex] = field(
         default_factory=dict, init=False
     )
@@ -159,23 +172,46 @@ class MailService:
                 continue
             email = None
             identity_uid = mail_ext.get_identity_uid()
+            from_name = None
+            from_address = None
+            transport_uid = None
             if identity_uid:
                 identity = self.registry.ref_source(identity_uid)
                 if identity and identity.has_extension("Mail Identity"):
                     ident = identity.get_extension("Mail Identity")
-                    email = ident.get_address()
+                    from_name = ident.get_name()
+                    from_address = ident.get_address()
+                    email = from_address
+                    if identity.has_extension("Mail Submission"):
+                        submission = identity.get_extension("Mail Submission")
+                        transport_uid = submission.get_transport_uid()
             accounts.append(
                 MailAccount(
                     uid=source.get_uid(),
                     name=source.get_display_name(),
                     email=email,
                     backend=backend,
+                    identity_uid=identity_uid,
+                    from_name=from_name,
+                    from_address=from_address,
+                    transport_uid=transport_uid,
                 )
             )
 
         order = {"microsoft365": 0, "ews": 1, "imapx": 2, "imap": 3, "pop3": 4}
         accounts.sort(key=lambda a: (order.get(a.backend or "", 99), a.name))
+        self._accounts_by_uid = {account.uid: account for account in accounts}
         return accounts
+
+    def get_account(self, account_uid: str) -> MailAccount:
+        with self._lock:
+            account = self._accounts_by_uid.get(account_uid)
+            if account is not None:
+                return account
+            for candidate in self.list_accounts():
+                if candidate.uid == account_uid:
+                    return candidate
+            raise ValueError(f"Unknown mail account: {account_uid}")
 
     def _ensure_session(self) -> Camel.Session:
         if self._session is not None:
@@ -230,6 +266,129 @@ class MailService:
 
         self._stores[account_uid] = store
         return store
+
+    def _get_transport_unlocked(self, account_uid: str) -> Camel.Transport:
+        account = self.get_account(account_uid)
+        transport_uid = account.transport_uid
+        if not transport_uid:
+            raise ValueError("No mail transport configured for this account")
+
+        if transport_uid in self._transports:
+            transport = self._transports[transport_uid]
+            if (
+                transport.get_connection_status()
+                == Camel.ServiceConnectionStatus.CONNECTED
+            ):
+                return transport
+            del self._transports[transport_uid]
+
+        transport_source = self.registry.ref_source(transport_uid)
+        if transport_source is None:
+            raise ValueError(f"Unknown mail transport: {transport_uid}")
+
+        session = self._ensure_session()
+        mail_transport = transport_source.get_extension("Mail Transport")
+        backend = mail_transport.get_backend_name()
+
+        service = session.ref_service(transport_uid)
+        if service is None:
+            service = session.add_service(
+                transport_uid, backend, Camel.ProviderType.TRANSPORT
+            )
+        if service is None:
+            raise RuntimeError(f"Could not create mail transport for {account_uid}")
+
+        transport_source.camel_configure_service(service)
+        transport = service
+
+        if hasattr(Camel, "OfflineTransport") and isinstance(
+            transport, Camel.OfflineTransport
+        ):
+            transport.set_online_sync(True, None)
+        else:
+            transport.connect_sync(None)
+
+        self._transports[transport_uid] = transport
+        return transport
+
+    def send_message(
+        self,
+        account_uid: str,
+        *,
+        to: list[str],
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        subject: str,
+        body: str,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._send_message_unlocked(
+                account_uid,
+                to=to,
+                cc=cc,
+                bcc=bcc,
+                subject=subject,
+                body=body,
+                in_reply_to=in_reply_to,
+                references=references,
+            )
+
+    def _send_message_unlocked(
+        self,
+        account_uid: str,
+        *,
+        to: list[str],
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str,
+        body: str,
+        in_reply_to: str | None,
+        references: str | None,
+    ) -> None:
+        account = self.get_account(account_uid)
+        from_address = account.from_address or account.email
+        if not from_address:
+            raise ValueError("No From address configured for this account")
+
+        message = build_plain_mime_message(
+            from_name=account.from_name,
+            from_address=from_address,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body=body,
+            in_reply_to=in_reply_to,
+            references=references,
+        )
+
+        sender = Camel.InternetAddress.new()
+        sender.add(account.from_name or "", from_address)
+
+        recipients = Camel.InternetAddress.new()
+        for group in (to, cc or [], bcc or []):
+            addrs = addresses_to_internet_address(group)
+            if addrs is not None:
+                recipients.cat(addrs)
+        if recipients.length() == 0:
+            raise ValueError("At least one recipient is required")
+
+        transport = self._get_transport_unlocked(account_uid)
+        try:
+            ok, _user_stop = transport.send_to_sync(
+                message, sender, recipients, None
+            )
+        finally:
+            try:
+                transport.disconnect_sync(True, None)
+            except Exception:
+                log.exception("Failed to disconnect transport after send")
+            self._transports.pop(account.transport_uid or "", None)
+
+        if not ok:
+            raise RuntimeError("Could not send message")
 
     def list_folders(self, account_uid: str) -> list[dict]:
         with self._lock:
@@ -452,6 +611,12 @@ class MailService:
         result["body_plain"] = bodies["plain"]
         result["body_html"] = bodies["html"]
         result["attachments"] = extract_attachments(mime)
+        if not result.get("message_id") and hasattr(mime, "get_message_id"):
+            result["message_id"] = mime.get_message_id()
+        if hasattr(mime, "get_header"):
+            references = mime.get_header("References")
+            if references:
+                result["references"] = references
 
         if was_unread:
             unread, total = self._mark_message_seen_unlocked(

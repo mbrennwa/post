@@ -120,6 +120,9 @@ def message_info_to_dict(info: Any) -> dict[str, Any]:
         "from": _safe_str(info.get_from()) or "",
         "to": _safe_str(info.get_to()) or "",
         "cc": _safe_str(info.get_cc()) or "",
+        "message_id": _safe_str(info.get_message_id())
+        if hasattr(info, "get_message_id")
+        else None,
         "sort_date": sort_date,
         "date_sent": format_message_datetime(date_sent),
         "date_received": format_message_datetime(date_recv),

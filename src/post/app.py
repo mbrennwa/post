@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import warnings
 
 import gi
 
@@ -20,6 +21,12 @@ from post.window import MainWindow
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO)
+    # PyGObject adds an extra ref when Python vfuncs return GObjects; harmless at exit.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Adding extra reference for.*FilterDriver",
+        category=RuntimeWarning,
+    )
 
     app = Adw.Application(application_id="io.github.mbrennwa.Post")
 

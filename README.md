@@ -16,10 +16,12 @@
 - Mark messages as read when opened; folder counts update
 - Open attachments from the reading pane (right-click to save or open with…)
 - Clear empty-folder and error states when loading fails
+- Context menu: mark read/unread, flag, archive, move to trash (with undo)
+- Compose plain-text **New Message** and **Reply** (Ctrl+N); send via account SMTP
 
 ## Planned
 
-- Compose and reply
+- Save draft, HTML compose, attachments, reply-all, forward
 - Own account setup
 - Conversation threading
 

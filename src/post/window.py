@@ -20,6 +20,7 @@ gi.require_version("Gdk", "4.0")
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, WebKit
 
+from post.compose_window import ComposeWindow
 from post.credentials import prompt_password_sync
 from post.mail import MailService
 from post.mail.eds import DEFAULT_MESSAGE_PAGE_SIZE, MailAccount
@@ -48,6 +49,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._current_account: MailAccount | None = None
         self._current_folder: str | None = None
         self._current_message_uid: str | None = None
+        self._current_message: dict | None = None
         self._current_body: dict[str, str | None] = {"plain": None, "html": None}
         self._messages_load_generation = 0
         self._message_read_generation = 0
@@ -67,7 +69,13 @@ class MainWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         title = Adw.WindowTitle(title="Post", subtitle="Mail")
         header.set_title_widget(title)
-        outer.append(header)
+
+        compose_btn = Gtk.Button()
+        compose_btn.set_icon_name("mail-message-new-symbolic")
+        compose_btn.set_label("New Message")
+        compose_btn.set_tooltip_text("New Message")
+        compose_btn.connect("clicked", self._on_compose_new_clicked)
+        header.pack_start(compose_btn)
 
         refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
         refresh_btn.set_tooltip_text("Refresh")
@@ -202,6 +210,16 @@ class MainWindow(Adw.ApplicationWindow):
         reader.set_margin_top(12)
         reader.set_margin_bottom(12)
 
+        reader_toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        new_message_btn = Gtk.Button(label="New Message")
+        new_message_btn.connect("clicked", self._on_compose_new_clicked)
+        reader_toolbar.append(new_message_btn)
+        self._reply_btn = Gtk.Button(label="Reply")
+        self._reply_btn.set_sensitive(False)
+        self._reply_btn.connect("clicked", self._on_reply_clicked)
+        reader_toolbar.append(self._reply_btn)
+        reader.append(reader_toolbar)
+
         self._reader_subject = Gtk.Label(
             label="Select a message",
             xalign=0,
@@ -238,11 +256,128 @@ class MainWindow(Adw.ApplicationWindow):
         self._toast_overlay.set_vexpand(True)
         self._toast_overlay.set_hexpand(True)
         self._toast_overlay.set_child(outer)
-        self.set_content(self._toast_overlay)
+
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(header)
+        toolbar_view.set_content(self._toast_overlay)
+        self.set_content(toolbar_view)
 
         self._setup_attachment_menu()
         self._setup_message_menu()
         self._setup_undo_action()
+        self._setup_compose_action()
+
+    def _setup_compose_action(self) -> None:
+        compose_action = Gio.SimpleAction.new("compose-new", None)
+        compose_action.connect("activate", self._on_compose_new_action)
+        self.add_action(compose_action)
+
+        reply_action = Gio.SimpleAction.new("compose-reply", None)
+        reply_action.connect("activate", self._on_reply_action)
+        self.add_action(reply_action)
+
+        application = self.get_application()
+        if application is not None:
+            application.set_accels_for_action("win.compose-new", ["<Control>n"])
+
+    def _on_compose_new_action(self, *_args) -> None:
+        self._open_compose_new()
+
+    def _on_compose_new_clicked(self, *_args) -> None:
+        self._open_compose_new()
+
+    def _on_reply_action(self, *_args) -> None:
+        self._open_compose_reply()
+
+    def _on_reply_clicked(self, *_args) -> None:
+        self._open_compose_reply()
+
+    def _compose_account(self) -> MailAccount | None:
+        if self._current_account is not None:
+            return self._current_account
+        accounts = self._mail.list_accounts()
+        return MailService.pick_default_account(accounts)
+
+    def _open_compose_new(self) -> None:
+        account = self._compose_account()
+        if account is None:
+            self._set_status("No mail account available for composing")
+            return
+        if not account.from_address and not account.email:
+            self._set_status("Selected account has no From address configured")
+            return
+        if not account.transport_uid:
+            self._set_status("Selected account has no mail transport configured")
+            return
+        self._present_compose_window(account, mode="new")
+
+    def _open_compose_reply(self) -> None:
+        if (
+            not self._current_account
+            or not self._current_folder
+            or not self._current_message_uid
+        ):
+            self._set_status("Select a message to reply")
+            return
+        account = self._current_account
+        if not account.transport_uid:
+            self._set_status("Selected account has no mail transport configured")
+            return
+        if self._current_message is not None:
+            self._present_compose_window(
+                account, mode="reply", reply_to=self._current_message
+            )
+            return
+
+        account_uid = account.uid
+        folder_name = self._current_folder
+        message_uid = self._current_message_uid
+        self._set_status("Preparing reply…")
+
+        def worker() -> None:
+            error: Exception | None = None
+            msg: dict | None = None
+            try:
+                msg = self._mail.read_message(account_uid, folder_name, message_uid)
+            except Exception as exc:
+                log.exception("Failed to load message for reply")
+                error = exc
+            GLib.idle_add(self._on_reply_message_loaded, account, msg, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_reply_message_loaded(
+        self,
+        account: MailAccount,
+        msg: dict | None,
+        error: Exception | None,
+    ) -> bool:
+        if error is not None:
+            self._set_status(f"Could not prepare reply: {error}")
+            return False
+        if msg is None:
+            return False
+        self._current_message = msg
+        self._reply_btn.set_sensitive(True)
+        self._present_compose_window(account, mode="reply", reply_to=msg)
+        return False
+
+    def _present_compose_window(
+        self,
+        account: MailAccount,
+        *,
+        mode: str,
+        reply_to: dict | None = None,
+    ) -> None:
+        window = ComposeWindow(
+            parent=self,
+            mail=self._mail,
+            account=account,
+            set_status=self._set_status,
+            mode=mode,  # type: ignore[arg-type]
+            reply_to=reply_to,
+        )
+        window.present()
 
     def _setup_undo_action(self) -> None:
         self._undo_move_action = Gio.SimpleAction.new("undo-move", None)
@@ -287,6 +422,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._trash_action = Gio.SimpleAction.new("message-move-trash", None)
         self._trash_action.connect("activate", self._on_message_menu_move_trash)
         self.add_action(self._trash_action)
+
+        reply_action = Gio.SimpleAction.new("message-reply", None)
+        reply_action.connect("activate", self._on_message_menu_reply)
+        self.add_action(reply_action)
 
         self._message_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
         self._message_popover.set_parent(self._message_scroll)
@@ -356,6 +495,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._reader_subject.set_label("Select a message")
         self._reader_meta.set_label("")
         self._current_message_uid = None
+        self._current_message = None
+        self._reply_btn.set_sensitive(False)
         self._clear_attachments()
         self._current_body = {"plain": None, "html": None}
         self._show_reader_document()
@@ -948,6 +1089,8 @@ class MainWindow(Adw.ApplicationWindow):
         menu = Gio.Menu()
         menu.append(self._read_menu_label(rows), "win.message-toggle-read")
         menu.append(self._flag_menu_label(rows), "win.message-toggle-flag")
+        if len(rows) == 1:
+            menu.append("Reply", "win.message-reply")
         if can_archive:
             menu.append(
                 self._count_menu_label("Archive", rows), "win.message-archive"
@@ -1006,6 +1149,9 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_message_menu_move_trash(self, *_args) -> None:
         self._move_context_messages("trash")
+
+    def _on_message_menu_reply(self, *_args) -> None:
+        self._open_compose_reply()
 
     def _move_context_messages(self, destination: str) -> None:
         rows = list(self._context_message_rows)
@@ -1416,6 +1562,8 @@ class MainWindow(Adw.ApplicationWindow):
             self._reader_subject.set_label("Could not read message")
             self._reader_meta.set_label(str(error))
             self._clear_attachments()
+            self._current_message = None
+            self._reply_btn.set_sensitive(False)
             self._current_body = {"plain": None, "html": None}
             self._web_view.load_html(
                 "<body style='font-family:sans-serif;color:#666;padding:1em'>"
@@ -1441,6 +1589,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._reader_subject.set_label(msg.get("subject") or "(no subject)")
         self._reader_meta.set_label(format_message_header(msg))
+        self._current_message = msg
+        self._reply_btn.set_sensitive(True)
         self._show_attachments(msg.get("attachments") or [])
         self._current_body = {
             "plain": msg.get("body_plain"),
