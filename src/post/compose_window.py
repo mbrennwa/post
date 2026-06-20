@@ -48,11 +48,14 @@ class ComposeWindow(Adw.Window):
     ) -> None:
         super().__init__(transient_for=parent, modal=False)
         self._mail = mail
-        self._account = account
         self._set_status = set_status
         self._mode = mode
         self._reply_to = reply_to
         self._sending = False
+        self._send_accounts = mail.list_sendable_accounts()
+        if not self._send_accounts:
+            raise ValueError("No mail account configured for sending")
+        self._account = account if account.can_send else self._send_accounts[0]
 
         title = "Reply" if mode == "reply" else "New Message"
         self.set_title(title)
@@ -87,9 +90,16 @@ class ComposeWindow(Adw.Window):
         self._error_label.set_visible(False)
         form.append(self._error_label)
 
-        form.append(
-            self._labeled_row("From", Gtk.Label(label=account.from_label, xalign=0, wrap=True))
-        )
+        from_labels = [send_account.from_label for send_account in self._send_accounts]
+        self._from_dropdown = Gtk.DropDown.new_from_strings(from_labels)
+        self._from_dropdown.set_hexpand(True)
+        for index, send_account in enumerate(self._send_accounts):
+            if send_account.uid == self._account.uid:
+                self._from_dropdown.set_selected(index)
+                break
+        if len(self._send_accounts) == 1:
+            self._from_dropdown.set_sensitive(False)
+        form.append(self._labeled_row("From", self._from_dropdown))
 
         self._to_entry = Gtk.Entry()
         self._to_entry.set_placeholder_text("recipient@example.com")
@@ -160,12 +170,20 @@ class ComposeWindow(Adw.Window):
         row.append(cls._field_label(label))
         if isinstance(widget, Gtk.Entry):
             widget.set_hexpand(True)
+        elif isinstance(widget, Gtk.DropDown):
+            widget.set_hexpand(True)
         elif isinstance(widget, Gtk.Label):
             widget.set_hexpand(True)
             widget.set_halign(Gtk.Align.START)
             widget.set_valign(Gtk.Align.CENTER)
         row.append(widget)
         return row
+
+    def _selected_account(self) -> MailAccount:
+        index = self._from_dropdown.get_selected()
+        if index == Gtk.INVALID_LIST_POSITION:
+            return self._account
+        return self._send_accounts[index]
 
     def _prefill_fields(self) -> None:
         if self._mode == "reply" and self._reply_to is not None:
@@ -234,7 +252,8 @@ class ComposeWindow(Adw.Window):
         self._send_btn.set_sensitive(False)
         self._set_status("Sending message…")
 
-        account_uid = self._account.uid
+        account = self._selected_account()
+        account_uid = account.uid
 
         def worker() -> None:
             error: Exception | None = None

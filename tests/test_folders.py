@@ -154,6 +154,25 @@ class MailAccountDisplayLabelTests(unittest.TestCase):
         account = MailAccount(uid="x", name="Work", email=None, backend="imapx")
         self.assertEqual(account.display_label, "Work")
 
+    def test_can_send_requires_transport_and_from(self) -> None:
+        ready = MailAccount(
+            uid="x",
+            name="Work",
+            email="user@example.com",
+            backend="imapx",
+            from_address="user@example.com",
+            transport_uid="transport-1",
+        )
+        missing_transport = MailAccount(
+            uid="y",
+            name="Work",
+            email="user@example.com",
+            backend="imapx",
+            from_address="user@example.com",
+        )
+        self.assertTrue(ready.can_send)
+        self.assertFalse(missing_transport.can_send)
+
 
 if __name__ == "__main__":
     unittest.main()

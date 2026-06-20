@@ -296,16 +296,13 @@ class MainWindow(Adw.ApplicationWindow):
         return MailService.pick_default_account(accounts)
 
     def _open_compose_new(self) -> None:
+        sendable = self._mail.list_sendable_accounts()
+        if not sendable:
+            self._set_status("No mail account configured for sending")
+            return
         account = self._compose_account()
-        if account is None:
-            self._set_status("No mail account available for composing")
-            return
-        if not account.from_address and not account.email:
-            self._set_status("Selected account has no From address configured")
-            return
-        if not account.transport_uid:
-            self._set_status("Selected account has no mail transport configured")
-            return
+        if account is None or not account.can_send:
+            account = MailService.pick_default_account(sendable) or sendable[0]
         self._present_compose_window(account, mode="new")
 
     def _open_compose_reply(self) -> None:
@@ -316,8 +313,11 @@ class MainWindow(Adw.ApplicationWindow):
         ):
             self._set_status("Select a message to reply")
             return
+        if not self._mail.list_sendable_accounts():
+            self._set_status("No mail account configured for sending")
+            return
         account = self._current_account
-        if not account.transport_uid:
+        if not account.can_send:
             self._set_status("Selected account has no mail transport configured")
             return
         if self._current_message is not None:

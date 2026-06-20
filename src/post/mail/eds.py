@@ -132,6 +132,10 @@ class MailAccount:
             return f"{self.from_name} <{self.from_address}>"
         return self.from_address or self.email or self.name
 
+    @property
+    def can_send(self) -> bool:
+        return bool(self.transport_uid and (self.from_address or self.email))
+
 
 @dataclass
 class MailService:
@@ -202,6 +206,9 @@ class MailService:
         accounts.sort(key=lambda a: (order.get(a.backend or "", 99), a.name))
         self._accounts_by_uid = {account.uid: account for account in accounts}
         return accounts
+
+    def list_sendable_accounts(self) -> list[MailAccount]:
+        return [account for account in self.list_accounts() if account.can_send]
 
     def get_account(self, account_uid: str) -> MailAccount:
         with self._lock:
