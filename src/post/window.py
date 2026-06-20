@@ -135,6 +135,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_list = Gtk.ListBox()
         self._message_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
         self._message_list.set_activate_on_single_click(False)
+        self._message_list.connect("row-selected", self._on_message_list_selection_changed)
         self._message_list.connect("row-selected", self._on_message_selected)
         context_gesture = Gtk.GestureClick()
         context_gesture.set_button(0)
@@ -263,6 +264,46 @@ class MainWindow(Adw.ApplicationWindow):
         self._setup_message_menu()
         self._setup_undo_action()
         self._setup_compose_action()
+        self._setup_delete_shortcut()
+
+    def _setup_delete_shortcut(self) -> None:
+        for widget in (self, self._message_list):
+            controller = Gtk.EventControllerKey()
+            controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            controller.connect("key-pressed", self._on_delete_key_pressed)
+            widget.add_controller(controller)
+
+    def _on_delete_key_pressed(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        _state: Gdk.ModifierType,
+    ) -> bool:
+        # Mac keyboards send BackSpace for the key labeled "delete"; PC Delete is
+        # KEY_Delete / KEY_KP_Delete (often Fn+Delete on Mac in a VM).
+        if keyval not in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete, Gdk.KEY_BackSpace):
+            return False
+        focus = self.get_focus()
+        if isinstance(focus, Gtk.Editable):
+            return False
+        return self._on_delete_shortcut(self)
+
+    def _on_delete_shortcut(
+        self,
+        _widget: Gtk.Widget,
+        _args: GLib.Variant | None = None,
+    ) -> bool:
+        rows = self._message_list.get_selected_rows()
+        if not rows or not self._current_account or not self._current_folder:
+            return False
+        state = self._sidebar.get_move_menu_state(
+            self._current_account.uid, self._current_folder
+        )
+        if not state.get("can_trash"):
+            return False
+        self._move_selected_messages("trash")
+        return True
 
     def _setup_compose_action(self) -> None:
         compose_action = Gio.SimpleAction.new("compose-new", None)
@@ -494,6 +535,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._current_message_uid = None
         self._current_message = None
         self._reply_btn.set_sensitive(False)
+        self._update_message_toolbar()
         self._clear_attachments()
         self._current_body = {"plain": None, "html": None}
         self._show_reader_document()
@@ -1134,6 +1176,9 @@ class MainWindow(Adw.ApplicationWindow):
         if Gdk.Event.triggers_context_menu(event):
             self._popup_message_menu(row, x, y)
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            return
+
+        GLib.idle_add(self._update_message_toolbar)
 
     def _on_message_menu_toggle_read(self, *_args) -> None:
         self._toggle_message_flag("seen")
@@ -1150,8 +1195,16 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_message_menu_reply(self, *_args) -> None:
         self._open_compose_reply()
 
+    def _move_selected_messages(self, destination: str) -> None:
+        rows = self._message_list.get_selected_rows()
+        if not rows:
+            return
+        self._move_messages(destination, list(rows))
+
     def _move_context_messages(self, destination: str) -> None:
-        rows = list(self._context_message_rows)
+        self._move_messages(destination, list(self._context_message_rows))
+
+    def _move_messages(self, destination: str, rows: list[Gtk.ListBoxRow]) -> None:
         if not rows or not self._current_account or not self._current_folder:
             return
 
@@ -1415,6 +1468,7 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             self._clear_move_undo()
             self._set_status(status_label)
+        self._update_message_toolbar()
         return False
 
     def _toggle_message_flag(self, flag_name: str) -> None:
@@ -1508,6 +1562,17 @@ class MainWindow(Adw.ApplicationWindow):
         flag_icon = getattr(row, "flag_icon", None)
         if isinstance(flag_icon, Gtk.Image):
             flag_icon.set_visible(bool(flags.get("flagged")))
+
+    def _on_message_list_selection_changed(
+        self, _listbox: Gtk.ListBox, _row: Gtk.ListBoxRow | None
+    ) -> None:
+        GLib.idle_add(self._update_message_toolbar)
+
+    def _update_message_toolbar(self) -> bool:
+        rows = self._message_list.get_selected_rows()
+        if len(rows) != 1:
+            self._reply_btn.set_sensitive(False)
+        return False
 
     def _on_message_selected(
         self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None
