@@ -134,27 +134,41 @@ class ComposeWindow(Adw.Window):
 
         self._to_entry = Gtk.Entry()
         self._to_entry.set_placeholder_text("recipient@example.com")
-        form.append(self._labeled_row("To", self._to_entry))
+        self._to_entry.set_hexpand(True)
         self._setup_address_completion(self._to_entry)
+
+        self._cc_toggle_btn = Gtk.Button(label="Cc")
+        self._cc_toggle_btn.add_css_class("flat")
+        self._cc_toggle_btn.set_can_focus(False)
+        self._cc_toggle_btn.connect("clicked", self._on_toggle_cc)
+
+        self._bcc_toggle_btn = Gtk.Button(label="Bcc")
+        self._bcc_toggle_btn.add_css_class("flat")
+        self._bcc_toggle_btn.set_can_focus(False)
+        self._bcc_toggle_btn.connect("clicked", self._on_toggle_bcc)
+
+        self._to_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self._to_row.append(self._field_label("To"))
+        self._to_row.append(self._to_entry)
+        self._to_row.append(self._cc_toggle_btn)
+        self._to_row.append(self._bcc_toggle_btn)
+        form.append(self._to_row)
 
         self._cc_entry = Gtk.Entry()
         self._cc_entry.set_placeholder_text("Optional")
         self._cc_entry.set_hexpand(True)
-
-        self._bcc_toggle_btn = Gtk.Button(label="Show Bcc")
-        self._bcc_toggle_btn.add_css_class("flat")
-        self._bcc_toggle_btn.connect("clicked", self._on_toggle_bcc)
-
+        self._cc_entry.set_can_focus(False)
         self._cc_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         self._cc_row.append(self._field_label("Cc"))
         self._cc_row.append(self._cc_entry)
-        self._cc_row.append(self._bcc_toggle_btn)
+        self._cc_row.set_visible(False)
         form.append(self._cc_row)
         self._setup_address_completion(self._cc_entry)
 
         self._bcc_entry = Gtk.Entry()
         self._bcc_entry.set_placeholder_text("Optional")
         self._bcc_entry.set_hexpand(True)
+        self._bcc_entry.set_can_focus(False)
         self._bcc_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         self._bcc_row.append(self._field_label("Bcc"))
         self._bcc_row.append(self._bcc_entry)
@@ -164,6 +178,11 @@ class ComposeWindow(Adw.Window):
 
         self._subject_entry = Gtk.Entry()
         form.append(self._labeled_row("Subject", self._subject_entry))
+
+        self._focus_body_at_start_on_enter = False
+        subject_focus = Gtk.EventControllerFocus()
+        subject_focus.connect("leave", self._on_subject_focus_leave)
+        self._subject_entry.add_controller(subject_focus)
 
         body_frame = Gtk.Frame()
         body_frame.add_css_class("view")
@@ -180,6 +199,10 @@ class ComposeWindow(Adw.Window):
         body_frame.set_child(body_scroll)
         body_frame.set_vexpand(True)
         form.append(body_frame)
+
+        body_focus = Gtk.EventControllerFocus()
+        body_focus.connect("enter", self._on_body_focus_in)
+        self._body_view.add_controller(body_focus)
 
         toolbar_view = Adw.ToolbarView()
         toolbar_view.add_top_bar(header)
@@ -376,6 +399,9 @@ class ComposeWindow(Adw.Window):
                     self._to_entry.set_text(format_address_list(to_addrs))
                     if cc_addrs:
                         self._cc_entry.set_text(format_address_list(cc_addrs))
+                        self._cc_row.set_visible(True)
+                        self._cc_entry.set_can_focus(True)
+                        self._cc_toggle_btn.set_label("Hide Cc")
                 else:
                     self._to_entry.set_text(
                         extract_reply_address(self._reply_to.get("from", ""))
@@ -416,18 +442,38 @@ class ComposeWindow(Adw.Window):
                 signature=signature,
             )
             self._body_view.get_buffer().set_text(body)
+            self._place_body_cursor_at_start()
+
+    def _place_body_cursor_at_start(self) -> None:
+        buffer = self._body_view.get_buffer()
+        buffer.place_cursor(buffer.get_start_iter())
+
+    def _on_subject_focus_leave(self, *_args) -> None:
+        if self._mode == "new":
+            self._focus_body_at_start_on_enter = True
+
+    def _on_body_focus_in(self, *_args) -> None:
+        if not self._focus_body_at_start_on_enter:
+            return
+        self._focus_body_at_start_on_enter = False
+        if self._mode == "new":
+            self._place_body_cursor_at_start()
+
+    def _on_toggle_cc(self, button: Gtk.Button) -> None:
+        reveal = not self._cc_row.get_visible()
+        self._cc_row.set_visible(reveal)
+        self._cc_entry.set_can_focus(reveal)
+        button.set_label("Hide Cc" if reveal else "Cc")
+        if reveal:
+            self._cc_entry.grab_focus()
 
     def _on_toggle_bcc(self, button: Gtk.Button) -> None:
         reveal = not self._bcc_row.get_visible()
         self._bcc_row.set_visible(reveal)
+        self._bcc_entry.set_can_focus(reveal)
+        button.set_label("Hide Bcc" if reveal else "Bcc")
         if reveal:
-            button.set_label("Hide Bcc")
-            self._cc_row.remove(button)
-            self._bcc_row.append(button)
-        else:
-            button.set_label("Show Bcc")
-            self._bcc_row.remove(button)
-            self._cc_row.append(button)
+            self._bcc_entry.grab_focus()
 
     def _on_cancel_clicked(self, *_args) -> None:
         self.close()
