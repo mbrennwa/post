@@ -40,6 +40,9 @@ from .search import MessageSearchQuery, message_matches
 
 log = logging.getLogger(__name__)
 
+# Limit autocomplete index size; messages are processed newest-first.
+_MAX_CORRESPONDENTS = 500
+
 # EDS also lists RSS feeds, search folders, etc. as "Mail Account" sources.
 _SKIP_BACKENDS = frozenset({"rss", "vfolder"})
 DEFAULT_MESSAGE_PAGE_SIZE = 50
@@ -470,7 +473,8 @@ class MailService:
             messages.extend(index.messages)
 
         messages.sort(key=lambda message: message.get("sort_date") or 0, reverse=True)
-        return collect_correspondents(messages, exclude_emails=exclude_emails)
+        correspondents = collect_correspondents(messages, exclude_emails=exclude_emails)
+        return correspondents[:_MAX_CORRESPONDENTS]
 
     def list_folders(self, account_uid: str) -> list[dict]:
         with self._lock:

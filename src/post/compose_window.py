@@ -123,6 +123,7 @@ class ComposeWindow(Adw.Window):
         self._correspondents: list[Correspondent] = []
         self._correspondents_generation = 0
         self._completion_model = Gtk.ListStore(str)
+        self._entry_match_cache: dict[int, tuple[str, frozenset[str]]] = {}
 
         self._to_entry = Gtk.Entry()
         self._to_entry.set_placeholder_text("recipient@example.com")
@@ -188,25 +189,42 @@ class ComposeWindow(Adw.Window):
         completion.set_minimum_key_length(1)
         completion.set_popup_completion(True)
 
-        def match_func(completion, key, tree_iter, _user_data) -> bool:
+        def match_func(completion, key, tree_iter, entry) -> bool:
             token = current_address_token(key)
             if not token:
                 return False
-            model = completion.get_model()
-            display = model.get_value(tree_iter, 0)
-            matches = match_correspondents(self._correspondents, token, limit=100)
-            return any(match.display == display for match in matches)
+            entry_id = id(entry)
+            cached = self._entry_match_cache.get(entry_id)
+            if cached is None or cached[0] != token:
+                matches = match_correspondents(self._correspondents, token, limit=100)
+                cached = (token, frozenset(match.display for match in matches))
+                self._entry_match_cache[entry_id] = cached
+            display = completion.get_model().get_value(tree_iter, 0)
+            return display in cached[1]
 
-        completion.set_match_func(match_func, None)
+        completion.set_match_func(match_func, entry)
+        entry.connect("changed", self._on_address_entry_changed, entry)
 
         def on_match_selected(completion, model, tree_iter, entry) -> bool:
             display = model.get_value(tree_iter, 0)
             entry.set_text(apply_address_completion(entry.get_text(), display))
             entry.set_position(-1)
+            self._entry_match_cache.pop(id(entry), None)
             return True
 
         completion.connect("match-selected", on_match_selected, entry)
         entry.set_completion(completion)
+
+    def _on_address_entry_changed(self, entry: Gtk.Entry, *_args) -> None:
+        self._entry_match_cache.pop(id(entry), None)
+
+    def _set_completion_model(self, model: Gtk.ListStore) -> None:
+        self._completion_model = model
+        self._entry_match_cache.clear()
+        for entry in (self._to_entry, self._cc_entry, self._bcc_entry):
+            completion = entry.get_completion()
+            if completion is not None:
+                completion.set_model(model)
 
     def _on_from_account_changed(self, *_args) -> None:
         self._load_correspondents()
@@ -241,9 +259,10 @@ class ComposeWindow(Adw.Window):
         if generation != self._correspondents_generation:
             return False
         self._correspondents = correspondents
-        self._completion_model.clear()
+        model = Gtk.ListStore(str)
         for correspondent in correspondents:
-            self._completion_model.append([correspondent.display])
+            model.append([correspondent.display])
+        self._set_completion_model(model)
         return False
 
     @classmethod

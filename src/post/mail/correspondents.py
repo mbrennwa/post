@@ -77,6 +77,18 @@ def _matches_prefix(value: str, prefix: str) -> bool:
     return value.casefold().startswith(prefix.casefold())
 
 
+def correspondent_matches_prefix(correspondent: Correspondent, prefix: str) -> bool:
+    """Return whether a single correspondent matches a typed prefix."""
+    prefix = prefix.strip()
+    if not prefix:
+        return False
+    if correspondent.name and _matches_prefix(correspondent.name, prefix):
+        return True
+    if _matches_prefix(correspondent.email, prefix):
+        return True
+    return _matches_prefix(correspondent.display, prefix)
+
+
 def match_correspondents(
     candidates: list[Correspondent],
     prefix: str,

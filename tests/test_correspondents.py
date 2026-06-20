@@ -9,6 +9,7 @@ from post.mail.compose import normalize_email
 from post.mail.correspondents import (
     apply_address_completion,
     collect_correspondents,
+    correspondent_matches_prefix,
     current_address_token,
     match_correspondents,
 )
@@ -118,6 +119,20 @@ class MatchCorrespondentsTests(unittest.TestCase):
     def test_respects_limit(self) -> None:
         matches = match_correspondents(self.candidates, "a", limit=1)
         self.assertEqual(len(matches), 1)
+
+
+class CorrespondentMatchesPrefixTests(unittest.TestCase):
+    def test_matches_name(self) -> None:
+        correspondent = collect_correspondents(
+            [{"from": "Alice <alice@example.com>", "to": "", "cc": ""}]
+        )[0]
+        self.assertTrue(correspondent_matches_prefix(correspondent, "ali"))
+
+    def test_matches_email(self) -> None:
+        correspondent = collect_correspondents(
+            [{"from": "Bob <bob@example.com>", "to": "", "cc": ""}]
+        )[0]
+        self.assertTrue(correspondent_matches_prefix(correspondent, "bob@ex"))
 
 
 class ApplyAddressCompletionTests(unittest.TestCase):
