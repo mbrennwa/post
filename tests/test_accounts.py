@@ -6,16 +6,19 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from post.mail.accounts import (
     BUILTIN_LOCAL_UID,
     LocalMailConfig,
+    POST_LOCAL_ACCOUNT_UID,
     _render_account_source,
     _render_identity_source,
     default_local_mail_config,
     default_spool_path,
     is_maildir_empty,
     is_spool_empty,
+    should_list_local_account,
     validate_local_mail_config,
 )
 
@@ -159,6 +162,40 @@ class DefaultConfigTests(unittest.TestCase):
 class BuiltinLocalUidTests(unittest.TestCase):
     def test_builtin_uid_constant(self) -> None:
         self.assertEqual(BUILTIN_LOCAL_UID, "local")
+
+
+class ShouldListLocalAccountTests(unittest.TestCase):
+    def _source(self, uid: str, backend: str) -> mock.Mock:
+        source = mock.Mock()
+        source.get_uid.return_value = uid
+        mail_ext = mock.Mock()
+        mail_ext.get_backend_name.return_value = backend
+        source.get_extension.return_value = mail_ext
+        return source
+
+    def test_imap_accounts_always_listed(self) -> None:
+        source = self._source("imap-1", "imapx")
+        self.assertTrue(should_list_local_account(source))
+
+    @mock.patch("post.mail.accounts.is_local_account_usable", return_value=True)
+    def test_skips_non_post_spool_accounts(self, _usable: mock.Mock) -> None:
+        source = self._source("post-spool-probe-abc", "spool")
+        self.assertFalse(should_list_local_account(source))
+
+    @mock.patch("post.mail.accounts.is_local_account_usable", return_value=True)
+    def test_allows_post_local_mail(self, _usable: mock.Mock) -> None:
+        source = self._source(POST_LOCAL_ACCOUNT_UID, "spool")
+        self.assertTrue(should_list_local_account(source))
+
+    @mock.patch("post.mail.accounts.is_local_account_usable", return_value=False)
+    def test_skips_post_local_without_path(self, _usable: mock.Mock) -> None:
+        source = self._source(POST_LOCAL_ACCOUNT_UID, "maildir")
+        self.assertFalse(should_list_local_account(source))
+
+    @mock.patch("post.mail.accounts.is_local_account_usable", return_value=True)
+    def test_allows_builtin_local(self, _usable: mock.Mock) -> None:
+        source = self._source(BUILTIN_LOCAL_UID, "maildir")
+        self.assertTrue(should_list_local_account(source))
 
 
 class BuiltinLocalEmptyIntegrationTests(unittest.TestCase):

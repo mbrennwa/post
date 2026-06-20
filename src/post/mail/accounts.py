@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 
 POST_LOCAL_ACCOUNT_UID = "post-local-mail"
 BUILTIN_LOCAL_UID = "local"
+LOCAL_BACKENDS = frozenset({"spool", "maildir"})
 
 LocalMailType = Literal["spool", "maildir"]
 
@@ -108,6 +109,54 @@ def is_builtin_local_store_empty(registry: EDataServer.SourceRegistry) -> bool:
     if not path:
         return True
     return is_maildir_empty(path)
+
+
+def get_local_backend_path(source: EDataServer.Source) -> str | None:
+    """Return the configured spool/Maildir path for a local mail source."""
+    mail_ext = source.get_extension("Mail Account")
+    backend = mail_ext.get_backend_name()
+    if backend not in LOCAL_BACKENDS:
+        return None
+
+    ext_name = "Spool Backend" if backend == "spool" else "Maildir Backend"
+    if not source.has_extension(ext_name):
+        return None
+
+    ext = source.get_extension(ext_name)
+    settings = ext.get_settings()
+    path = settings.get_path() if hasattr(settings, "get_path") else None
+    if not path:
+        return None
+    path = str(path).strip()
+    return path or None
+
+
+def is_local_account_usable(source: EDataServer.Source) -> bool:
+    """True when a spool/Maildir account has an absolute storage path configured."""
+    mail_ext = source.get_extension("Mail Account")
+    if mail_ext.get_backend_name() not in LOCAL_BACKENDS:
+        return True
+
+    path = get_local_backend_path(source)
+    return bool(path and os.path.isabs(path))
+
+
+def should_list_local_account(source: EDataServer.Source) -> bool:
+    """Whether a spool/Maildir source should appear in Post's sidebar."""
+    uid = source.get_uid()
+    mail_ext = source.get_extension("Mail Account")
+    backend = mail_ext.get_backend_name()
+    if backend not in LOCAL_BACKENDS:
+        return True
+    if uid == BUILTIN_LOCAL_UID:
+        return True
+    if uid != POST_LOCAL_ACCOUNT_UID:
+        log.debug("Skipping non-Post local account %s", uid)
+        return False
+    if not is_local_account_usable(source):
+        log.debug("Skipping Post local account %s: no valid path", uid)
+        return False
+    return True
 
 
 def read_local_mail_config(

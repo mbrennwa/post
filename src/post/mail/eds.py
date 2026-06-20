@@ -26,7 +26,11 @@ from .helpers import (
     sort_messages_newest_first,
     walk_folder_info,
 )
-from .accounts import BUILTIN_LOCAL_UID, is_builtin_local_store_empty
+from .accounts import (
+    BUILTIN_LOCAL_UID,
+    is_builtin_local_store_empty,
+    should_list_local_account,
+)
 from .auth import PasswordPromptCallback, authenticate_service_sync
 from .compose import addresses_to_internet_address, build_plain_mime_message
 from .folders import find_folder_by_type, guess_inbox_name
@@ -193,6 +197,8 @@ class MailService:
             mail_ext = source.get_extension("Mail Account")
             backend = mail_ext.get_backend_name()
             if backend in _SKIP_BACKENDS:
+                continue
+            if not should_list_local_account(source):
                 continue
             email = None
             identity_uid = mail_ext.get_identity_uid()
