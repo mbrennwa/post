@@ -8,9 +8,23 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from typing import Any
+from typing import Any, Literal
 
 _PREF_PATH = os.path.join(os.path.expanduser("~"), ".config", "post", "preferences.json")
+
+MessageAppearance = Literal["adapt_text", "adapt_background", "accept_sender"]
+
+MESSAGE_APPEARANCE_ADAPT_TEXT: MessageAppearance = "adapt_text"
+MESSAGE_APPEARANCE_ADAPT_BACKGROUND: MessageAppearance = "adapt_background"
+MESSAGE_APPEARANCE_ACCEPT_SENDER: MessageAppearance = "accept_sender"
+
+_MESSAGE_APPEARANCE_VALUES: frozenset[str] = frozenset(
+    {
+        MESSAGE_APPEARANCE_ADAPT_TEXT,
+        MESSAGE_APPEARANCE_ADAPT_BACKGROUND,
+        MESSAGE_APPEARANCE_ACCEPT_SENDER,
+    }
+)
 
 _DEFAULT_WINDOW_WIDTH = 1100
 _DEFAULT_WINDOW_HEIGHT = 720
@@ -58,6 +72,21 @@ def get_load_remote_content() -> bool:
 def set_load_remote_content(value: bool) -> None:
     data = _load_raw()
     data["load_remote_content"] = value
+    _save_raw(data)
+
+
+def get_message_appearance() -> MessageAppearance:
+    value = _load_raw().get("message_appearance")
+    if isinstance(value, str) and value in _MESSAGE_APPEARANCE_VALUES:
+        return value  # type: ignore[return-value]
+    return MESSAGE_APPEARANCE_ADAPT_TEXT
+
+
+def set_message_appearance(value: MessageAppearance) -> None:
+    if value not in _MESSAGE_APPEARANCE_VALUES:
+        raise ValueError(f"Invalid message appearance: {value!r}")
+    data = _load_raw()
+    data["message_appearance"] = value
     _save_raw(data)
 
 

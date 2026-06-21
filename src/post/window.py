@@ -54,8 +54,10 @@ from post.mail.helpers import (
 from post.reader import build_reader_document
 from post.wrap_label import WrappingLabel
 from post.preferences import (
+    MessageAppearance,
     get_auto_sync,
     get_load_remote_content,
+    get_message_appearance,
     get_sidebar_state,
     get_window_state,
     set_active_message_uid,
@@ -147,6 +149,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._undo_toast: Adw.Toast | None = None
         self._settings_dialog: SettingsWindow | None = None
         self._load_remote_content = get_load_remote_content()
+        self._message_appearance = get_message_appearance()
         self._restore_message_folder: tuple[str, str] | None = None
         self._pending_restore_message_uid: str | None = None
         self._restoring_selection = False
@@ -855,6 +858,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_saved=self._reload_sidebar,
             on_load_remote_content_changed=self._on_load_remote_content_changed,
             on_auto_sync_changed=self._on_auto_sync_changed,
+            on_message_appearance_changed=self._on_message_appearance_changed,
         )
         self._settings_dialog = dialog
         dialog.connect("closed", self._on_settings_closed)
@@ -936,6 +940,11 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_load_remote_content_changed(self, enabled: bool) -> None:
         self._load_remote_content = enabled
+        if self._current_body.get("html") or self._current_body.get("plain"):
+            self._show_reader_document()
+
+    def _on_message_appearance_changed(self, appearance: MessageAppearance) -> None:
+        self._message_appearance = appearance
         if self._current_body.get("html") or self._current_body.get("plain"):
             self._show_reader_document()
 
@@ -2713,6 +2722,7 @@ class MainWindow(Adw.ApplicationWindow):
             body_plain=self._current_body.get("plain"),
             allow_remote=self._load_remote_content,
             dark=self._app_prefers_dark(),
+            message_appearance=self._message_appearance,
             inline_images=self._current_message.get("inline_images"),
         )
         self._web_view.load_html(document, None)

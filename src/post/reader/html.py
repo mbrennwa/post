@@ -9,6 +9,8 @@ import base64
 import html
 import re
 
+from post.preferences import MessageAppearance, MESSAGE_APPEARANCE_ADAPT_TEXT
+
 # Block http(s) images and trackers when remote content is disabled.
 _EXTERNAL_IMG = re.compile(
     r'(<img\b[^>]*\ssrc=)(["\'])https?://[^"\']*\2',
@@ -188,6 +190,18 @@ blockquote {
 }
 """
 
+_ADAPT_TEXT_CSS = """
+.message-body :where(p, div, span, li, td, th, font, h1, h2, h3, h4, h5, h6) {
+  color: inherit !important;
+}
+"""
+
+
+def _effective_reader_dark(app_dark: bool, appearance: MessageAppearance) -> bool:
+    if appearance == "adapt_background":
+        return not app_dark
+    return app_dark
+
 
 def build_reader_document(
     *,
@@ -195,10 +209,12 @@ def build_reader_document(
     body_plain: str | None,
     allow_remote: bool,
     dark: bool = False,
+    message_appearance: MessageAppearance = MESSAGE_APPEARANCE_ADAPT_TEXT,
     inline_images: dict[str, tuple[str, bytes]] | None = None,
 ) -> str:
     """Wrap message content in a safe HTML shell for WebKit."""
     blocked_notice = ""
+    html_body = body_html is not None
     if body_html:
         content = body_html
         if inline_images:
@@ -213,6 +229,8 @@ def build_reader_document(
                     "Remote images are hidden. Enable “Load remote content” in Settings to show them."
                     "</p>"
                 )
+        if message_appearance == "adapt_text":
+            content = f'<div class="message-body">{content}</div>'
     elif body_plain:
         content = f'<pre class="plain-body">{html.escape(body_plain)}</pre>'
     else:
@@ -232,8 +250,11 @@ def build_reader_document(
             "font-src data:;"
         )
 
-    color_scheme = "dark" if dark else "light"
-    reader_css = _READER_CSS_DARK if dark else _READER_CSS_LIGHT
+    reader_dark = _effective_reader_dark(dark, message_appearance)
+    color_scheme = "dark" if reader_dark else "light"
+    reader_css = _READER_CSS_DARK if reader_dark else _READER_CSS_LIGHT
+    if message_appearance == "adapt_text" and html_body:
+        reader_css = f"{reader_css}\n{_ADAPT_TEXT_CSS}"
 
     return f"""<!DOCTYPE html>
 <html>

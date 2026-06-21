@@ -10,10 +10,14 @@ import unittest
 from unittest import mock
 
 from post.preferences import (
+    MESSAGE_APPEARANCE_ACCEPT_SENDER,
+    MESSAGE_APPEARANCE_ADAPT_BACKGROUND,
+    MESSAGE_APPEARANCE_ADAPT_TEXT,
     get_account_signature,
     get_account_signatures,
     get_auto_sync,
     get_load_remote_content,
+    get_message_appearance,
     get_show_evolution_local,
     get_sidebar_state,
     get_window_state,
@@ -23,6 +27,7 @@ from post.preferences import (
     set_active_message_uid,
     set_auto_sync,
     set_load_remote_content,
+    set_message_appearance,
     set_show_evolution_local,
     set_sidebar_state,
     set_window_state,
@@ -64,6 +69,43 @@ class PreferencesTests(unittest.TestCase):
                 self.assertTrue(get_load_remote_content())
                 set_load_remote_content(False)
                 self.assertFalse(get_load_remote_content())
+
+    def test_message_appearance_defaults_adapt_text(self) -> None:
+        with mock.patch(
+            "post.preferences._PREF_PATH",
+            os.path.join(tempfile.gettempdir(), "post-prefs-appearance-missing.json"),
+        ):
+            self.assertEqual(get_message_appearance(), MESSAGE_APPEARANCE_ADAPT_TEXT)
+
+    def test_message_appearance_invalid_value_defaults_adapt_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "preferences.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"message_appearance": "invalid"}, handle)
+            with mock.patch("post.preferences._PREF_PATH", path):
+                self.assertEqual(get_message_appearance(), MESSAGE_APPEARANCE_ADAPT_TEXT)
+
+    def test_message_appearance_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "preferences.json")
+            with mock.patch("post.preferences._PREF_PATH", path):
+                set_message_appearance(MESSAGE_APPEARANCE_ADAPT_BACKGROUND)
+                self.assertEqual(
+                    get_message_appearance(), MESSAGE_APPEARANCE_ADAPT_BACKGROUND
+                )
+                set_message_appearance(MESSAGE_APPEARANCE_ACCEPT_SENDER)
+                self.assertEqual(
+                    get_message_appearance(), MESSAGE_APPEARANCE_ACCEPT_SENDER
+                )
+                with open(path, encoding="utf-8") as handle:
+                    data = json.load(handle)
+                self.assertEqual(
+                    data["message_appearance"], MESSAGE_APPEARANCE_ACCEPT_SENDER
+                )
+
+    def test_set_message_appearance_rejects_invalid(self) -> None:
+        with self.assertRaises(ValueError):
+            set_message_appearance("invalid")  # type: ignore[arg-type]
 
     def test_auto_sync_defaults_true(self) -> None:
         with mock.patch(
