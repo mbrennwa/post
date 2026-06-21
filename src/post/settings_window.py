@@ -99,7 +99,7 @@ class SettingsDialog(Adw.PreferencesDialog):
 
         self._auto_sync_row = Adw.SwitchRow(title="Auto sync")
         self._auto_sync_row.set_subtitle(
-            "Check for new mail and server-side changes"
+            "Check for new mail while Post is open. When off, use Refresh to update."
         )
         self._auto_sync_row.set_active(get_auto_sync())
         self._auto_sync_row.connect("notify::active", self._on_auto_sync_row_changed)

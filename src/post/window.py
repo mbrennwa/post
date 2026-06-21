@@ -24,6 +24,7 @@ from post.compose_window import ComposeWindow
 from post.credentials import prompt_password_sync
 from post.mail import MailService
 from post.mail.eds import DEFAULT_MESSAGE_PAGE_SIZE, MailAccount
+from post.mail.sync_watcher import MailSyncWatcher
 from post.mail.folders import POST_OUTBOX_FOLDER, is_post_outbox_folder
 from post.mail.search import MessageSearchQuery, parse_search_query
 from post.mail.send_queue import (
@@ -51,6 +52,7 @@ from post.mail.helpers import (
 )
 from post.reader import build_reader_document
 from post.preferences import (
+    get_auto_sync,
     get_load_remote_content,
     get_sidebar_state,
     get_window_state,
@@ -89,6 +91,11 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._mail = MailService.connect()
         self._mail.set_password_prompt(self._prompt_account_password)
+        self._sync_watcher = MailSyncWatcher(
+            self._mail,
+            on_folder_changed=self._on_sync_folder_changed,
+            on_folder_tree_changed=self._on_sync_folder_tree_changed,
+        )
         self._current_account: MailAccount | None = None
         self._current_folder: str | None = None
         self._current_message_uid: str | None = None
@@ -178,6 +185,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_refresh_account=self._on_sidebar_refresh_account,
             on_refresh_folder=self._on_sidebar_refresh_folder,
             on_send_outbox=self._on_sidebar_send_outbox,
+            on_accounts_loaded=self._on_accounts_loaded,
             on_folder_tree_changed=self._on_sidebar_folder_tree_changed,
             on_folder_contents_changed=self._on_sidebar_folder_contents_changed,
         )
@@ -396,7 +404,12 @@ class MainWindow(Adw.ApplicationWindow):
         if online:
             self._flush_send_queue_idle()
             if self._current_account and self._current_folder:
-                self._load_messages(self._current_account.uid, self._current_folder)
+                if get_auto_sync():
+                    self._load_messages(
+                        self._current_account.uid,
+                        self._current_folder,
+                        sync=True,
+                    )
             else:
                 GLib.idle_add(self._reload_sidebar)
 
@@ -485,6 +498,7 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
     def _on_close_request(self, *_args) -> bool:
+        self._sync_watcher.stop()
         try:
             self._mail.shutdown_sync()
         except Exception:
@@ -769,6 +783,7 @@ class MainWindow(Adw.ApplicationWindow):
             set_status=self._set_status,
             on_saved=self._reload_sidebar,
             on_load_remote_content_changed=self._on_load_remote_content_changed,
+            on_auto_sync_changed=self._on_auto_sync_changed,
         )
         self._settings_dialog = dialog
         dialog.connect("closed", self._on_settings_closed)
@@ -788,7 +803,7 @@ class MainWindow(Adw.ApplicationWindow):
             and self._current_account.uid == account_uid
             and self._current_folder == folder_name
         ):
-            self._load_messages(account_uid, folder_name)
+            self._load_messages(account_uid, folder_name, sync=True)
 
     def _on_sidebar_send_outbox(self) -> None:
         self._flush_send_queue_idle()
@@ -809,13 +824,41 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_sidebar_folder_contents_changed(
         self, account_uid: str, folder_name: str
     ) -> None:
+        self._refresh_folder_view(account_uid, folder_name)
+
+    def _on_accounts_loaded(self, account_uids: list[str]) -> None:
+        self._sync_watcher.set_accounts(account_uids)
+        if get_auto_sync() and not self._sync_watcher.running:
+            self._sync_watcher.start()
+
+    def _on_auto_sync_changed(self, enabled: bool) -> None:
+        if enabled:
+            if self._current_account and self._current_folder:
+                self._sync_watcher.set_current_folder(
+                    self._current_account.uid, self._current_folder
+                )
+            if not self._sync_watcher.running:
+                self._sync_watcher.start()
+        else:
+            self._sync_watcher.stop()
+
+    def _on_sync_folder_changed(self, account_uid: str, folder_name: str) -> None:
+        self._mail.invalidate_folder_index(account_uid, folder_name)
+        self._refresh_folder_view(account_uid, folder_name)
+
+    def _on_sync_folder_tree_changed(self, account_uid: str) -> None:
+        self._sidebar.reload_account(account_uid)
+        self._on_sidebar_folder_tree_changed(account_uid, None)
+
+    def _refresh_folder_view(self, account_uid: str, folder_name: str) -> None:
+        self._sidebar.refresh_folder_row(account_uid, folder_name)
         if (
             self._current_account
             and self._current_folder
             and self._current_account.uid == account_uid
             and self._current_folder == folder_name
         ):
-            self._load_messages(account_uid, folder_name)
+            self._load_messages(account_uid, folder_name, sync=True)
 
     def _on_load_remote_content_changed(self, enabled: bool) -> None:
         self._load_remote_content = enabled
@@ -1050,6 +1093,7 @@ class MainWindow(Adw.ApplicationWindow):
         return prompt_password_sync(self, account_label)
 
     def _reload_sidebar(self) -> bool:
+        self._sync_watcher.set_current_folder(None, None)
         self._clear_reader()
         self._message_popover.popdown()
         self._clear_listbox(self._message_list)
@@ -1131,6 +1175,8 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_folder_selected(self, account: MailAccount, folder_name: str) -> None:
         self._current_account = account
         self._current_folder = folder_name
+        if self._sync_watcher.running:
+            self._sync_watcher.set_current_folder(account.uid, folder_name)
         self._update_search_entry_state()
         selection = (account.uid, folder_name)
         sidebar_state = get_sidebar_state()
@@ -1445,7 +1491,9 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_refresh(self, *_args) -> None:
         if self._current_account and self._current_folder:
             self._search_query = self._parse_search_from_entry()
-            self._load_messages(self._current_account.uid, self._current_folder)
+            self._load_messages(
+                self._current_account.uid, self._current_folder, sync=True
+            )
         else:
             GLib.idle_add(self._reload_sidebar)
 
@@ -1459,11 +1507,19 @@ class MainWindow(Adw.ApplicationWindow):
             child = next_child
 
     def _load_messages(
-        self, account_uid: str, folder_name: str, *, offset: int = 0
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        offset: int = 0,
+        sync: bool | None = None,
     ) -> None:
         account = self._current_account
         if account is None or account.uid != account_uid:
             return
+
+        if sync is None:
+            sync = get_auto_sync()
 
         if offset == 0:
             self._messages_load_generation += 1
@@ -1497,6 +1553,7 @@ class MainWindow(Adw.ApplicationWindow):
         search_query = self._search_query
         viewing_outbox = is_post_outbox_folder(folder_name)
         from_label = account.email or account.display_label
+        should_sync = sync
 
         def worker() -> None:
             error: Exception | None = None
@@ -1519,6 +1576,7 @@ class MainWindow(Adw.ApplicationWindow):
                         search_query,
                         offset=offset,
                         limit=DEFAULT_MESSAGE_PAGE_SIZE,
+                        sync=should_sync,
                     )
                 else:
                     messages, unread, total, has_more = self._mail.list_messages_page(
@@ -1526,6 +1584,7 @@ class MainWindow(Adw.ApplicationWindow):
                         folder_name,
                         offset=offset,
                         limit=DEFAULT_MESSAGE_PAGE_SIZE,
+                        sync=should_sync,
                     )
             except Exception as exc:
                 log_mail_error(log, "Failed to list messages", exc)

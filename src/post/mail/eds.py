@@ -994,10 +994,15 @@ class MailService:
         *,
         offset: int = 0,
         limit: int = DEFAULT_MESSAGE_PAGE_SIZE,
+        sync: bool = True,
     ) -> tuple[list[dict], int, int, bool]:
         with self._lock:
             return self._list_messages_page_unlocked(
-                account_uid, folder_name, offset=offset, limit=limit
+                account_uid,
+                folder_name,
+                offset=offset,
+                limit=limit,
+                sync=sync,
             )
 
     def list_messages_with_stats(
@@ -1019,10 +1024,16 @@ class MailService:
         *,
         offset: int = 0,
         limit: int = DEFAULT_MESSAGE_PAGE_SIZE,
+        sync: bool = True,
     ) -> tuple[list[dict], int, int, bool]:
         with self._lock:
             return self._search_messages_page_unlocked(
-                account_uid, folder_name, query, offset=offset, limit=limit
+                account_uid,
+                folder_name,
+                query,
+                offset=offset,
+                limit=limit,
+                sync=sync,
             )
 
     def _search_messages_page_unlocked(
@@ -1033,11 +1044,14 @@ class MailService:
         *,
         offset: int,
         limit: int,
+        sync: bool,
     ) -> tuple[list[dict], int, int, bool]:
         key = (account_uid, folder_name)
         index = self._folder_indexes.get(key)
-        if index is None:
-            index = self._build_folder_index_unlocked(account_uid, folder_name)
+        if index is None or sync:
+            index = self._build_folder_index_unlocked(
+                account_uid, folder_name, sync=sync
+            )
             self._folder_indexes[key] = index
 
         filtered = [msg for msg in index.messages if message_matches(msg, query)]
@@ -1052,15 +1066,28 @@ class MailService:
         *,
         offset: int,
         limit: int,
+        sync: bool,
     ) -> tuple[list[dict], int, int, bool]:
         key = (account_uid, folder_name)
         if offset == 0:
-            index = self._build_folder_index_unlocked(account_uid, folder_name)
-            self._folder_indexes[key] = index
+            if sync:
+                index = self._build_folder_index_unlocked(
+                    account_uid, folder_name, sync=True
+                )
+                self._folder_indexes[key] = index
+            else:
+                index = self._folder_indexes.get(key)
+                if index is None:
+                    index = self._build_folder_index_unlocked(
+                        account_uid, folder_name, sync=False
+                    )
+                    self._folder_indexes[key] = index
         else:
             index = self._folder_indexes.get(key)
             if index is None:
-                index = self._build_folder_index_unlocked(account_uid, folder_name)
+                index = self._build_folder_index_unlocked(
+                    account_uid, folder_name, sync=sync
+                )
                 self._folder_indexes[key] = index
 
         page, has_more = paginate_messages(index.messages, offset, limit)
@@ -1094,14 +1121,15 @@ class MailService:
         return folder
 
     def _build_folder_index_unlocked(
-        self, account_uid: str, folder_name: str
+        self, account_uid: str, folder_name: str, *, sync: bool = True
     ) -> _FolderMessageIndex:
         folder = self._open_folder_unlocked(account_uid, folder_name)
         if folder is None:
             return _FolderMessageIndex(messages=[], unread=0, total=0)
 
         try:
-            folder.refresh_info_sync(None)
+            if sync:
+                folder.refresh_info_sync(None)
             unread = folder.get_unread_message_count()
             total = folder.get_message_count()
 
