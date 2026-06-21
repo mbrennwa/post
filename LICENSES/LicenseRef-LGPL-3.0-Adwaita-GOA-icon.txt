@@ -1,0 +1,19 @@
+Post includes artwork derived from the Adwaita icon theme
+(GNOME Online Accounts @ glyph), used under the GNU Lesser General
+Public License v3.0 or later. Post elects the LGPL-3.0-or-later option
+from Adwaita's dual license (LGPL-3.0-or-later or CC-BY-SA-3.0).
+
+Upstream: https://gitlab.gnome.org/GNOME/adwaita-icon-theme
+Upstream file: Adwaita/symbolic/legacy/goa-panel-symbolic.svg
+Vendored from: adwaita-icon-theme 50.0
+Attribution: GNOME Project — https://www.gnome.org/
+
+See LICENSES/LGPL-3.0-or-later.txt for the license text.
+
+When composing this glyph into another Post icon (for example
+data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg), add that
+file to the Derived Post files list below and in licensing/third_party.json,
+and mark the composed icon with SPDX-License-Identifier:
+GPL-3.0-or-later AND LGPL-3.0-or-later.
+
+Derived Post files: data/icons/sources/adwaita-goa-at-symbol.svg

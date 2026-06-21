@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  SPDX-FileCopyrightText: GNOME Design Team
+  SPDX-License-Identifier: LGPL-3.0-or-later AND LicenseRef-LGPL-3.0-Adwaita-GOA-icon
+
+  @ glyph from Adwaita goa-panel-symbolic.svg (GNOME Online Accounts panel icon).
+  Upstream: adwaita-icon-theme, Adwaita/symbolic/legacy/goa-panel-symbolic.svg
+  See LICENSES/LicenseRef-LGPL-3.0-Adwaita-GOA-icon.txt
+-->
+
+<svg
+   height="20"
+   viewBox="0 0 20 20"
+   width="20"
+   version="1.1"
+   id="svg1"
+   sodipodi:docname="adwaita-goa-at-symbol.svg"
+   inkscape:version="1.4.3 (0d15f75042, 2025-12-25)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs1" />
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="13.214058"
+     inkscape:cx="17.935444"
+     inkscape:cy="10.821808"
+     inkscape:window-width="1470"
+     inkscape:window-height="851"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg1" />
+  <circle
+     style="fill:#ff4919;fill-opacity:0.85000002;stroke:none;stroke-width:36.939;stroke-linecap:round;stroke-linejoin:round"
+     id="path2"
+     cx="10"
+     cy="10"
+     r="10" />
+  <g
+     id="adwaita-goa-at-symbol"
+     fill="currentColor"
+     transform="translate(1.9974062,2.001546)"
+     style="fill:#ffffff;fill-opacity:0.8988049">
+    <path
+       d="M 7.664062,0.0078125 C 5.050781,0.117188 2.660156,1.496094 1.253906,3.703125 c -1.90625,3 -1.605468,6.898437 0.734375,9.574219 2.347657,2.667968 6.175781,3.472656 9.398438,1.96875 0.5,-0.234375 0.71875,-0.828125 0.484375,-1.328125 -0.234375,-0.5 -0.828125,-0.71875 -1.332032,-0.484375 C 8.125,14.566406 5.25,13.964844 3.492188,11.957031 1.730469,9.953125 1.503906,7.023438 2.941406,4.777344 4.371094,2.523438 7.121094,1.488281 9.679688,2.238281 12.242188,2.984375 14.003906,5.332031 14,8 V 8.039062 9 c 0,0.359375 -0.1875,0.683594 -0.5,0.863281 -0.308594,0.179688 -0.6875,0.179688 -1,0 C 12.191406,9.6875 12,9.355469 12,9 V 8 C 12,5.800781 10.199219,4 8,4 5.804688,4 4,5.800781 4,8 c 0,2.195312 1.804688,4 4,4 1.046875,0 1.992188,-0.417969 2.707031,-1.078125 0.222657,0.265625 0.488281,0.496094 0.792969,0.675781 0.929688,0.535156 2.074219,0.535156 3,0 C 15.429688,11.058594 16,10.070312 16,9 V 8 C 16,4.441406 13.652344,1.316406 10.238281,0.316406 9.402344,0.0742188 8.535156,-0.03125 7.664062,0.0078125 Z M 8,6 c 1.117188,0 2,0.882812 2,2 0,1.113281 -0.882812,2 -2,2 C 6.886719,10 6,9.113281 6,8 6,6.882812 6.886719,6 8,6 Z m 0,0"
+       id="path1"
+       style="fill:#ffffff;fill-opacity:0.8988049" />
+  </g>
+</svg>
