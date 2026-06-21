@@ -1,0 +1,16 @@
+{
+  "entries": [
+    {
+      "id": "evolutionmcp",
+      "license_file": "LICENSES/LicenseRef-MIT-EvolutionMCP.txt",
+      "files": [
+        "src/post/mail/eds.py",
+        "src/post/mail/helpers.py"
+      ],
+      "header_must_contain": [
+        "EvolutionMCP",
+        "LICENSES/LicenseRef-MIT-EvolutionMCP.txt"
+      ]
+    }
+  ]
+}
