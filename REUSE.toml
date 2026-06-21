@@ -30,6 +30,17 @@ SPDX-License-Identifier = "LGPL-3.0-or-later"
 [[annotations]]
 path = [
     "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg",
+    "data/icons/hicolor/48x48/apps/io.github.mbrennwa.Post.png",
+    "data/icons/hicolor/96x96/apps/io.github.mbrennwa.Post.png",
+    "data/icons/hicolor/128x128/apps/io.github.mbrennwa.Post.png",
+    "data/icons/hicolor/192x192/apps/io.github.mbrennwa.Post.png",
+    "data/icons/hicolor/256x256/apps/io.github.mbrennwa.Post.png",
+    "src/post/icons/hicolor/48x48/apps/io.github.mbrennwa.Post.png",
+    "src/post/icons/hicolor/96x96/apps/io.github.mbrennwa.Post.png",
+    "src/post/icons/hicolor/128x128/apps/io.github.mbrennwa.Post.png",
+    "src/post/icons/hicolor/192x192/apps/io.github.mbrennwa.Post.png",
+    "src/post/icons/hicolor/256x256/apps/io.github.mbrennwa.Post.png",
+    "src/post/icon_utils.py",
     "data/icons/hicolor/scalable/actions/mail-archive-symbolic.svg",
     "data/io.github.mbrennwa.Post.desktop",
     "src/post/icons/hicolor/scalable/actions/mail-archive-symbolic.svg",

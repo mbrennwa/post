@@ -23,12 +23,24 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-post = ["icons/**/*.svg"]
+post = ["icons/**/*.png", "icons/**/*.svg"]
 
 [tool.setuptools.data-files]
 "share/applications" = ["data/io.github.mbrennwa.Post.desktop"]
-"share/icons/hicolor/scalable/apps" = [
-  "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg",
+"share/icons/hicolor/48x48/apps" = [
+  "data/icons/hicolor/48x48/apps/io.github.mbrennwa.Post.png",
+]
+"share/icons/hicolor/96x96/apps" = [
+  "data/icons/hicolor/96x96/apps/io.github.mbrennwa.Post.png",
+]
+"share/icons/hicolor/128x128/apps" = [
+  "data/icons/hicolor/128x128/apps/io.github.mbrennwa.Post.png",
+]
+"share/icons/hicolor/192x192/apps" = [
+  "data/icons/hicolor/192x192/apps/io.github.mbrennwa.Post.png",
+]
+"share/icons/hicolor/256x256/apps" = [
+  "data/icons/hicolor/256x256/apps/io.github.mbrennwa.Post.png",
 ]
 "share/icons/hicolor/scalable/actions" = [
   "data/icons/hicolor/scalable/actions/mail-archive-symbolic.svg",

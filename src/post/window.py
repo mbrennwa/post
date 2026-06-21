@@ -22,6 +22,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk, WebKit
 
 from post.compose_window import ComposeWindow
 from post.credentials import prompt_password_sync
+from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.eds import DEFAULT_MESSAGE_PAGE_SIZE, MailAccount
 from post.mail.sync_watcher import MailSyncWatcher
@@ -109,6 +110,7 @@ class MainWindow(Adw.ApplicationWindow):
         super().__init__(**kwargs)
         self._install_message_list_style()
         self.set_title("Post")
+        apply_window_icon(self)
         window_state = get_window_state()
         self._last_normal_width = int(window_state["width"])
         self._last_normal_height = int(window_state["height"])
@@ -147,6 +149,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._load_remote_content = get_load_remote_content()
         self._restore_message_folder: tuple[str, str] | None = None
         self._pending_restore_message_uid: str | None = None
+        self._restoring_selection = False
+        self._suppress_sync_list_reload: tuple[str, str] | None = None
         self._user_message_click_pending = False
         self._search_query: MessageSearchQuery | None = None
         self._search_entry_updating = False
@@ -775,12 +779,28 @@ class MainWindow(Adw.ApplicationWindow):
             return None
         return row
 
+    def _ensure_row_selected(self, row: Gtk.ListBoxRow) -> None:
+        if row in self._message_list.get_selected_rows():
+            return
+        uid = getattr(row, "message_uid", None)
+        skip_read = uid is not None and uid == self._current_message_uid
+        if skip_read:
+            self._restoring_selection = True
+        self._message_list.select_row(row)
+        if skip_read:
+            self._restoring_selection = False
+
+    def _ensure_row_selected_idle(self, row: Gtk.ListBoxRow) -> bool:
+        self._ensure_row_selected(row)
+        return False
+
     def _on_read_toggle_clicked(self, *_args) -> None:
         row = self._reader_action_row()
         if row is None:
             return
         flags = dict(getattr(row, "message_flags", {}) or {})
         self._set_message_flags("seen", seen=not flags.get("seen", True), rows=[row])
+        GLib.idle_add(self._ensure_row_selected_idle, row)
 
     def _on_flag_toggle_clicked(self, *_args) -> None:
         row = self._reader_action_row()
@@ -792,6 +812,7 @@ class MainWindow(Adw.ApplicationWindow):
             flagged=not flags.get("flagged", False),
             rows=[row],
         )
+        GLib.idle_add(self._ensure_row_selected_idle, row)
 
     def _setup_compose_action(self) -> None:
         compose_action = Gio.SimpleAction.new("compose-new", None)
@@ -908,6 +929,9 @@ class MainWindow(Adw.ApplicationWindow):
             and self._current_account.uid == account_uid
             and self._current_folder == folder_name
         ):
+            if self._suppress_sync_list_reload == (account_uid, folder_name):
+                self._suppress_sync_list_reload = None
+                return
             self._load_messages(account_uid, folder_name, sync=True)
 
     def _on_load_remote_content_changed(self, enabled: bool) -> None:
@@ -1598,6 +1622,16 @@ class MainWindow(Adw.ApplicationWindow):
                 self._set_status(f"Searching {display_folder}…")
             else:
                 self._set_status(f"Loading {display_folder}…")
+            if (
+                not self._pending_restore_message_uid
+                and self._current_message_uid
+                and self._current_account
+                and self._current_folder
+                and self._current_account.uid == account_uid
+                and self._current_folder == folder_name
+            ):
+                self._pending_restore_message_uid = self._current_message_uid
+                self._restore_message_folder = (account_uid, folder_name)
             self._message_popover.popdown()
             self._clear_listbox(self._message_list)
             self._clear_reader()
@@ -2455,6 +2489,12 @@ class MainWindow(Adw.ApplicationWindow):
         if self._current_message_uid in updates_by_uid:
             self._update_reader_toggle_buttons()
 
+        if self._current_account and self._current_folder:
+            self._suppress_sync_list_reload = (
+                self._current_account.uid,
+                self._current_folder,
+            )
+
         if flag_name == "seen" and self._current_account and self._current_folder:
             unread = result.get("folder_unread")
             total = result.get("folder_total")
@@ -2509,6 +2549,8 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_message_selected(
         self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None
     ) -> None:
+        if self._restoring_selection:
+            return
         mark_seen = self._user_message_click_pending
         self._user_message_click_pending = False
         if row is None or not self._current_account or not self._current_folder:
