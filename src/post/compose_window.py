@@ -118,7 +118,7 @@ class ComposeWindow(Adw.Window):
         self._send_btn.connect("clicked", self._on_send_clicked)
         header.pack_end(self._send_btn)
 
-        self._save_draft_btn = Gtk.Button(label="Save draft")
+        self._save_draft_btn = Gtk.Button(label="Save Draft")
         self._save_draft_btn.connect("clicked", self._on_save_draft_clicked)
         header.pack_end(self._save_draft_btn)
 
@@ -580,7 +580,7 @@ class ComposeWindow(Adw.Window):
         )
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("discard", "Discard")
-        dialog.add_response("save", "Save draft")
+        dialog.add_response("save", "Save Draft")
         dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
         dialog.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
         dialog.set_default_response("save")

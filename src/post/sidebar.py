@@ -272,7 +272,7 @@ class MailSidebar:
             return
 
         self._clear_listbox(folder_list)
-        loading = Gtk.Label(label="Loading folders…", xalign=0)
+        loading = Gtk.Label(label="Loading Folders…", xalign=0)
         loading.add_css_class("dim-label")
         loading.set_margin_start(12)
         loading.set_margin_end(12)
@@ -928,7 +928,7 @@ class MailSidebar:
         self._inbox_list = inbox_list
         self._inbox_expander = expander
 
-        loading = Gtk.Label(label="Loading inboxes…", xalign=0)
+        loading = Gtk.Label(label="Loading Inboxes…", xalign=0)
         loading.add_css_class("dim-label")
         loading.set_margin_start(12)
         loading.set_margin_end(12)
@@ -1094,7 +1094,7 @@ class MailSidebar:
         folder_list.connect("row-selected", self._on_folder_row_selected)
         self._folder_lists[account.uid] = folder_list
 
-        loading = Gtk.Label(label="Loading folders…", xalign=0)
+        loading = Gtk.Label(label="Loading Folders…", xalign=0)
         loading.add_css_class("dim-label")
         loading.set_margin_start(12)
         loading.set_margin_end(12)

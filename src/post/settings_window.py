@@ -89,7 +89,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         group = Adw.PreferencesGroup()
         group.set_title("Message display")
 
-        self._remote_content_row = Adw.SwitchRow(title="Load remote content")
+        self._remote_content_row = Adw.SwitchRow(title="Load Remote Content")
         self._remote_content_row.set_subtitle(
             "Show remote images and linked resources in HTML messages"
         )
@@ -99,7 +99,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         )
         group.add(self._remote_content_row)
 
-        self._auto_sync_row = Adw.SwitchRow(title="Auto sync")
+        self._auto_sync_row = Adw.SwitchRow(title="Auto Sync")
         self._auto_sync_row.set_subtitle(
             "Check for new mail while Post is open. When off, use Refresh to update."
         )
@@ -229,7 +229,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         spool_group = Adw.PreferencesGroup()
         spool_group.set_title("System mail")
 
-        self._enable_row = Adw.SwitchRow(title="Enable system mail")
+        self._enable_row = Adw.SwitchRow(title="Enable System Mail")
         self._enable_row.set_active(self._config.enabled)
         self._enable_row.connect("notify::active", self._on_system_mail_changed)
         spool_group.add(self._enable_row)
@@ -250,13 +250,13 @@ class SettingsDialog(Adw.PreferencesDialog):
         self._path_entry.add_suffix(browse_btn)
         spool_group.add(self._path_entry)
 
-        self._name_row = Adw.EntryRow(title="From name")
+        self._name_row = Adw.EntryRow(title="From Name")
         self._name_row.set_text(self._config.from_name)
         self._name_row.connect("changed", self._on_system_mail_entry_changed)
         self._name_row.connect("apply", self._on_system_mail_apply)
         spool_group.add(self._name_row)
 
-        self._address_row = Adw.EntryRow(title="From address")
+        self._address_row = Adw.EntryRow(title="From Address")
         self._address_row.set_text(self._config.from_address)
         self._address_row.connect("changed", self._on_system_mail_entry_changed)
         self._address_row.connect("apply", self._on_system_mail_apply)

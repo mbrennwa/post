@@ -198,8 +198,8 @@ def flag_menu_items(flagged_states: list[bool]) -> list[str]:
 def read_menu_label(action: str, count: int) -> str:
     suffix = message_menu_count_suffix(count)
     if action == "read":
-        return f"Mark as read{suffix}"
-    return f"Mark as unread{suffix}"
+        return f"Mark as Read{suffix}"
+    return f"Mark as Unread{suffix}"
 
 
 def flag_menu_label(action: str, count: int) -> str:

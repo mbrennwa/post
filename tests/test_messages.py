@@ -129,8 +129,8 @@ class MessageMenuItemsTests(unittest.TestCase):
         self.assertEqual(flag_menu_items([True, False]), ["flag", "unflag"])
 
     def test_read_menu_labels_include_count(self) -> None:
-        self.assertEqual(read_menu_label("read", 3), "Mark as read (3)")
-        self.assertEqual(read_menu_label("unread", 1), "Mark as unread")
+        self.assertEqual(read_menu_label("read", 3), "Mark as Read (3)")
+        self.assertEqual(read_menu_label("unread", 1), "Mark as Unread")
 
     def test_flag_menu_labels_include_count(self) -> None:
         self.assertEqual(flag_menu_label("flag", 2), "Flag (2)")
