@@ -12,7 +12,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Sequence, Callable
 
 import gi
 
@@ -61,11 +61,13 @@ from .send_queue import (
     is_network_unavailable_error,
     is_queueable_network_error,
     list_queued_outbound_messages,
+    load_queued_attachments,
     remove_queued_outbound_message,
 )
 from post.preferences import get_show_evolution_local
 from .auth import PasswordPromptCallback, authenticate_service_sync
 from .compose import (
+    ComposeAttachment,
     addresses_to_internet_address,
     build_draft_mime_message,
     build_plain_mime_message,
@@ -545,6 +547,7 @@ class MailService:
         body: str,
         in_reply_to: str | None = None,
         references: str | None = None,
+        attachments: Sequence[ComposeAttachment] | None = None,
     ) -> None:
         with self._lock:
             self._send_message_unlocked(
@@ -556,6 +559,7 @@ class MailService:
                 body=body,
                 in_reply_to=in_reply_to,
                 references=references,
+                attachments=attachments,
                 from_queue=False,
             )
 
@@ -570,6 +574,7 @@ class MailService:
         body: str,
         in_reply_to: str | None,
         references: str | None,
+        attachments: Sequence[ComposeAttachment] | None = None,
         from_queue: bool = False,
     ) -> None:
         account = self.get_account(account_uid)
@@ -587,6 +592,7 @@ class MailService:
             "body": body,
             "in_reply_to": in_reply_to,
             "references": references,
+            "attachments": attachments,
         }
         message = build_plain_mime_message(**compose_kwargs)
         sent_message = build_plain_mime_message(**compose_kwargs)
@@ -655,6 +661,7 @@ class MailService:
                     body=body,
                     in_reply_to=in_reply_to,
                     references=references,
+                    attachments=attachments,
                 )
                 raise SendQueued(MESSAGE_QUEUED) from exc
             if cancellable.is_cancelled():
@@ -685,6 +692,7 @@ class MailService:
         body: str,
         in_reply_to: str | None,
         references: str | None,
+        attachments: Sequence[ComposeAttachment] | None = None,
     ) -> None:
         enqueue_outbound_message(
             QueuedOutboundMessage(
@@ -696,7 +704,8 @@ class MailService:
                 body=body,
                 in_reply_to=in_reply_to,
                 references=references,
-            )
+            ),
+            attachment_payloads=attachments,
         )
 
     def _flush_send_queue_unlocked(self) -> int:
@@ -712,6 +721,7 @@ class MailService:
                     body=queued.body,
                     in_reply_to=queued.in_reply_to,
                     references=queued.references,
+                    attachments=load_queued_attachments(queue_id, queued),
                     from_queue=True,
                 )
             except SendQueued:
@@ -878,6 +888,7 @@ class MailService:
         references: str | None = None,
         existing_uid: str | None = None,
         drafts_folder_name: str | None = None,
+        attachments: Sequence[ComposeAttachment] | None = None,
     ) -> tuple[str, str]:
         """Save or update a draft. Returns (drafts_folder_name, message_uid)."""
         with self._lock:
@@ -892,6 +903,7 @@ class MailService:
                 references=references,
                 existing_uid=existing_uid,
                 drafts_folder_name=drafts_folder_name,
+                attachments=attachments,
             )
 
     def _save_draft_unlocked(
@@ -907,6 +919,7 @@ class MailService:
         references: str | None,
         existing_uid: str | None,
         drafts_folder_name: str | None,
+        attachments: Sequence[ComposeAttachment] | None = None,
     ) -> tuple[str, str]:
         account = self.get_account(account_uid)
         from_address = account.from_address or account.email
@@ -923,6 +936,7 @@ class MailService:
             body=body,
             in_reply_to=in_reply_to,
             references=references,
+            attachments=attachments,
         )
 
         folder_name = drafts_folder_name or self._drafts_folder_name_unlocked(

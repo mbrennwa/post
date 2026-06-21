@@ -8,13 +8,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
+from .compose import ComposeAttachment
 from .helpers import paginate_messages
 
 import gi
@@ -42,12 +44,29 @@ class QueuedOutboundMessage:
     in_reply_to: str | None = None
     references: str | None = None
     queued_at: float = 0.0
+    attachments: list[dict[str, str]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> QueuedOutboundMessage:
+        raw_attachments = data.get("attachments")
+        attachments: list[dict[str, str]] | None
+        if raw_attachments is None:
+            attachments = None
+        else:
+            attachments = [
+                {
+                    "filename": str(item.get("filename") or "attachment"),
+                    "mime_type": str(
+                        item.get("mime_type") or "application/octet-stream"
+                    ),
+                    "path": str(item.get("path") or ""),
+                }
+                for item in raw_attachments
+                if isinstance(item, dict)
+            ]
         return cls(
             account_uid=str(data["account_uid"]),
             to=list(data.get("to") or []),
@@ -58,11 +77,74 @@ class QueuedOutboundMessage:
             in_reply_to=data.get("in_reply_to"),
             references=data.get("references"),
             queued_at=float(data.get("queued_at") or 0.0),
+            attachments=attachments,
         )
 
 
 def outbox_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".config", "post", "outbox")
+
+
+def _queued_attachment_dir(queue_id: str) -> str:
+    return os.path.join(outbox_dir(), queue_id)
+
+
+def _write_attachment_sidecars(
+    queue_id: str,
+    attachments: Sequence[ComposeAttachment],
+) -> list[dict[str, str]]:
+    if not attachments:
+        return []
+    directory = _queued_attachment_dir(queue_id)
+    os.makedirs(directory, exist_ok=True)
+    refs: list[dict[str, str]] = []
+    for index, attachment in enumerate(attachments):
+        rel_path = str(index)
+        path = os.path.join(directory, rel_path)
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".post-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(attachment.data)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        refs.append(
+            {
+                "filename": attachment.filename,
+                "mime_type": attachment.mime_type,
+                "path": rel_path,
+            }
+        )
+    return refs
+
+
+def load_queued_attachments(
+    queue_id: str,
+    message: QueuedOutboundMessage,
+) -> list[ComposeAttachment]:
+    if not message.attachments:
+        return []
+    directory = _queued_attachment_dir(queue_id)
+    loaded: list[ComposeAttachment] = []
+    for ref in message.attachments:
+        rel_path = ref.get("path")
+        if not rel_path:
+            continue
+        path = os.path.join(directory, rel_path)
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            continue
+        loaded.append(
+            ComposeAttachment(
+                filename=ref.get("filename") or "attachment",
+                mime_type=ref.get("mime_type") or "application/octet-stream",
+                data=data,
+            )
+        )
+    return loaded
 
 
 def is_queueable_network_error(exc: BaseException) -> bool:
@@ -131,10 +213,16 @@ def offline_status_text(*, queued_count: int) -> str:
     return "Offline"
 
 
-def enqueue_outbound_message(message: QueuedOutboundMessage) -> str:
+def enqueue_outbound_message(
+    message: QueuedOutboundMessage,
+    *,
+    attachment_payloads: Sequence[ComposeAttachment] | None = None,
+) -> str:
     directory = outbox_dir()
     os.makedirs(directory, exist_ok=True)
     queue_id = f"{int(time.time() * 1_000_000)}-{uuid.uuid4().hex}"
+    if attachment_payloads:
+        message.attachments = _write_attachment_sidecars(queue_id, attachment_payloads)
     payload = message.to_dict()
     payload["queued_at"] = message.queued_at or time.time()
     path = os.path.join(directory, f"{queue_id}.json")
@@ -178,6 +266,9 @@ def remove_queued_outbound_message(queue_id: str) -> None:
         os.unlink(path)
     except FileNotFoundError:
         pass
+    attachment_dir = _queued_attachment_dir(queue_id)
+    if os.path.isdir(attachment_dir):
+        shutil.rmtree(attachment_dir, ignore_errors=True)
 
 
 def count_queued_for_account(account_uid: str) -> int:

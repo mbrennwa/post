@@ -15,6 +15,7 @@ gi.require_version("GLib", "2.0")
 
 from gi.repository import GLib
 
+from post.mail.compose import ComposeAttachment
 from post.mail.send_queue import (
     QueuedOutboundMessage,
     count_queued_for_account,
@@ -23,6 +24,7 @@ from post.mail.send_queue import (
     list_queued_for_account,
     list_queued_messages_page,
     list_queued_outbound_messages,
+    load_queued_attachments,
     queued_to_list_dict,
     read_queued_message,
     remove_queued_outbound_message,
@@ -112,6 +114,60 @@ class OutboundQueueStorageTests(unittest.TestCase):
                     data = json.load(handle)
                 self.assertEqual(data["to"], ["user@example.com"])
                 self.assertEqual(data["in_reply_to"], "<abc@example.com>")
+
+    def test_enqueue_with_attachments_writes_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                queue_id = enqueue_outbound_message(
+                    QueuedOutboundMessage(
+                        account_uid="account-1",
+                        to=["user@example.com"],
+                        cc=None,
+                        bcc=None,
+                        subject="With files",
+                        body="Body text",
+                    ),
+                    attachment_payloads=[
+                        ComposeAttachment(
+                            filename="doc.pdf",
+                            mime_type="application/pdf",
+                            data=b"%PDF-fake",
+                        )
+                    ],
+                )
+                queued = list_queued_outbound_messages()
+                self.assertEqual(len(queued), 1)
+                message = queued[0][1]
+                self.assertIsNotNone(message.attachments)
+                assert message.attachments is not None
+                self.assertEqual(len(message.attachments), 1)
+                self.assertEqual(message.attachments[0]["filename"], "doc.pdf")
+
+                attachment_dir = os.path.join(tmp, queue_id)
+                self.assertTrue(os.path.isdir(attachment_dir))
+                self.assertTrue(os.path.isfile(os.path.join(attachment_dir, "0")))
+
+                loaded = load_queued_attachments(queue_id, message)
+                self.assertEqual(len(loaded), 1)
+                self.assertEqual(loaded[0].filename, "doc.pdf")
+                self.assertEqual(loaded[0].data, b"%PDF-fake")
+
+                remove_queued_outbound_message(queue_id)
+                self.assertEqual(list_queued_outbound_messages(), [])
+                self.assertFalse(os.path.isdir(attachment_dir))
+
+    def test_from_dict_without_attachments(self) -> None:
+        message = QueuedOutboundMessage.from_dict(
+            {
+                "account_uid": "a",
+                "to": ["b@example.com"],
+                "cc": None,
+                "bcc": None,
+                "subject": "Hi",
+                "body": "Body",
+            }
+        )
+        self.assertIsNone(message.attachments)
 
 
 class OutboxAccountFilterTests(unittest.TestCase):
