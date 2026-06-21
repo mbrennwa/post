@@ -50,6 +50,10 @@ SetStatus = Callable[[str], None]
 OnDraftSaved = Callable[[], None]
 
 _LABEL_WIDTH = 72
+_TO_PLACEHOLDER = "Add a recipient in the To field."
+_CC_PLACEHOLDER = "Optional"
+_BCC_PLACEHOLDER = "Optional"
+_SUBJECT_PLACEHOLDER = "Subject is required"
 
 
 class ComposeWindow(Adw.Window):
@@ -152,7 +156,7 @@ class ComposeWindow(Adw.Window):
         self._entry_match_cache: dict[int, tuple[str, int, frozenset[str]]] = {}
 
         self._to_entry = Gtk.Entry()
-        self._to_entry.set_placeholder_text("recipient@example.com")
+        self._to_entry.set_placeholder_text(_TO_PLACEHOLDER)
         self._to_entry.set_hexpand(True)
         self._to_entry.connect("changed", self._on_form_field_changed)
         self._setup_address_completion(self._to_entry)
@@ -175,7 +179,7 @@ class ComposeWindow(Adw.Window):
         form.append(self._to_row)
 
         self._cc_entry = Gtk.Entry()
-        self._cc_entry.set_placeholder_text("Optional")
+        self._cc_entry.set_placeholder_text(_CC_PLACEHOLDER)
         self._cc_entry.set_hexpand(True)
         self._cc_entry.set_can_focus(False)
         self._cc_entry.connect("changed", self._on_form_field_changed)
@@ -187,7 +191,7 @@ class ComposeWindow(Adw.Window):
         self._setup_address_completion(self._cc_entry)
 
         self._bcc_entry = Gtk.Entry()
-        self._bcc_entry.set_placeholder_text("Optional")
+        self._bcc_entry.set_placeholder_text(_BCC_PLACEHOLDER)
         self._bcc_entry.set_hexpand(True)
         self._bcc_entry.set_can_focus(False)
         self._bcc_entry.connect("changed", self._on_form_field_changed)
@@ -199,6 +203,7 @@ class ComposeWindow(Adw.Window):
         self._setup_address_completion(self._bcc_entry)
 
         self._subject_entry = Gtk.Entry()
+        self._subject_entry.set_placeholder_text(_SUBJECT_PLACEHOLDER)
         self._subject_entry.connect("changed", self._on_form_field_changed)
         form.append(self._labeled_row("Subject", self._subject_entry))
 
@@ -238,6 +243,7 @@ class ComposeWindow(Adw.Window):
         self._prefill_fields()
         self._tracking_edits = True
         self._load_correspondents()
+        self._update_field_hints()
         self._update_send_enabled()
         self.connect("close-request", self._on_close_request)
         GLib.idle_add(self._set_initial_focus)
@@ -430,20 +436,105 @@ class ComposeWindow(Adw.Window):
 
     def _on_form_field_changed(self, *_args) -> None:
         self._mark_user_edited()
+        self._update_field_hints()
         self._update_send_enabled()
+
+    @staticmethod
+    def _required_address_hint(text: str) -> str | None:
+        stripped = text.strip()
+        if not stripped:
+            return "Add a recipient in the To field."
+        try:
+            if not parse_address_list(text):
+                return "Add a recipient in the To field."
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    @staticmethod
+    def _optional_address_hint(text: str) -> str | None:
+        stripped = text.strip()
+        if not stripped:
+            return None
+        try:
+            parse_address_list(text)
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    @staticmethod
+    def _subject_hint_text(text: str) -> str | None:
+        if not text.strip():
+            return "Subject is required"
+        return None
+
+    def _apply_entry_hint(
+        self,
+        entry: Gtk.Entry,
+        message: str | None,
+        *,
+        default_placeholder: str,
+    ) -> None:
+        if message is None:
+            entry.set_placeholder_text(default_placeholder)
+            entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, None)
+            entry.set_tooltip_text(None)
+            return
+        if not entry.get_text().strip():
+            entry.set_placeholder_text(message)
+            entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, None)
+            entry.set_tooltip_text(None)
+            return
+        entry.set_placeholder_text(default_placeholder)
+        entry.set_icon_from_icon_name(
+            Gtk.EntryIconPosition.SECONDARY,
+            "dialog-warning-symbolic",
+        )
+        entry.set_icon_tooltip_text(Gtk.EntryIconPosition.SECONDARY, message)
+        entry.set_tooltip_text(message)
+
+    def _update_field_hints(self) -> None:
+        self._apply_entry_hint(
+            self._to_entry,
+            self._required_address_hint(self._to_entry.get_text()),
+            default_placeholder=_TO_PLACEHOLDER,
+        )
+        if self._cc_row.get_visible():
+            self._apply_entry_hint(
+                self._cc_entry,
+                self._optional_address_hint(self._cc_entry.get_text()),
+                default_placeholder=_CC_PLACEHOLDER,
+            )
+        else:
+            self._apply_entry_hint(
+                self._cc_entry, None, default_placeholder=_CC_PLACEHOLDER
+            )
+        if self._bcc_row.get_visible():
+            self._apply_entry_hint(
+                self._bcc_entry,
+                self._optional_address_hint(self._bcc_entry.get_text()),
+                default_placeholder=_BCC_PLACEHOLDER,
+            )
+        else:
+            self._apply_entry_hint(
+                self._bcc_entry, None, default_placeholder=_BCC_PLACEHOLDER
+            )
+        self._apply_entry_hint(
+            self._subject_entry,
+            self._subject_hint_text(self._subject_entry.get_text()),
+            default_placeholder=_SUBJECT_PLACEHOLDER,
+        )
 
     def _validate_send_fields(self) -> bool:
         if not self._selected_account().can_send:
             return False
-        try:
-            to_addrs = parse_address_list(self._to_entry.get_text())
-            parse_address_list(self._cc_entry.get_text())
-            parse_address_list(self._bcc_entry.get_text())
-        except ValueError:
+        if self._required_address_hint(self._to_entry.get_text()) is not None:
             return False
-        if not to_addrs:
+        if self._optional_address_hint(self._cc_entry.get_text()) is not None:
             return False
-        return bool(self._subject_entry.get_text().strip())
+        if self._optional_address_hint(self._bcc_entry.get_text()) is not None:
+            return False
+        return self._subject_hint_text(self._subject_entry.get_text()) is None
 
     def _update_send_enabled(self) -> None:
         if self._sending or self._saving_draft:
@@ -456,6 +547,7 @@ class ComposeWindow(Adw.Window):
             self._prefill_fields_impl()
         finally:
             self._tracking_edits = True
+        self._update_field_hints()
         self._update_send_enabled()
 
     def _prefill_fields_impl(self) -> None:
@@ -552,6 +644,7 @@ class ComposeWindow(Adw.Window):
         self._cc_row.set_visible(reveal)
         self._cc_entry.set_can_focus(reveal)
         button.set_label("Hide Cc" if reveal else "Cc")
+        self._update_field_hints()
         if reveal:
             self._cc_entry.grab_focus()
 
@@ -560,6 +653,7 @@ class ComposeWindow(Adw.Window):
         self._bcc_row.set_visible(reveal)
         self._bcc_entry.set_can_focus(reveal)
         button.set_label("Hide Bcc" if reveal else "Bcc")
+        self._update_field_hints()
         if reveal:
             self._bcc_entry.grab_focus()
 
