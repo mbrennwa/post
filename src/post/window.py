@@ -129,10 +129,9 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._header_search_entry = Gtk.SearchEntry()
         self._header_search_entry.set_placeholder_text(
-            "Search messages…  from: to: subject: cc: is:unread is:flagged has:attachment"
+            "Search…  from: to: subject: cc: is:(!)read is:(!)flagged has:(!)attachment"
         )
-        self._header_search_entry.set_tooltip_text("Select a folder to search")
-        self._header_search_entry.set_size_request(420, -1)
+        self._header_search_entry.set_size_request(546, -1)
         self._header_search_entry.set_hexpand(True)
         self._header_search_entry.set_sensitive(False)
         self._header_search_entry.set_search_delay(300)
@@ -1111,14 +1110,7 @@ class MainWindow(Adw.ApplicationWindow):
             and not is_post_outbox_folder(self._current_folder)
         )
         self._header_search_entry.set_sensitive(enabled)
-        if enabled:
-            self._header_search_entry.set_tooltip_text(
-                "Search this folder. Plain text matches subject, from, to, and cc. "
-                "Use from: to: subject: cc: is:unread is:flagged has:attachment "
-                "to narrow results."
-            )
-        else:
-            self._header_search_entry.set_tooltip_text("Select a folder to search")
+        if not enabled:
             self._search_entry_updating = True
             self._header_search_entry.set_text("")
             self._search_entry_updating = False

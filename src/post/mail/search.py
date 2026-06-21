@@ -10,18 +10,10 @@ import shlex
 from dataclasses import dataclass
 from typing import Any
 
-_BOOLEAN_FIELDS: dict[str, str] = {
-    "is:unread": "unread",
-    "is:flagged": "flagged",
-    "has:attachment": "attachment",
-}
-
-_DEFAULT_TEXT_FIELDS = ("subject", "from", "to", "cc")
-
 # Optional whitespace after ":" so "subject: Auburn" works like "subject:Auburn".
 _QUERY_PATTERN = re.compile(
     r"""
-    \b(?P<boolean>is:unread|is:flagged|has:attachment)\b
+    \b(?P<boolean>is|has):\s*(?P<negated>!)?(?P<prop>read|flagged|attachment)\b
     |
     \b(?P<header>from|to|subject|cc):\s*
     (?:
@@ -38,6 +30,9 @@ _QUERY_PATTERN = re.compile(
 class SearchTerm:
     field: str
     value: str | None = None
+    negated: bool = False
+
+_DEFAULT_TEXT_FIELDS = ("subject", "from", "to", "cc")
 
 
 @dataclass(frozen=True)
@@ -70,8 +65,11 @@ def parse_search_query(raw: str) -> MessageSearchQuery | None:
     for match in _QUERY_PATTERN.finditer(text):
         boolean = match.group("boolean")
         if boolean is not None:
-            field = _BOOLEAN_FIELDS[boolean.lower()]
-            terms.append(SearchTerm(field=field, value=None))
+            prop = match.group("prop")
+            if prop is None:
+                continue
+            negated = match.group("negated") is not None
+            terms.append(SearchTerm(field=prop.lower(), negated=negated))
             spans.append(match.span())
             continue
 
@@ -120,15 +118,21 @@ def _text_matches(msg: dict[str, Any], needle: str) -> bool:
     return False
 
 
-def _term_matches(msg: dict[str, Any], term: SearchTerm) -> bool:
+def _boolean_matches(msg: dict[str, Any], field: str) -> bool:
     flags = msg.get("flags") or {}
-
-    if term.field == "unread":
-        return not flags.get("seen", True)
-    if term.field == "flagged":
+    if field == "read":
+        return bool(flags.get("seen", True))
+    if field == "flagged":
         return bool(flags.get("flagged"))
-    if term.field == "attachment":
+    if field == "attachment":
         return bool(flags.get("attachments"))
+    return False
+
+
+def _term_matches(msg: dict[str, Any], term: SearchTerm) -> bool:
+    if term.field in ("read", "flagged", "attachment"):
+        result = _boolean_matches(msg, term.field)
+        return not result if term.negated else result
     if term.field == "text":
         assert term.value is not None
         return _text_matches(msg, term.value)

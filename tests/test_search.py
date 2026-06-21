@@ -103,16 +103,56 @@ class ParseSearchQueryTests(unittest.TestCase):
         )
 
     def test_boolean_prefixes(self) -> None:
-        query = parse_search_query("is:unread is:flagged has:attachment")
+        query = parse_search_query("is:read is:flagged has:attachment")
         assert query is not None
         self.assertEqual(
             query.terms,
             (
-                SearchTerm(field="unread", value=None),
-                SearchTerm(field="flagged", value=None),
-                SearchTerm(field="attachment", value=None),
+                SearchTerm(field="read"),
+                SearchTerm(field="flagged"),
+                SearchTerm(field="attachment"),
             ),
         )
+
+    def test_boolean_negation(self) -> None:
+        query = parse_search_query("is:!read is:!flagged has:!attachment")
+        assert query is not None
+        self.assertEqual(
+            query.terms,
+            (
+                SearchTerm(field="read", negated=True),
+                SearchTerm(field="flagged", negated=True),
+                SearchTerm(field="attachment", negated=True),
+            ),
+        )
+
+    def test_boolean_spacing_after_colon(self) -> None:
+        query = parse_search_query("is: read is: !flagged has: attachment")
+        assert query is not None
+        self.assertEqual(
+            query.terms,
+            (
+                SearchTerm(field="read"),
+                SearchTerm(field="flagged", negated=True),
+                SearchTerm(field="attachment"),
+            ),
+        )
+
+    def test_boolean_case_insensitive(self) -> None:
+        query = parse_search_query("IS:!READ Has:!Attachment")
+        assert query is not None
+        self.assertEqual(
+            query.terms,
+            (
+                SearchTerm(field="read", negated=True),
+                SearchTerm(field="attachment", negated=True),
+            ),
+        )
+
+    def test_is_unread_is_not_boolean(self) -> None:
+        query = parse_search_query("is:unread")
+        assert query is not None
+        self.assertEqual(query.terms, (SearchTerm(field="text", value="is:unread"),))
 
     def test_mixed_with_unknown_ignored(self) -> None:
         query = parse_search_query("from:alice unknown:foo subject:test")
@@ -161,19 +201,29 @@ class MessageMatchesTests(unittest.TestCase):
         cc_query = MessageSearchQuery(terms=(SearchTerm(field="cc", value="team"),))
         self.assertTrue(message_matches(_msg(cc="team-list@example.com"), cc_query))
 
-    def test_unread_flag(self) -> None:
-        query = MessageSearchQuery(terms=(SearchTerm(field="unread", value=None),))
-        self.assertTrue(message_matches(_msg(seen=False), query))
-        self.assertFalse(message_matches(_msg(seen=True), query))
+    def test_read_flag(self) -> None:
+        unread = MessageSearchQuery(terms=(SearchTerm(field="read", negated=True),))
+        self.assertTrue(message_matches(_msg(seen=False), unread))
+        self.assertFalse(message_matches(_msg(seen=True), unread))
+
+        read = MessageSearchQuery(terms=(SearchTerm(field="read"),))
+        self.assertTrue(message_matches(_msg(seen=True), read))
+        self.assertFalse(message_matches(_msg(seen=False), read))
 
     def test_flagged_and_attachment(self) -> None:
-        flagged = MessageSearchQuery(terms=(SearchTerm(field="flagged", value=None),))
+        flagged = MessageSearchQuery(terms=(SearchTerm(field="flagged"),))
         self.assertTrue(message_matches(_msg(flagged=True), flagged))
+        unflagged = MessageSearchQuery(terms=(SearchTerm(field="flagged", negated=True),))
+        self.assertTrue(message_matches(_msg(flagged=False), unflagged))
+        self.assertFalse(message_matches(_msg(flagged=True), unflagged))
 
-        attach = MessageSearchQuery(
-            terms=(SearchTerm(field="attachment", value=None),)
-        )
+        attach = MessageSearchQuery(terms=(SearchTerm(field="attachment"),))
         self.assertTrue(message_matches(_msg(attachments=True), attach))
+        no_attach = MessageSearchQuery(
+            terms=(SearchTerm(field="attachment", negated=True),)
+        )
+        self.assertTrue(message_matches(_msg(attachments=False), no_attach))
+        self.assertFalse(message_matches(_msg(attachments=True), no_attach))
 
     def test_and_semantics(self) -> None:
         query = MessageSearchQuery(

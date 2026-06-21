@@ -42,6 +42,8 @@ from post.preferences import (
 
 log = logging.getLogger(__name__)
 
+_SIGNATURE_EDITOR_MIN_HEIGHT = 120
+
 SetStatus = Callable[[str], None]
 OnSaved = Callable[[], None]
 OnLoadRemoteContentChanged = Callable[[bool], None]
@@ -114,9 +116,6 @@ class SettingsDialog(Adw.PreferencesDialog):
 
         group = Adw.PreferencesGroup()
         group.set_title("Signatures")
-        group.set_description(
-            "Plain-text signatures added when composing from each account"
-        )
 
         self._signature_accounts = self._mail.list_sendable_accounts()
         self._signature_account_uid: str | None = None
@@ -131,17 +130,8 @@ class SettingsDialog(Adw.PreferencesDialog):
             page.add(group)
             self._signature_buffer = None
             self._signature_view = None
-            self._signature_account_row = None
+            self._signature_account_dropdown = None
             return page
-
-        labels = [account.from_label for account in self._signature_accounts]
-        self._signature_account_row = Adw.ComboRow(title="Account")
-        self._signature_account_row.set_model(Gtk.StringList.new(labels))
-        self._signature_account_row.set_selected(0)
-        self._signature_account_row.connect(
-            "notify::selected", self._on_signature_account_changed
-        )
-        group.add(self._signature_account_row)
 
         editor_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         editor_box.set_margin_start(12)
@@ -149,18 +139,31 @@ class SettingsDialog(Adw.PreferencesDialog):
         editor_box.set_margin_top(6)
         editor_box.set_margin_bottom(12)
 
-        editor_label = Gtk.Label(
-            label="Signature",
+        account_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        account_label = Gtk.Label(
+            label="Account",
             xalign=0,
         )
-        editor_label.add_css_class("heading")
-        editor_box.append(editor_label)
+        account_label.add_css_class("heading")
+        account_label.set_valign(Gtk.Align.CENTER)
+        account_row.append(account_label)
+
+        labels = [account.from_label for account in self._signature_accounts]
+        self._signature_account_dropdown = Gtk.DropDown.new_from_strings(labels)
+        self._signature_account_dropdown.set_selected(0)
+        self._signature_account_dropdown.set_hexpand(True)
+        self._signature_account_dropdown.connect(
+            "notify::selected", self._on_signature_account_changed
+        )
+        account_row.append(self._signature_account_dropdown)
+        editor_box.append(account_row)
 
         editor_frame = Gtk.Frame()
         editor_frame.add_css_class("view")
         editor_scroll = Gtk.ScrolledWindow()
-        editor_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
-        editor_scroll.set_min_content_height(120)
+        editor_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        editor_scroll.set_propagate_natural_height(False)
+        editor_scroll.set_size_request(-1, _SIGNATURE_EDITOR_MIN_HEIGHT)
         self._signature_view = Gtk.TextView()
         self._signature_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self._signature_view.set_left_margin(8)
@@ -180,9 +183,9 @@ class SettingsDialog(Adw.PreferencesDialog):
         return page
 
     def _selected_signature_account_uid(self) -> str | None:
-        if self._signature_account_row is None:
+        if self._signature_account_dropdown is None:
             return None
-        index = self._signature_account_row.get_selected()
+        index = self._signature_account_dropdown.get_selected()
         if index == Gtk.INVALID_LIST_POSITION:
             return None
         return self._signature_accounts[index].uid
@@ -225,7 +228,6 @@ class SettingsDialog(Adw.PreferencesDialog):
 
         spool_group = Adw.PreferencesGroup()
         spool_group.set_title("System mail")
-        spool_group.set_description("Mail file or folder")
 
         self._enable_row = Adw.SwitchRow(title="Enable system mail")
         self._enable_row.set_active(self._config.enabled)
@@ -263,11 +265,10 @@ class SettingsDialog(Adw.PreferencesDialog):
 
         evolution_group = Adw.PreferencesGroup()
         evolution_group.set_title(EDS_LOCAL_DISPLAY_NAME)
-        evolution_group.set_description(
-            "Local mail at ~/.local/share/evolution/mail/local"
-        )
 
-        self._evolution_local_row = Adw.SwitchRow(title="Enable Evolution Data Server")
+        self._evolution_local_row = Adw.SwitchRow(
+            title="Enable mail at ~/.local/share/evolution/mail/local"
+        )
         pref = get_show_evolution_local()
         if pref is None:
             self._evolution_local_row.set_active(
