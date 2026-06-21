@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from post.mail.eds import MailAccount
+from post.mail.accounts import MailAccount
 from post.mail.folders import (
     POST_OUTBOX_FOLDER,
     filter_sidebar_folders,

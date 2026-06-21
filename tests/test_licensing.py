@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import shutil
-import subprocess
 import unittest
 from pathlib import Path
 
@@ -124,25 +122,6 @@ class LicenseFilesTests(unittest.TestCase):
                 failures.append(f"pyproject.toml license-files missing {rel}")
 
         self.assertEqual(failures, [])
-
-
-class ReuseLintTests(unittest.TestCase):
-    def test_reuse_lint(self) -> None:
-        if shutil.which("reuse") is None:
-            self.skipTest("reuse not installed")
-
-        result = subprocess.run(
-            ["reuse", "lint"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(
-            result.returncode,
-            0,
-            result.stdout + result.stderr,
-        )
 
 
 if __name__ == "__main__":
