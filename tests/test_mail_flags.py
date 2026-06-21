@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -11,22 +12,19 @@ import gi
 gi.require_version("Camel", "1.2")
 from gi.repository import Camel
 
-from post.mail.eds import MailService
+from post.mail import message_flags
 
 
 class ApplyMessageFlagsTests(unittest.TestCase):
     def test_uses_folder_set_message_flags_and_marks_folder_flagged(self) -> None:
-        service = MailService(registry=MagicMock())
         folder = MagicMock()
         info = MagicMock()
         info.get_flags.return_value = 0
         folder.get_message_info.return_value = info
         folder.set_message_flags.return_value = True
 
-        changed = service._apply_message_flags_unlocked(
+        changed = message_flags.apply_message_flags(
             folder,
-            "account",
-            "INBOX",
             "42",
             Camel.MessageFlags.SEEN,
             Camel.MessageFlags.SEEN,
@@ -41,16 +39,13 @@ class ApplyMessageFlagsTests(unittest.TestCase):
         info.set_folder_flagged.assert_called_once_with(True)
 
     def test_skips_when_flags_already_match(self) -> None:
-        service = MailService(registry=MagicMock())
         folder = MagicMock()
         info = MagicMock()
         info.get_flags.return_value = Camel.MessageFlags.SEEN
         folder.get_message_info.return_value = info
 
-        changed = service._apply_message_flags_unlocked(
+        changed = message_flags.apply_message_flags(
             folder,
-            "account",
-            "INBOX",
             "42",
             Camel.MessageFlags.SEEN,
             Camel.MessageFlags.SEEN,
@@ -60,45 +55,47 @@ class ApplyMessageFlagsTests(unittest.TestCase):
         folder.set_message_flags.assert_not_called()
         info.set_folder_flagged.assert_not_called()
 
-    @patch.object(MailService, "_persist_message_flag_changes_unlocked")
-    def test_mark_seen_persists_when_changed(
-        self, persist_mock: MagicMock
-    ) -> None:
-        service = MailService(registry=MagicMock())
+
+class MarkMessageSeenTests(unittest.TestCase):
+    def test_mark_seen_persists_when_changed(self) -> None:
         folder = MagicMock()
         folder.get_unread_message_count.return_value = 0
         folder.get_message_count.return_value = 1
+        persist = MagicMock()
 
         with patch.object(
-            service,
-            "_apply_message_flags_unlocked",
+            message_flags,
+            "apply_message_flags",
             return_value=True,
         ) as apply_mock:
-            unread, total = service._mark_message_seen_unlocked(
-                folder, "account", "INBOX", "42"
+            unread, total = message_flags.mark_message_seen(
+                folder,
+                "42",
+                persist_uids=persist,
             )
 
         apply_mock.assert_called_once()
-        persist_mock.assert_called_once_with("account", folder, ["42"])
+        persist.assert_called_once_with(["42"])
         self.assertEqual((unread, total), (0, 1))
 
-    @patch.object(MailService, "_persist_message_flag_changes_unlocked")
-    def test_mark_seen_skips_persist_when_unchanged(
-        self, persist_mock: MagicMock
-    ) -> None:
-        service = MailService(registry=MagicMock())
+    def test_mark_seen_skips_persist_when_unchanged(self) -> None:
         folder = MagicMock()
         folder.get_unread_message_count.return_value = 0
         folder.get_message_count.return_value = 1
+        persist = MagicMock()
 
         with patch.object(
-            service,
-            "_apply_message_flags_unlocked",
+            message_flags,
+            "apply_message_flags",
             return_value=False,
         ):
-            service._mark_message_seen_unlocked(folder, "account", "INBOX", "42")
+            message_flags.mark_message_seen(
+                folder,
+                "42",
+                persist_uids=persist,
+            )
 
-        persist_mock.assert_not_called()
+        persist.assert_not_called()
 
 
 class PersistFolderFlagsTests(unittest.TestCase):
@@ -116,7 +113,7 @@ class PersistFolderFlagsTests(unittest.TestCase):
         folder.synchronize_message_sync.return_value = True
         folder.synchronize_sync.return_value = True
 
-        MailService._persist_folder_flags_unlocked(store, folder, ["42"])
+        message_flags.persist_folder_flags(store, folder, ["42"])
 
         summary.touch.assert_called_once_with()
         summary.save.assert_called_once_with()
@@ -125,14 +122,20 @@ class PersistFolderFlagsTests(unittest.TestCase):
         store.synchronize_sync.assert_called_once_with(False, None)
 
 
+@unittest.skipUnless(
+    os.environ.get("POST_EDS_TESTS"),
+    "Set POST_EDS_TESTS=1 to run EDS integration tests",
+)
 class ReadMessageTests(unittest.TestCase):
-    @patch.object(MailService, "_mark_message_seen_unlocked")
-    @patch.object(MailService, "_get_store_unlocked")
+    @patch("post.mail.eds.MailService._mark_message_seen_unlocked")
+    @patch("post.mail.eds.MailService._get_store_unlocked")
     def test_read_message_can_skip_mark_seen(
         self,
         get_store_mock: MagicMock,
         mark_seen_mock: MagicMock,
     ) -> None:
+        from post.mail.eds import MailService
+
         service = MailService(registry=MagicMock())
         folder = MagicMock()
         info = MagicMock()

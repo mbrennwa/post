@@ -32,11 +32,19 @@ from .helpers import (
 from .accounts import (
     BUILTIN_LOCAL_UID,
     EDS_LOCAL_DISPLAY_NAME,
+    MailAccount,
     POST_LOCAL_ACCOUNT_UID,
+    compose_from_accounts,
     ensure_post_local_mail_transport,
     is_builtin_local_store_empty,
     read_local_mail_config,
     should_list_local_account,
+)
+from .camel_util import camel_uid_list
+from .message_flags import (
+    apply_message_flags as _apply_message_flags,
+    mark_message_seen as _mark_message_seen,
+    persist_folder_flags as _persist_folder_flags,
 )
 from .local_delivery import all_recipients_local, can_deliver_locally, deliver_local_message
 from .send_errors import (
@@ -157,34 +165,6 @@ class MailSession(Camel.Session):
         except Exception:
             log.exception("OAuth2 failed for %s", service.get_uid())
         return False, "", 0
-
-
-@dataclass
-class MailAccount:
-    uid: str
-    name: str
-    email: str | None
-    backend: str | None
-    identity_uid: str | None = None
-    from_name: str | None = None
-    from_address: str | None = None
-    transport_uid: str | None = None
-
-    @property
-    def display_label(self) -> str:
-        if self.uid == BUILTIN_LOCAL_UID:
-            return EDS_LOCAL_DISPLAY_NAME
-        return self.email or self.name
-
-    @property
-    def from_label(self) -> str:
-        if self.from_name and self.from_address:
-            return f"{self.from_name} <{self.from_address}>"
-        return self.from_address or self.email or self.name
-
-    @property
-    def can_send(self) -> bool:
-        return bool(self.transport_uid and (self.from_address or self.email))
 
 
 @dataclass
@@ -400,14 +380,7 @@ class MailService:
     def compose_from_accounts(
         sendable: list[MailAccount], preferred: MailAccount | None
     ) -> list[MailAccount]:
-        """Return From accounts for compose, keeping the selected account first."""
-        if preferred is None:
-            return sendable
-        if preferred.uid in {account.uid for account in sendable}:
-            return sendable
-        if preferred.from_address or preferred.email:
-            return [preferred, *sendable]
-        return sendable
+        return compose_from_accounts(sendable, preferred)
 
     def get_account(self, account_uid: str) -> MailAccount:
         with self._lock:
@@ -1112,7 +1085,7 @@ class MailService:
         self, account_uid: str, folder_name: str
     ) -> dict[str, Any]:
         folder = self._require_folder_unlocked(account_uid, folder_name)
-        uids = self._camel_uid_list(folder.get_uids())
+        uids = camel_uid_list(folder.get_uids())
         deleted = Camel.MessageFlags.DELETED
         batch_size = 50
         for offset in range(0, len(uids), batch_size):
@@ -1603,23 +1576,21 @@ class MailService:
         folder_name: str,
         message_uid: str,
     ) -> tuple[int, int]:
-        """Mark a message seen without refreshing the whole folder summary."""
-        changed = self._apply_message_flags_unlocked(
+        return _mark_message_seen(
             folder,
-            account_uid,
-            folder_name,
             message_uid,
-            Camel.MessageFlags.SEEN,
-            Camel.MessageFlags.SEEN,
+            on_seen_changed=lambda seen: self._update_cached_message_flags(
+                account_uid, folder_name, message_uid, seen=seen
+            ),
+            update_folder_counts=lambda unread, total: (
+                self._update_cached_folder_counts(
+                    account_uid, folder_name, unread, total
+                )
+            ),
+            persist_uids=lambda uids: self._persist_message_flag_changes_unlocked(
+                account_uid, folder, uids
+            ),
         )
-        unread = folder.get_unread_message_count()
-        total = folder.get_message_count()
-        self._update_cached_folder_counts(account_uid, folder_name, unread, total)
-        if changed:
-            self._persist_message_flag_changes_unlocked(
-                account_uid, folder, [message_uid]
-            )
-        return unread, total
 
     def _toggle_message_seen_unlocked(
         self, account_uid: str, folder_name: str, message_uid: str
@@ -1937,7 +1908,7 @@ class MailService:
 
         # Camel returns destination UIDs; the UI and cache use source UIDs.
         moved_uids = list(message_uids)
-        destination_uids = self._camel_uid_list(transferred)
+        destination_uids = camel_uid_list(transferred)
         source_folder.refresh_info_sync(None)
         destination_folder.refresh_info_sync(None)
         if not destination_uids:
@@ -1987,27 +1958,11 @@ class MailService:
         folder: Camel.Folder,
         message_uids: list[str],
     ) -> None:
-        """Save folder summary and push flag changes to the mail store."""
-        summary = folder.get_folder_summary()
-        if summary is not None:
-            summary.touch()
-            if not summary.save():
-                raise RuntimeError("Could not save folder summary after flag change")
+        _persist_folder_flags(store, folder, message_uids)
 
-        for message_uid in message_uids:
-            if not folder.synchronize_message_sync(message_uid, None):
-                raise RuntimeError(
-                    f"Could not synchronize message {message_uid} after flag change"
-                )
-
-        if not folder.synchronize_sync(False, None):
-            raise RuntimeError("Could not synchronize folder after flag change")
-
-        if (
-            store.get_connection_status() == Camel.ServiceConnectionStatus.CONNECTED
-            and not store.synchronize_sync(False, None)
-        ):
-            raise RuntimeError("Could not synchronize mail store after flag change")
+    @staticmethod
+    def _camel_uid_list(value: Any) -> list[str]:
+        return camel_uid_list(value)
 
     @staticmethod
     def _commit_folder_transfer_unlocked(
@@ -2018,22 +1973,6 @@ class MailService:
         if not source_folder.synchronize_sync(True, None):
             raise RuntimeError("Could not synchronize source folder after move")
         destination_folder.synchronize_sync(False, None)
-
-    @staticmethod
-    def _camel_uid_list(value: Any) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, str):
-            return [value] if value else []
-        try:
-            length = value.get_length()
-            return [str(value.get_nth(index)) for index in range(length)]
-        except (AttributeError, TypeError):
-            pass
-        try:
-            return [str(uid) for uid in value]
-        except TypeError:
-            return [str(value)]
 
     def _message_dicts_for_uids_unlocked(
         self, folder: Camel.Folder, message_uids: list[str]
@@ -2087,37 +2026,26 @@ class MailService:
         mask: int,
         value: int,
     ) -> bool:
-        info = folder.get_message_info(message_uid)
-        if info is None:
-            return False
-
-        current = info.get_flags() & mask
-        target = value & mask
-        if current == target:
-            return False
-
-        if not folder.set_message_flags(message_uid, mask, value):
-            return False
-
-        info = folder.get_message_info(message_uid)
-        if info is not None:
-            info.set_folder_flagged(True)
-
-        if mask & Camel.MessageFlags.SEEN:
-            self._update_cached_message_flags(
-                account_uid,
-                folder_name,
-                message_uid,
-                seen=bool(value & Camel.MessageFlags.SEEN),
-            )
-        if mask & Camel.MessageFlags.FLAGGED:
-            self._update_cached_message_flags(
-                account_uid,
-                folder_name,
-                message_uid,
-                flagged=bool(value & Camel.MessageFlags.FLAGGED),
-            )
-        return True
+        return _apply_message_flags(
+            folder,
+            message_uid,
+            mask,
+            value,
+            on_seen_changed=(
+                lambda seen: self._update_cached_message_flags(
+                    account_uid, folder_name, message_uid, seen=seen
+                )
+                if mask & Camel.MessageFlags.SEEN
+                else None
+            ),
+            on_flagged_changed=(
+                lambda flagged: self._update_cached_message_flags(
+                    account_uid, folder_name, message_uid, flagged=flagged
+                )
+                if mask & Camel.MessageFlags.FLAGGED
+                else None
+            ),
+        )
 
     def _update_cached_message_flags(
         self,

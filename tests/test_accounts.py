@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -12,9 +13,11 @@ from post.mail.accounts import (
     BUILTIN_LOCAL_UID,
     EDS_LOCAL_DISPLAY_NAME,
     LocalMailConfig,
+    MailAccount,
     POST_LOCAL_ACCOUNT_UID,
     _render_account_source,
     _render_identity_source,
+    compose_from_accounts,
     default_local_mail_config,
     default_spool_path,
     is_maildir_empty,
@@ -22,7 +25,6 @@ from post.mail.accounts import (
     should_list_local_account,
     validate_local_mail_config,
 )
-from post.mail.eds import MailAccount, MailService
 
 
 class MaildirEmptyTests(unittest.TestCase):
@@ -207,7 +209,7 @@ class ComposeFromAccountsTests(unittest.TestCase):
             from_address="remote@example.com",
         )
         sendable = [remote]
-        result = MailService.compose_from_accounts(sendable, local)
+        result = compose_from_accounts(sendable, local)
         self.assertEqual(result[0].uid, POST_LOCAL_ACCOUNT_UID)
         self.assertEqual(len(result), 2)
 
@@ -221,7 +223,7 @@ class ComposeFromAccountsTests(unittest.TestCase):
             from_address="remote@example.com",
         )
         sendable = [remote]
-        result = MailService.compose_from_accounts(sendable, remote)
+        result = compose_from_accounts(sendable, remote)
         self.assertIs(result, sendable)
 
 
@@ -260,6 +262,10 @@ class ShouldListLocalAccountTests(unittest.TestCase):
 
 
 class BuiltinLocalEmptyIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(
+        os.environ.get("POST_EDS_TESTS"),
+        "Set POST_EDS_TESTS=1 to run EDS integration tests",
+    )
     def test_builtin_local_empty_reads_registry_when_available(self) -> None:
         try:
             import gi

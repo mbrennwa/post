@@ -5,23 +5,23 @@ from __future__ import annotations
 
 import unittest
 
-from post.mail.eds import MailService
+from post.mail.camel_util import camel_uid_list
 
 _SPOOL_BACKEND = "spool"
 
 
 class CamelUidListTests(unittest.TestCase):
     def test_none(self) -> None:
-        self.assertEqual(MailService._camel_uid_list(None), [])
+        self.assertEqual(camel_uid_list(None), [])
 
     def test_string(self) -> None:
-        self.assertEqual(MailService._camel_uid_list("42"), ["42"])
+        self.assertEqual(camel_uid_list("42"), ["42"])
 
     def test_sequence(self) -> None:
-        self.assertEqual(MailService._camel_uid_list(["1", "2"]), ["1", "2"])
+        self.assertEqual(camel_uid_list(["1", "2"]), ["1", "2"])
 
     def test_empty_string(self) -> None:
-        self.assertEqual(MailService._camel_uid_list(""), [])
+        self.assertEqual(camel_uid_list(""), [])
 
 
 class SpoolTrashTests(unittest.TestCase):

@@ -39,6 +39,47 @@ class LocalMailConfig:
     from_address: str
 
 
+@dataclass
+class MailAccount:
+    uid: str
+    name: str
+    email: str | None
+    backend: str | None
+    identity_uid: str | None = None
+    from_name: str | None = None
+    from_address: str | None = None
+    transport_uid: str | None = None
+
+    @property
+    def display_label(self) -> str:
+        if self.uid == BUILTIN_LOCAL_UID:
+            return EDS_LOCAL_DISPLAY_NAME
+        return self.email or self.name
+
+    @property
+    def from_label(self) -> str:
+        if self.from_name and self.from_address:
+            return f"{self.from_name} <{self.from_address}>"
+        return self.from_address or self.email or self.name
+
+    @property
+    def can_send(self) -> bool:
+        return bool(self.transport_uid and (self.from_address or self.email))
+
+
+def compose_from_accounts(
+    sendable: list[MailAccount], preferred: MailAccount | None
+) -> list[MailAccount]:
+    """Return From accounts for compose, keeping the selected account first."""
+    if preferred is None:
+        return sendable
+    if preferred.uid in {account.uid for account in sendable}:
+        return sendable
+    if preferred.from_address or preferred.email:
+        return [preferred, *sendable]
+    return sendable
+
+
 def default_spool_path() -> str:
     user = os.environ.get("USER") or getpass.getuser()
     return f"/var/spool/mail/{user}"
