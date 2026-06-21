@@ -13,28 +13,42 @@ install_desktop_integration() {
   local post_bin="$ROOT/.venv/bin/post"
   local desktop_file="$dest/applications/io.github.mbrennwa.Post.desktop"
   local icon_src="$ROOT/data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg"
-  local icon_installed="$dest/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg"
-  local icon_dir="$dest/icons/hicolor/scalable/apps"
-  local action_icon_dir="$dest/icons/hicolor/scalable/actions"
-  local action_icons=(
-    mail-archive-symbolic.svg
-    mail-flag-symbolic.svg
-    mail-unflag-symbolic.svg
-  )
+  local icon_png="$dest/icons/hicolor/128x128/apps/io.github.mbrennwa.Post.png"
+  local broken_hicolor_theme="$dest/icons/hicolor/index.theme"
+  local stale_svg="$dest/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg"
+  local stale_adwaita_icon="$dest/icons/Adwaita/scalable/apps/io.github.mbrennwa.Post.svg"
 
-  mkdir -p "$dest/applications" "$icon_dir" "$action_icon_dir"
+  mkdir -p "$dest/applications"
+
+  # A previous version wrote a minimal hicolor index.theme here, which shadowed
+  # the system hicolor fallback and broke icons for Firefox and other apps.
+  if [[ -f "$broken_hicolor_theme" ]] \
+    && grep -q '^Directories=scalable/apps,scalable/actions$' "$broken_hicolor_theme"; then
+    rm -f "$broken_hicolor_theme" "$dest/icons/hicolor/icon-theme.cache"
+    echo "post: removed broken local hicolor icon theme — restart GNOME Shell if other app icons still look wrong" >&2
+  fi
+
+  rm -f "$stale_svg" "$stale_adwaita_icon"
 
   local icon_changed=0
-  if [[ ! -f "$icon_installed" ]] || ! cmp -s "$icon_src" "$icon_installed"; then
-    icon_changed=1
-    cp -f "$icon_src" "$icon_installed"
+  if [[ ! -f "$icon_src" ]]; then
+    echo "post: missing icon source $icon_src" >&2
+    exit 1
   fi
-  for action_icon in "${action_icons[@]}"; do
-    local action_icon_src="$ROOT/data/icons/hicolor/scalable/actions/$action_icon"
-    local action_icon_installed="$action_icon_dir/$action_icon"
-    if [[ ! -f "$action_icon_installed" ]] || ! cmp -s "$action_icon_src" "$action_icon_installed"; then
+  if ! command -v rsvg-convert >/dev/null; then
+    echo "post: rsvg-convert is required to install launcher icons" >&2
+    exit 1
+  fi
+
+  # GNOME Shell's app switcher uses St, which often renders SVG app icons blank.
+  # Install raster icons only and point the .desktop file at a PNG path.
+  for size in 16 22 24 32 48 64 96 128 192 256; do
+    local png_dir="$dest/icons/hicolor/${size}x${size}/apps"
+    local png_installed="$png_dir/io.github.mbrennwa.Post.png"
+    mkdir -p "$png_dir"
+    if [[ ! -f "$png_installed" ]] || [[ "$icon_src" -nt "$png_installed" ]]; then
       icon_changed=1
-      cp -f "$action_icon_src" "$action_icon_installed"
+      rsvg-convert -w "$size" -h "$size" "$icon_src" -o "$png_installed"
     fi
   done
 
@@ -43,7 +57,8 @@ install_desktop_integration() {
 Name=Post
 GenericName=Email
 Comment=Send and receive email
-Icon=$icon_src
+Icon=$icon_png
+StartupWMClass=io.github.mbrennwa.Post
 TryExec=$post_bin
 Exec=$post_bin %U
 Type=Application
@@ -53,27 +68,6 @@ StartupNotify=true
 EOF
   chmod 644 "$desktop_file"
 
-  cat >"$dest/icons/hicolor/index.theme" <<'EOF'
-[Icon Theme]
-Name=Hicolor
-Comment=Fallback icon theme
-Directories=scalable/apps,scalable/actions
-
-[scalable/apps]
-Size=256
-Type=Scalable
-MinSize=1
-MaxSize=512
-
-[scalable/actions]
-Size=256
-Type=Scalable
-MinSize=1
-MaxSize=512
-EOF
-
-  rm -f "$dest/icons/hicolor/icon-theme.cache"
-  gtk-update-icon-cache -f "$dest/icons/hicolor" 2>/dev/null || true
   update-desktop-database "$dest/applications" 2>/dev/null || true
   if (( icon_changed )); then
     echo "post: icon updated — restart GNOME Shell if the launcher still shows the old icon" >&2

@@ -3,6 +3,7 @@ Name=Post
 GenericName=Email
 Comment=Send and receive email
 Icon=io.github.mbrennwa.Post
+StartupWMClass=io.github.mbrennwa.Post
 TryExec=post
 Exec=post
 Type=Application

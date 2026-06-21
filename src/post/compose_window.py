@@ -17,6 +17,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, GLib, Gtk
 
+from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.compose import (
     body_is_unedited_signature_template,
@@ -73,6 +74,7 @@ class ComposeWindow(Adw.Window):
         draft_message: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(transient_for=parent, modal=False)
+        apply_window_icon(self)
         self._mail = mail
         self._set_status = set_status
         self._on_outbox_changed = on_outbox_changed
