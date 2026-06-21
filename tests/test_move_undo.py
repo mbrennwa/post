@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from post.mail.camel_util import camel_uid_list
+from post.mail.camel_util import camel_uid_list, normalize_camel_uid
 
 _SPOOL_BACKEND = "spool"
 
@@ -22,6 +22,21 @@ class CamelUidListTests(unittest.TestCase):
 
     def test_empty_string(self) -> None:
         self.assertEqual(camel_uid_list(""), [])
+
+
+class NormalizeCamelUidTests(unittest.TestCase):
+    def test_valid(self) -> None:
+        self.assertEqual(normalize_camel_uid("42"), "42")
+        self.assertEqual(normalize_camel_uid("  7  "), "7")
+
+    def test_rejects_empty_and_zero(self) -> None:
+        self.assertIsNone(normalize_camel_uid(""))
+        self.assertIsNone(normalize_camel_uid("0"))
+        self.assertIsNone(normalize_camel_uid("  "))
+
+    def test_rejects_non_numeric(self) -> None:
+        self.assertIsNone(normalize_camel_uid("abc"))
+        self.assertIsNone(normalize_camel_uid("12a"))
 
 
 class SpoolTrashTests(unittest.TestCase):
