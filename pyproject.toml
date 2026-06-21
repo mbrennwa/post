@@ -32,4 +32,6 @@ post = ["icons/**/*.svg"]
 ]
 "share/icons/hicolor/scalable/actions" = [
   "data/icons/hicolor/scalable/actions/mail-archive-symbolic.svg",
+  "data/icons/hicolor/scalable/actions/mail-flag-symbolic.svg",
+  "data/icons/hicolor/scalable/actions/mail-unflag-symbolic.svg",
 ]
