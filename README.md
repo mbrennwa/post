@@ -43,7 +43,7 @@ You need at least one mail account: add one in **Settings → Online Accounts**,
 
 GPL-3.0-or-later — see [LICENSE](LICENSE).
 
-Known third-party code: EvolutionMCP (MIT), documented in [LICENSES/](LICENSES/) and [licensing/third_party.json](licensing/third_party.json).
+Known third-party code and artwork: EvolutionMCP (MIT) and the Adwaita GNOME Online Accounts `@` glyph (LGPL-3.0-or-later), documented in [LICENSES/](LICENSES/) and [licensing/third_party.json](licensing/third_party.json). The vendored `@` source lives at `data/icons/sources/adwaita-goa-at-symbol.svg`.
 
 This project was developed with substantial assistance from AI coding tools. The code was reviewed through iterative development, discussion, testing, and acceptance by the project maintainer.
 

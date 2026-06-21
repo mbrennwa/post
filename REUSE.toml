@@ -4,6 +4,21 @@ SPDX-License-Identifier = "GPL-3.0-or-later"
 
 [[annotations]]
 path = [
+    "data/icons/sources/adwaita-goa-at-symbol.svg",
+]
+SPDX-FileCopyrightText = "GNOME Design Team"
+SPDX-License-Identifier = "LGPL-3.0-or-later AND LicenseRef-LGPL-3.0-Adwaita-GOA-icon"
+
+[[annotations]]
+path = [
+    "LICENSES/LGPL-3.0-or-later.txt",
+    "LICENSES/LicenseRef-LGPL-3.0-Adwaita-GOA-icon.txt",
+]
+SPDX-FileCopyrightText = "2007 Free Software Foundation, Inc."
+SPDX-License-Identifier = "LGPL-3.0-or-later"
+
+[[annotations]]
+path = [
     "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg",
     "data/icons/hicolor/scalable/actions/mail-archive-symbolic.svg",
     "data/io.github.mbrennwa.Post.desktop",
