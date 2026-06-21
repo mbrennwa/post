@@ -1,7 +1,7 @@
 # Copyright (C) 2026 mbrennwa
-# SPDX-License-Identifier: GPL-3.0-or-later AND LicenseRef-MIT-EvolutionMCP
+# SPDX-License-Identifier: GPL-3.0-or-later
 #
-# EDS/Camel glue derived from EvolutionMCP (MIT) — see LICENSES/LicenseRef-MIT-EvolutionMCP.txt
+# EDS/Camel glue derived from EvolutionMCP (MIT) — see LICENSES/MIT-EvolutionMCP.txt
 
 """EDS SourceRegistry + Camel session."""
 

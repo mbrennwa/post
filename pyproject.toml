@@ -8,9 +8,6 @@ license = "GPL-3.0-or-later"
 license-files = ["LICENSE", "LICENSES/*.txt"]
 authors = [{ name = "mbrennwa" }]
 
-[project.optional-dependencies]
-dev = ["reuse>=5"]
-
 [project.scripts]
 post = "post.main:main"
 post-probe = "post.probe:main"
