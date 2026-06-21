@@ -210,7 +210,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_loading_spinner = Gtk.Spinner()
         self._message_loading_spinner.set_size_request(32, 32)
         loading_box.append(self._message_loading_spinner)
-        self._message_loading_label = Gtk.Label(label="Loading messages…")
+        self._message_loading_label = Gtk.Label(label="Loading Messages…")
         self._message_loading_label.set_wrap(True)
         self._message_loading_label.add_css_class("dim-label")
         loading_box.append(self._message_loading_label)
@@ -235,7 +235,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         message_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         message_panel.append(message_scroll)
-        self._load_more_btn = Gtk.Button(label="Load more")
+        self._load_more_btn = Gtk.Button(label="Load More")
         self._load_more_btn.set_margin_start(12)
         self._load_more_btn.set_margin_end(12)
         self._load_more_btn.set_margin_top(6)
@@ -258,7 +258,7 @@ class MainWindow(Adw.ApplicationWindow):
         empty_icon.set_pixel_size(48)
         empty_icon.add_css_class("dim-label")
         empty_box.append(empty_icon)
-        self._message_empty_label = Gtk.Label(label="No messages")
+        self._message_empty_label = Gtk.Label(label="No Messages")
         self._message_empty_label.set_wrap(True)
         self._message_empty_label.add_css_class("dim-label")
         empty_box.append(self._message_empty_label)
@@ -280,7 +280,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_error_label.set_wrap(True)
         self._message_error_label.set_justify(Gtk.Justification.CENTER)
         error_box.append(self._message_error_label)
-        retry_btn = Gtk.Button(label="Try again")
+        retry_btn = Gtk.Button(label="Try Again")
         retry_btn.connect("clicked", self._on_refresh)
         error_box.append(retry_btn)
         self._message_stack.add_named(error_box, "error")
@@ -637,7 +637,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._read_toggle_btn = self._make_message_action_button(
             "mail-read-symbolic",
-            "Mark as read",
+            "Mark as Read",
             self._on_read_toggle_clicked,
         )
         self._flag_toggle_btn = self._make_message_action_button(
@@ -710,10 +710,10 @@ class MainWindow(Adw.ApplicationWindow):
 
         if seen:
             self._read_toggle_btn.set_icon_name("mail-unread-symbolic")
-            self._read_toggle_btn.set_tooltip_text("Mark as unread")
+            self._read_toggle_btn.set_tooltip_text("Mark as Unread")
         else:
             self._read_toggle_btn.set_icon_name("mail-read-symbolic")
-            self._read_toggle_btn.set_tooltip_text("Mark as read")
+            self._read_toggle_btn.set_tooltip_text("Mark as Read")
 
         if flagged:
             self._flag_toggle_btn.set_icon_name("starred-symbolic")
@@ -1022,7 +1022,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         menu = Gio.Menu()
         menu.append("Save...", "win.attachment-save")
-        menu.append("Open with…", "win.attachment-open-with")
+        menu.append("Open With…", "win.attachment-open-with")
         self._attachment_popover = Gtk.PopoverMenu.new_from_model(menu)
 
     def _setup_message_menu(self) -> None:
@@ -1245,7 +1245,7 @@ class MainWindow(Adw.ApplicationWindow):
 
             btn = Gtk.Button()
             btn.add_css_class("flat")
-            btn.set_tooltip_text("Open attachment")
+            btn.set_tooltip_text("Open Attachment")
             btn.connect("clicked", self._on_attachment_clicked, index)
 
             menu_gesture = Gtk.GestureClick()
@@ -1398,7 +1398,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._set_status("Attachment error: no data")
             return
 
-        dialog = Gtk.FileDialog(title="Save attachment")
+        dialog = Gtk.FileDialog(title="Save Attachment")
         dialog.set_initial_name(filename)
         dialog.save(self, None, self._on_attachment_save_finished, (filename, data))
 
@@ -1460,7 +1460,7 @@ class MainWindow(Adw.ApplicationWindow):
             Gtk.DialogFlags.MODAL,
             content_type,
         )
-        dialog.set_heading("Open with")
+        dialog.set_heading("Open With")
         dialog.connect("response", self._on_app_chooser_response, (path, filename))
         dialog.present()
 
@@ -1673,7 +1673,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._message_loading_spinner.stop()
         self._load_more_btn.set_sensitive(True)
-        self._load_more_btn.set_label("Load more")
+        self._load_more_btn.set_label("Load More")
 
         if error is not None:
             if is_network_unavailable_error(error):
@@ -1704,7 +1704,7 @@ class MainWindow(Adw.ApplicationWindow):
         if offset == 0 and not messages:
             folder_label = "Outbox" if is_post_outbox_folder(folder_name) else folder_name
             if is_post_outbox_folder(folder_name):
-                self._message_empty_label.set_label("No queued messages")
+                self._message_empty_label.set_label("No Queued Messages")
             elif self._search_query is not None:
                 self._message_empty_label.set_label(f"No matches in {folder_label}")
             else:
@@ -1784,7 +1784,7 @@ class MainWindow(Adw.ApplicationWindow):
             if message_has_attachments(msg):
                 attach_icon = Gtk.Image.new_from_icon_name("mail-attachment-symbolic")
                 attach_icon.add_css_class("dim-label")
-                attach_icon.set_tooltip_text("Has attachments")
+                attach_icon.set_tooltip_text("Has Attachments")
                 bottom_row.append(attach_icon)
 
             flag_icon = Gtk.Image.new_from_icon_name("starred-symbolic")
