@@ -65,33 +65,36 @@ from post.toast import show_error_toast
 
 log = logging.getLogger(__name__)
 
-_PANE_TOP_MARGIN = 8
-_CONTENT_TOP_INSET = 8
+_SIDEBAR_TOP_INSET = 12
 
-_MESSAGE_LIST_CSS = """
-list.message-list row {
+_MESSAGE_LIST_CSS = f"""
+list.message-list row {{
   padding-top: 0;
   padding-bottom: 0;
-}
-list.navigation-sidebar {
+}}
+list.navigation-sidebar {{
   margin-top: 0;
   padding-top: 0;
-}
-expander.sidebar-section > title {
+}}
+expander.sidebar-section > title {{
   min-height: 0;
-  padding-top: 8px;
+  padding-top: 4px;
   padding-bottom: 4px;
-}
-expander.sidebar-section {
+}}
+expander.sidebar-section {{
   margin-top: 0;
   padding-top: 0;
-}
-.message-unread-dot {
+}}
+separator.header-divider {{
+  min-height: 1px;
+  background-color: alpha(@window_fg_color, 0.12);
+}}
+.message-unread-dot {{
   min-width: 10px;
   min-height: 10px;
   border-radius: 999px;
   background-color: @accent_bg_color;
-}
+}}
 """
 
 
@@ -163,10 +166,9 @@ class MainWindow(Adw.ApplicationWindow):
         search_title = Gtk.Box()
         search_title.set_halign(Gtk.Align.CENTER)
         search_title.set_hexpand(True)
+        search_title.set_valign(Gtk.Align.CENTER)
         search_title.set_margin_start(48)
         search_title.set_margin_end(48)
-        search_title.set_margin_top(10)
-        search_title.set_margin_bottom(0)
         search_title.append(self._header_search_entry)
         header.set_title_widget(search_title)
 
@@ -177,7 +179,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         header_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         header_actions.set_margin_end(10)
-        header_actions.set_margin_top(10)
+        header_actions.set_valign(Gtk.Align.CENTER)
 
         compose_btn = Gtk.Button(icon_name="mail-message-new-symbolic")
         compose_btn.set_tooltip_text("New Message (Ctrl+N)")
@@ -198,9 +200,12 @@ class MainWindow(Adw.ApplicationWindow):
 
         header.pack_end(header_actions)
 
+        header_divider = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        header_divider.add_css_class("header-divider")
+        outer.append(header_divider)
+
         content_panes = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         content_panes.set_vexpand(True)
-        content_panes.set_margin_top(_PANE_TOP_MARGIN)
         outer.append(content_panes)
 
         self._sidebar = MailSidebar(
@@ -214,9 +219,12 @@ class MainWindow(Adw.ApplicationWindow):
             on_folder_tree_changed=self._on_sidebar_folder_tree_changed,
             on_folder_contents_changed=self._on_sidebar_folder_contents_changed,
         )
-        content_panes.append(self._sidebar.widget)
+        sidebar_widget = self._sidebar.widget
+        sidebar_widget.set_margin_top(_SIDEBAR_TOP_INSET)
+        content_panes.append(sidebar_widget)
 
         sep1 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep1.set_vexpand(True)
         content_panes.append(sep1)
 
         self._message_stack = Gtk.Stack()
@@ -317,6 +325,7 @@ class MainWindow(Adw.ApplicationWindow):
         content_panes.append(self._message_stack)
 
         sep2 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep2.set_vexpand(True)
         content_panes.append(sep2)
 
         reader = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -338,7 +347,6 @@ class MainWindow(Adw.ApplicationWindow):
 
         header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header_row.set_hexpand(True)
-        header_row.set_margin_top(_CONTENT_TOP_INSET)
         subject_box = Gtk.Box()
         subject_box.set_hexpand(True)
         subject_box.append(self._reader_subject)
@@ -1789,7 +1797,7 @@ class MainWindow(Adw.ApplicationWindow):
             preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             preview.set_margin_start(4)
             preview.set_margin_end(12)
-            preview.set_margin_top(_CONTENT_TOP_INSET)
+            preview.set_margin_top(8)
             preview.set_margin_bottom(8)
 
             top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
