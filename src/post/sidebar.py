@@ -109,7 +109,6 @@ class MailSidebar:
         self._context_popover: Gtk.PopoverMenu | None = None
 
         self._sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self._sidebar_box.add_css_class("navigation-sidebar")
 
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -933,16 +932,16 @@ class MailSidebar:
 
     def _make_inbox_section_loading(self) -> Gtk.Expander:
         expander = Gtk.Expander()
+        expander.add_css_class("sidebar-section")
         expander.set_expanded(self._inbox_expanded)
         expander.connect("notify::expanded", self._on_inbox_expanded)
         header = Gtk.Label(label="Inbox", xalign=0)
         header.add_css_class("heading")
-        header.set_margin_top(4)
         header.set_margin_bottom(4)
         expander.set_label_widget(header)
         expander.set_margin_start(6)
         expander.set_margin_end(6)
-        expander.set_margin_top(4)
+        expander.set_margin_top(0)
 
         inbox_list = Gtk.ListBox()
         inbox_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
@@ -1105,12 +1104,13 @@ class MailSidebar:
 
     def _make_account_section_loading(self, account: MailAccount) -> Gtk.Expander:
         expander = Gtk.Expander()
+        expander.add_css_class("sidebar-section")
         expander.set_expanded(self._expanded_accounts.get(account.uid, True))
         expander.connect("notify::expanded", self._on_account_expanded, account.uid)
         expander.set_label_widget(self._make_account_header(account))
         expander.set_margin_start(6)
         expander.set_margin_end(6)
-        expander.set_margin_top(4)
+        expander.set_margin_top(0 if self._sidebar_box.get_first_child() is None else 4)
 
         folder_list = Gtk.ListBox()
         folder_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
@@ -1136,7 +1136,6 @@ class MailSidebar:
         label = Gtk.Label(label=account.display_label, xalign=0)
         label.add_css_class("heading")
         label.set_ellipsize(3)
-        label.set_margin_top(4)
         label.set_margin_bottom(4)
         self._attach_refresh_menu(label, account_uid=account.uid, folder_name=None)
         return label
