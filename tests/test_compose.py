@@ -6,6 +6,7 @@ from __future__ import annotations
 import unittest
 
 from post.mail.compose import (
+    build_draft_mime_message,
     build_forward_subject,
     build_reply_all_recipients,
     build_reply_references,
@@ -99,6 +100,34 @@ class BuildForwardSubjectTests(unittest.TestCase):
 
     def test_keeps_existing_fw(self) -> None:
         self.assertEqual(build_forward_subject("FW: Hello"), "FW: Hello")
+
+
+class BuildDraftMimeMessageTests(unittest.TestCase):
+    def test_allows_empty_to_and_subject(self) -> None:
+        message = build_draft_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=[],
+            cc=None,
+            bcc=None,
+            subject="",
+            body="Work in progress",
+        )
+        self.assertEqual(message.get_subject(), "")
+        self.assertIsNotNone(message.get_from())
+
+    def test_includes_recipients_when_present(self) -> None:
+        message = build_draft_mime_message(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=["cc@example.com"],
+            bcc=None,
+            subject="Hi",
+            body="Hello",
+        )
+        self.assertIsNotNone(message.get_recipients("to"))
+        self.assertIsNotNone(message.get_recipients("cc"))
 
 
 class QuotePlainForwardTests(unittest.TestCase):

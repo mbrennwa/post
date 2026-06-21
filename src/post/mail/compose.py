@@ -336,3 +336,50 @@ def build_plain_mime_message(
     encoded_body = (body or "").encode("utf-8")
     message.set_content(encoded_body, "text/plain; charset=utf-8")
     return message
+
+
+def build_draft_mime_message(
+    *,
+    from_name: str | None,
+    from_address: str,
+    to: list[str] | None,
+    cc: list[str] | None,
+    bcc: list[str] | None,
+    subject: str,
+    body: str,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+) -> Any:
+    """Build a MIME message for saving to the Drafts folder (recipients optional)."""
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    message = Camel.MimeMessage.new()
+    message.set_subject(subject or "")
+
+    sender = Camel.InternetAddress.new()
+    sender.add(from_name or "", from_address)
+    message.set_from(sender)
+
+    to_addrs = addresses_to_internet_address(to or [])
+    if to_addrs is not None:
+        message.set_recipients("To", to_addrs)
+
+    cc_addrs = addresses_to_internet_address(cc or [])
+    if cc_addrs is not None:
+        message.set_recipients("Cc", cc_addrs)
+
+    bcc_addrs = addresses_to_internet_address(bcc or [])
+    if bcc_addrs is not None:
+        message.set_recipients("Bcc", bcc_addrs)
+
+    if in_reply_to:
+        message.set_header("In-Reply-To", in_reply_to)
+    if references:
+        message.set_header("References", references)
+
+    encoded_body = (body or "").encode("utf-8")
+    message.set_content(encoded_body, "text/plain; charset=utf-8")
+    return message

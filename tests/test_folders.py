@@ -17,6 +17,8 @@ from post.mail.folders import (
     format_folder_label,
     guess_inbox_name,
     is_post_outbox_folder,
+    is_drafts_folder,
+    is_drafts_folder_name,
     is_system_folder,
     outbox_folder_dict,
     resolve_move_menu_state,
@@ -455,6 +457,24 @@ class MailAccountDisplayLabelTests(unittest.TestCase):
         )
         self.assertTrue(ready.can_send)
         self.assertFalse(missing_transport.can_send)
+
+
+class DraftsFolderTests(unittest.TestCase):
+    def test_is_drafts_folder_by_type(self) -> None:
+        folder = {"full_name": "Drafts", "display_name": "Drafts", "flags": 12288}
+        self.assertTrue(is_drafts_folder(folder))
+
+    def test_is_drafts_folder_by_name(self) -> None:
+        folder = {"full_name": "mail/drafts", "display_name": "Drafts", "flags": 0}
+        self.assertTrue(is_drafts_folder(folder))
+
+    def test_is_drafts_folder_name_lookup(self) -> None:
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 1024},
+            {"full_name": "Drafts", "display_name": "Drafts", "flags": 12288},
+        ]
+        self.assertTrue(is_drafts_folder_name(folders, "Drafts"))
+        self.assertFalse(is_drafts_folder_name(folders, "INBOX"))
 
 
 class PostOutboxFolderTests(unittest.TestCase):

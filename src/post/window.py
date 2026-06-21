@@ -389,6 +389,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._setup_send_queue_flush()
 
     def _setup_send_queue_flush(self) -> None:
+        self._mail.set_network_available(self._network_available)
         monitor = Gio.NetworkMonitor.get_default()
         monitor.connect("notify::network-available", self._on_network_available_changed)
         self._refresh_status_display()
@@ -399,8 +400,10 @@ class MainWindow(Adw.ApplicationWindow):
         if online == self._network_available:
             return
         self._network_available = online
+        self._mail.set_network_available(online)
         self._refresh_status_display()
         if online:
+            self._mail.go_online_sync()
             self._flush_send_queue_idle()
             if self._current_account and self._current_folder:
                 if get_auto_sync():
@@ -411,6 +414,12 @@ class MainWindow(Adw.ApplicationWindow):
                     )
             else:
                 GLib.idle_add(self._reload_sidebar)
+        elif self._current_account and self._current_folder:
+            self._load_messages(
+                self._current_account.uid,
+                self._current_folder,
+                sync=False,
+            )
 
     def _flush_send_queue_idle(self) -> bool:
         threading.Thread(target=self._flush_send_queue_worker, daemon=True).start()
@@ -961,6 +970,9 @@ class MainWindow(Adw.ApplicationWindow):
         *,
         mode: str,
         reply_to: dict | None = None,
+        draft_folder_name: str | None = None,
+        draft_message_uid: str | None = None,
+        draft_message: dict | None = None,
     ) -> None:
         window = ComposeWindow(
             parent=self,
@@ -968,10 +980,23 @@ class MainWindow(Adw.ApplicationWindow):
             account=account,
             set_status=self._set_status,
             on_outbox_changed=self._on_outbox_changed,
+            on_draft_saved=self._on_draft_saved,
             mode=mode,  # type: ignore[arg-type]
             reply_to=reply_to,
+            draft_folder_name=draft_folder_name,
+            draft_message_uid=draft_message_uid,
+            draft_message=draft_message,
         )
         window.present()
+
+    def _on_draft_saved(self) -> None:
+        if self._current_account is None or self._current_folder is None:
+            return
+        self._load_messages(
+            self._current_account.uid,
+            self._current_folder,
+            sync=self._network_available and get_auto_sync(),
+        )
 
     def _setup_undo_action(self) -> None:
         self._undo_move_action = Gio.SimpleAction.new("undo-move", None)
@@ -1512,6 +1537,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         if sync is None:
             sync = get_auto_sync()
+        if not self._network_available:
+            sync = False
 
         if offset == 0:
             self._messages_load_generation += 1
@@ -1579,8 +1606,28 @@ class MainWindow(Adw.ApplicationWindow):
                         sync=should_sync,
                     )
             except Exception as exc:
-                log_mail_error(log, "Failed to list messages", exc)
-                error = exc
+                if (
+                    not viewing_outbox
+                    and search_query is None
+                    and should_sync
+                    and is_network_unavailable_error(exc)
+                ):
+                    try:
+                        messages, unread, total, has_more = (
+                            self._mail.list_messages_page(
+                                account_uid,
+                                folder_name,
+                                offset=offset,
+                                limit=DEFAULT_MESSAGE_PAGE_SIZE,
+                                sync=False,
+                            )
+                        )
+                    except Exception as retry_exc:
+                        log_mail_error(log, "Failed to list messages", retry_exc)
+                        error = retry_exc
+                else:
+                    log_mail_error(log, "Failed to list messages", exc)
+                    error = exc
             GLib.idle_add(
                 self._on_messages_loaded,
                 load_id,
@@ -2432,6 +2479,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_read_generation += 1
         read_id = self._message_read_generation
         viewing_outbox = is_post_outbox_folder(folder_name)
+        viewing_drafts = self._sidebar.folder_is_drafts(account.uid, folder_name)
         from_label = account.email or account.display_label
 
         def worker() -> None:
@@ -2449,21 +2497,53 @@ class MainWindow(Adw.ApplicationWindow):
                         account.uid,
                         folder_name,
                         uid,
-                        mark_seen=mark_seen,
+                        mark_seen=mark_seen and not viewing_drafts,
                     )
             except Exception as exc:
                 log.exception("Failed to read message")
                 error = exc
-            GLib.idle_add(
-                self._on_message_read,
-                read_id,
-                row,
-                uid,
-                msg,
-                error,
-            )
+            if viewing_drafts:
+                GLib.idle_add(
+                    self._on_draft_message_loaded,
+                    account,
+                    folder_name,
+                    uid,
+                    msg,
+                    error,
+                )
+            else:
+                GLib.idle_add(
+                    self._on_message_read,
+                    read_id,
+                    row,
+                    uid,
+                    msg,
+                    error,
+                )
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_draft_message_loaded(
+        self,
+        account: MailAccount,
+        folder_name: str,
+        message_uid: str,
+        msg: dict | None,
+        error: Exception | None,
+    ) -> bool:
+        if error is not None:
+            self._set_status(f"Could not open draft: {error}")
+            return False
+        if msg is None:
+            return False
+        self._present_compose_window(
+            account,
+            mode="draft",
+            draft_folder_name=folder_name,
+            draft_message_uid=message_uid,
+            draft_message=msg,
+        )
+        return False
 
     def _on_message_read(
         self,
