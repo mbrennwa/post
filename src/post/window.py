@@ -95,6 +95,12 @@ separator.header-divider {{
   border-radius: 999px;
   background-color: @accent_bg_color;
 }}
+.message-flagged-icon {{
+  color: @error_color;
+}}
+button.message-flagged {{
+  color: @error_color;
+}}
 """
 
 
@@ -675,7 +681,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._on_read_toggle_clicked,
         )
         self._flag_toggle_btn = self._make_message_action_button(
-            "non-starred-symbolic",
+            "mail-unflag-symbolic",
             "Flag",
             self._on_flag_toggle_clicked,
         )
@@ -750,10 +756,12 @@ class MainWindow(Adw.ApplicationWindow):
             self._read_toggle_btn.set_tooltip_text("Mark as Read")
 
         if flagged:
-            self._flag_toggle_btn.set_icon_name("starred-symbolic")
+            self._flag_toggle_btn.set_icon_name("mail-flag-symbolic")
+            self._flag_toggle_btn.add_css_class("message-flagged")
             self._flag_toggle_btn.set_tooltip_text("Unflag")
         else:
-            self._flag_toggle_btn.set_icon_name("non-starred-symbolic")
+            self._flag_toggle_btn.set_icon_name("mail-unflag-symbolic")
+            self._flag_toggle_btn.remove_css_class("message-flagged")
             self._flag_toggle_btn.set_tooltip_text("Flag")
 
     def _reader_action_row(self) -> Gtk.ListBoxRow | None:
@@ -1824,8 +1832,8 @@ class MainWindow(Adw.ApplicationWindow):
                 attach_icon.set_tooltip_text("Has Attachments")
                 bottom_row.append(attach_icon)
 
-            flag_icon = Gtk.Image.new_from_icon_name("starred-symbolic")
-            flag_icon.add_css_class("dim-label")
+            flag_icon = Gtk.Image.new_from_icon_name("mail-flag-symbolic")
+            flag_icon.add_css_class("message-flagged-icon")
             flag_icon.set_tooltip_text("Flagged")
             flag_icon.set_visible(message_is_flagged(msg))
             bottom_row.append(flag_icon)
