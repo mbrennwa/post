@@ -1,0 +1,25 @@
+version = 1
+SPDX-FileCopyrightText = "2026 mbrennwa"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+[[annotations]]
+path = [
+    "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg",
+    "data/icons/hicolor/scalable/actions/mail-archive-symbolic.svg",
+    "data/io.github.mbrennwa.Post.desktop",
+    "src/post/icons/hicolor/scalable/actions/mail-archive-symbolic.svg",
+    "licensing/third_party.json",
+    "licensing/paths.json",
+    "scripts/check.sh",
+    "run.sh",
+    ".github/workflows/test.yml",
+    "README.md",
+    "pyproject.toml",
+    ".gitignore",
+    "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post-sketch.svg",
+    "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post_old.svg",
+    ".github/issue-assets/30-long-subject-reader-width.png",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 mbrennwa"
+SPDX-License-Identifier = "GPL-3.0-or-later"

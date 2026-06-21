@@ -1,7 +1,7 @@
 # Copyright (C) 2026 mbrennwa
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later AND LicenseRef-MIT-EvolutionMCP
 #
-# Folder-tree walking derived from EvolutionMCP (MIT) — see LICENSES/MIT-EvolutionMCP.txt
+# Folder-tree walking derived from EvolutionMCP (MIT) — see LICENSES/LicenseRef-MIT-EvolutionMCP.txt
 
 """CamelFolderInfo tree walking and message helpers."""
 
