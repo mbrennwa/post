@@ -288,6 +288,12 @@ def body_is_unedited_signature_template(body: str, signatures: list[str]) -> boo
     return False
 
 
+def _encode_plain_body(body: str) -> bytes:
+    """Encode a plain-text body for Camel; zero-length payloads break serialization."""
+    encoded = (body or "").encode("utf-8")
+    return encoded if encoded else b"\n"
+
+
 def build_plain_mime_message(
     *,
     from_name: str | None,
@@ -333,7 +339,7 @@ def build_plain_mime_message(
     if references:
         message.set_header("References", references)
 
-    encoded_body = (body or "").encode("utf-8")
+    encoded_body = _encode_plain_body(body)
     message.set_content(encoded_body, "text/plain; charset=utf-8")
     return message
 
@@ -380,6 +386,6 @@ def build_draft_mime_message(
     if references:
         message.set_header("References", references)
 
-    encoded_body = (body or "").encode("utf-8")
+    encoded_body = _encode_plain_body(body)
     message.set_content(encoded_body, "text/plain; charset=utf-8")
     return message
