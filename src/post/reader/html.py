@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import re
 
@@ -36,6 +37,81 @@ def _remote_img_tag_is_notifiable(tag: str) -> bool:
     if width and height and int(width.group(2)) <= 1 and int(height.group(2)) <= 1:
         return False
     return True
+
+
+_CID_IMG_SRC_QUOTED = re.compile(
+    r'(\ssrc\s*=\s*)(["\'])cid:(.*?)\2',
+    re.IGNORECASE,
+)
+_CID_IMG_SRC_UNQUOTED = re.compile(
+    r'(\ssrc\s*=\s*)cid:(<[^>]+>|[^"\'>\s]+)',
+    re.IGNORECASE,
+)
+_CID_CSS_URL = re.compile(
+    r"url\(\s*['\"]?cid:(<[^>]+>|[^)'\"\s]+)['\"]?\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_cid_reference(cid_ref: str) -> str:
+    ref = cid_ref.strip()
+    if ref.startswith("<") and ref.endswith(">"):
+        ref = ref[1:-1]
+    return ref
+
+
+def _lookup_inline_image(
+    inline_images: dict[str, tuple[str, bytes]], cid_ref: str
+) -> tuple[str, bytes] | None:
+    ref = _normalize_cid_reference(cid_ref)
+    if ref in inline_images:
+        return inline_images[ref]
+    lower_ref = ref.lower()
+    for key, value in inline_images.items():
+        if key.lower() == lower_ref:
+            return value
+    return None
+
+
+def _inline_image_data_url(mime_type: str, data: bytes) -> str:
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def resolve_cid_images(
+    body_html: str, inline_images: dict[str, tuple[str, bytes]]
+) -> str:
+    """Replace cid: image references with embedded data URLs for WebKit."""
+    if not inline_images:
+        return body_html
+
+    def replace_img_src_quoted(match: re.Match[str]) -> str:
+        prefix, quote, cid_ref = match.groups()
+        found = _lookup_inline_image(inline_images, cid_ref)
+        if found is None:
+            return match.group(0)
+        data_url = _inline_image_data_url(found[0], found[1])
+        return f"{prefix}{quote}{data_url}{quote}"
+
+    def replace_img_src_unquoted(match: re.Match[str]) -> str:
+        prefix, cid_ref = match.groups()
+        found = _lookup_inline_image(inline_images, cid_ref)
+        if found is None:
+            return match.group(0)
+        data_url = _inline_image_data_url(found[0], found[1])
+        return f'{prefix}"{data_url}"'
+
+    def replace_css_url(match: re.Match[str]) -> str:
+        cid_ref = match.group(1)
+        found = _lookup_inline_image(inline_images, cid_ref)
+        if found is None:
+            return match.group(0)
+        data_url = _inline_image_data_url(found[0], found[1])
+        return f"url({data_url})"
+
+    body_html = _CID_IMG_SRC_QUOTED.sub(replace_img_src_quoted, body_html)
+    body_html = _CID_IMG_SRC_UNQUOTED.sub(replace_img_src_unquoted, body_html)
+    return _CID_CSS_URL.sub(replace_css_url, body_html)
 
 
 def html_has_blocked_remote_content(body_html: str) -> bool:
@@ -119,11 +195,14 @@ def build_reader_document(
     body_plain: str | None,
     allow_remote: bool,
     dark: bool = False,
+    inline_images: dict[str, tuple[str, bytes]] | None = None,
 ) -> str:
     """Wrap message content in a safe HTML shell for WebKit."""
     blocked_notice = ""
     if body_html:
         content = body_html
+        if inline_images:
+            content = resolve_cid_images(content, inline_images)
         if not allow_remote:
             has_remote = html_has_blocked_remote_content(content)
             content = _EXTERNAL_IMG.sub(r'\1""', content)

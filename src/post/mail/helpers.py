@@ -275,6 +275,20 @@ def extract_attachments(mime_msg: Any) -> list[dict[str, Any]]:
     return attachments
 
 
+def _normalize_content_id(content_id: str) -> str:
+    cid = content_id.strip()
+    if cid.startswith("<") and cid.endswith(">"):
+        cid = cid[1:-1]
+    return cid
+
+
+def extract_inline_images(mime_msg: Any) -> dict[str, tuple[str, bytes]]:
+    """Return Content-ID -> (mime_type, raw bytes) for inline image parts."""
+    images: dict[str, tuple[str, bytes]] = {}
+    _email_collect_inline_images(mime_msg, images)
+    return images
+
+
 def get_attachment_data(mime_msg: Any, index: int) -> tuple[str, bytes]:
     """Return (filename, raw bytes) for an attachment by index."""
     attachments, parts = _collect_attachments(mime_msg)
@@ -443,6 +457,41 @@ def _mime_part_is_attachment(part: Any, mime_type: str) -> bool:
         return True
 
     return False
+
+
+def _email_collect_inline_images(
+    mime_msg: Any, images: dict[str, tuple[str, bytes]]
+) -> None:
+    import email
+    import email.policy
+
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    try:
+        stream = Camel.StreamMem.new()
+        mime_msg.write_to_stream_sync(stream, None)
+        stream.seek(0, 0)
+        raw = stream.get_byte_array()
+        if raw is None:
+            return
+        raw_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
+        msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
+        for part in msg.walk():
+            content_id = part.get("Content-ID")
+            if not content_id:
+                continue
+            mime_type = part.get_content_type()
+            if not mime_type.startswith("image/"):
+                continue
+            payload = part.get_payload(decode=True) or b""
+            if not payload:
+                continue
+            images[_normalize_content_id(str(content_id))] = (mime_type, payload)
+    except Exception:
+        pass
 
 
 def _email_collect_attachments(mime_msg: Any, attachments: list[dict[str, Any]]) -> None:

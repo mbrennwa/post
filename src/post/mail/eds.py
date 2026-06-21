@@ -1512,7 +1512,11 @@ class MailService:
         *,
         mark_seen: bool = True,
     ) -> dict:
-        from .helpers import extract_attachments, extract_message_bodies
+        from .helpers import (
+            extract_attachments,
+            extract_inline_images,
+            extract_message_bodies,
+        )
 
         store = self._get_store_unlocked(account_uid)
         folder = store.get_folder_sync(folder_name, 0, None)
@@ -1533,6 +1537,7 @@ class MailService:
         result["body_plain"] = bodies["plain"]
         result["body_html"] = bodies["html"]
         result["attachments"] = extract_attachments(mime)
+        result["inline_images"] = extract_inline_images(mime)
         if not result.get("message_id") and hasattr(mime, "get_message_id"):
             result["message_id"] = mime.get_message_id()
         if hasattr(mime, "get_header"):

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from post.mail.helpers import get_attachment_data
+from post.mail.helpers import extract_inline_images, get_attachment_data
 
 
 class _FakeMimeMessage:
@@ -35,6 +35,26 @@ Content-Disposition: attachment; filename="doc.pdf"
 --bound--
 """
 
+_SAMPLE_INLINE_MIME = b"""From: a@example.com
+To: b@example.com
+Subject: Inline image test
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="bound"
+
+--bound
+Content-Type: text/html; charset=utf-8
+
+<html><body><img src="cid:logo@local"></body></html>
+--bound
+Content-Type: image/png
+Content-Transfer-Encoding: base64
+Content-ID: <logo@local>
+Content-Disposition: inline; filename="logo.png"
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADULEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
+--bound--
+"""
+
 
 class GetAttachmentDataTests(unittest.TestCase):
     def test_email_fallback_extracts_attachment_bytes(self) -> None:
@@ -47,6 +67,16 @@ class GetAttachmentDataTests(unittest.TestCase):
         mime = _FakeMimeMessage(_SAMPLE_MIME)
         with self.assertRaises(ValueError):
             get_attachment_data(mime, 99)
+
+
+class ExtractInlineImagesTests(unittest.TestCase):
+    def test_email_fallback_extracts_inline_image_by_content_id(self) -> None:
+        mime = _FakeMimeMessage(_SAMPLE_INLINE_MIME)
+        images = extract_inline_images(mime)
+        self.assertIn("logo@local", images)
+        mime_type, data = images["logo@local"]
+        self.assertEqual(mime_type, "image/png")
+        self.assertTrue(data.startswith(b"\x89PNG"))
 
 
 if __name__ == "__main__":
