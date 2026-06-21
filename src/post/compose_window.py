@@ -154,7 +154,7 @@ class ComposeWindow(Adw.Window):
         self._to_entry = Gtk.Entry()
         self._to_entry.set_placeholder_text("recipient@example.com")
         self._to_entry.set_hexpand(True)
-        self._to_entry.connect("changed", self._mark_user_edited)
+        self._to_entry.connect("changed", self._on_form_field_changed)
         self._setup_address_completion(self._to_entry)
 
         self._cc_toggle_btn = Gtk.Button(label="Cc")
@@ -178,7 +178,7 @@ class ComposeWindow(Adw.Window):
         self._cc_entry.set_placeholder_text("Optional")
         self._cc_entry.set_hexpand(True)
         self._cc_entry.set_can_focus(False)
-        self._cc_entry.connect("changed", self._mark_user_edited)
+        self._cc_entry.connect("changed", self._on_form_field_changed)
         self._cc_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         self._cc_row.append(self._field_label("Cc"))
         self._cc_row.append(self._cc_entry)
@@ -190,7 +190,7 @@ class ComposeWindow(Adw.Window):
         self._bcc_entry.set_placeholder_text("Optional")
         self._bcc_entry.set_hexpand(True)
         self._bcc_entry.set_can_focus(False)
-        self._bcc_entry.connect("changed", self._mark_user_edited)
+        self._bcc_entry.connect("changed", self._on_form_field_changed)
         self._bcc_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         self._bcc_row.append(self._field_label("Bcc"))
         self._bcc_row.append(self._bcc_entry)
@@ -199,7 +199,7 @@ class ComposeWindow(Adw.Window):
         self._setup_address_completion(self._bcc_entry)
 
         self._subject_entry = Gtk.Entry()
-        self._subject_entry.connect("changed", self._mark_user_edited)
+        self._subject_entry.connect("changed", self._on_form_field_changed)
         form.append(self._labeled_row("Subject", self._subject_entry))
 
         self._focus_body_at_start_on_enter = False
@@ -238,6 +238,7 @@ class ComposeWindow(Adw.Window):
         self._prefill_fields()
         self._tracking_edits = True
         self._load_correspondents()
+        self._update_send_enabled()
         self.connect("close-request", self._on_close_request)
         GLib.idle_add(self._set_initial_focus)
 
@@ -322,6 +323,7 @@ class ComposeWindow(Adw.Window):
         self._load_correspondents()
         if self._mode == "new":
             self._refresh_signature_for_account(self._selected_account())
+        self._update_send_enabled()
 
     def _known_signatures(self) -> list[str]:
         return list(get_account_signatures().values())
@@ -426,12 +428,35 @@ class ComposeWindow(Adw.Window):
         if self._tracking_edits:
             self._user_edited = True
 
+    def _on_form_field_changed(self, *_args) -> None:
+        self._mark_user_edited()
+        self._update_send_enabled()
+
+    def _validate_send_fields(self) -> bool:
+        if not self._selected_account().can_send:
+            return False
+        try:
+            to_addrs = parse_address_list(self._to_entry.get_text())
+            parse_address_list(self._cc_entry.get_text())
+            parse_address_list(self._bcc_entry.get_text())
+        except ValueError:
+            return False
+        if not to_addrs:
+            return False
+        return bool(self._subject_entry.get_text().strip())
+
+    def _update_send_enabled(self) -> None:
+        if self._sending or self._saving_draft:
+            return
+        self._send_btn.set_sensitive(self._validate_send_fields())
+
     def _prefill_fields(self) -> None:
         self._tracking_edits = False
         try:
             self._prefill_fields_impl()
         finally:
             self._tracking_edits = True
+        self._update_send_enabled()
 
     def _prefill_fields_impl(self) -> None:
         account = self._selected_account()
@@ -555,9 +580,14 @@ class ComposeWindow(Adw.Window):
         self._prompt_save_before_close()
 
     def _set_compose_actions_sensitive(self, sensitive: bool) -> None:
-        self._cancel_btn.set_sensitive(sensitive)
-        self._save_draft_btn.set_sensitive(sensitive)
-        self._send_btn.set_sensitive(sensitive)
+        if not sensitive:
+            self._cancel_btn.set_sensitive(False)
+            self._save_draft_btn.set_sensitive(False)
+            self._send_btn.set_sensitive(False)
+            return
+        self._cancel_btn.set_sensitive(True)
+        self._save_draft_btn.set_sensitive(True)
+        self._update_send_enabled()
 
     def _on_close_request(self, *_args) -> bool:
         """Window manager / header close: block while busy or when prompting."""
