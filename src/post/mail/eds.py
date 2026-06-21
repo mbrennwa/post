@@ -41,7 +41,7 @@ from .accounts import (
     read_local_mail_config,
     should_list_local_account,
 )
-from .camel_util import camel_uid_list
+from .camel_util import camel_uid_list, normalize_camel_uid
 from .message_flags import (
     apply_message_flags as _apply_message_flags,
     mark_message_seen as _mark_message_seen,
@@ -92,6 +92,9 @@ _MAX_CORRESPONDENTS = 500
 _SKIP_BACKENDS = frozenset({"rss", "vfolder"})
 DEFAULT_MESSAGE_PAGE_SIZE = 50
 _SEND_TIMEOUT_SECONDS = 30
+# Stay below Camel IMAPx MAX_UIDSET_ITEMS (100) to avoid spurious uidset warnings
+# in evolution-data-server 3.56 when batching UID MOVE/COPY commands.
+_TRANSFER_MESSAGE_BATCH_SIZE = 50
 
 
 @dataclass
@@ -1925,6 +1928,22 @@ class MailService:
             account_uid, folder_name, message_uids, archive_folder
         )
 
+    @staticmethod
+    def _transfer_uids_in_folder(
+        folder: Camel.Folder, message_uids: list[str]
+    ) -> list[str]:
+        seen: set[str] = set()
+        transfer_uids: list[str] = []
+        for raw_uid in message_uids:
+            uid = normalize_camel_uid(raw_uid)
+            if uid is None or uid in seen:
+                continue
+            if folder.get_message_info(uid) is None:
+                continue
+            seen.add(uid)
+            transfer_uids.append(uid)
+        return transfer_uids
+
     def _transfer_messages_unlocked(
         self,
         account_uid: str,
@@ -1940,21 +1959,28 @@ class MailService:
         if dest_name and dest_name == source_folder_name:
             raise ValueError("Messages are already in that folder")
 
+        transfer_uids = self._transfer_uids_in_folder(source_folder, message_uids)
+        if not transfer_uids:
+            return {"moved_uids": []}
+
         source_messages = self._message_dicts_for_uids_unlocked(
-            source_folder, message_uids
+            source_folder, transfer_uids
         )
 
-        ok, transferred = source_folder.transfer_messages_to_sync(
-            message_uids, destination_folder, True, None
-        )
-        if not ok:
-            raise RuntimeError("Could not move messages")
+        destination_uids: list[str] = []
+        for offset in range(0, len(transfer_uids), _TRANSFER_MESSAGE_BATCH_SIZE):
+            batch = transfer_uids[offset : offset + _TRANSFER_MESSAGE_BATCH_SIZE]
+            ok, transferred = source_folder.transfer_messages_to_sync(
+                batch, destination_folder, True, None
+            )
+            if not ok:
+                raise RuntimeError("Could not move messages")
+            destination_uids.extend(camel_uid_list(transferred))
 
         self._commit_folder_transfer_unlocked(source_folder, destination_folder)
 
         # Camel returns destination UIDs; the UI and cache use source UIDs.
-        moved_uids = list(message_uids)
-        destination_uids = camel_uid_list(transferred)
+        moved_uids = list(transfer_uids)
         source_folder.refresh_info_sync(None)
         destination_folder.refresh_info_sync(None)
         if not destination_uids:
