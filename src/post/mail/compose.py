@@ -6,7 +6,15 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+import uuid
+from dataclasses import dataclass
+from typing import Any, Sequence
+
+import gi
+
+gi.require_version("Gio", "2.0")
+
+from gi.repository import Gio
 
 _ADDRESS_SPLIT = re.compile(r",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)")
 
@@ -294,57 +302,43 @@ def _encode_plain_body(body: str) -> bytes:
     return encoded if encoded else b"\n"
 
 
-def build_plain_mime_message(
-    *,
-    from_name: str | None,
-    from_address: str,
-    to: list[str],
-    cc: list[str] | None,
-    bcc: list[str] | None,
-    subject: str,
-    body: str,
-    in_reply_to: str | None = None,
-    references: str | None = None,
-) -> Any:
-    import gi
-
-    gi.require_version("Camel", "1.2")
-    from gi.repository import Camel
-
-    if not to:
-        raise ValueError("At least one To address is required")
-
-    message = Camel.MimeMessage.new()
-    message.set_subject(subject or "")
-
-    sender = Camel.InternetAddress.new()
-    sender.add(from_name or "", from_address)
-    message.set_from(sender)
-
-    to_addrs = addresses_to_internet_address(to)
-    if to_addrs is None:
-        raise ValueError("At least one valid To address is required")
-    message.set_recipients("To", to_addrs)
-
-    cc_addrs = addresses_to_internet_address(cc or [])
-    if cc_addrs is not None:
-        message.set_recipients("Cc", cc_addrs)
-
-    bcc_addrs = addresses_to_internet_address(bcc or [])
-    if bcc_addrs is not None:
-        message.set_recipients("Bcc", bcc_addrs)
-
-    if in_reply_to:
-        message.set_header("In-Reply-To", in_reply_to)
-    if references:
-        message.set_header("References", references)
-
-    encoded_body = _encode_plain_body(body)
-    message.set_content(encoded_body, "text/plain; charset=utf-8")
-    return message
+@dataclass(frozen=True)
+class ComposeAttachment:
+    filename: str
+    mime_type: str
+    data: bytes
 
 
-def build_draft_mime_message(
+def guess_attachment_mime_type(filename: str, data: bytes) -> str:
+    """Guess a MIME type for a compose attachment."""
+    guessed, _certain = Gio.content_type_guess(filename, data)
+    if guessed:
+        return guessed
+    return "application/octet-stream"
+
+
+def read_compose_attachments_from_message(mime_msg: Any) -> list[ComposeAttachment]:
+    """Extract attachment payloads from a Camel MIME message."""
+    from .helpers import extract_attachments, get_attachment_data
+
+    attachments: list[ComposeAttachment] = []
+    for meta in extract_attachments(mime_msg):
+        index = meta.get("index")
+        if index is None:
+            continue
+        filename, data = get_attachment_data(mime_msg, int(index))
+        attachments.append(
+            ComposeAttachment(
+                filename=filename,
+                mime_type=str(meta.get("mime_type") or "application/octet-stream"),
+                data=data,
+            )
+        )
+    return attachments
+
+
+def _apply_compose_headers(
+    message: Any,
     *,
     from_name: str | None,
     from_address: str,
@@ -352,17 +346,15 @@ def build_draft_mime_message(
     cc: list[str] | None,
     bcc: list[str] | None,
     subject: str,
-    body: str,
-    in_reply_to: str | None = None,
-    references: str | None = None,
-) -> Any:
-    """Build a MIME message for saving to the Drafts folder (recipients optional)."""
+    in_reply_to: str | None,
+    references: str | None,
+    require_to: bool,
+) -> None:
     import gi
 
     gi.require_version("Camel", "1.2")
     from gi.repository import Camel
 
-    message = Camel.MimeMessage.new()
     message.set_subject(subject or "")
 
     sender = Camel.InternetAddress.new()
@@ -370,7 +362,11 @@ def build_draft_mime_message(
     message.set_from(sender)
 
     to_addrs = addresses_to_internet_address(to or [])
-    if to_addrs is not None:
+    if require_to:
+        if to_addrs is None:
+            raise ValueError("At least one valid To address is required")
+        message.set_recipients("To", to_addrs)
+    elif to_addrs is not None:
         message.set_recipients("To", to_addrs)
 
     cc_addrs = addresses_to_internet_address(cc or [])
@@ -386,6 +382,111 @@ def build_draft_mime_message(
     if references:
         message.set_header("References", references)
 
+
+def _set_message_body(
+    message: Any,
+    body: str,
+    attachments: Sequence[ComposeAttachment] | None,
+) -> None:
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
     encoded_body = _encode_plain_body(body)
-    message.set_content(encoded_body, "text/plain; charset=utf-8")
+    if not attachments:
+        message.set_content(encoded_body, "text/plain; charset=utf-8")
+        return
+
+    multipart = Camel.Multipart.new()
+    multipart.set_boundary(f"----post-{uuid.uuid4().hex}")
+
+    body_part = Camel.MimePart.new()
+    body_part.set_content(encoded_body, "text/plain; charset=utf-8")
+    body_part.set_encoding(Camel.TransferEncoding.ENCODING_7BIT)
+    multipart.add_part(body_part)
+
+    for attachment in attachments:
+        part = Camel.MimePart.new()
+        part.set_content(attachment.data, attachment.mime_type)
+        part.set_disposition("attachment")
+        part.set_filename(attachment.filename)
+        part.set_encoding(Camel.TransferEncoding.ENCODING_BASE64)
+        multipart.add_part(part)
+
+    message.props.content = multipart
+    message.set_mime_type("multipart/mixed")
+
+
+def build_plain_mime_message(
+    *,
+    from_name: str | None,
+    from_address: str,
+    to: list[str],
+    cc: list[str] | None,
+    bcc: list[str] | None,
+    subject: str,
+    body: str,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+    attachments: Sequence[ComposeAttachment] | None = None,
+) -> Any:
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    if not to:
+        raise ValueError("At least one To address is required")
+
+    message = Camel.MimeMessage.new()
+    _apply_compose_headers(
+        message,
+        from_name=from_name,
+        from_address=from_address,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        subject=subject,
+        in_reply_to=in_reply_to,
+        references=references,
+        require_to=True,
+    )
+    _set_message_body(message, body, attachments)
+    return message
+
+
+def build_draft_mime_message(
+    *,
+    from_name: str | None,
+    from_address: str,
+    to: list[str] | None,
+    cc: list[str] | None,
+    bcc: list[str] | None,
+    subject: str,
+    body: str,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+    attachments: Sequence[ComposeAttachment] | None = None,
+) -> Any:
+    """Build a MIME message for saving to the Drafts folder (recipients optional)."""
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    message = Camel.MimeMessage.new()
+    _apply_compose_headers(
+        message,
+        from_name=from_name,
+        from_address=from_address,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        subject=subject,
+        in_reply_to=in_reply_to,
+        references=references,
+        require_to=False,
+    )
+    _set_message_body(message, body, attachments)
     return message

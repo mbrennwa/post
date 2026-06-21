@@ -6,6 +6,7 @@ from __future__ import annotations
 import unittest
 
 from post.mail.compose import (
+    ComposeAttachment,
     build_draft_mime_message,
     build_plain_mime_message,
     build_forward_subject,
@@ -19,7 +20,9 @@ from post.mail.compose import (
     parse_address_list,
     quote_plain_forward,
     quote_plain_reply,
+    read_compose_attachments_from_message,
 )
+from post.mail.helpers import _mime_message_raw_bytes, extract_attachments, get_attachment_data
 
 
 class ParseAddressListTests(unittest.TestCase):
@@ -143,6 +146,125 @@ class BuildPlainMimeMessageTests(unittest.TestCase):
             body="",
         )
         self.assertIsNotNone(message.get_content())
+
+    def test_without_attachments_is_single_part(self) -> None:
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hi",
+            body="Hello",
+        )
+        content_type = message.get_content_type()
+        self.assertIsNotNone(content_type)
+        self.assertEqual(content_type.simple(), "text/plain")
+
+    def test_with_attachments_is_multipart_mixed(self) -> None:
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Files",
+            body="See attached",
+            attachments=[
+                ComposeAttachment(
+                    filename="doc.pdf",
+                    mime_type="application/pdf",
+                    data=b"%PDF-fake",
+                )
+            ],
+        )
+        content_type = message.get_content_type()
+        self.assertIsNotNone(content_type)
+        self.assertEqual(content_type.simple(), "multipart/mixed")
+        extracted = extract_attachments(message)
+        self.assertEqual(len(extracted), 1)
+        self.assertEqual(extracted[0]["filename"], "doc.pdf")
+        filename, data = get_attachment_data(message, 0)
+        self.assertEqual(filename, "doc.pdf")
+        self.assertEqual(data, b"%PDF-fake")
+
+    def test_attachments_serialize_with_base64_encoding(self) -> None:
+        message = build_plain_mime_message(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Binary",
+            body="2",
+            attachments=[
+                ComposeAttachment(
+                    filename="Untitled.jpg",
+                    mime_type="image/jpeg",
+                    data=b"\xff\xd8\xff\xe0" + b"\x00" * 16,
+                )
+            ],
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertIn(b"Content-Transfer-Encoding: base64", raw)
+        self.assertNotIn(b"\xff\xd8", raw)
+
+    def test_with_multiple_attachments_round_trips(self) -> None:
+        attachments = [
+            ComposeAttachment(
+                filename="one.txt",
+                mime_type="text/plain",
+                data=b"first",
+            ),
+            ComposeAttachment(
+                filename="two.bin",
+                mime_type="application/octet-stream",
+                data=b"\x00\x01",
+            ),
+        ]
+        message = build_plain_mime_message(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Multi",
+            body="Body",
+            attachments=attachments,
+        )
+        round_tripped = read_compose_attachments_from_message(message)
+        self.assertEqual(len(round_tripped), 2)
+        self.assertEqual(round_tripped[0].filename, "one.txt")
+        self.assertEqual(round_tripped[0].data, b"first")
+        self.assertEqual(round_tripped[1].filename, "two.bin")
+        self.assertEqual(round_tripped[1].data, b"\x00\x01")
+
+
+class BuildDraftMimeMessageAttachmentTests(unittest.TestCase):
+    def test_draft_with_attachments(self) -> None:
+        message = build_draft_mime_message(
+            from_name=None,
+            from_address="alice@example.com",
+            to=None,
+            cc=None,
+            bcc=None,
+            subject="Draft",
+            body="Draft body",
+            attachments=[
+                ComposeAttachment(
+                    filename="note.txt",
+                    mime_type="text/plain",
+                    data=b"attachment text",
+                )
+            ],
+        )
+        content_type = message.get_content_type()
+        self.assertIsNotNone(content_type)
+        self.assertEqual(content_type.simple(), "multipart/mixed")
+        round_tripped = read_compose_attachments_from_message(message)
+        self.assertEqual(len(round_tripped), 1)
+        self.assertEqual(round_tripped[0].filename, "note.txt")
 
 
 class QuotePlainForwardTests(unittest.TestCase):

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections.abc import Callable
 from typing import Any, Literal
@@ -13,13 +14,15 @@ from typing import Any, Literal
 import gi
 
 gi.require_version("Adw", "1")
+gi.require_version("Gio", "2.0")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Adw, GLib, Gtk
+from gi.repository import Adw, Gio, GLib, Gtk
 
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.compose import (
+    ComposeAttachment,
     body_is_unedited_signature_template,
     build_forward_subject,
     build_reply_all_recipients,
@@ -28,11 +31,13 @@ from post.mail.compose import (
     compose_body_with_signature,
     extract_reply_address,
     format_address_list,
+    guess_attachment_mime_type,
     normalize_email,
     parse_address_list,
     quote_plain_forward,
     quote_plain_reply,
 )
+from post.mail.helpers import format_attachment_size
 from post.mail.correspondents import (
     Correspondent,
     apply_address_completion,
@@ -86,6 +91,7 @@ class ComposeWindow(Adw.Window):
         self._draft_message = draft_message
         self._sending = False
         self._saving_draft = False
+        self._attachments: list[ComposeAttachment] = []
         self._close_when_saved = False
         self._unsaved_dialog: Adw.AlertDialog | None = None
         self._user_edited = False
@@ -128,6 +134,10 @@ class ComposeWindow(Adw.Window):
         self._save_draft_btn = Gtk.Button(label="Save Draft")
         self._save_draft_btn.connect("clicked", self._on_save_draft_clicked)
         header.pack_end(self._save_draft_btn)
+
+        self._attach_btn = Gtk.Button(label="Attach")
+        self._attach_btn.connect("clicked", self._on_attach_clicked)
+        header.pack_end(self._attach_btn)
 
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -231,6 +241,18 @@ class ComposeWindow(Adw.Window):
         body_frame.set_vexpand(True)
         form.append(body_frame)
 
+        attachments_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._attach_files_btn = Gtk.Button(label="Attach Files…")
+        self._attach_files_btn.set_halign(Gtk.Align.START)
+        self._attach_files_btn.connect("clicked", self._on_attach_clicked)
+        attachments_section.append(self._attach_files_btn)
+        self._attachments_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=4
+        )
+        self._attachments_box.set_visible(False)
+        attachments_section.append(self._attachments_box)
+        form.append(attachments_section)
+
         body_focus = Gtk.EventControllerFocus()
         body_focus.connect("enter", self._on_body_focus_in)
         self._body_view.add_controller(body_focus)
@@ -249,6 +271,140 @@ class ComposeWindow(Adw.Window):
         self._update_send_enabled()
         self.connect("close-request", self._on_close_request)
         GLib.idle_add(self._set_initial_focus)
+        if self._mode == "draft":
+            GLib.idle_add(self._begin_load_draft_attachments)
+
+    def _on_attach_clicked(self, *_args) -> None:
+        if self._sending or self._saving_draft:
+            return
+        dialog = Gtk.FileDialog(title="Attach Files")
+
+        def on_selected(_dialog: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
+            try:
+                files = _dialog.open_multiple_finish(result)
+            except GLib.Error:
+                return
+            if not files:
+                return
+            added = False
+            for gfile in files:
+                path = gfile.get_path()
+                if not path:
+                    continue
+                filename = os.path.basename(path)
+                try:
+                    with open(path, "rb") as handle:
+                        data = handle.read()
+                except OSError as exc:
+                    show_error_toast(self, f"Could not read {filename}: {exc}")
+                    continue
+                mime_type = guess_attachment_mime_type(filename, data)
+                self._attachments.append(
+                    ComposeAttachment(
+                        filename=filename,
+                        mime_type=mime_type,
+                        data=data,
+                    )
+                )
+                added = True
+            if added:
+                self._mark_user_edited()
+                self._refresh_attachments_ui()
+
+        dialog.open_multiple(self, None, on_selected)
+
+    def _refresh_attachments_ui(self) -> None:
+        while child := self._attachments_box.get_first_child():
+            self._attachments_box.remove(child)
+        if not self._attachments:
+            self._attachments_box.set_visible(False)
+            return
+        self._attachments_box.set_visible(True)
+        for index, attachment in enumerate(self._attachments):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            row.add_css_class("linked")
+            icon = Gtk.Image.new_from_icon_name("mail-attachment-symbolic")
+            icon.add_css_class("dim-label")
+            row.append(icon)
+            label = Gtk.Label(
+                label=f"{attachment.filename} ({format_attachment_size(len(attachment.data))})"
+            )
+            label.set_xalign(0)
+            label.set_hexpand(True)
+            label.set_ellipsize(3)  # Pango.EllipsizeMode.END
+            row.append(label)
+            remove_btn = Gtk.Button(icon_name="window-close-symbolic")
+            remove_btn.set_tooltip_text("Remove Attachment")
+            remove_btn.add_css_class("flat")
+            remove_btn.connect("clicked", self._on_remove_attachment, index)
+            row.append(remove_btn)
+            self._attachments_box.append(row)
+
+    def _on_remove_attachment(self, _button: Gtk.Button, index: int) -> None:
+        if self._sending or self._saving_draft:
+            return
+        if index < 0 or index >= len(self._attachments):
+            return
+        del self._attachments[index]
+        self._mark_user_edited()
+        self._refresh_attachments_ui()
+
+    def _begin_load_draft_attachments(self) -> bool:
+        if self._mode != "draft" or self._draft_message is None:
+            return False
+        attachments_meta = self._draft_message.get("attachments") or []
+        if not attachments_meta:
+            return False
+        folder_name = self._draft_folder_name
+        message_uid = self._draft_message_uid
+        if not folder_name or not message_uid:
+            return False
+
+        account_uid = self._account.uid
+
+        def worker() -> None:
+            loaded: list[ComposeAttachment] = []
+            for meta in attachments_meta:
+                attachment_index = meta.get("index")
+                if attachment_index is None:
+                    continue
+                try:
+                    filename, data = self._mail.read_attachment_data(
+                        account_uid,
+                        folder_name,
+                        message_uid,
+                        int(attachment_index),
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Could not load draft attachment %s: %s",
+                        attachment_index,
+                        exc,
+                    )
+                    continue
+                mime_type = str(
+                    meta.get("mime_type")
+                    or guess_attachment_mime_type(filename, data)
+                )
+                loaded.append(
+                    ComposeAttachment(
+                        filename=filename,
+                        mime_type=mime_type,
+                        data=data,
+                    )
+                )
+            GLib.idle_add(self._on_draft_attachments_loaded, loaded)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return False
+
+    def _on_draft_attachments_loaded(
+        self, attachments: list[ComposeAttachment]
+    ) -> bool:
+        if attachments:
+            self._attachments = attachments
+            self._refresh_attachments_ui()
+        return False
 
     def _set_initial_focus(self) -> bool:
         if self._mode == "new":
@@ -680,9 +836,15 @@ class ComposeWindow(Adw.Window):
             self._cancel_btn.set_sensitive(False)
             self._save_draft_btn.set_sensitive(False)
             self._send_btn.set_sensitive(False)
+            self._attach_btn.set_sensitive(False)
+            self._attach_files_btn.set_sensitive(False)
+            self._attachments_box.set_sensitive(False)
             return
         self._cancel_btn.set_sensitive(True)
         self._save_draft_btn.set_sensitive(True)
+        self._attach_btn.set_sensitive(True)
+        self._attach_files_btn.set_sensitive(True)
+        self._attachments_box.set_sensitive(True)
         self._update_send_enabled()
 
     def _on_close_request(self, *_args) -> bool:
@@ -791,6 +953,7 @@ class ComposeWindow(Adw.Window):
         account_uid = account.uid
         existing_uid = self._draft_message_uid
         drafts_folder_name = self._draft_folder_name
+        attachments = list(self._attachments)
 
         def worker() -> None:
             error: Exception | None = None
@@ -807,6 +970,7 @@ class ComposeWindow(Adw.Window):
                     references=references,
                     existing_uid=existing_uid,
                     drafts_folder_name=drafts_folder_name,
+                    attachments=attachments or None,
                 )
             except Exception as exc:
                 log.warning("Save draft failed: %s", exc)
@@ -884,6 +1048,7 @@ class ComposeWindow(Adw.Window):
         account_uid = account.uid
         draft_folder = self._draft_folder_name
         draft_uid = self._draft_message_uid
+        attachments = list(self._attachments)
 
         def worker() -> None:
             error: Exception | None = None
@@ -897,6 +1062,7 @@ class ComposeWindow(Adw.Window):
                     body=body,
                     in_reply_to=in_reply_to,
                     references=references,
+                    attachments=attachments or None,
                 )
             except SendQueued as exc:
                 if self._on_outbox_changed is not None:
