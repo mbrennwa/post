@@ -28,6 +28,7 @@ from post.mail.folders import (
     filter_sidebar_folders,
     find_inbox_folder,
     format_folder_label,
+    is_drafts_folder_name,
     is_post_outbox_folder,
     outbox_folder_dict,
     resolve_move_menu_state,
@@ -207,6 +208,12 @@ class MailSidebar:
 
     def inbox_folder_for_account(self, account_uid: str) -> str | None:
         return self._account_inbox_folders.get(account_uid)
+
+    def folder_is_drafts(self, account_uid: str, folder_name: str) -> bool:
+        return is_drafts_folder_name(
+            self._account_folders.get(account_uid, []),
+            folder_name,
+        )
 
     def refresh_inbox_counts(self, account_uid: str) -> None:
         """Re-fetch inbox stats and update sidebar rows (incl. unified Inbox)."""

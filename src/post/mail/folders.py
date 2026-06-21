@@ -211,14 +211,41 @@ def find_folder_by_type(
     return None
 
 
+_TYPE_DRAFTS = 12288  # Camel.FolderInfoFlags.TYPE_DRAFTS
+_DRAFTS_NAME_FALLBACKS = frozenset({"drafts", "draft"})
+
 _SYSTEM_FOLDER_TYPES: tuple[int, ...] = (
     1024,   # TYPE_INBOX
     5120,   # TYPE_SENT
     3072,   # TYPE_TRASH
     4096,   # TYPE_JUNK
-    12288,  # TYPE_DRAFTS
+    _TYPE_DRAFTS,
     11264,  # TYPE_ARCHIVE
 )
+
+
+def is_drafts_folder(folder: dict, *, type_mask: int = 64512) -> bool:
+    """Return True when Camel marks a folder as Drafts (or name matches)."""
+    if folder_matches_type(folder, _TYPE_DRAFTS, type_mask=type_mask):
+        return True
+    display = (folder.get("display_name") or "").strip().lower()
+    full = (folder.get("full_name") or "").strip().lower()
+    base = full.rsplit("/", 1)[-1]
+    return display in _DRAFTS_NAME_FALLBACKS or base in _DRAFTS_NAME_FALLBACKS
+
+
+def is_drafts_folder_name(
+    folders: list[dict],
+    folder_name: str,
+    *,
+    type_mask: int = 64512,
+) -> bool:
+    """Return True when folder_name refers to a Drafts folder."""
+    for folder in folders:
+        if folder.get("full_name") == folder_name:
+            return is_drafts_folder(folder, type_mask=type_mask)
+    base = folder_name.rsplit("/", 1)[-1].lower()
+    return base in _DRAFTS_NAME_FALLBACKS
 
 
 def is_system_folder(

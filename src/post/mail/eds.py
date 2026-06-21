@@ -49,13 +49,19 @@ from .send_errors import (
 from .send_queue import (
     QueuedOutboundMessage,
     enqueue_outbound_message,
+    is_network_unavailable_error,
     is_queueable_network_error,
     list_queued_outbound_messages,
     remove_queued_outbound_message,
 )
 from post.preferences import get_show_evolution_local
 from .auth import PasswordPromptCallback, authenticate_service_sync
-from .compose import addresses_to_internet_address, build_plain_mime_message, normalize_email
+from .compose import (
+    addresses_to_internet_address,
+    build_draft_mime_message,
+    build_plain_mime_message,
+    normalize_email,
+)
 from .correspondents import Correspondent, collect_correspondents
 from .folders import (
     find_folder_by_type,
@@ -196,6 +202,8 @@ class MailService:
     _correspondent_indexes: dict[str, list[Correspondent]] = field(
         default_factory=dict, init=False
     )
+    _folder_tree_cache: dict[str, list[dict]] = field(default_factory=dict, init=False)
+    _network_available: bool = field(default=True, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _password_prompt: PasswordPromptCallback | None = field(default=None, init=False)
     _pending_mail_ops: int = field(default=0, init=False)
@@ -271,6 +279,39 @@ class MailService:
         if isinstance(self._session, MailSession):
             self._session.set_password_prompt(callback)
 
+    def set_network_available(self, available: bool) -> None:
+        """Update Camel session/store online state from Gio.NetworkMonitor."""
+        with self._lock:
+            if self._network_available == available:
+                return
+            self._network_available = available
+            if self._session is not None:
+                self._session.set_online(available)
+            for store in self._stores.values():
+                if isinstance(store, Camel.OfflineStore):
+                    try:
+                        store.set_online_sync(available, None)
+                    except GLib.Error:
+                        log.debug(
+                            "Could not set store offline=%s",
+                            not available,
+                            exc_info=True,
+                        )
+
+    def go_online_sync(self) -> None:
+        """Bring offline stores back online and drop cached folder indexes."""
+        with self._lock:
+            self._network_available = True
+            if self._session is not None:
+                self._session.set_online(True)
+            for store in self._stores.values():
+                if isinstance(store, Camel.OfflineStore):
+                    try:
+                        store.set_online_sync(True, None)
+                    except GLib.Error:
+                        log.exception("Failed to bring mail store online")
+            self._folder_indexes.clear()
+
     def reload_registry(self) -> None:
         """Reconnect to EDS and drop cached Camel services (after account changes)."""
         with self._lock:
@@ -278,6 +319,7 @@ class MailService:
             self._transports.clear()
             self._folder_indexes.clear()
             self._correspondent_indexes.clear()
+            self._folder_tree_cache.clear()
             self._accounts_by_uid.clear()
             self._session = None
             registry = EDataServer.SourceRegistry.new_sync(None)
@@ -379,7 +421,7 @@ class MailService:
 
     def _ensure_session(self) -> Camel.Session:
         if self._session is not None:
-            self._session.set_online(True)
+            self._session.set_online(self._network_available)
             return self._session
 
         user_data = os.path.expanduser("~/.local/share/evolution")
@@ -391,7 +433,7 @@ class MailService:
             password_prompt=self._password_prompt,
             user_data_dir=user_data,
             user_cache_dir=user_cache,
-            online=True,
+            online=self._network_available,
         )
         return self._session
 
@@ -411,8 +453,7 @@ class MailService:
         if account_uid in self._stores:
             store = self._stores[account_uid]
             if store.get_connection_status() == Camel.ServiceConnectionStatus.CONNECTED:
-                if isinstance(store, Camel.OfflineStore) and not store.get_online():
-                    store.set_online_sync(True, None)
+                self._sync_store_online_state_unlocked(store)
                 self._configure_store_settings_unlocked(store)
                 return store
             del self._stores[account_uid]
@@ -432,14 +473,17 @@ class MailService:
         source.camel_configure_service(service)
         store = service
 
-        if isinstance(store, Camel.OfflineStore):
-            store.set_online_sync(True, None)
-        else:
-            store.connect_sync(None)
+        self._sync_store_online_state_unlocked(store)
 
         self._configure_store_settings_unlocked(store)
         self._stores[account_uid] = store
         return store
+
+    def _sync_store_online_state_unlocked(self, store: Camel.Store) -> None:
+        if isinstance(store, Camel.OfflineStore):
+            store.set_online_sync(self._network_available, None)
+        elif self._network_available:
+            store.connect_sync(None)
 
     @staticmethod
     def _configure_store_settings_unlocked(store: Camel.Store) -> None:
@@ -764,6 +808,156 @@ class MailService:
             log.debug("Failed to refresh Sent folder after append", exc_info=True)
         self._invalidate_folder_index(account_uid, folder_name)
 
+    def _drafts_folder_name_unlocked(self, account_uid: str) -> str | None:
+        folders = self._list_folders_unlocked(account_uid)
+        drafts_info = find_folder_by_type(
+            folders,
+            Camel.FolderInfoFlags.TYPE_DRAFTS,
+            type_mask=Camel.FOLDER_TYPE_MASK,
+            name_fallbacks=frozenset({"drafts", "draft"}),
+        )
+        if drafts_info is None:
+            return None
+        return drafts_info.get("full_name")
+
+    def _draft_message_info(self) -> Camel.MessageInfo | None:
+        draft_flag = getattr(Camel.MessageFlags, "DRAFT", None)
+        if draft_flag is None:
+            return None
+        info = Camel.MessageInfo.new()
+        info.set_flags(draft_flag, draft_flag)
+        return info
+
+    def _delete_message_unlocked(
+        self, account_uid: str, folder_name: str, message_uid: str
+    ) -> None:
+        folder = self._require_folder_unlocked(account_uid, folder_name)
+        deleted = Camel.MessageFlags.DELETED
+        folder.set_message_flags(message_uid, deleted, deleted)
+        folder.expunge_sync(None)
+        try:
+            folder.refresh_info_sync(None)
+        except GLib.Error:
+            log.debug("Failed to refresh folder after delete", exc_info=True)
+        self._invalidate_folder_index(account_uid, folder_name)
+
+    def _append_draft_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message: Camel.MimeMessage,
+    ) -> str | None:
+        folder = self._open_folder_unlocked(account_uid, folder_name)
+        if folder is None:
+            raise RuntimeError(f"Drafts folder {folder_name!r} is not available")
+
+        info = self._draft_message_info()
+        try:
+            result = folder.append_message_sync(message, info, None)
+            if isinstance(result, tuple):
+                ok, appended_uid = result
+            else:
+                ok = bool(result)
+                appended_uid = None
+        except GLib.Error as exc:
+            raise RuntimeError(f"Could not save draft: {exc.message}") from exc
+
+        if not ok:
+            raise RuntimeError("Could not append message to Drafts folder")
+
+        try:
+            folder.refresh_info_sync(None)
+        except GLib.Error:
+            log.debug("Failed to refresh Drafts folder after append", exc_info=True)
+        self._invalidate_folder_index(account_uid, folder_name)
+
+        if appended_uid:
+            return str(appended_uid)
+        uids = folder.get_uids()
+        if uids:
+            return str(uids[-1])
+        return None
+
+    def save_draft(
+        self,
+        account_uid: str,
+        *,
+        to: list[str] | None = None,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        subject: str,
+        body: str,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+        existing_uid: str | None = None,
+        drafts_folder_name: str | None = None,
+    ) -> tuple[str, str]:
+        """Save or update a draft. Returns (drafts_folder_name, message_uid)."""
+        with self._lock:
+            return self._save_draft_unlocked(
+                account_uid,
+                to=to,
+                cc=cc,
+                bcc=bcc,
+                subject=subject,
+                body=body,
+                in_reply_to=in_reply_to,
+                references=references,
+                existing_uid=existing_uid,
+                drafts_folder_name=drafts_folder_name,
+            )
+
+    def _save_draft_unlocked(
+        self,
+        account_uid: str,
+        *,
+        to: list[str] | None,
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str,
+        body: str,
+        in_reply_to: str | None,
+        references: str | None,
+        existing_uid: str | None,
+        drafts_folder_name: str | None,
+    ) -> tuple[str, str]:
+        account = self.get_account(account_uid)
+        from_address = account.from_address or account.email
+        if not from_address:
+            raise ValueError("No From address configured for this account")
+
+        message = build_draft_mime_message(
+            from_name=account.from_name,
+            from_address=from_address,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body=body,
+            in_reply_to=in_reply_to,
+            references=references,
+        )
+
+        folder_name = drafts_folder_name or self._drafts_folder_name_unlocked(
+            account_uid
+        )
+        if not folder_name:
+            raise RuntimeError("No Drafts folder is configured for this account")
+
+        if existing_uid:
+            self._delete_message_unlocked(account_uid, folder_name, existing_uid)
+
+        appended_uid = self._append_draft_unlocked(account_uid, folder_name, message)
+        if not appended_uid:
+            raise RuntimeError("Draft was saved but its UID could not be determined")
+        return folder_name, appended_uid
+
+    def delete_draft(
+        self, account_uid: str, folder_name: str, message_uid: str
+    ) -> None:
+        with self._lock:
+            self._delete_message_unlocked(account_uid, folder_name, message_uid)
+
     def get_correspondents(self, account_uid: str) -> list[Correspondent]:
         with self._lock:
             cached = self._correspondent_indexes.get(account_uid)
@@ -800,14 +994,26 @@ class MailService:
             return self._list_folders_unlocked(account_uid)
 
     def _list_folders_unlocked(self, account_uid: str) -> list[dict]:
-        store = self._get_store_unlocked(account_uid)
-        root = store.get_folder_info_sync(
-            None, Camel.StoreGetFolderInfoFlags.RECURSIVE, None
-        )
-        folders: list[dict] = []
-        if root is not None:
-            walk_folder_info(root, folders)
-        return [f for f in folders if f.get("full_name")]
+        cached = self._folder_tree_cache.get(account_uid)
+        try:
+            store = self._get_store_unlocked(account_uid)
+            root = store.get_folder_info_sync(
+                None, Camel.StoreGetFolderInfoFlags.RECURSIVE, None
+            )
+            folders: list[dict] = []
+            if root is not None:
+                walk_folder_info(root, folders)
+            result = [f for f in folders if f.get("full_name")]
+            self._folder_tree_cache[account_uid] = result
+            return result
+        except GLib.Error as exc:
+            if cached is not None and is_network_unavailable_error(exc):
+                log.debug(
+                    "Using cached folder list for account %s while offline",
+                    account_uid,
+                )
+                return cached
+            raise
 
     def get_folder_stats(
         self, account_uid: str, folder_name: str
