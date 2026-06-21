@@ -1710,9 +1710,9 @@ class MainWindow(Adw.ApplicationWindow):
             if is_post_outbox_folder(folder_name):
                 self._message_empty_label.set_label("No Queued Messages")
             elif self._search_query is not None:
-                self._message_empty_label.set_label(f"No matches in {folder_label}")
+                self._message_empty_label.set_label(f"No Matches in {folder_label}")
             else:
-                self._message_empty_label.set_label(f"No messages in {folder_label}")
+                self._message_empty_label.set_label(f"No Messages in {folder_label}")
             self._message_stack.set_visible_child_name("empty")
             self._update_message_status(account, folder_name)
             return False
@@ -2272,7 +2272,7 @@ class MainWindow(Adw.ApplicationWindow):
             child = child.get_next_sibling()
         if remaining_rows == 0 and self._current_folder:
             self._message_empty_label.set_label(
-                f"No messages in {self._current_folder}"
+                f"No Messages in {self._current_folder}"
             )
             self._message_stack.set_visible_child_name("empty")
 

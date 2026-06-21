@@ -109,12 +109,37 @@ _SENTENCE_KEYWORDS = frozenset(
 _HEADER_CALLS: dict[str, int] = {
     "set_tooltip_text": 0,
     "add_response": 1,
+    "set_title": 0,
 }
 
 _SENTENCE_CALLS: dict[str, int] = {
     "_set_status": 0,
     "set_body": 0,
 }
+
+# Gtk.Label / button targets whose set_label text uses header capitalization.
+_HEADER_SET_LABEL_RECEIVERS = frozenset(
+    {
+        "_message_empty_label",
+        "_message_loading_label",
+    }
+)
+
+# Gtk.Label targets whose set_label text uses sentence capitalization.
+_SENTENCE_SET_LABEL_RECEIVERS = frozenset(
+    {
+        "_status",
+        "_reader_subject",
+        "_reader_meta",
+        "_message_error_label",
+    }
+)
+
+# Local variables assigned UI strings later passed to header-style labels.
+_HEADER_LABEL_VARIABLES = frozenset({"loading_label"})
+
+# Substitute for {…} placeholders when checking f-string UI templates.
+_FSTRING_PLACEHOLDER = "Inbox"
 
 
 def _is_string_literal(node: ast.AST) -> str | None:
@@ -143,6 +168,48 @@ def _gtk_widget_name(node: ast.Call) -> str | None:
     if isinstance(func, ast.Name):
         return func.id
     return None
+
+
+def _attribute_chain_leaf(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _fstring_sample(node: ast.JoinedStr) -> str | None:
+    parts: list[str] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            parts.append(value.value)
+        elif isinstance(value, ast.FormattedValue):
+            parts.append(_FSTRING_PLACEHOLDER)
+        else:
+            return None
+    result = "".join(parts)
+    return result or None
+
+
+def _collect_literal_ui_strings(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.JoinedStr):
+        sample = _fstring_sample(node)
+        return [sample] if sample else []
+    if isinstance(node, ast.IfExp):
+        return _collect_literal_ui_strings(node.body) + _collect_literal_ui_strings(
+            node.orelse
+        )
+    return []
+
+
+def _is_header_set_label_receiver(receiver: str | None) -> bool:
+    if receiver is None:
+        return False
+    if receiver in _HEADER_SET_LABEL_RECEIVERS:
+        return True
+    return receiver.endswith("_btn")
 
 
 class _UIStringCollector(ast.NodeVisitor):
@@ -178,6 +245,9 @@ class _UIStringCollector(ast.NodeVisitor):
             value = _is_string_literal(node.value)
             if value is not None:
                 self._record("header", value, node.lineno)
+        elif isinstance(target, ast.Name) and target.id in _HEADER_LABEL_VARIABLES:
+            for text in _collect_literal_ui_strings(node.value):
+                self._record("header", text, node.lineno)
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -219,7 +289,13 @@ class _UIStringCollector(ast.NodeVisitor):
                     style = heading_capitalization_style(value)
                     self._record(style, value, node.lineno)
 
-        if widget_name in {"Gtk.Button", "Adw.SwitchRow", "Adw.EntryRow", "Adw.ComboRow"}:
+        if widget_name in {
+            "Gtk.Button",
+            "Adw.SwitchRow",
+            "Adw.EntryRow",
+            "Adw.ComboRow",
+            "Adw.ActionRow",
+        }:
             for keyword in node.keywords:
                 if keyword.arg in _HEADER_KEYWORDS:
                     value = _is_string_literal(keyword.value)
@@ -254,6 +330,19 @@ class _UIStringCollector(ast.NodeVisitor):
                 value = _is_string_literal(node.args[0])
                 if value is not None and _looks_like_menu_label(value):
                     self._record("header", value, node.lineno)
+
+        if call_name == "set_label" and node.args:
+            receiver = (
+                _attribute_chain_leaf(node.func.value)
+                if isinstance(node.func, ast.Attribute)
+                else None
+            )
+            if _is_header_set_label_receiver(receiver):
+                for text in _collect_literal_ui_strings(node.args[0]):
+                    self._record("header", text, node.lineno)
+            elif receiver in _SENTENCE_SET_LABEL_RECEIVERS:
+                for text in _collect_literal_ui_strings(node.args[0]):
+                    self._record("sentence", text, node.lineno)
 
         if widget_name == "Gtk.FileDialog":
             for keyword in node.keywords:
@@ -359,6 +448,15 @@ class MenuLabelCapitalizationTests(unittest.TestCase):
 
 
 class UISourceCapitalizationTests(unittest.TestCase):
+    def test_collects_preference_group_titles_and_fstring_labels(self) -> None:
+        collected = {
+            (module, text)
+            for module, _style, text, _lineno in _collect_ui_strings()
+        }
+        self.assertIn(("settings_window.py", "Message Display"), collected)
+        self.assertIn(("settings_window.py", "No Sendable Accounts"), collected)
+        self.assertIn(("window.py", "No Messages in Inbox"), collected)
+
     def test_ui_source_strings_follow_gnome_capitalization(self) -> None:
         failures: list[str] = []
         for module, style, text, lineno in _collect_ui_strings():

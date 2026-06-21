@@ -88,7 +88,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         page.set_icon_name("mail-read-symbolic")
 
         group = Adw.PreferencesGroup()
-        group.set_title("Message display")
+        group.set_title("Message Display")
 
         self._remote_content_row = Adw.SwitchRow(title="Load Remote Content")
         self._remote_content_row.set_subtitle(
@@ -123,7 +123,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         self._signature_loading = False
 
         if not self._signature_accounts:
-            empty_row = Adw.ActionRow(title="No sendable accounts")
+            empty_row = Adw.ActionRow(title="No Sendable Accounts")
             empty_row.set_subtitle(
                 "Configure a mail account with outgoing mail to set signatures"
             )
@@ -228,7 +228,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         page.set_icon_name("computer-symbolic")
 
         spool_group = Adw.PreferencesGroup()
-        spool_group.set_title("System mail")
+        spool_group.set_title("System Mail")
 
         self._enable_row = Adw.SwitchRow(title="Enable System Mail")
         self._enable_row.set_active(self._config.enabled)
