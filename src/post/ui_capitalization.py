@@ -12,7 +12,23 @@ import re
 
 # Articles and prepositions that stay lowercase in the middle of header labels.
 _HEADER_LOWER_MIDDLE = frozenset(
-    {"a", "an", "the", "to", "in", "on", "at", "by", "for", "of", "as", "and", "or", "with"}
+    {
+        "a",
+        "an",
+        "the",
+        "to",
+        "in",
+        "on",
+        "at",
+        "by",
+        "for",
+        "of",
+        "as",
+        "and",
+        "or",
+        "with",
+        "all",
+    }
 )
 
 # Words that stay capitalized in sentence-style running text.

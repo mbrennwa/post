@@ -213,6 +213,17 @@ def find_folder_by_type(
 
 _TYPE_DRAFTS = 12288  # Camel.FolderInfoFlags.TYPE_DRAFTS
 _DRAFTS_NAME_FALLBACKS = frozenset({"drafts", "draft"})
+_SENT_NAME_FALLBACKS = frozenset({"sent", "sent mail", "sent messages"})
+_JUNK_NAME_FALLBACKS = frozenset({"junk", "spam"})
+
+
+def _folder_matches_name_fallbacks(
+    folder: dict, fallbacks: frozenset[str]
+) -> bool:
+    display = (folder.get("display_name") or "").strip().lower()
+    full = (folder.get("full_name") or "").strip().lower()
+    base = full.rsplit("/", 1)[-1]
+    return display in fallbacks or base in fallbacks
 
 _SYSTEM_FOLDER_TYPES: tuple[int, ...] = (
     1024,   # TYPE_INBOX
@@ -257,6 +268,12 @@ def is_system_folder(
     if is_post_outbox_folder(folder.get("full_name")):
         return True
     if is_virtual_folder(folder.get("full_name")):
+        return True
+    if is_drafts_folder(folder, type_mask=type_mask):
+        return True
+    if _folder_matches_name_fallbacks(folder, _SENT_NAME_FALLBACKS):
+        return True
+    if _folder_matches_name_fallbacks(folder, _JUNK_NAME_FALLBACKS):
         return True
     return any(
         folder_matches_type(folder, folder_type, type_mask=type_mask)
@@ -335,6 +352,7 @@ def resolve_sidebar_context_menu(
     )
     show_delete = show_rename
     show_archive_read = is_inbox and archive_name is not None
+    show_archive_read_unflagged = show_archive_read
     show_send_now = is_outbox
     show_empty_trash = is_trash
     show_refresh = True
@@ -350,6 +368,8 @@ def resolve_sidebar_context_menu(
         "enable_delete": show_delete,
         "show_archive_read": show_archive_read,
         "enable_archive_read": show_archive_read and read_count > 0,
+        "show_archive_read_unflagged": show_archive_read_unflagged,
+        "enable_archive_read_unflagged": show_archive_read_unflagged and read_count > 0,
         "show_send_now": show_send_now,
         "enable_send_now": show_send_now and outbox_count > 0,
         "show_empty_trash": show_empty_trash,
