@@ -135,10 +135,6 @@ class ComposeWindow(Adw.Window):
         self._save_draft_btn.connect("clicked", self._on_save_draft_clicked)
         header.pack_end(self._save_draft_btn)
 
-        self._attach_btn = Gtk.Button(label="Attach")
-        self._attach_btn.connect("clicked", self._on_attach_clicked)
-        header.pack_end(self._attach_btn)
-
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_vexpand(True)
@@ -836,13 +832,11 @@ class ComposeWindow(Adw.Window):
             self._cancel_btn.set_sensitive(False)
             self._save_draft_btn.set_sensitive(False)
             self._send_btn.set_sensitive(False)
-            self._attach_btn.set_sensitive(False)
             self._attach_files_btn.set_sensitive(False)
             self._attachments_box.set_sensitive(False)
             return
         self._cancel_btn.set_sensitive(True)
         self._save_draft_btn.set_sensitive(True)
-        self._attach_btn.set_sensitive(True)
         self._attach_files_btn.set_sensitive(True)
         self._attachments_box.set_sensitive(True)
         self._update_send_enabled()
