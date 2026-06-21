@@ -66,7 +66,7 @@ _EXEMPT_STRINGS = frozenset(
         "Flag",
         "Unflag",
         "Settings",
-        "Inbox",
+        "Inboxes",
         "Reading",
         "Composing",
         "Attachments",

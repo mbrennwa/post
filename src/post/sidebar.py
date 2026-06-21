@@ -935,7 +935,7 @@ class MailSidebar:
         expander.add_css_class("sidebar-section")
         expander.set_expanded(self._inbox_expanded)
         expander.connect("notify::expanded", self._on_inbox_expanded)
-        header = Gtk.Label(label="Inbox", xalign=0)
+        header = Gtk.Label(label="Inboxes", xalign=0)
         header.add_css_class("heading")
         header.set_margin_bottom(4)
         expander.set_label_widget(header)
