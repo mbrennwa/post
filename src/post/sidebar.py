@@ -101,6 +101,7 @@ class MailSidebar:
         self._account_folders: dict[str, list[dict]] = {}
         self._account_inbox_folders: dict[str, str] = {}
         self._load_generation = 0
+        self._folder_loads_pending = 0
         self._needs_initial_selection = False
         self._activated_folder: tuple[str, str] | None = None
         self._context_target: dict | None = None
@@ -128,6 +129,7 @@ class MailSidebar:
         load_id = self._load_generation
         self._needs_initial_selection = True
         self._activated_folder = None
+        self._folder_loads_pending = 0
 
         try:
             self._accounts = self._mail.list_accounts()
@@ -151,6 +153,7 @@ class MailSidebar:
         if len(self._accounts) > 1:
             self._sidebar_box.append(self._make_inbox_section_loading())
 
+        self._folder_loads_pending = len(self._accounts)
         for account in self._accounts:
             self._sidebar_box.append(self._make_account_section_loading(account))
             self._start_folder_load(load_id, account)
@@ -818,6 +821,8 @@ class MailSidebar:
             error_label.set_margin_bottom(8)
             folder_list.append(self._wrap_list_row(error_label))
             self._add_outbox_row(account_uid)
+            self._folder_loads_pending -= 1
+            self._maybe_apply_initial_selection()
             return False
 
         assert folders is not None
@@ -830,11 +835,8 @@ class MailSidebar:
         self._add_inbox_row(account_uid, folders)
         self.refresh_inbox_counts(account_uid)
 
-        if self._needs_initial_selection:
-            initial_list, initial_row = self._find_initial_folder()
-            if initial_list is not None and initial_row is not None:
-                self._activate_folder_row(initial_list, initial_row)
-                self._needs_initial_selection = False
+        self._folder_loads_pending -= 1
+        self._maybe_apply_initial_selection()
 
         return False
 
@@ -873,6 +875,18 @@ class MailSidebar:
             lists.append(self._inbox_list)
         return lists
 
+    def _maybe_apply_initial_selection(self) -> None:
+        if not self._needs_initial_selection:
+            return
+        initial_list, initial_row = self._find_initial_folder()
+        if initial_list is None or initial_row is None:
+            if self._folder_loads_pending > 0:
+                return
+            self._needs_initial_selection = False
+            return
+        self._activate_folder_row(initial_list, initial_row)
+        self._needs_initial_selection = False
+
     def _find_initial_folder(self) -> tuple[Gtk.ListBox | None, Gtk.ListBoxRow | None]:
         saved = self._saved_active_folder
         if saved is not None:
@@ -886,7 +900,17 @@ class MailSidebar:
                     ):
                         return listbox, row
                     row = row.get_next_sibling()
+            if self._folder_loads_pending > 0:
+                return None, None
 
+        if self._folder_loads_pending > 0:
+            return None, None
+
+        return self._default_initial_folder()
+
+    def _default_initial_folder(
+        self,
+    ) -> tuple[Gtk.ListBox | None, Gtk.ListBoxRow | None]:
         if self._inbox_list is not None:
             row = self._inbox_list.get_first_child()
             while row is not None:
@@ -1177,6 +1201,22 @@ class MailSidebar:
             return
         self._activate_folder_row(listbox, row)
 
+    def _find_folder_row(
+        self,
+        listbox: Gtk.ListBox,
+        account_uid: str,
+        folder_name: str,
+    ) -> Gtk.ListBoxRow | None:
+        row = listbox.get_first_child()
+        while row is not None:
+            if (
+                getattr(row, "account_uid", None) == account_uid
+                and getattr(row, "folder_name", None) == folder_name
+            ):
+                return row
+            row = row.get_next_sibling()
+        return None
+
     def _activate_folder_row(self, listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
         account_uid = getattr(row, "account_uid", None)
         folder_name = getattr(row, "folder_name", None)
@@ -1193,6 +1233,12 @@ class MailSidebar:
 
         self._sidebar_selecting = True
         listbox.select_row(row)
+        for other in self._all_folder_listboxes():
+            if other is listbox:
+                continue
+            mirror = self._find_folder_row(other, account_uid, folder_name)
+            if mirror is not None:
+                other.select_row(mirror)
         self._sidebar_selecting = False
 
         account = self._accounts_by_uid.get(account_uid)
