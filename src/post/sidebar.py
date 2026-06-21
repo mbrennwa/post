@@ -331,6 +331,7 @@ class MailSidebar:
             ("rename-folder", self._on_rename_folder_activate),
             ("delete-folder", self._on_delete_folder_activate),
             ("archive-read", self._on_archive_read_activate),
+            ("archive-read-unflagged", self._on_archive_read_unflagged_activate),
             ("send-now", self._on_send_now_activate),
             ("empty-trash", self._on_empty_trash_activate),
             ("refresh", self._on_refresh_menu_activate),
@@ -381,47 +382,28 @@ class MailSidebar:
 
     def _build_context_menu_model(self, state: dict[str, bool]) -> Gio.Menu:
         menu = Gio.Menu()
-        edit_section = Gio.Menu()
-        edit_added = False
 
-        def append_edit(label: str, action: str, key: str) -> None:
-            nonlocal edit_added
+        def append_item(label: str, action: str, key: str) -> None:
             if not state.get(f"show_{key}"):
                 return
             self._context_actions[action.split(".")[-1]].set_enabled(
                 bool(state.get(f"enable_{key}"))
             )
-            edit_section.append(label, action)
-            edit_added = True
+            menu.append(label, action)
 
-        append_edit("New Folder…", "sidebar.new-folder", "new_folder")
-        append_edit("New Sub-folder…", "sidebar.new-subfolder", "new_subfolder")
-        append_edit("Rename…", "sidebar.rename-folder", "rename")
-        append_edit("Delete", "sidebar.delete-folder", "delete")
-        if edit_added:
-            menu.append_section(None, edit_section)
-
-        special_section = Gio.Menu()
-        special_added = False
-
-        def append_special(label: str, action: str, key: str) -> None:
-            nonlocal special_added
-            if not state.get(f"show_{key}"):
-                return
-            self._context_actions[action.split(".")[-1]].set_enabled(
-                bool(state.get(f"enable_{key}"))
-            )
-            special_section.append(label, action)
-            special_added = True
-
-        append_special("Archive All Read", "sidebar.archive-read", "archive_read")
-        append_special("Send Now", "sidebar.send-now", "send_now")
-        append_special("Empty Trash", "sidebar.empty-trash", "empty_trash")
-        if special_added:
-            menu.append_section(None, special_section)
-
-        self._context_actions["refresh"].set_enabled(bool(state.get("enable_refresh")))
-        menu.append("Refresh", "sidebar.refresh")
+        append_item("Refresh", "sidebar.refresh", "refresh")
+        append_item("Archive all Read", "sidebar.archive-read", "archive_read")
+        append_item(
+            "Archive all Read and Unflagged",
+            "sidebar.archive-read-unflagged",
+            "archive_read_unflagged",
+        )
+        append_item("Send Now", "sidebar.send-now", "send_now")
+        append_item("Empty Trash", "sidebar.empty-trash", "empty_trash")
+        append_item("New Folder…", "sidebar.new-folder", "new_folder")
+        append_item("New Sub-Folder…", "sidebar.new-subfolder", "new_subfolder")
+        append_item("Rename…", "sidebar.rename-folder", "rename")
+        append_item("Delete", "sidebar.delete-folder", "delete")
         return menu
 
     def _hide_context_popover(self) -> None:
@@ -567,6 +549,53 @@ class MailSidebar:
         self._run_folder_operation(
             lambda: self._mail.archive_read_messages(account_uid, folder_name),
             success_status=f"Archived {read_count} read {noun}",
+            on_success=lambda _result: self._after_folder_contents_changed(
+                account_uid, folder_name
+            ),
+            error_heading="Could not archive messages",
+        )
+
+    def _on_archive_read_unflagged_activate(self, *_args) -> None:
+        if self._context_target is None:
+            return
+        parent = self._dialog_parent(self._widget)
+        if parent is None:
+            return
+        account_uid = self._context_target["account_uid"]
+        folder_name = self._context_target["folder_name"]
+        if not folder_name:
+            return
+        try:
+            read_unflagged_count = self._mail.count_read_unflagged_messages(
+                account_uid, folder_name
+            )
+        except Exception as exc:
+            show_error(
+                parent,
+                heading="Could not archive messages",
+                body=str(exc),
+            )
+            return
+        if read_unflagged_count <= 0:
+            return
+        noun = "message" if read_unflagged_count == 1 else "messages"
+        if not confirm_action(
+            parent,
+            heading="Archive all Read and Unflagged Messages?",
+            body=(
+                f"Archive {read_unflagged_count} read and unflagged {noun} "
+                "from this inbox?"
+            ),
+            confirm_label="Archive",
+        ):
+            return
+        self._run_folder_operation(
+            lambda: self._mail.archive_read_unflagged_messages(
+                account_uid, folder_name
+            ),
+            success_status=(
+                f"Archived {read_unflagged_count} read and unflagged {noun}"
+            ),
             on_success=lambda _result: self._after_folder_contents_changed(
                 account_uid, folder_name
             ),

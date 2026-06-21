@@ -24,6 +24,7 @@ from gi.repository import Camel, EDataServer, GLib, Gio
 
 from .helpers import (
     message_info_to_dict,
+    message_is_read_unflagged,
     message_is_unread,
     paginate_messages,
     sort_messages_newest_first,
@@ -98,6 +99,14 @@ class _FolderMessageIndex:
     messages: list[dict]
     unread: int
     total: int
+
+
+def _read_unflagged_uids(index: _FolderMessageIndex) -> list[str]:
+    return [
+        message["uid"]
+        for message in index.messages
+        if message.get("uid") and message_is_read_unflagged(message)
+    ]
 
 
 class MailSession(Camel.Session):
@@ -1030,6 +1039,22 @@ class MailService:
         with self._lock:
             return self._archive_read_messages_unlocked(account_uid, folder_name)
 
+    def count_read_unflagged_messages(
+        self, account_uid: str, folder_name: str
+    ) -> int:
+        with self._lock:
+            return self._count_read_unflagged_messages_unlocked(
+                account_uid, folder_name
+            )
+
+    def archive_read_unflagged_messages(
+        self, account_uid: str, folder_name: str
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._archive_read_unflagged_messages_unlocked(
+                account_uid, folder_name
+            )
+
     def _create_folder_unlocked(
         self,
         account_uid: str,
@@ -1124,6 +1149,27 @@ class MailService:
             account_uid, folder_name, read_uids
         )
         result["archived_count"] = len(read_uids)
+        return result
+
+    def _count_read_unflagged_messages_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> int:
+        index = self._build_folder_index_unlocked(account_uid, folder_name)
+        return len(_read_unflagged_uids(index))
+
+    def _archive_read_unflagged_messages_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> dict[str, Any]:
+        index = self._build_folder_index_unlocked(account_uid, folder_name)
+        uids = _read_unflagged_uids(index)
+        if not uids:
+            return {
+                "archived_count": 0,
+                "source_folder_unread": index.unread,
+                "source_folder_total": index.total,
+            }
+        result = self._archive_messages_unlocked(account_uid, folder_name, uids)
+        result["archived_count"] = len(uids)
         return result
 
     def _invalidate_account_folder_tree(

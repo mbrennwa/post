@@ -14,6 +14,7 @@ from post.mail.helpers import (
     format_message_list_date,
     message_has_attachments,
     message_is_flagged,
+    message_is_read_unflagged,
     message_is_unread,
     paginate_messages,
     read_menu_items,
@@ -107,6 +108,17 @@ class MessageFlagTests(unittest.TestCase):
     def test_flagged_flag(self) -> None:
         self.assertTrue(message_is_flagged({"flags": {"flagged": True}}))
         self.assertFalse(message_is_flagged({"flags": {"flagged": False}}))
+
+    def test_read_unflagged_flag(self) -> None:
+        self.assertTrue(
+            message_is_read_unflagged({"flags": {"seen": True, "flagged": False}})
+        )
+        self.assertFalse(
+            message_is_read_unflagged({"flags": {"seen": True, "flagged": True}})
+        )
+        self.assertFalse(
+            message_is_read_unflagged({"flags": {"seen": False, "flagged": False}})
+        )
 
 
 class MessageMenuItemsTests(unittest.TestCase):

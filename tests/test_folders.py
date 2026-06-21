@@ -257,6 +257,8 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
         )
         self.assertTrue(with_archive["show_archive_read"])
         self.assertTrue(with_archive["enable_archive_read"])
+        self.assertTrue(with_archive["show_archive_read_unflagged"])
+        self.assertTrue(with_archive["enable_archive_read_unflagged"])
 
         without_archive = resolve_sidebar_context_menu(
             folders=folders,
@@ -270,6 +272,7 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
             folder_crud_enabled=True,
         )
         self.assertFalse(without_archive["show_archive_read"])
+        self.assertFalse(without_archive["show_archive_read_unflagged"])
 
     def test_inbox_archive_read_disabled_without_read_messages(self) -> None:
         state = resolve_sidebar_context_menu(
@@ -285,6 +288,8 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
         )
         self.assertTrue(state["show_archive_read"])
         self.assertFalse(state["enable_archive_read"])
+        self.assertTrue(state["show_archive_read_unflagged"])
+        self.assertFalse(state["enable_archive_read_unflagged"])
 
     def test_outbox_send_now_enabled_with_queue(self) -> None:
         state = resolve_sidebar_context_menu(
@@ -400,6 +405,29 @@ class IsSystemFolderTests(unittest.TestCase):
             folder_crud_enabled=True,
         )
         self.assertFalse(state["show_delete"])
+
+    def test_sent_folder_without_type_flags_is_protected(self) -> None:
+        folder = {"full_name": "Sent", "display_name": "Sent", "flags": 0}
+        self.assertTrue(is_system_folder(folder, type_mask=self.TYPE_MASK))
+
+    def test_sidebar_blocks_delete_for_sent_folder(self) -> None:
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 1024},
+            {"full_name": "Sent", "display_name": "Sent", "flags": 0},
+        ]
+        state = resolve_sidebar_context_menu(
+            folders=folders,
+            folder_name="Sent",
+            inbox_name="INBOX",
+            trash_name=None,
+            archive_name=None,
+            unread=0,
+            total=5,
+            outbox_count=0,
+            folder_crud_enabled=True,
+        )
+        self.assertFalse(state["show_delete"])
+        self.assertFalse(state["show_rename"])
 
 
 class ValidateFolderDisplayNameTests(unittest.TestCase):
