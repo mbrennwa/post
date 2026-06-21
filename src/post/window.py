@@ -65,7 +65,27 @@ from post.toast import show_error_toast
 
 log = logging.getLogger(__name__)
 
+_PANE_TOP_MARGIN = 8
+_CONTENT_TOP_INSET = 8
+
 _MESSAGE_LIST_CSS = """
+list.message-list row {
+  padding-top: 0;
+  padding-bottom: 0;
+}
+list.navigation-sidebar {
+  margin-top: 0;
+  padding-top: 0;
+}
+expander.sidebar-section > title {
+  min-height: 0;
+  padding-top: 8px;
+  padding-bottom: 4px;
+}
+expander.sidebar-section {
+  margin-top: 0;
+  padding-top: 0;
+}
 .message-unread-dot {
   min-width: 10px;
   min-height: 10px;
@@ -145,6 +165,8 @@ class MainWindow(Adw.ApplicationWindow):
         search_title.set_hexpand(True)
         search_title.set_margin_start(48)
         search_title.set_margin_end(48)
+        search_title.set_margin_top(10)
+        search_title.set_margin_bottom(0)
         search_title.append(self._header_search_entry)
         header.set_title_widget(search_title)
 
@@ -155,6 +177,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         header_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         header_actions.set_margin_end(10)
+        header_actions.set_margin_top(10)
 
         compose_btn = Gtk.Button(icon_name="mail-message-new-symbolic")
         compose_btn.set_tooltip_text("New Message (Ctrl+N)")
@@ -175,9 +198,10 @@ class MainWindow(Adw.ApplicationWindow):
 
         header.pack_end(header_actions)
 
-        panes = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        panes.set_vexpand(True)
-        outer.append(panes)
+        content_panes = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        content_panes.set_vexpand(True)
+        content_panes.set_margin_top(_PANE_TOP_MARGIN)
+        outer.append(content_panes)
 
         self._sidebar = MailSidebar(
             self._mail,
@@ -190,10 +214,10 @@ class MainWindow(Adw.ApplicationWindow):
             on_folder_tree_changed=self._on_sidebar_folder_tree_changed,
             on_folder_contents_changed=self._on_sidebar_folder_contents_changed,
         )
-        panes.append(self._sidebar.widget)
+        content_panes.append(self._sidebar.widget)
 
         sep1 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-        panes.append(sep1)
+        content_panes.append(sep1)
 
         self._message_stack = Gtk.Stack()
         self._message_stack.set_size_request(320, -1)
@@ -223,6 +247,7 @@ class MainWindow(Adw.ApplicationWindow):
         message_scroll.set_vexpand(True)
         self._message_scroll = message_scroll
         self._message_list = Gtk.ListBox()
+        self._message_list.add_css_class("message-list")
         self._message_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
         self._message_list.set_activate_on_single_click(False)
         self._message_list.connect("row-selected", self._on_message_list_selection_changed)
@@ -289,16 +314,15 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._message_stack.set_visible_child_name("list")
 
-        panes.append(self._message_stack)
+        content_panes.append(self._message_stack)
 
         sep2 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-        panes.append(sep2)
+        content_panes.append(sep2)
 
         reader = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         reader.set_hexpand(True)
         reader.set_margin_start(16)
         reader.set_margin_end(16)
-        reader.set_margin_top(12)
         reader.set_margin_bottom(12)
 
         self._reader_subject = WrappingLabel(
@@ -314,6 +338,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header_row.set_hexpand(True)
+        header_row.set_margin_top(_CONTENT_TOP_INSET)
         subject_box = Gtk.Box()
         subject_box.set_hexpand(True)
         subject_box.append(self._reader_subject)
@@ -365,7 +390,7 @@ class MainWindow(Adw.ApplicationWindow):
         style_manager = Adw.StyleManager.get_default()
         style_manager.connect("notify::dark", self._on_app_dark_changed)
 
-        panes.append(reader)
+        content_panes.append(reader)
 
         self._status = Gtk.Label(label="", xalign=0, margin_start=12, margin_bottom=6)
         self._status.add_css_class("dim-label")
@@ -1764,7 +1789,7 @@ class MainWindow(Adw.ApplicationWindow):
             preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             preview.set_margin_start(4)
             preview.set_margin_end(12)
-            preview.set_margin_top(8)
+            preview.set_margin_top(_CONTENT_TOP_INSET)
             preview.set_margin_bottom(8)
 
             top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
