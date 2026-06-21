@@ -13,9 +13,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Install GI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-gi \
+            python3-venv \
+            gir1.2-camel-1.2 \
+            gir1.2-edataserver-1.2 \
+            gir1.2-glib-2.0
 
       - name: Run checks
-        run: ./scripts/check.sh
+        run: |
+          python3 -m venv .venv --system-site-packages
+          ./scripts/check.sh
