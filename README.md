@@ -43,4 +43,21 @@ You need at least one mail account: add one in **Settings → Online Accounts**,
 
 GPL-3.0-or-later — see [LICENSE](LICENSE).
 
-This project was developed with substantial assistance from AI coding tools. The code was reviewed through iterative development, discussion, testing, and acceptance by the project maintainer. A targeted search for third-party code did not identify any license incompatibilities.
+Known third-party code: EvolutionMCP (MIT), documented in [LICENSES/](LICENSES/) and [licensing/third_party.json](licensing/third_party.json).
+
+This project was developed with substantial assistance from AI coding tools. The code was reviewed through iterative development, discussion, testing, and acceptance by the project maintainer.
+
+### Compliance checks
+
+Before releases, run:
+
+```bash
+./scripts/check.sh
+```
+
+CI runs the same checks on every push, pull request, and release:
+
+- **Unit tests** — including licensing checks in `tests/test_licensing.py` (SPDX headers, known third-party attribution, license file consistency).
+- **REUSE lint** — verifies REUSE metadata across the repository.
+
+These checks enforce project licensing hygiene but **do not** detect unknown copied code from external sources. Periodic manual review or external scanners (e.g. ScanCode) remain recommended before major releases.
