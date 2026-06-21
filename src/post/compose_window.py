@@ -41,6 +41,7 @@ from post.mail.correspondents import (
 from post.mail.eds import MailAccount
 from post.mail.send_errors import SendQueued, user_send_error_message
 from post.preferences import get_account_signature, get_account_signatures
+from post.toast import show_error_toast
 
 log = logging.getLogger(__name__)
 
@@ -132,11 +133,6 @@ class ComposeWindow(Adw.Window):
         form.set_margin_top(12)
         form.set_margin_bottom(12)
         scrolled.set_child(form)
-
-        self._error_label = Gtk.Label(label="", xalign=0, wrap=True)
-        self._error_label.add_css_class("error")
-        self._error_label.set_visible(False)
-        form.append(self._error_label)
 
         from_labels = [from_account.from_label for from_account in self._from_accounts]
         self._from_dropdown = Gtk.DropDown.new_from_strings(from_labels)
@@ -235,7 +231,9 @@ class ComposeWindow(Adw.Window):
         toolbar_view = Adw.ToolbarView()
         toolbar_view.add_top_bar(header)
         toolbar_view.set_content(scrolled)
-        self.set_content(toolbar_view)
+        self._toast_overlay = Adw.ToastOverlay()
+        self._toast_overlay.set_child(toolbar_view)
+        self.set_content(self._toast_overlay)
 
         self._prefill_fields()
         self._tracking_edits = True
@@ -638,7 +636,6 @@ class ComposeWindow(Adw.Window):
         if self._saving_draft or self._sending:
             return
 
-        self._error_label.set_visible(False)
         try:
             (
                 to_addrs,
@@ -703,7 +700,6 @@ class ComposeWindow(Adw.Window):
         self._close_when_saved = False
         if error is not None:
             self._show_error(str(error))
-            self._set_status("Could not save draft")
             return False
 
         assert result is not None
@@ -720,7 +716,6 @@ class ComposeWindow(Adw.Window):
         if self._sending:
             return
 
-        self._error_label.set_visible(False)
         try:
             to_addrs = parse_address_list(self._to_entry.get_text())
             cc_addrs = parse_address_list(self._cc_entry.get_text())
@@ -817,7 +812,6 @@ class ComposeWindow(Adw.Window):
         if error is not None:
             message = user_send_error_message(error)
             self._show_error(message)
-            self._set_status("Send failed")
             return False
 
         if draft_folder and draft_uid:
@@ -853,5 +847,4 @@ class ComposeWindow(Adw.Window):
         return False
 
     def _show_error(self, message: str) -> None:
-        self._error_label.set_label(message)
-        self._error_label.set_visible(True)
+        show_error_toast(self, message)

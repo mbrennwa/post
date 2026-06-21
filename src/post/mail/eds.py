@@ -592,17 +592,19 @@ class MailService:
         if not from_address:
             raise ValueError("No From address configured for this account")
 
-        message = build_plain_mime_message(
-            from_name=account.from_name,
-            from_address=from_address,
-            to=to,
-            cc=cc,
-            bcc=bcc,
-            subject=subject,
-            body=body,
-            in_reply_to=in_reply_to,
-            references=references,
-        )
+        compose_kwargs = {
+            "from_name": account.from_name,
+            "from_address": from_address,
+            "to": to,
+            "cc": cc,
+            "bcc": bcc,
+            "subject": subject,
+            "body": body,
+            "in_reply_to": in_reply_to,
+            "references": references,
+        }
+        message = build_plain_mime_message(**compose_kwargs)
+        sent_message = build_plain_mime_message(**compose_kwargs)
 
         sender = Camel.InternetAddress.new()
         sender.add(account.from_name or "", from_address)
@@ -634,7 +636,7 @@ class MailService:
                         if key[0] == account_uid:
                             self._folder_indexes.pop(key, None)
                     self._correspondent_indexes.pop(account_uid, None)
-                    self._append_to_sent_folder_unlocked(account_uid, message)
+                    self._append_to_sent_folder_unlocked(account_uid, sent_message)
                     return
                 if not all_recipients_local(
                     to=to,
@@ -685,7 +687,7 @@ class MailService:
         if not ok:
             raise SendError(user_send_error_message(RuntimeError("Could not send message")))
 
-        self._append_to_sent_folder_unlocked(account_uid, message)
+        self._append_to_sent_folder_unlocked(account_uid, sent_message)
 
     def _queue_outbound_message_unlocked(
         self,

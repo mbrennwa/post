@@ -285,7 +285,9 @@ def _normalize_content_id(content_id: str) -> str:
 def extract_inline_images(mime_msg: Any) -> dict[str, tuple[str, bytes]]:
     """Return Content-ID -> (mime_type, raw bytes) for inline image parts."""
     images: dict[str, tuple[str, bytes]] = {}
-    _email_collect_inline_images(mime_msg, images)
+    _walk_inline_image_parts(mime_msg, images)
+    if not images:
+        _email_collect_inline_images(mime_msg, images)
     return images
 
 
@@ -355,24 +357,114 @@ def _walk_mime_parts(part: Any, bodies: dict[str, str | None]) -> None:
         bodies["html"] = _decode_text_part(part)
 
 
-def _email_module_fallback(mime_msg: Any, bodies: dict[str, str | None]) -> None:
-    """Parse raw MIME with Python's email module when Camel walking finds nothing."""
-    import email
-    import email.policy
-
+def _mime_message_raw_bytes(mime_msg: Any) -> bytes | None:
+    """Serialize a MIME message to raw bytes when Camel allows it."""
     import gi
 
     gi.require_version("Camel", "1.2")
     from gi.repository import Camel
 
+    if not hasattr(mime_msg, "write_to_stream_sync"):
+        return None
+
+    if isinstance(mime_msg, Camel.MimeMessage) and not _mime_message_can_serialize(
+        mime_msg
+    ):
+        return None
+
     try:
         stream = Camel.StreamMem.new()
-        mime_msg.write_to_stream_sync(stream, None)
+        if not mime_msg.write_to_stream_sync(stream, None):
+            return None
         stream.seek(0, 0)
         raw = stream.get_byte_array()
         if raw is None:
-            return
+            return None
         raw_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
+        return raw_bytes or None
+    except Exception:
+        return None
+
+
+def _mime_message_can_serialize(mime_msg: Any) -> bool:
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    content_type = mime_msg.get_content_type()
+    if content_type is None:
+        return False
+
+    mime_type = content_type.simple()
+    if mime_type.startswith("multipart/"):
+        if isinstance(mime_msg, Camel.Multipart):
+            return mime_msg.get_number() > 0
+        wrapper = mime_msg.get_content()
+        if wrapper is None or not hasattr(wrapper, "get_number"):
+            return False
+        return wrapper.get_number() > 0
+
+    return mime_msg.get_content() is not None
+
+
+def _walk_inline_image_parts(
+    part: Any, images: dict[str, tuple[str, bytes]]
+) -> None:
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    if not hasattr(part, "get_content_type"):
+        return
+
+    content_type = part.get_content_type()
+    if content_type is None:
+        return
+
+    mime_type = content_type.simple()
+    if mime_type.startswith("multipart/"):
+        if isinstance(part, Camel.Multipart):
+            for i in range(part.get_number()):
+                child = part.get_part(i)
+                if child is not None:
+                    _walk_inline_image_parts(child, images)
+            return
+        wrapper = part.get_content()
+        if wrapper is not None and hasattr(wrapper, "get_number"):
+            for i in range(wrapper.get_number()):
+                child = wrapper.get_part(i)
+                if child is not None:
+                    _walk_inline_image_parts(child, images)
+        return
+
+    if not mime_type.startswith("image/"):
+        return
+
+    content_id = part.get_content_id() if hasattr(part, "get_content_id") else None
+    if not content_id and hasattr(part, "get_header"):
+        content_id = part.get_header("Content-ID")
+    if not content_id:
+        return
+
+    data = _decode_attachment_part(part)
+    if not data:
+        return
+
+    images[_normalize_content_id(str(content_id))] = (mime_type, data)
+
+
+def _email_module_fallback(mime_msg: Any, bodies: dict[str, str | None]) -> None:
+    """Parse raw MIME with Python's email module when Camel walking finds nothing."""
+    import email
+    import email.policy
+
+    raw_bytes = _mime_message_raw_bytes(mime_msg)
+    if raw_bytes is None:
+        return
+
+    try:
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
         for part in msg.walk():
             ct = part.get_content_type()
@@ -465,19 +557,11 @@ def _email_collect_inline_images(
     import email
     import email.policy
 
-    import gi
-
-    gi.require_version("Camel", "1.2")
-    from gi.repository import Camel
+    raw_bytes = _mime_message_raw_bytes(mime_msg)
+    if raw_bytes is None:
+        return
 
     try:
-        stream = Camel.StreamMem.new()
-        mime_msg.write_to_stream_sync(stream, None)
-        stream.seek(0, 0)
-        raw = stream.get_byte_array()
-        if raw is None:
-            return
-        raw_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
         for part in msg.walk():
             content_id = part.get("Content-ID")
@@ -498,19 +582,11 @@ def _email_collect_attachments(mime_msg: Any, attachments: list[dict[str, Any]])
     import email
     import email.policy
 
-    import gi
-
-    gi.require_version("Camel", "1.2")
-    from gi.repository import Camel
+    raw_bytes = _mime_message_raw_bytes(mime_msg)
+    if raw_bytes is None:
+        return
 
     try:
-        stream = Camel.StreamMem.new()
-        mime_msg.write_to_stream_sync(stream, None)
-        stream.seek(0, 0)
-        raw = stream.get_byte_array()
-        if raw is None:
-            return
-        raw_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
         for part in msg.walk():
             disposition = part.get_content_disposition()
@@ -537,19 +613,11 @@ def _email_attachment_data_by_index(mime_msg: Any, index: int) -> bytes | None:
     import email
     import email.policy
 
-    import gi
-
-    gi.require_version("Camel", "1.2")
-    from gi.repository import Camel
+    raw_bytes = _mime_message_raw_bytes(mime_msg)
+    if raw_bytes is None:
+        return None
 
     try:
-        stream = Camel.StreamMem.new()
-        mime_msg.write_to_stream_sync(stream, None)
-        stream.seek(0, 0)
-        raw = stream.get_byte_array()
-        if raw is None:
-            return None
-        raw_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
         collected: list[bytes] = []
         for part in msg.walk():

@@ -61,6 +61,7 @@ from post.preferences import (
     set_window_state,
 )
 from post.sidebar import MailSidebar
+from post.toast import show_error_toast
 
 log = logging.getLogger(__name__)
 
@@ -955,7 +956,7 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> bool:
         if error is not None:
             action = "forward" if mode == "forward" else "reply"
-            self._set_status(f"Could not prepare {action}: {error}")
+            show_error_toast(self, f"Could not prepare {action}: {error}")
             return False
         if msg is None:
             return False
@@ -1372,10 +1373,10 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> None:
         if error is not None:
-            self._set_status(f"Attachment error: {error}")
+            show_error_toast(self, f"Attachment error: {error}")
             return
         if data is None:
-            self._set_status("Attachment error: no data")
+            show_error_toast(self, "Attachment error: no data")
             return
 
         try:
@@ -1383,7 +1384,7 @@ class MainWindow(Adw.ApplicationWindow):
             file = Gio.File.new_for_path(path)
             Gio.AppInfo.launch_default_for_uri(file.get_uri(), None)
         except (OSError, GLib.Error) as exc:
-            self._set_status(f"Could not open attachment: {exc}")
+            show_error_toast(self, f"Could not open attachment: {exc}")
             return
 
         self._set_status(f"Opened {os.path.basename(filename)}")
@@ -1395,10 +1396,10 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> None:
         if error is not None:
-            self._set_status(f"Attachment error: {error}")
+            show_error_toast(self, f"Attachment error: {error}")
             return
         if data is None:
-            self._set_status("Attachment error: no data")
+            show_error_toast(self, "Attachment error: no data")
             return
 
         dialog = Gtk.FileDialog(title="Save Attachment")
@@ -1417,19 +1418,19 @@ class MainWindow(Adw.ApplicationWindow):
         except GLib.Error as exc:
             if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
                 return
-            self._set_status(f"Save error: {exc.message}")
+            show_error_toast(self, f"Save error: {exc.message}")
             return
 
         path = file.get_path()
         if path is None:
-            self._set_status("Save error: no path")
+            show_error_toast(self, "Save error: no path")
             return
 
         try:
             with open(path, "wb") as handle:
                 handle.write(data)
         except OSError as exc:
-            self._set_status(f"Save error: {exc}")
+            show_error_toast(self, f"Save error: {exc}")
             return
 
         self._set_status(f"Saved {os.path.basename(filename)}")
@@ -1441,16 +1442,16 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> None:
         if error is not None:
-            self._set_status(f"Attachment error: {error}")
+            show_error_toast(self, f"Attachment error: {error}")
             return
         if data is None:
-            self._set_status("Attachment error: no data")
+            show_error_toast(self, "Attachment error: no data")
             return
 
         try:
             path = self._write_temp_attachment(filename, data)
         except OSError as exc:
-            self._set_status(f"Could not open attachment: {exc}")
+            show_error_toast(self, f"Could not open attachment: {exc}")
             return
 
         content_type = self._guess_content_type(
@@ -1482,7 +1483,7 @@ class MainWindow(Adw.ApplicationWindow):
                     app_info.launch_uris([file.get_uri()], None)
                     self._set_status(f"Opened {os.path.basename(filename)}")
                 except GLib.Error as exc:
-                    self._set_status(f"Could not open attachment: {exc.message}")
+                    show_error_toast(self, f"Could not open attachment: {exc.message}")
         dialog.destroy()
 
     @staticmethod
@@ -1685,7 +1686,7 @@ class MainWindow(Adw.ApplicationWindow):
             else:
                 self._message_error_label.set_label(str(error))
                 self._message_stack.set_visible_child_name("error")
-                self._set_status(f"Could not load {folder_name}")
+                show_error_toast(self, f"Could not load {folder_name}")
             self._load_more_btn.set_visible(False)
             return False
 
@@ -2193,7 +2194,7 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> bool:
         if error is not None:
-            self._set_status(f"Undo failed: {error}")
+            show_error_toast(self, f"Undo failed: {error}")
             return False
         if result is None:
             return False
@@ -2239,7 +2240,7 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> bool:
         if error is not None:
-            self._set_status(f"Could not move messages: {error}")
+            show_error_toast(self, f"Could not move messages: {error}")
             return False
         if result is None:
             return False
@@ -2260,7 +2261,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_total = max(0, self._message_total - removed_count)
 
         if removed_count == 0:
-            self._set_status("Messages moved, but the list could not be updated")
+            show_error_toast(self, "Messages moved, but the list could not be updated")
             return False
 
         remaining_rows = 0
@@ -2389,7 +2390,7 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> bool:
         if error is not None:
-            self._set_status(f"Could not update messages: {error}")
+            show_error_toast(self, f"Could not update messages: {error}")
             return False
         if result is None:
             return False
@@ -2535,7 +2536,7 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> bool:
         if error is not None:
-            self._set_status(f"Could not open draft: {error}")
+            show_error_toast(self, f"Could not open draft: {error}")
             return False
         if msg is None:
             return False
@@ -2575,7 +2576,7 @@ class MainWindow(Adw.ApplicationWindow):
                 "This message could not be loaded.</body>",
                 None,
             )
-            self._set_status(f"Read error: {error}")
+            show_error_toast(self, f"Read error: {error}")
             return False
 
         assert msg is not None
@@ -2642,7 +2643,7 @@ class MainWindow(Adw.ApplicationWindow):
         try:
             Gio.AppInfo.launch_default_for_uri(uri, None)
         except GLib.Error as exc:
-            self._set_status(f"Could not open link: {exc.message}")
+            show_error_toast(self, f"Could not open link: {exc.message}")
 
     def _on_web_view_decide_policy(
         self,

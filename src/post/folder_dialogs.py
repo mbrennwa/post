@@ -13,6 +13,8 @@ gi.require_version("GLib", "2.0")
 
 from gi.repository import Adw, GLib, Gtk
 
+from post.toast import show_error_toast
+
 DialogParent = Gtk.Window | Adw.ApplicationWindow | Adw.Window
 
 
@@ -85,8 +87,4 @@ def confirm_action(
 
 
 def show_error(parent: DialogParent, heading: str, body: str) -> None:
-    dialog = Adw.AlertDialog(heading=heading, body=body)
-    dialog.add_response("ok", "OK")
-    dialog.set_default_response("ok")
-    dialog.set_close_response("ok")
-    dialog.present(parent)
+    show_error_toast(parent, body, heading=heading)

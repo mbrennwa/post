@@ -7,6 +7,7 @@ import unittest
 
 from post.mail.compose import (
     build_draft_mime_message,
+    build_plain_mime_message,
     build_forward_subject,
     build_reply_all_recipients,
     build_reply_references,
@@ -128,6 +129,20 @@ class BuildDraftMimeMessageTests(unittest.TestCase):
         )
         self.assertIsNotNone(message.get_recipients("to"))
         self.assertIsNotNone(message.get_recipients("cc"))
+
+
+class BuildPlainMimeMessageTests(unittest.TestCase):
+    def test_empty_body_has_valid_content_wrapper(self) -> None:
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hi",
+            body="",
+        )
+        self.assertIsNotNone(message.get_content())
 
 
 class QuotePlainForwardTests(unittest.TestCase):

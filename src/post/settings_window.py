@@ -39,6 +39,7 @@ from post.preferences import (
     set_load_remote_content,
     set_show_evolution_local,
 )
+from post.toast import show_error_toast
 
 log = logging.getLogger(__name__)
 
@@ -455,7 +456,6 @@ class SettingsDialog(Adw.PreferencesDialog):
         self._saving = False
         if error is not None:
             self._show_error(str(error))
-            self._set_status(f"Could not save system mail settings: {error}")
             return False
 
         self._set_status("Settings saved")
@@ -463,14 +463,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         return False
 
     def _show_error(self, message: str) -> None:
-        dialog = Adw.AlertDialog(
-            heading="Could not save settings",
-            body=message,
-        )
-        dialog.add_response("ok", "OK")
-        dialog.set_default_response("ok")
-        dialog.set_close_response("ok")
-        dialog.present(self._parent)
+        show_error_toast(self._parent, message, heading="Could not save settings")
 
 
 # Backwards-compatible alias for imports.
