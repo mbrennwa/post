@@ -51,6 +51,7 @@ from post.mail.helpers import (
     read_menu_label,
 )
 from post.reader import build_reader_document
+from post.wrap_label import WrappingLabel
 from post.preferences import (
     get_auto_sync,
     get_load_remote_content,
@@ -299,14 +300,13 @@ class MainWindow(Adw.ApplicationWindow):
         reader.set_margin_top(12)
         reader.set_margin_bottom(12)
 
-        self._reader_subject = Gtk.Label(
+        self._reader_subject = WrappingLabel(
             label="",
             xalign=0,
             wrap=True,
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
         )
         self._reader_subject.add_css_class("title-2")
-        self._reader_subject.set_width_chars(1)
         self._reader_subject.set_hexpand(True)
         self._reader_subject.set_halign(Gtk.Align.FILL)
         self._reader_subject.set_visible(False)
@@ -2626,6 +2626,7 @@ class MainWindow(Adw.ApplicationWindow):
             body_plain=self._current_body.get("plain"),
             allow_remote=self._load_remote_content,
             dark=self._app_prefers_dark(),
+            inline_images=self._current_message.get("inline_images"),
         )
         self._web_view.load_html(document, None)
 
