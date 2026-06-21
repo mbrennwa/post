@@ -1236,6 +1236,9 @@ class MainWindow(Adw.ApplicationWindow):
         heading.add_css_class("heading")
         self._reader_attachments.append(heading)
 
+        list_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        list_row.set_halign(Gtk.Align.START)
+
         for attachment in attachments:
             index = attachment.get("index", 0)
             name = attachment.get("filename") or "attachment"
@@ -1263,12 +1266,12 @@ class MainWindow(Adw.ApplicationWindow):
             icon = Gtk.Image.new_from_icon_name("mail-attachment-symbolic")
             icon.add_css_class("dim-label")
             label = Gtk.Label(label=label_text, xalign=0, ellipsize=3)
-            label.set_hexpand(True)
             row.append(icon)
             row.append(label)
             btn.set_child(row)
-            self._reader_attachments.append(btn)
+            list_row.append(btn)
 
+        self._reader_attachments.append(list_row)
         self._reader_attachments.set_visible(True)
 
     def _on_attachment_menu_pressed(

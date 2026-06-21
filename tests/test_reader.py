@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import base64
 import unittest
 
 from post.reader import build_reader_document
+from post.reader.html import resolve_cid_images
 
 
 class BuildReaderDocumentTests(unittest.TestCase):
@@ -120,6 +122,42 @@ class BuildReaderDocumentTests(unittest.TestCase):
         )
         self.assertIn('style="background:#ffffff"', doc)
         self.assertIn("background: #1e1e1e", doc)
+
+    def test_cid_images_are_embedded_as_data_urls(self) -> None:
+        png = b"\x89PNG\r\n\x1a\n"
+        html = '<img src="cid:logo@local">'
+        doc = build_reader_document(
+            body_html=html,
+            body_plain=None,
+            allow_remote=False,
+            inline_images={"logo@local": ("image/png", png)},
+        )
+        expected = base64.b64encode(png).decode("ascii")
+        self.assertIn(f"data:image/png;base64,{expected}", doc)
+        self.assertNotIn("cid:logo@local", doc)
+
+    def test_cid_css_background_is_embedded(self) -> None:
+        png = b"\x89PNG\r\n\x1a\n"
+        html = '<div style="background-image: url(cid:logo@local)"></div>'
+        doc = build_reader_document(
+            body_html=html,
+            body_plain=None,
+            allow_remote=False,
+            inline_images={"logo@local": ("image/png", png)},
+        )
+        expected = base64.b64encode(png).decode("ascii")
+        self.assertIn(f"url(data:image/png;base64,{expected})", doc)
+
+
+class ResolveCidImagesTests(unittest.TestCase):
+    def test_matches_angle_bracket_content_id(self) -> None:
+        png = b"image-bytes"
+        html = '<img src="cid:<logo@local>">'
+        resolved = resolve_cid_images(
+            html, {"logo@local": ("image/png", png)}
+        )
+        self.assertIn("data:image/png;base64,", resolved)
+        self.assertNotIn("cid:", resolved)
 
 
 if __name__ == "__main__":
