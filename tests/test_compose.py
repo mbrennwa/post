@@ -326,9 +326,76 @@ class BuildReplyAllRecipientsTests(unittest.TestCase):
         self.assertEqual(to_addrs, ["Alice <alice@example.com>"])
         self.assertEqual(cc_addrs, [])
 
-    def test_no_recipients_raises(self) -> None:
+    def test_reply_all_includes_cc_not_in_from_or_to(self) -> None:
+        original = {
+            "from": "Matthias Brennwald <info@gasometrix.com>",
+            "to": "matthias@brennwald, mbrennwa@gmail.com",
+            "cc": "Carol <carol@example.com>",
+        }
+        to_addrs, cc_addrs = build_reply_all_recipients(
+            original,
+            own_addresses={
+                normalize_email("info@gasometrix.com"),
+                normalize_email("matthias@brennwald"),
+            },
+        )
+        self.assertEqual(
+            to_addrs,
+            ["mbrennwa@gmail.com"],
+        )
+        self.assertEqual(cc_addrs, ["Carol <carol@example.com>"])
+
+    def test_reply_all_omits_cc_matching_compose_from(self) -> None:
+        original = {
+            "from": "Matthias Brennwald <info@gasometrix.com>",
+            "to": "matthias@brennwald, mbrennwa@gmail.com, Matthias Brennwald <brennmat@gmail.com>",
+            "cc": "info@gasometrix.com",
+        }
+        to_addrs, cc_addrs = build_reply_all_recipients(
+            original,
+            own_addresses={
+                normalize_email("info@gasometrix.com"),
+                normalize_email("matthias@brennwald"),
+            },
+        )
+        self.assertEqual(
+            to_addrs,
+            ["mbrennwa@gmail.com", "Matthias Brennwald <brennmat@gmail.com>"],
+        )
+        self.assertEqual(cc_addrs, [])
+
+    def test_reply_all_omits_cc_addresses_already_in_to(self) -> None:
+        original = {
+            "from": "Matthias Brennwald <info@gasometrix.com>",
+            "to": "mbrennwa@gmail.com",
+            "cc": "info@gasometrix.com",
+        }
+        to_addrs, cc_addrs = build_reply_all_recipients(
+            original,
+            own_addresses={normalize_email("mbrennwa@gmail.com")},
+        )
+        self.assertEqual(
+            to_addrs,
+            ["Matthias Brennwald <info@gasometrix.com>"],
+        )
+        self.assertEqual(cc_addrs, [])
+
+    def test_self_to_self_falls_back_to_from(self) -> None:
         original = {
             "from": "Me <me@example.com>",
+            "to": "Me <me@example.com>",
+            "cc": "",
+        }
+        to_addrs, cc_addrs = build_reply_all_recipients(
+            original,
+            own_addresses={normalize_email("me@example.com")},
+        )
+        self.assertEqual(to_addrs, ["Me <me@example.com>"])
+        self.assertEqual(cc_addrs, [])
+
+    def test_no_recipients_raises_without_from(self) -> None:
+        original = {
+            "from": "",
             "to": "Me <me@example.com>",
             "cc": "",
         }

@@ -98,6 +98,37 @@ def _safe_str(value: Any) -> str | None:
     return str(value)
 
 
+def format_recipient_header(value: Any) -> str:
+    """Return a formatted To/Cc/From header string from Camel metadata."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    formatter = getattr(value, "format", None)
+    if callable(formatter):
+        try:
+            formatted = formatter()
+            if formatted:
+                return str(formatted).strip()
+        except (TypeError, ValueError):
+            pass
+    return (_safe_str(value) or "").strip()
+
+
+def enrich_message_dict_from_mime(result: dict[str, Any], mime: Any) -> None:
+    """Fill To/Cc from MIME when Camel MessageInfo summary omitted them."""
+    if not hasattr(mime, "get_header"):
+        return
+    if not (result.get("to") or "").strip():
+        to_header = mime.get_header("To")
+        if to_header:
+            result["to"] = to_header
+    if not (result.get("cc") or "").strip():
+        cc_header = mime.get_header("Cc")
+        if cc_header:
+            result["cc"] = cc_header
+
+
 def _valid_unix_timestamp(unix_time: float | int | None) -> float | None:
     """Return unix seconds when in a sane range, otherwise None."""
     if unix_time is None:
@@ -143,9 +174,9 @@ def message_info_to_dict(info: Any) -> dict[str, Any]:
     return {
         "uid": _safe_str(info.get_uid()),
         "subject": _safe_str(info.get_subject()) or "(no subject)",
-        "from": _safe_str(info.get_from()) or "",
-        "to": _safe_str(info.get_to()) or "",
-        "cc": _safe_str(info.get_cc()) or "",
+        "from": format_recipient_header(info.get_from()),
+        "to": format_recipient_header(info.get_to()),
+        "cc": format_recipient_header(info.get_cc()),
         "message_id": _safe_str(info.get_message_id())
         if hasattr(info, "get_message_id")
         else None,

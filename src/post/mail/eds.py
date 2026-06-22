@@ -1551,6 +1551,7 @@ class MailService:
         mark_seen: bool = True,
     ) -> dict:
         from .helpers import (
+            enrich_message_dict_from_mime,
             extract_attachments,
             extract_inline_images,
             extract_message_bodies,
@@ -1571,6 +1572,7 @@ class MailService:
             raise ValueError(f"Message not found: {message_uid}")
 
         result = message_info_to_dict(info) if info else {"uid": message_uid}
+        enrich_message_dict_from_mime(result, mime)
         bodies = extract_message_bodies(mime)
         result["body_plain"] = bodies["plain"]
         result["body_html"] = bodies["html"]
