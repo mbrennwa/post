@@ -276,11 +276,33 @@ def format_message_list_date(msg: dict[str, Any]) -> str:
     return ""
 
 
+def _reply_to_differs_from_from(from_header: str, reply_to_header: str) -> bool:
+    """True when Reply-To addresses are not the same set as From."""
+    from .compose import normalize_email, parse_address_header
+
+    from_addrs = {
+        normalize_email(address)
+        for address in parse_address_header(from_header)
+    }
+    reply_addrs = {
+        normalize_email(address)
+        for address in parse_address_header(reply_to_header)
+    }
+    from_addrs.discard("")
+    reply_addrs.discard("")
+    if not reply_addrs:
+        return False
+    return reply_addrs != from_addrs
+
+
 def format_message_header(msg: dict[str, Any]) -> str:
     lines = [
         f"From: {msg.get('from', '')}",
-        f"To: {msg.get('to', '')}",
     ]
+    reply_to = (msg.get("reply_to") or "").strip()
+    if reply_to and _reply_to_differs_from_from(msg.get("from", ""), reply_to):
+        lines.append(f"Reply-To: {reply_to}")
+    lines.append(f"To: {msg.get('to', '')}")
     cc = (msg.get("cc") or "").strip()
     if cc:
         lines.append(f"CC: {cc}")
