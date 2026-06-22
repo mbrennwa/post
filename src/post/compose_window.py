@@ -30,7 +30,7 @@ from post.mail.compose import (
     build_reply_references,
     build_reply_subject,
     compose_body_with_signature,
-    extract_reply_address,
+    extract_reply_target_addresses,
     format_address_list,
     guess_attachment_mime_type,
     normalize_email,
@@ -908,7 +908,9 @@ class ComposeWindow(Adw.Window):
                         self._show_cc_field(format_address_list(cc_addrs))
                 else:
                     self._to_entry.set_text(
-                        extract_reply_address(self._reply_to.get("from", ""))
+                        format_address_list(
+                            extract_reply_target_addresses(self._reply_to)
+                        )
                     )
             except ValueError as exc:
                 self._show_error(str(exc))

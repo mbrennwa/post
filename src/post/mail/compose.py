@@ -174,10 +174,11 @@ def build_reply_all_recipients(
 ) -> tuple[list[str], list[str]]:
     """Return To and Cc lists for reply-all.
 
-    To contains the original sender and To recipients, excluding own addresses.
+    To contains all Reply-To addresses (or From when Reply-To is absent), then
+    every original To recipient, excluding own addresses.
     Cc contains the original Cc recipients not already in To or own addresses.
     When every To participant is filtered out (e.g. a message sent only to yourself),
-    fall back to the original From address so reply-all matches plain reply.
+    fall back to the reply target so reply-all matches plain reply.
     """
     own = {normalize_email(item) for item in own_addresses if item}
 
@@ -207,12 +208,12 @@ def build_reply_all_recipients(
     to_addrs: list[str] = []
 
     try:
-        from_addr = extract_reply_address(original.get("from", ""))
+        reply_targets = extract_reply_target_addresses(original)
     except ValueError:
-        from_addr = ""
+        reply_targets = []
 
-    if from_addr:
-        add_to_unique(to_addrs, seen, from_addr)
+    for address in reply_targets:
+        add_to_unique(to_addrs, seen, address)
 
     for address in parse_address_header(original.get("to", "")):
         add_to_unique(to_addrs, seen, address)
@@ -222,12 +223,26 @@ def build_reply_all_recipients(
         add_cc_unique(cc_addrs, seen, address)
 
     if not to_addrs:
-        if from_addr:
-            to_addrs = [from_addr]
+        if reply_targets:
+            to_addrs = list(reply_targets)
         else:
             raise ValueError("No recipients for reply-all")
 
     return to_addrs, cc_addrs
+
+
+def extract_reply_target_addresses(message: dict[str, Any]) -> list[str]:
+    """Return all addresses replies should go to (Reply-To if set, else From)."""
+    reply_to = (message.get("reply_to") or "").strip()
+    if reply_to:
+        addresses = parse_address_header(reply_to)
+        if addresses:
+            return addresses
+
+    from_header = (message.get("from") or "").strip()
+    if not from_header:
+        raise ValueError("Original message has no From address")
+    return [extract_reply_address(from_header)]
 
 
 def extract_reply_address(from_header: str) -> str:
