@@ -123,6 +123,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.connect("close-request", self._on_close_request)
         self.connect("notify::width", self._on_window_size_changed)
         self.connect("notify::height", self._on_window_size_changed)
+        self._close_after_outbound_send = False
 
         self._mail = MailService.connect()
         self._mail.set_password_prompt(self._prompt_account_password)
@@ -562,6 +563,20 @@ class MainWindow(Adw.ApplicationWindow):
                 "A message is still sending. Post will close when sending finishes.",
                 timeout=8,
             )
+            if not self._close_after_outbound_send:
+                self._close_after_outbound_send = True
+                self._mail.when_outbound_sends_complete(
+                    self._continue_close_after_outbound_send
+                )
+            return True
+
+        return self._finish_close()
+
+    def _continue_close_after_outbound_send(self) -> None:
+        self._close_after_outbound_send = False
+        self.close()
+
+    def _finish_close(self) -> bool:
         self._sync_watcher.stop()
         try:
             self._mail.shutdown_sync()

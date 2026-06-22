@@ -90,6 +90,22 @@ class OutboundSendTrackingTests(unittest.TestCase):
         self.assertTrue(done.is_set())
         self.assertFalse(service.outbound_sends_pending())
 
+    @mock.patch("post.mail.eds.GLib.idle_add", side_effect=lambda fn, *a: fn(*a) or 0)
+    def test_when_outbound_sends_complete_runs_callback_after_send(
+        self, _idle_add
+    ) -> None:
+        service = MailService(registry=mock.Mock())
+        service._begin_outbound_send()
+        callback = mock.Mock()
+
+        def release() -> None:
+            service._end_outbound_send()
+
+        threading.Timer(0.05, release).start()
+        service.when_outbound_sends_complete(callback, timeout=1.0)
+        threading.Event().wait(0.2)
+        callback.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

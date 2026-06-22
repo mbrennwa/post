@@ -37,6 +37,9 @@ def main() -> int:
     def on_startup(_application: Adw.Application) -> None:
         register_bundled_icons()
         Gtk.Window.set_default_icon_name(APP_ICON_NAME)
+        from post.mail.io_thread import get_mail_io_thread
+
+        get_mail_io_thread()
 
     def on_activate(application: Adw.Application) -> None:
         win = application.get_active_window()
