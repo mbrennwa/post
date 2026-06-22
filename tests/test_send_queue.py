@@ -25,6 +25,8 @@ from post.mail.send_queue import (
     list_queued_messages_page,
     list_queued_outbound_messages,
     load_queued_attachments,
+    load_queued_outbound_message,
+    persist_outbound_send,
     queued_to_list_dict,
     read_queued_message,
     remove_queued_outbound_message,
@@ -245,3 +247,19 @@ class OutboxAccountFilterTests(unittest.TestCase):
                 self.assertEqual(msg["body_plain"], "Hello queued")
                 self.assertEqual(msg["to"], "dest@example.com")
                 self.assertEqual(msg["cc"], "cc@example.com")
+
+    def test_persist_outbound_send_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                queue_id = persist_outbound_send(
+                    account_uid="account-1",
+                    to=["user@example.com"],
+                    cc=None,
+                    bcc=None,
+                    subject="Hello",
+                    body="Body text",
+                    in_reply_to="<msg@example.com>",
+                )
+                loaded = load_queued_outbound_message(queue_id)
+                self.assertEqual(loaded.subject, "Hello")
+                self.assertEqual(loaded.in_reply_to, "<msg@example.com>")

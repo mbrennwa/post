@@ -9,6 +9,7 @@ import logging
 import os
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import gi
@@ -46,6 +47,7 @@ from post.mail.correspondents import (
 )
 from post.mail.eds import MailAccount
 from post.mail.send_errors import SendQueued, user_send_error_message
+from post.mail.send_queue import persist_outbound_send
 from post.preferences import get_account_signature, get_account_signatures
 from post.toast import show_error_toast
 
@@ -54,6 +56,179 @@ log = logging.getLogger(__name__)
 ComposeMode = Literal["new", "reply", "reply-all", "forward", "draft"]
 SetStatus = Callable[[str], None]
 OnDraftSaved = Callable[[], None]
+
+
+@dataclass
+class OutboundSendRequest:
+    account_uid: str
+    to: list[str]
+    cc: list[str] | None
+    bcc: list[str] | None
+    subject: str
+    body: str
+    in_reply_to: str | None
+    references: str | None
+    attachments: list[ComposeAttachment] | None
+    draft_folder: str | None = None
+    draft_uid: str | None = None
+    queue_id: str | None = None
+
+
+_OUTBOX_FAILURE_SUFFIX = " Message saved in Outbox."
+
+
+def run_outbound_send(
+    *,
+    mail: MailService,
+    parent: Gtk.Window | None,
+    set_status: SetStatus,
+    on_outbox_changed: Callable[[], None] | None,
+    on_draft_saved: OnDraftSaved | None,
+    request: OutboundSendRequest,
+) -> None:
+    """Persist to outbox, then send on a worker thread; report on the main window."""
+    queue_id = request.queue_id
+    if queue_id is None:
+        try:
+            queue_id = persist_outbound_send(
+                account_uid=request.account_uid,
+                to=request.to,
+                cc=request.cc,
+                bcc=request.bcc,
+                subject=request.subject,
+                body=request.body,
+                in_reply_to=request.in_reply_to,
+                references=request.references,
+                attachments=request.attachments,
+            )
+        except OSError as exc:
+            log.error("Could not persist outbound message to outbox: %s", exc)
+            if parent is not None:
+                show_error_toast(
+                    parent,
+                    f"Could not save message for sending: {exc}",
+                )
+            return
+        request = replace(request, queue_id=queue_id)
+        if on_outbox_changed is not None:
+            on_outbox_changed()
+
+    def worker() -> None:
+        error: Exception | None = None
+        try:
+            mail.send_outbound_queue_item(queue_id)
+        except SendQueued as exc:
+            if on_outbox_changed is not None:
+                GLib.idle_add(on_outbox_changed)
+            GLib.idle_add(
+                _finish_outbound_send,
+                parent,
+                set_status,
+                on_draft_saved,
+                on_outbox_changed,
+                mail,
+                request,
+                None,
+                exc.user_message,
+            )
+            return
+        except Exception as exc:
+            log.warning("Send failed: %s", user_send_error_message(exc))
+            error = exc
+            GLib.idle_add(
+                _finish_outbound_send,
+                parent,
+                set_status,
+                on_draft_saved,
+                on_outbox_changed,
+                mail,
+                request,
+                error,
+                None,
+            )
+            return
+        GLib.idle_add(
+            _finish_outbound_send,
+            parent,
+            set_status,
+            on_draft_saved,
+            on_outbox_changed,
+            mail,
+            request,
+            None,
+            None,
+        )
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _finish_outbound_send(
+    parent: Gtk.Window | None,
+    set_status: SetStatus,
+    on_draft_saved: OnDraftSaved | None,
+    on_outbox_changed: Callable[[], None] | None,
+    mail: MailService,
+    request: OutboundSendRequest,
+    error: Exception | None,
+    success_status: str | None,
+) -> bool:
+    if error is not None:
+        message = user_send_error_message(error)
+        if request.queue_id:
+            message = f"{message}{_OUTBOX_FAILURE_SUFFIX}"
+        if parent is not None:
+            show_error_toast(parent, message)
+        else:
+            log.error("Send failed (no parent window for toast): %s", message)
+        if on_outbox_changed is not None:
+            on_outbox_changed()
+        return False
+
+    if request.draft_folder and request.draft_uid:
+
+        def delete_worker() -> None:
+            try:
+                mail.delete_draft(
+                    request.account_uid,
+                    request.draft_folder,
+                    request.draft_uid,
+                )
+            except Exception:
+                log.warning(
+                    "Could not delete draft %s in %r after send",
+                    request.draft_uid,
+                    request.draft_folder,
+                    exc_info=True,
+                )
+            GLib.idle_add(
+                _complete_outbound_send_success,
+                set_status,
+                on_draft_saved,
+                on_outbox_changed,
+                success_status,
+            )
+
+        threading.Thread(target=delete_worker, daemon=True).start()
+        return False
+
+    _complete_outbound_send_success(
+        set_status, on_draft_saved, on_outbox_changed, success_status
+    )
+    return False
+
+
+def _complete_outbound_send_success(
+    set_status: SetStatus,
+    on_draft_saved: OnDraftSaved | None,
+    on_outbox_changed: Callable[[], None] | None,
+    success_status: str | None,
+) -> bool:
+    if on_draft_saved is not None:
+        on_draft_saved()
+    if on_outbox_changed is not None:
+        on_outbox_changed()
+    set_status(success_status or "Message sent")
+    return False
 
 _LABEL_WIDTH = 72
 _TO_PLACEHOLDER = "Add a recipient in the To field."
@@ -89,7 +264,6 @@ class ComposeWindow(Adw.Window):
         self._draft_folder_name = draft_folder_name
         self._draft_message_uid = draft_message_uid
         self._draft_message = draft_message
-        self._sending = False
         self._saving_draft = False
         self._attachments: list[ComposeAttachment] = []
         self._close_when_saved = False
@@ -271,7 +445,7 @@ class ComposeWindow(Adw.Window):
             GLib.idle_add(self._begin_load_draft_attachments)
 
     def _on_attach_clicked(self, *_args) -> None:
-        if self._sending or self._saving_draft:
+        if self._saving_draft:
             return
         dialog = Gtk.FileDialog(title="Attach Files")
 
@@ -337,7 +511,7 @@ class ComposeWindow(Adw.Window):
             self._attachments_box.append(row)
 
     def _on_remove_attachment(self, _button: Gtk.Button, index: int) -> None:
-        if self._sending or self._saving_draft:
+        if self._saving_draft:
             return
         if index < 0 or index >= len(self._attachments):
             return
@@ -691,7 +865,7 @@ class ComposeWindow(Adw.Window):
         return self._subject_hint_text(self._subject_entry.get_text()) is None
 
     def _update_send_enabled(self) -> None:
-        if self._sending or self._saving_draft:
+        if self._saving_draft:
             return
         self._send_btn.set_sensitive(self._validate_send_fields())
 
@@ -820,7 +994,7 @@ class ComposeWindow(Adw.Window):
 
     def _request_dismiss(self) -> None:
         """Cancel button and explicit dismiss: prompt only when the user edited."""
-        if self._sending or self._saving_draft:
+        if self._saving_draft:
             return
         if not self._user_edited:
             self._dismiss()
@@ -843,7 +1017,7 @@ class ComposeWindow(Adw.Window):
 
     def _on_close_request(self, *_args) -> bool:
         """Window manager / header close: block while busy or when prompting."""
-        if self._sending or self._saving_draft:
+        if self._saving_draft:
             return True
         if not self._user_edited:
             return False
@@ -915,7 +1089,7 @@ class ComposeWindow(Adw.Window):
         )
 
     def _begin_save_draft(self, *, close_when_done: bool) -> None:
-        if self._saving_draft or self._sending:
+        if self._saving_draft:
             return
 
         try:
@@ -997,13 +1171,16 @@ class ComposeWindow(Adw.Window):
         return False
 
     def _on_send_clicked(self, *_args) -> None:
-        if self._sending:
-            return
-
         try:
-            to_addrs = parse_address_list(self._to_entry.get_text())
-            cc_addrs = parse_address_list(self._cc_entry.get_text())
-            bcc_addrs = parse_address_list(self._bcc_entry.get_text())
+            (
+                to_addrs,
+                cc_addrs,
+                bcc_addrs,
+                subject,
+                body,
+                in_reply_to,
+                references,
+            ) = self._collect_draft_fields()
         except ValueError as exc:
             self._show_error(str(exc))
             return
@@ -1012,125 +1189,40 @@ class ComposeWindow(Adw.Window):
             self._show_error("Add a recipient in the To field.")
             return
 
-        subject = self._subject_entry.get_text().strip()
         if not subject:
             self._show_error("Subject is required")
             return
-
-        buffer = self._body_view.get_buffer()
-        start, end = buffer.get_bounds()
-        body = buffer.get_text(start, end, False)
-
-        in_reply_to = None
-        references = None
-        if self._mode in ("reply", "reply-all") and self._reply_to is not None:
-            in_reply_to = self._reply_to.get("message_id")
-            references = build_reply_references(
-                in_reply_to,
-                self._reply_to.get("references"),
-            )
 
         account = self._selected_account()
         if not account.can_send:
             self._show_error("This account has no mail transport configured")
             return
 
-        self._sending = True
-        self._set_compose_actions_sensitive(False)
+        parent = self.get_transient_for()
+        request = OutboundSendRequest(
+            account_uid=account.uid,
+            to=to_addrs,
+            cc=cc_addrs or None,
+            bcc=bcc_addrs or None,
+            subject=subject,
+            body=body,
+            in_reply_to=in_reply_to,
+            references=references,
+            attachments=list(self._attachments) or None,
+            draft_folder=self._draft_folder_name,
+            draft_uid=self._draft_message_uid,
+        )
+
         self._set_status("Sending message…")
-
-        account_uid = account.uid
-        draft_folder = self._draft_folder_name
-        draft_uid = self._draft_message_uid
-        attachments = list(self._attachments)
-
-        def worker() -> None:
-            error: Exception | None = None
-            try:
-                self._mail.send_message(
-                    account_uid,
-                    to=to_addrs,
-                    cc=cc_addrs or None,
-                    bcc=bcc_addrs or None,
-                    subject=subject,
-                    body=body,
-                    in_reply_to=in_reply_to,
-                    references=references,
-                    attachments=attachments or None,
-                )
-            except SendQueued as exc:
-                if self._on_outbox_changed is not None:
-                    GLib.idle_add(self._on_outbox_changed)
-                GLib.idle_add(
-                    self._on_send_finished, None, exc.user_message, None, None
-                )
-                return
-            except Exception as exc:
-                log.warning("Send failed: %s", user_send_error_message(exc))
-                error = exc
-                GLib.idle_add(
-                    self._on_send_finished,
-                    error,
-                    None,
-                    None,
-                    None,
-                )
-                return
-            GLib.idle_add(
-                self._on_send_finished,
-                error,
-                None,
-                draft_folder,
-                draft_uid,
-            )
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_send_finished(
-        self,
-        error: Exception | None,
-        success_status: str | None = None,
-        draft_folder: str | None = None,
-        draft_uid: str | None = None,
-    ) -> bool:
-        self._sending = False
-        self._set_compose_actions_sensitive(True)
-        if error is not None:
-            message = user_send_error_message(error)
-            self._show_error(message)
-            return False
-
-        if draft_folder and draft_uid:
-            account = self._selected_account()
-
-            def delete_worker() -> None:
-                try:
-                    self._mail.delete_draft(
-                        account.uid, draft_folder, draft_uid
-                    )
-                except Exception:
-                    log.warning(
-                        "Could not delete draft %s in %r after send",
-                        draft_uid,
-                        draft_folder,
-                        exc_info=True,
-                    )
-                GLib.idle_add(self._finish_send_after_draft_delete, success_status)
-
-            threading.Thread(target=delete_worker, daemon=True).start()
-            return False
-
-        self._finish_send_after_draft_delete(success_status)
-        return False
-
-    def _finish_send_after_draft_delete(
-        self, success_status: str | None = None
-    ) -> bool:
-        if self._on_draft_saved is not None:
-            self._on_draft_saved()
-        self._set_status(success_status or "Message sent")
         self._dismiss()
-        return False
+        run_outbound_send(
+            mail=self._mail,
+            parent=parent,
+            set_status=self._set_status,
+            on_outbox_changed=self._on_outbox_changed,
+            on_draft_saved=self._on_draft_saved,
+            request=request,
+        )
 
     def _show_error(self, message: str) -> None:
         show_error_toast(self, message)

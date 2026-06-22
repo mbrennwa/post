@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import warnings
 
@@ -21,7 +22,9 @@ from post.window import MainWindow
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO)
+    # POST_LOG_LEVEL=DEBUG enables verbose send-phase logging in post.mail.eds.
+    log_level = os.environ.get("POST_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=getattr(logging, log_level, logging.INFO))
     # PyGObject adds an extra ref when Python vfuncs return GObjects; harmless at exit.
     warnings.filterwarnings(
         "ignore",
