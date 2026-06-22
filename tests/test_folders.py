@@ -17,6 +17,7 @@ from post.mail.folders import (
     format_folder_label,
     guess_inbox_name,
     is_post_outbox_folder,
+    is_post_local_folder,
     is_drafts_folder,
     is_drafts_folder_name,
     is_system_folder,
@@ -510,6 +511,8 @@ class PostOutboxFolderTests(unittest.TestCase):
         self.assertEqual(POST_OUTBOX_FOLDER, ".post/Outbox")
         self.assertTrue(is_post_outbox_folder(POST_OUTBOX_FOLDER))
         self.assertFalse(is_post_outbox_folder("INBOX"))
+        self.assertTrue(is_post_local_folder(POST_OUTBOX_FOLDER))
+        self.assertFalse(is_post_local_folder("INBOX"))
 
     def test_outbox_folder_dict(self) -> None:
         folder = outbox_folder_dict(3)

@@ -19,6 +19,7 @@ gi.require_version("GObject", "2.0")
 from gi.repository import Camel, GLib, GObject
 
 from .eds import MailService
+from .folders import is_post_local_folder
 from .send_queue import is_network_unavailable_error, log_mail_error
 
 log = logging.getLogger(__name__)
@@ -193,7 +194,7 @@ class MailSyncWatcher:
         desired_names: set[str] = set()
         if inbox_name:
             desired_names.add(inbox_name)
-        if current_name:
+        if current_name and not is_post_local_folder(current_name):
             desired_names.add(current_name)
 
         for folder_name in list(watch.watched_folders):

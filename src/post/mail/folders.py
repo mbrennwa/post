@@ -63,6 +63,11 @@ def is_post_outbox_folder(full_name: str | None) -> bool:
     return full_name == POST_OUTBOX_FOLDER
 
 
+def is_post_local_folder(full_name: str | None) -> bool:
+    """True for Post-local folders (outbox queue), not on the mail server."""
+    return bool(full_name and full_name.startswith(".post/"))
+
+
 def outbox_folder_dict(total: int) -> dict:
     return {
         "full_name": POST_OUTBOX_FOLDER,
