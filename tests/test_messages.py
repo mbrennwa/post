@@ -86,6 +86,42 @@ class FormatMessageHeaderTests(unittest.TestCase):
         )
         self.assertNotIn("CC:", header)
 
+    def test_includes_reply_to_when_different_from_from(self) -> None:
+        header = format_message_header(
+            {
+                "from": "Newsletters <mbrennwa@gmail.com>",
+                "reply_to": "Test Author <matthias@brennwald.org>",
+                "to": "mbrennwa@gmail.com",
+                "date_received": "2026-06-22 19:31:58",
+            }
+        )
+        self.assertIn("From: Newsletters <mbrennwa@gmail.com>", header)
+        self.assertIn("Reply-To: Test Author <matthias@brennwald.org>", header)
+        lines = header.splitlines()
+        self.assertEqual(lines[0], "From: Newsletters <mbrennwa@gmail.com>")
+        self.assertEqual(lines[1], "Reply-To: Test Author <matthias@brennwald.org>")
+
+    def test_omits_reply_to_when_same_address_as_from(self) -> None:
+        header = format_message_header(
+            {
+                "from": "Alice <alice@example.com>",
+                "reply_to": "Alice <alice@example.com>",
+                "to": "Bob <bob@example.com>",
+                "date_received": "2026-06-22 19:31:58",
+            }
+        )
+        self.assertNotIn("Reply-To:", header)
+
+    def test_omits_reply_to_when_absent(self) -> None:
+        header = format_message_header(
+            {
+                "from": "Alice <alice@example.com>",
+                "to": "Bob <bob@example.com>",
+                "date_received": "2026-06-22 19:31:58",
+            }
+        )
+        self.assertNotIn("Reply-To:", header)
+
 
 class FormatMessageDatetimeTests(unittest.TestCase):
     def test_space_separated(self) -> None:
