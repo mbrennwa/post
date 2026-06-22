@@ -60,6 +60,27 @@ class ReadSmtpTransportConfigTests(unittest.TestCase):
         )
 
 
+class ConnectSmtpTests(unittest.TestCase):
+    @mock.patch("post.mail.smtp_send.smtplib.SMTP_SSL")
+    def test_ssl_connection_issues_ehlo(self, smtp_ssl_cls: mock.Mock) -> None:
+        smtp = mock.Mock()
+        smtp_ssl_cls.return_value = smtp
+        config = SmtpTransportConfig(
+            host="smtp.gmail.com",
+            port=465,
+            username="user@example.com",
+            security="ssl-on-alternate-port",
+            auth_method="xoauth2",
+        )
+
+        from post.mail.smtp_send import _connect_smtp
+
+        result = _connect_smtp(config)
+
+        self.assertIs(result, smtp)
+        smtp.ehlo.assert_called_once()
+
+
 class SendViaSmtpTests(unittest.TestCase):
     @mock.patch("post.mail.smtp_send._authenticate_smtp")
     @mock.patch("post.mail.smtp_send._connect_smtp")

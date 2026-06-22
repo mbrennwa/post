@@ -112,8 +112,10 @@ def _lookup_password(
 
 
 def _lookup_oauth2_token(
+    registry: EDataServer.SourceRegistry,
     transport_source: EDataServer.Source,
 ) -> str | None:
+    ensure_goa_credentials(registry, transport_source, None)
     try:
         ok, token, _expires_in = transport_source.get_oauth2_access_token_sync(None)
     except GLib.Error as exc:
@@ -128,12 +130,14 @@ def _connect_smtp(config: SmtpTransportConfig) -> smtplib.SMTP:
     timeout = 30
     if config.security in _SECURITY_SSL:
         context = ssl.create_default_context()
-        return smtplib.SMTP_SSL(
+        smtp = smtplib.SMTP_SSL(
             config.host,
             config.port,
             timeout=timeout,
             context=context,
         )
+        smtp.ehlo()
+        return smtp
     smtp = smtplib.SMTP(config.host, config.port, timeout=timeout)
     smtp.ehlo()
     if config.security in _SECURITY_STARTTLS:
@@ -159,7 +163,7 @@ def _authenticate_smtp(
         username = config.username
         if not username:
             raise SendError(user_send_error_message(RuntimeError("No SMTP user")))
-        token = _lookup_oauth2_token(transport_source)
+        token = _lookup_oauth2_token(registry, transport_source)
         if not token:
             raise SendError(user_send_error_message(RuntimeError("OAuth2 sign-in failed")))
         auth_string = _oauth2_auth_string(username, token)
