@@ -4,15 +4,19 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import MagicMock
 
 from post.mail.helpers import (
+    enrich_message_dict_from_mime,
     flag_menu_items,
     flag_menu_label,
     format_attachment_size,
     format_message_datetime,
     format_message_header,
     format_message_list_date,
+    format_recipient_header,
     message_has_attachments,
+    message_info_to_dict,
     message_is_flagged,
     message_is_read_unflagged,
     message_is_unread,
@@ -195,6 +199,60 @@ class PaginateMessagesTests(unittest.TestCase):
         page, has_more = paginate_messages([], offset=0, limit=50)
         self.assertEqual(page, [])
         self.assertFalse(has_more)
+
+
+class FormatRecipientHeaderTests(unittest.TestCase):
+    def test_plain_string(self) -> None:
+        self.assertEqual(format_recipient_header("a@b.com"), "a@b.com")
+
+    def test_camel_internet_address(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        addresses = Camel.InternetAddress.new()
+        addresses.add("Carol", "carol@example.com")
+        addresses.add("Dave", "dave@example.com")
+        self.assertEqual(
+            format_recipient_header(addresses),
+            "Carol <carol@example.com>, Dave <dave@example.com>",
+        )
+
+
+class MessageInfoToDictTests(unittest.TestCase):
+    def test_formats_camel_cc_address(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        cc = Camel.InternetAddress.new()
+        cc.add("Carol", "carol@example.com")
+        info = MagicMock()
+        info.get_uid.return_value = "1"
+        info.get_subject.return_value = "Hi"
+        info.get_from.return_value = "Alice <alice@example.com>"
+        info.get_to.return_value = "Bob <bob@example.com>"
+        info.get_cc.return_value = cc
+        info.get_date_sent.return_value = 1_700_000_000
+        info.get_date_received.return_value = 1_700_000_100
+        info.get_flags.return_value = 0
+        info.get_size.return_value = 100
+        result = message_info_to_dict(info)
+        self.assertEqual(result["cc"], "Carol <carol@example.com>")
+
+
+class EnrichMessageDictFromMimeTests(unittest.TestCase):
+    def test_fills_missing_cc(self) -> None:
+        result = {"to": "Bob <bob@example.com>"}
+        mime = MagicMock()
+        mime.get_header.side_effect = lambda name: {
+            "To": None,
+            "Cc": "Carol <carol@example.com>",
+        }.get(name)
+        enrich_message_dict_from_mime(result, mime)
+        self.assertEqual(result["cc"], "Carol <carol@example.com>")
 
 
 if __name__ == "__main__":

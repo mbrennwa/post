@@ -716,10 +716,7 @@ class ComposeWindow(Adw.Window):
                     )
                     self._to_entry.set_text(format_address_list(to_addrs))
                     if cc_addrs:
-                        self._cc_entry.set_text(format_address_list(cc_addrs))
-                        self._cc_row.set_visible(True)
-                        self._cc_entry.set_can_focus(True)
-                        self._cc_toggle_btn.set_label("Hide Cc")
+                        self._show_cc_field(format_address_list(cc_addrs))
                 else:
                     self._to_entry.set_text(
                         extract_reply_address(self._reply_to.get("from", ""))
@@ -758,10 +755,7 @@ class ComposeWindow(Adw.Window):
             if msg.get("to"):
                 self._to_entry.set_text(str(msg["to"]))
             if msg.get("cc"):
-                self._cc_entry.set_text(str(msg["cc"]))
-                self._cc_row.set_visible(True)
-                self._cc_entry.set_can_focus(True)
-                self._cc_toggle_btn.set_label("Hide Cc")
+                self._show_cc_field(str(msg["cc"]))
             if msg.get("bcc"):
                 self._bcc_entry.set_text(str(msg["bcc"]))
                 self._bcc_row.set_visible(True)
@@ -792,6 +786,12 @@ class ComposeWindow(Adw.Window):
         self._focus_body_at_start_on_enter = False
         if self._mode == "new":
             self._place_body_cursor_at_start()
+
+    def _show_cc_field(self, text: str) -> None:
+        self._cc_entry.set_text(text)
+        self._cc_row.set_visible(True)
+        self._cc_entry.set_can_focus(True)
+        self._cc_toggle_btn.set_label("Hide Cc")
 
     def _on_toggle_cc(self, button: Gtk.Button) -> None:
         reveal = not self._cc_row.get_visible()

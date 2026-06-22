@@ -172,15 +172,31 @@ def build_reply_all_recipients(
     *,
     own_addresses: set[str],
 ) -> tuple[list[str], list[str]]:
-    """Return To and Cc lists for reply-all, excluding the sender's own addresses."""
+    """Return To and Cc lists for reply-all.
+
+    To contains the original sender and To recipients, excluding own addresses.
+    Cc contains the original Cc recipients not already in To or own addresses.
+    When every To participant is filtered out (e.g. a message sent only to yourself),
+    fall back to the original From address so reply-all matches plain reply.
+    """
     own = {normalize_email(item) for item in own_addresses if item}
 
     def is_own(address: str) -> bool:
         return normalize_email(address) in own
 
-    def add_unique(
+    def add_to_unique(
         target: list[str], seen: set[str], address: str
     ) -> None:
+        email = normalize_email(address)
+        if not email or email in seen or is_own(address):
+            return
+        seen.add(email)
+        target.append(address)
+
+    def add_cc_unique(
+        target: list[str], seen: set[str], address: str
+    ) -> None:
+        """Add a Cc recipient unless already in To or own addresses."""
         email = normalize_email(address)
         if not email or email in seen or is_own(address):
             return
@@ -196,17 +212,20 @@ def build_reply_all_recipients(
         from_addr = ""
 
     if from_addr:
-        add_unique(to_addrs, seen, from_addr)
+        add_to_unique(to_addrs, seen, from_addr)
 
     for address in parse_address_header(original.get("to", "")):
-        add_unique(to_addrs, seen, address)
+        add_to_unique(to_addrs, seen, address)
 
     cc_addrs: list[str] = []
     for address in parse_address_header(original.get("cc", "")):
-        add_unique(cc_addrs, seen, address)
+        add_cc_unique(cc_addrs, seen, address)
 
     if not to_addrs:
-        raise ValueError("No recipients for reply-all")
+        if from_addr:
+            to_addrs = [from_addr]
+        else:
+            raise ValueError("No recipients for reply-all")
 
     return to_addrs, cc_addrs
 
