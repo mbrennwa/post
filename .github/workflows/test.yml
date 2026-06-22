@@ -19,9 +19,11 @@ jobs:
           sudo apt-get install -y \
             python3-gi \
             python3-venv \
+            gir1.2-adw-1 \
             gir1.2-camel-1.2 \
             gir1.2-edataserver-1.2 \
-            gir1.2-glib-2.0
+            gir1.2-glib-2.0 \
+            gir1.2-gtk-4.0
 
       - name: Run checks
         run: |
