@@ -437,6 +437,60 @@ def _set_message_body(
     message.set_mime_type("multipart/mixed")
 
 
+def build_outbound_email_bytes(
+    *,
+    from_name: str | None,
+    from_address: str,
+    to: list[str],
+    cc: list[str] | None,
+    bcc: list[str] | None,
+    subject: str,
+    body: str,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+    attachments: Sequence[ComposeAttachment] | None = None,
+) -> bytes:
+    """Build a MIME message for SMTP without Camel/GObject."""
+    from email.message import EmailMessage
+    from email.utils import formataddr
+
+    if not to:
+        raise ValueError("At least one To address is required")
+
+    message = EmailMessage()
+    message["From"] = (
+        formataddr((from_name, from_address)) if from_name else from_address
+    )
+    message["To"] = ", ".join(to)
+    if cc:
+        message["Cc"] = ", ".join(cc)
+    if bcc:
+        message["Bcc"] = ", ".join(bcc)
+    message["Subject"] = subject or ""
+    if in_reply_to:
+        message["In-Reply-To"] = in_reply_to
+    if references:
+        message["References"] = references
+
+    text = body if body else "\n"
+    if not attachments:
+        message.set_content(text, charset="utf-8")
+        return message.as_bytes()
+
+    message.set_content(text, charset="utf-8")
+    for attachment in attachments:
+        maintype, _, subtype = attachment.mime_type.partition("/")
+        if not subtype:
+            maintype, subtype = "application", "octet-stream"
+        message.add_attachment(
+            attachment.data,
+            maintype=maintype,
+            subtype=subtype,
+            filename=attachment.filename,
+        )
+    return message.as_bytes()
+
+
 def build_plain_mime_message(
     *,
     from_name: str | None,

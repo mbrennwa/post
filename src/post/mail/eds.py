@@ -48,6 +48,8 @@ from .message_flags import (
     persist_folder_flags as _persist_folder_flags,
 )
 from .local_delivery import all_recipients_local, can_deliver_locally, deliver_local_message
+from .io_thread import get_mail_io_thread, is_mail_io_thread
+from .smtp_send import send_via_smtp
 from .send_errors import (
     MESSAGE_QUEUED,
     SYSTEM_MAIL_EXTERNAL_RECIPIENTS,
@@ -71,6 +73,7 @@ from .compose import (
     ComposeAttachment,
     addresses_to_internet_address,
     build_draft_mime_message,
+    build_outbound_email_bytes,
     build_plain_mime_message,
     normalize_email,
 )
@@ -98,6 +101,52 @@ _SEND_TIMEOUT_SECONDS = 30
 # Stay below Camel IMAPx MAX_UIDSET_ITEMS (100) to avoid spurious uidset warnings
 # in evolution-data-server 3.56 when batching UID MOVE/COPY commands.
 _TRANSFER_MESSAGE_BATCH_SIZE = 50
+
+_camel_worker_tls = threading.local()
+
+
+def prepare_camel_worker_thread() -> None:
+    """Give the current thread its own GLib main context for blocking Camel I/O.
+
+    Camel sync calls made from a worker without a thread-default context are
+    marshaled onto the GTK main loop and freeze the UI.
+    """
+    if getattr(_camel_worker_tls, "ready", False):
+        return
+    context = GLib.MainContext.new()
+    context.push_thread_default()
+    _camel_worker_tls.ready = True
+    _camel_worker_tls.session = None
+    _camel_worker_tls.stores = {}
+    _camel_worker_tls.transports = {}
+
+
+def _send_debug_delay_seconds() -> float:
+    """Optional sleep for manual testing (POST_SEND_DELAY_SECONDS)."""
+    raw = os.environ.get("POST_SEND_DELAY_SECONDS", "0").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.0
+
+
+def apply_send_debug_delay() -> None:
+    delay = _send_debug_delay_seconds()
+    if not delay:
+        return
+    log.warning(
+        "POST_SEND_DELAY_SECONDS=%s: delaying background send for testing",
+        delay,
+    )
+    time.sleep(delay)
+
+
+_apply_send_debug_delay = apply_send_debug_delay  # backwards compat for tests
+
+
+def _run_on_gtk_thread(callback: Callable[[], None]) -> bool:
+    callback()
+    return False
 
 
 @dataclass
@@ -209,6 +258,7 @@ class MailService:
     _outbound_sends_cond: threading.Condition = field(
         default_factory=threading.Condition, init=False, repr=False
     )
+    _active_outbound_deliveries: set[str] = field(default_factory=set, init=False)
 
     def _enter_mail_op(self) -> None:
         with self._pending_mail_ops_cond:
@@ -242,6 +292,25 @@ class MailService:
             if self._outbound_sends_in_progress == 0:
                 self._outbound_sends_cond.notify_all()
 
+    def claim_outbound_delivery(self, queue_id: str) -> None:
+        """Reserve an outbox item for an active compose delivery worker."""
+        with self._outbound_sends_cond:
+            self._active_outbound_deliveries.add(queue_id)
+
+    def release_outbound_delivery(self, queue_id: str) -> None:
+        with self._outbound_sends_cond:
+            self._active_outbound_deliveries.discard(queue_id)
+
+    def _is_outbound_delivery_claimed(self, queue_id: str) -> bool:
+        with self._outbound_sends_cond:
+            return queue_id in self._active_outbound_deliveries
+
+    def begin_outbound_send(self) -> None:
+        self._begin_outbound_send()
+
+    def end_outbound_send(self) -> None:
+        self._end_outbound_send()
+
     def wait_for_outbound_sends(self, timeout: float = 120.0) -> None:
         deadline = time.monotonic() + timeout
         with self._outbound_sends_cond:
@@ -254,6 +323,23 @@ class MailService:
                     )
                     return
                 self._outbound_sends_cond.wait(timeout=remaining)
+
+    def when_outbound_sends_complete(
+        self,
+        callback: Callable[[], None],
+        *,
+        timeout: float = 120.0,
+    ) -> None:
+        """Run callback on the GTK thread after outbound sends finish.
+
+        Waits on a worker thread so the UI main loop is not blocked.
+        """
+
+        def worker() -> None:
+            self.wait_for_outbound_sends(timeout=timeout)
+            GLib.idle_add(_run_on_gtk_thread, callback)
+
+        threading.Thread(target=worker, daemon=True, name="post-send-wait").start()
 
     def wait_for_pending_mail_ops(self, timeout: float = 10.0) -> None:
         deadline = time.monotonic() + timeout
@@ -457,6 +543,122 @@ class MailService:
         )
         return self._session
 
+    def _ensure_worker_session(self) -> Camel.Session:
+        prepare_camel_worker_thread()
+        session = _camel_worker_tls.session
+        if session is not None:
+            session.set_online(self._network_available)
+            return session
+
+        user_data = os.path.expanduser("~/.local/share/evolution")
+        user_cache = os.path.expanduser("~/.cache/evolution")
+        Camel.init(user_data, False)
+
+        session = MailSession(
+            self.registry,
+            password_prompt=self._password_prompt,
+            user_data_dir=user_data,
+            user_cache_dir=user_cache,
+            online=self._network_available,
+        )
+        _camel_worker_tls.session = session
+        return session
+
+    def _get_worker_store_unlocked(self, account_uid: str) -> Camel.Store:
+        stores: dict[str, Camel.Store] = _camel_worker_tls.stores
+        if account_uid in stores:
+            store = stores[account_uid]
+            if store.get_connection_status() == Camel.ServiceConnectionStatus.CONNECTED:
+                self._sync_store_online_state_unlocked(store)
+                self._configure_store_settings_unlocked(store)
+                return store
+            del stores[account_uid]
+
+        source = self.registry.ref_source(account_uid)
+        if source is None:
+            raise ValueError(f"Unknown mail account: {account_uid}")
+
+        session = self._ensure_worker_session()
+        mail_ext = source.get_extension("Mail Account")
+        service = session.add_service(
+            account_uid, mail_ext.get_backend_name(), Camel.ProviderType.STORE
+        )
+        if service is None:
+            raise RuntimeError(f"Could not create mail store for {account_uid}")
+
+        source.camel_configure_service(service)
+        store = service
+
+        self._sync_store_online_state_unlocked(store)
+        self._configure_store_settings_unlocked(store)
+        stores[account_uid] = store
+        return store
+
+    def _get_worker_transport_unlocked(
+        self,
+        account_uid: str,
+        cancellable: Gio.Cancellable | None = None,
+    ) -> Camel.Transport:
+        account = self.get_account(account_uid)
+        transport_uid = account.transport_uid
+        if not transport_uid:
+            raise ValueError("No mail transport configured for this account")
+
+        transport_source = self.registry.ref_source(transport_uid)
+        if transport_source is None:
+            raise ValueError(f"Unknown mail transport: {transport_uid}")
+
+        mail_transport = transport_source.get_extension("Mail Transport")
+        expected_backend = mail_transport.get_backend_name()
+
+        transports: dict[str, Camel.Transport] = _camel_worker_tls.transports
+        if transport_uid in transports:
+            transport = transports[transport_uid]
+            if (
+                transport.get_connection_status()
+                == Camel.ServiceConnectionStatus.CONNECTED
+            ):
+                return transport
+            del transports[transport_uid]
+
+        session = self._ensure_worker_session()
+        service = session.ref_service(transport_uid)
+        if service is None:
+            service = session.add_service(
+                transport_uid, expected_backend, Camel.ProviderType.TRANSPORT
+            )
+        if service is None:
+            raise RuntimeError(f"Could not create mail transport for {account_uid}")
+
+        transport_source.camel_configure_service(service)
+        transport = service
+
+        if hasattr(Camel, "OfflineTransport") and isinstance(
+            transport, Camel.OfflineTransport
+        ):
+            transport.set_online_sync(True, cancellable)
+        else:
+            transport.connect_sync(cancellable)
+
+        transports[transport_uid] = transport
+        return transport
+
+    def _open_worker_folder_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> Camel.Folder | None:
+        store = self._get_worker_store_unlocked(account_uid)
+        try:
+            return store.get_folder_sync(folder_name, 0, None)
+        except GLib.Error as exc:
+            if self._is_missing_folder_error(exc):
+                log.debug(
+                    "Skipping unavailable folder %r for account %s",
+                    folder_name,
+                    account_uid,
+                )
+                return None
+            raise
+
     def get_store(self, account_uid: str) -> Camel.Store:
         with self._lock:
             return self._get_store_unlocked(account_uid)
@@ -566,8 +768,9 @@ class MailService:
 
     def flush_send_queue(self) -> int:
         """Try to send messages queued while offline. Returns count sent."""
-        with self._lock:
+        if is_mail_io_thread():
             return self._flush_send_queue_unlocked()
+        return get_mail_io_thread().run_sync(self._flush_send_queue_unlocked)
 
     def send_message(
         self,
@@ -596,25 +799,36 @@ class MailService:
                 from_queue=False,
             )
 
+    def deliver_outbound_queue_item(self, queue_id: str) -> None:
+        """SMTP-deliver a persisted outbox item and remove it on success."""
+        if is_mail_io_thread():
+            self._deliver_outbound_queue_item_impl(queue_id)
+            return
+        get_mail_io_thread().run_sync(self._deliver_outbound_queue_item_impl, queue_id)
+
+    def _deliver_outbound_queue_item_impl(self, queue_id: str) -> None:
+        with self._lock:
+            queued = load_queued_outbound_message(queue_id)
+            attachments = load_queued_attachments(queue_id, queued)
+        self._send_message_unlocked(
+            queued.account_uid,
+            to=queued.to,
+            cc=queued.cc,
+            bcc=queued.bcc,
+            subject=queued.subject,
+            body=queued.body,
+            in_reply_to=queued.in_reply_to,
+            references=queued.references,
+            attachments=attachments,
+            from_queue=True,
+            queue_id=queue_id,
+        )
+
     def send_outbound_queue_item(self, queue_id: str) -> None:
-        """Send a persisted outbox item and remove it on success."""
+        """Send a persisted outbox item (flush / retry path)."""
         self._begin_outbound_send()
         try:
-            with self._lock:
-                queued = load_queued_outbound_message(queue_id)
-                self._send_message_unlocked(
-                    queued.account_uid,
-                    to=queued.to,
-                    cc=queued.cc,
-                    bcc=queued.bcc,
-                    subject=queued.subject,
-                    body=queued.body,
-                    in_reply_to=queued.in_reply_to,
-                    references=queued.references,
-                    attachments=load_queued_attachments(queue_id, queued),
-                    from_queue=True,
-                    queue_id=queue_id,
-                )
+            self.deliver_outbound_queue_item(queue_id)
         finally:
             self._end_outbound_send()
 
@@ -663,6 +877,40 @@ class MailService:
             "references": references,
             "attachments": attachments,
         }
+
+        if from_queue and account_uid != POST_LOCAL_ACCOUNT_UID:
+            transport_uid = account.transport_uid
+            if not transport_uid:
+                raise ValueError("No mail transport configured for this account")
+            try:
+                payload = build_outbound_email_bytes(**compose_kwargs)
+                send_via_smtp(
+                    registry=self.registry,
+                    transport_uid=transport_uid,
+                    payload=payload,
+                    envelope_from=from_address,
+                    to=to,
+                    cc=cc,
+                    bcc=bcc,
+                    password_prompt=self._password_prompt,
+                )
+            except SendError:
+                raise
+            except Exception as exc:
+                log.warning("Outbound SMTP failed", exc_info=True)
+                if is_queueable_network_error(exc):
+                    raise SendQueued(MESSAGE_QUEUED) from exc
+                raise SendError(user_send_error_message(exc)) from exc
+            if queue_id:
+                remove_queued_outbound_message(queue_id)
+            log.info(
+                "Send finished account=%s in %.2fs",
+                account_uid,
+                time.monotonic() - send_start,
+            )
+            self._append_sent_copy_from_compose(account_uid, compose_kwargs)
+            return
+
         message = build_plain_mime_message(**compose_kwargs)
         sent_message = build_plain_mime_message(**compose_kwargs)
 
@@ -696,7 +944,10 @@ class MailService:
                         if key[0] == account_uid:
                             self._folder_indexes.pop(key, None)
                     self._correspondent_indexes.pop(account_uid, None)
-                    self._append_to_sent_folder_unlocked(account_uid, sent_message)
+                    if from_queue:
+                        self._append_to_sent_folder_worker(account_uid, sent_message)
+                    else:
+                        self._append_to_sent_folder_unlocked(account_uid, sent_message)
                     if queue_id:
                         remove_queued_outbound_message(queue_id)
                     log.info(
@@ -719,8 +970,20 @@ class MailService:
         transport: Camel.Transport | None = None
         ok = False
         smtp_start = time.monotonic()
+        transport_uid = ""
+        get_transport = (
+            self._get_worker_transport_unlocked
+            if from_queue
+            else self._get_transport_unlocked
+        )
         try:
-            transport = self._get_transport_unlocked(account_uid, cancellable)
+            if from_queue:
+                prepare_camel_worker_thread()
+                transport = get_transport(account_uid, cancellable)
+            else:
+                with self._lock:
+                    transport = get_transport(account_uid, cancellable)
+            transport_uid = account.transport_uid or ""
             ok, _user_stop = transport.send_to_sync(
                 message, sender, recipients, cancellable
             )
@@ -768,7 +1031,12 @@ class MailService:
                     transport.disconnect_sync(True, cancellable)
                 except Exception:
                     log.debug("Failed to disconnect transport after send", exc_info=True)
-            self._transports.pop(account.transport_uid or "", None)
+            if transport_uid:
+                if from_queue:
+                    _camel_worker_tls.transports.pop(transport_uid, None)
+                else:
+                    with self._lock:
+                        self._transports.pop(transport_uid, None)
 
         log.debug("SMTP send finished in %.2fs ok=%s", time.monotonic() - smtp_start, ok)
 
@@ -780,7 +1048,29 @@ class MailService:
             )
             raise SendError(user_send_error_message(RuntimeError("Could not send message")))
 
-        self._append_to_sent_folder_unlocked(account_uid, sent_message)
+        self._append_sent_copy_and_finish_queue_item(
+            account_uid,
+            sent_message,
+            queue_id,
+            send_start=send_start,
+            from_queue=from_queue,
+        )
+
+    def _append_sent_copy_and_finish_queue_item(
+        self,
+        account_uid: str,
+        sent_message: Camel.MimeMessage,
+        queue_id: str | None,
+        *,
+        send_start: float,
+        from_queue: bool = False,
+    ) -> None:
+        append = (
+            self._append_to_sent_folder_worker
+            if from_queue
+            else self._append_to_sent_folder_unlocked
+        )
+        append(account_uid, sent_message)
         if queue_id:
             remove_queued_outbound_message(queue_id)
         log.info(
@@ -817,8 +1107,11 @@ class MailService:
         )
 
     def _flush_send_queue_unlocked(self) -> int:
+        prepare_camel_worker_thread()
         sent = 0
         for queue_id, queued in list_queued_outbound_messages():
+            if self._is_outbound_delivery_claimed(queue_id):
+                continue
             self._begin_outbound_send()
             try:
                 try:
@@ -881,6 +1174,13 @@ class MailService:
             return None
         return sent_info.get("full_name")
 
+    def _append_sent_copy_from_compose(
+        self, account_uid: str, compose_kwargs: dict[str, Any]
+    ) -> None:
+        prepare_camel_worker_thread()
+        sent_message = build_plain_mime_message(**compose_kwargs)
+        self._append_to_sent_folder_worker(account_uid, sent_message)
+
     def _append_to_sent_folder_unlocked(
         self, account_uid: str, message: Camel.MimeMessage
     ) -> None:
@@ -935,6 +1235,64 @@ class MailService:
         except GLib.Error:
             log.debug("Failed to refresh Sent folder after append", exc_info=True)
         self._invalidate_folder_index(account_uid, folder_name)
+
+    def _append_to_sent_folder_worker(
+        self, account_uid: str, message: Camel.MimeMessage
+    ) -> None:
+        prepare_camel_worker_thread()
+        with self._lock:
+            folder_name = self._sent_folder_name_unlocked(account_uid)
+        if not folder_name:
+            return
+
+        folder = self._open_worker_folder_unlocked(account_uid, folder_name)
+        if folder is None:
+            log.warning(
+                "Sent folder %r is not available for account %s",
+                folder_name,
+                account_uid,
+            )
+            return
+
+        cancellable = Gio.Cancellable()
+        timer = threading.Timer(_SEND_TIMEOUT_SECONDS, cancellable.cancel)
+        timer.start()
+        append_start = time.monotonic()
+        try:
+            ok, _uid = folder.append_message_sync(message, None, cancellable)
+        except GLib.Error as exc:
+            if cancellable.is_cancelled():
+                log.warning(
+                    "Sent folder append timed out after %ds folder=%r",
+                    _SEND_TIMEOUT_SECONDS,
+                    folder_name,
+                )
+            else:
+                log.warning(
+                    "Failed to save a copy to Sent folder %r: %s",
+                    folder_name,
+                    exc.message,
+                )
+            return
+        finally:
+            timer.cancel()
+
+        if not ok:
+            log.warning("Could not append message to Sent folder %r", folder_name)
+            return
+
+        log.debug(
+            "Sent folder append finished in %.2fs folder=%r",
+            time.monotonic() - append_start,
+            folder_name,
+        )
+
+        try:
+            folder.refresh_info_sync(None)
+        except GLib.Error:
+            log.debug("Failed to refresh Sent folder after append", exc_info=True)
+        with self._lock:
+            self._invalidate_folder_index(account_uid, folder_name)
 
     def _drafts_folder_name_unlocked(self, account_uid: str) -> str | None:
         folders = self._list_folders_unlocked(account_uid)

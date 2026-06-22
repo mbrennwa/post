@@ -45,9 +45,10 @@ from post.mail.correspondents import (
     current_address_token,
     match_correspondents,
 )
-from post.mail.eds import MailAccount
+from post.mail.eds import MailAccount, apply_send_debug_delay, prepare_camel_worker_thread
+from post.mail.io_thread import get_mail_io_thread
 from post.mail.send_errors import SendQueued, user_send_error_message
-from post.mail.send_queue import persist_outbound_send
+from post.mail.send_queue import new_outbound_queue_id, persist_outbound_send
 from post.preferences import get_account_signature, get_account_signatures
 from post.toast import show_error_toast
 
@@ -86,11 +87,35 @@ def run_outbound_send(
     on_draft_saved: OnDraftSaved | None,
     request: OutboundSendRequest,
 ) -> None:
-    """Persist to outbox, then send on a worker thread; report on the main window."""
-    queue_id = request.queue_id
-    if queue_id is None:
+    """Persist to outbox and send on the mail I/O thread; never block the UI thread."""
+
+    get_mail_io_thread().submit(
+        _run_outbound_send_worker,
+        mail=mail,
+        parent=parent,
+        set_status=set_status,
+        on_outbox_changed=on_outbox_changed,
+        on_draft_saved=on_draft_saved,
+        request=request,
+    )
+
+
+def _run_outbound_send_worker(
+    *,
+    mail: MailService,
+    parent: Gtk.Window | None,
+    set_status: SetStatus,
+    on_outbox_changed: Callable[[], None] | None,
+    on_draft_saved: OnDraftSaved | None,
+    request: OutboundSendRequest,
+) -> None:
+    prepare_camel_worker_thread()
+    queue_id = request.queue_id or new_outbound_queue_id()
+    mail.begin_outbound_send()
+    try:
+        mail.claim_outbound_delivery(queue_id)
         try:
-            queue_id = persist_outbound_send(
+            persist_outbound_send(
                 account_uid=request.account_uid,
                 to=request.to,
                 cc=request.cc,
@@ -100,26 +125,30 @@ def run_outbound_send(
                 in_reply_to=request.in_reply_to,
                 references=request.references,
                 attachments=request.attachments,
+                queue_id=queue_id,
             )
         except OSError as exc:
             log.error("Could not persist outbound message to outbox: %s", exc)
             if parent is not None:
-                show_error_toast(
+                GLib.idle_add(
+                    _show_send_error_toast,
                     parent,
                     f"Could not save message for sending: {exc}",
                 )
             return
-        request = replace(request, queue_id=queue_id)
-        if on_outbox_changed is not None:
-            on_outbox_changed()
 
-    def worker() -> None:
-        error: Exception | None = None
+        request_with_id = replace(request, queue_id=queue_id)
+        if on_outbox_changed is not None:
+            GLib.idle_add(_notify_outbox_changed, on_outbox_changed)
+
+        apply_send_debug_delay()
+        log.debug("Starting SMTP delivery for outbox item %s", queue_id)
+
         try:
-            mail.send_outbound_queue_item(queue_id)
+            mail.deliver_outbound_queue_item(queue_id)
         except SendQueued as exc:
             if on_outbox_changed is not None:
-                GLib.idle_add(on_outbox_changed)
+                GLib.idle_add(_notify_outbox_changed, on_outbox_changed)
             GLib.idle_add(
                 _finish_outbound_send,
                 parent,
@@ -127,14 +156,13 @@ def run_outbound_send(
                 on_draft_saved,
                 on_outbox_changed,
                 mail,
-                request,
+                request_with_id,
                 None,
                 exc.user_message,
             )
             return
         except Exception as exc:
-            log.warning("Send failed: %s", user_send_error_message(exc))
-            error = exc
+            log.warning("Send failed: %s", user_send_error_message(exc), exc_info=True)
             GLib.idle_add(
                 _finish_outbound_send,
                 parent,
@@ -142,11 +170,12 @@ def run_outbound_send(
                 on_draft_saved,
                 on_outbox_changed,
                 mail,
-                request,
-                error,
+                request_with_id,
+                exc,
                 None,
             )
             return
+
         GLib.idle_add(
             _finish_outbound_send,
             parent,
@@ -154,12 +183,23 @@ def run_outbound_send(
             on_draft_saved,
             on_outbox_changed,
             mail,
-            request,
+            request_with_id,
             None,
             None,
         )
+    finally:
+        mail.end_outbound_send()
+        mail.release_outbound_delivery(queue_id)
 
-    threading.Thread(target=worker, daemon=True).start()
+
+def _show_send_error_toast(parent: Gtk.Window, message: str) -> bool:
+    show_error_toast(parent, message)
+    return False
+
+
+def _notify_outbox_changed(on_outbox_changed: Callable[[], None]) -> bool:
+    on_outbox_changed()
+    return False
 
 
 def _finish_outbound_send(
@@ -229,6 +269,7 @@ def _complete_outbound_send_success(
         on_outbox_changed()
     set_status(success_status or "Message sent")
     return False
+
 
 _LABEL_WIDTH = 72
 _TO_PLACEHOLDER = "Add a recipient in the To field."
@@ -386,50 +427,36 @@ class ComposeWindow(Adw.Window):
 
         self._subject_entry = Gtk.Entry()
         self._subject_entry.set_placeholder_text(_SUBJECT_PLACEHOLDER)
+        self._subject_entry.set_hexpand(True)
         self._subject_entry.connect("changed", self._on_form_field_changed)
-        form.append(self._labeled_row("Subject", self._subject_entry))
-
-        self._focus_body_at_start_on_enter = False
         subject_focus = Gtk.EventControllerFocus()
         subject_focus.connect("leave", self._on_subject_focus_leave)
         self._subject_entry.add_controller(subject_focus)
+        form.append(self._labeled_row("Subject", self._subject_entry))
 
-        body_frame = Gtk.Frame()
-        body_frame.add_css_class("view")
-        body_scroll = Gtk.ScrolledWindow()
-        body_scroll.set_min_content_height(240)
-        body_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self._body_view = Gtk.TextView()
         self._body_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self._body_view.set_left_margin(8)
-        self._body_view.set_right_margin(8)
-        self._body_view.set_top_margin(8)
-        self._body_view.set_bottom_margin(8)
+        self._body_view.set_vexpand(True)
         self._body_view.get_buffer().connect("changed", self._mark_user_edited)
-        body_scroll.set_child(self._body_view)
-        body_frame.set_child(body_scroll)
-        body_frame.set_vexpand(True)
-        form.append(body_frame)
-
-        attachments_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self._attach_files_btn = Gtk.Button(label="Attach Files…")
-        self._attach_files_btn.set_halign(Gtk.Align.START)
-        self._attach_files_btn.connect("clicked", self._on_attach_clicked)
-        attachments_section.append(self._attach_files_btn)
-        self._attachments_box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=4
-        )
-        self._attachments_box.set_visible(False)
-        attachments_section.append(self._attachments_box)
-        form.append(attachments_section)
-
         body_focus = Gtk.EventControllerFocus()
         body_focus.connect("enter", self._on_body_focus_in)
         self._body_view.add_controller(body_focus)
+        form.append(self._body_view)
+
+        self._attach_files_btn = Gtk.Button(label="Attach Files")
+        self._attach_files_btn.connect("clicked", self._on_attach_clicked)
+        form.append(self._attach_files_btn)
+
+        self._attachments_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._attachments_box.set_visible(False)
+        form.append(self._attachments_box)
+
+        self._focus_body_at_start_on_enter = False
 
         toolbar_view = Adw.ToolbarView()
         toolbar_view.add_top_bar(header)
         toolbar_view.set_content(scrolled)
+
         self._toast_overlay = Adw.ToastOverlay()
         self._toast_overlay.set_child(toolbar_view)
         self.set_content(self._toast_overlay)
@@ -681,52 +708,41 @@ class ComposeWindow(Adw.Window):
         account = self._selected_account()
         generation = self._correspondents_generation + 1
         self._correspondents_generation = generation
-        self._correspondents = []
-        self._set_completion_model(Gtk.ListStore(str))
-        self._refresh_address_completions()
-        account_uid = account.uid
 
         def worker() -> None:
             try:
-                correspondents = self._mail.get_correspondents(account_uid)
-            except Exception as exc:
-                log.debug(
-                    "Could not load address suggestions for account %s: %s",
-                    account_uid,
-                    exc,
+                correspondents = self._mail.get_correspondents(account.uid)
+            except Exception:
+                log.warning(
+                    "Could not load correspondents for %s",
+                    account.uid,
+                    exc_info=True,
                 )
-                correspondents = []
+                return
             GLib.idle_add(
-                self._on_correspondents_loaded,
-                generation,
-                correspondents,
+                self._on_correspondents_loaded, generation, correspondents
             )
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_correspondents_loaded(
-        self,
-        generation: int,
-        correspondents: list[Correspondent],
+        self, generation: int, correspondents: list[Correspondent]
     ) -> bool:
         if generation != self._correspondents_generation:
             return False
         self._correspondents = correspondents
         model = Gtk.ListStore(str)
-        for correspondent in correspondents:
-            model.append([correspondent.display])
+        for item in correspondents:
+            model.append([item.display])
         self._set_completion_model(model)
         self._refresh_address_completions()
         return False
 
-    @classmethod
-    def _field_label(cls, text: str) -> Gtk.Label:
-        label = Gtk.Label(label=text, xalign=1)
-        label.set_size_request(_LABEL_WIDTH, -1)
-        label.set_halign(Gtk.Align.END)
-        label.set_valign(Gtk.Align.CENTER)
-        if text:
-            label.add_css_class("heading")
+    @staticmethod
+    def _field_label(text: str) -> Gtk.Label:
+        label = Gtk.Label(label=text)
+        label.set_width_chars(8)
+        label.set_xalign(0)
         return label
 
     @classmethod

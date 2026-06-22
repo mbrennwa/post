@@ -222,6 +222,10 @@ def load_queued_outbound_message(queue_id: str) -> QueuedOutboundMessage:
     return QueuedOutboundMessage.from_dict(data)
 
 
+def new_outbound_queue_id() -> str:
+    return f"{int(time.time() * 1_000_000)}-{uuid.uuid4().hex}"
+
+
 def persist_outbound_send(
     *,
     account_uid: str,
@@ -233,6 +237,7 @@ def persist_outbound_send(
     in_reply_to: str | None = None,
     references: str | None = None,
     attachments: Sequence[ComposeAttachment] | None = None,
+    queue_id: str | None = None,
 ) -> str:
     """Write an outbound message to the outbox before attempting delivery."""
     return enqueue_outbound_message(
@@ -247,6 +252,7 @@ def persist_outbound_send(
             references=references,
         ),
         attachment_payloads=attachments,
+        queue_id=queue_id,
     )
 
 
@@ -254,10 +260,11 @@ def enqueue_outbound_message(
     message: QueuedOutboundMessage,
     *,
     attachment_payloads: Sequence[ComposeAttachment] | None = None,
+    queue_id: str | None = None,
 ) -> str:
     directory = outbox_dir()
     os.makedirs(directory, exist_ok=True)
-    queue_id = f"{int(time.time() * 1_000_000)}-{uuid.uuid4().hex}"
+    queue_id = queue_id or new_outbound_queue_id()
     if attachment_payloads:
         message.attachments = _write_attachment_sidecars(queue_id, attachment_payloads)
     payload = message.to_dict()
