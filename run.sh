@@ -3,9 +3,19 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
 
-if [[ ! -d .venv ]]; then
+if [[ ! -d .venv ]] || [[ ! -f .venv/bin/post ]]; then
+  rm -rf .venv
   python3 -m venv .venv --system-site-packages
   .venv/bin/pip install -e .
+else
+  post_shebang="$(head -1 .venv/bin/post)"
+  if [[ "$post_shebang" != "#!$ROOT/.venv/bin/python" \
+    && "$post_shebang" != "#!$ROOT/.venv/bin/python3" ]] \
+    || ! .venv/bin/python3 -c 'import post' 2>/dev/null; then
+    rm -rf .venv
+    python3 -m venv .venv --system-site-packages
+    .venv/bin/pip install -e .
+  fi
 fi
 
 install_desktop_integration() {
