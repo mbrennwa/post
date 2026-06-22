@@ -232,6 +232,8 @@ class MainWindow(Adw.ApplicationWindow):
             on_accounts_loaded=self._on_accounts_loaded,
             on_folder_tree_changed=self._on_sidebar_folder_tree_changed,
             on_folder_contents_changed=self._on_sidebar_folder_contents_changed,
+            on_move_started=self._on_sidebar_move_started,
+            on_move_undo_available=self._on_sidebar_move_undo_available,
         )
         sidebar_widget = self._sidebar.widget
         sidebar_widget.set_margin_top(_SIDEBAR_TOP_INSET)
@@ -924,6 +926,29 @@ class MainWindow(Adw.ApplicationWindow):
         self, account_uid: str, folder_name: str
     ) -> None:
         self._refresh_folder_view(account_uid, folder_name)
+
+    def _on_sidebar_move_started(self, account_uid: str, folder_name: str) -> None:
+        self._clear_move_undo()
+
+    def _on_sidebar_move_undo_available(
+        self,
+        account_uid: str,
+        source_folder: str,
+        result: dict,
+        status_label: str,
+    ) -> None:
+        dest_folder = result.get("destination_folder")
+        dest_uids = result.get("destination_uids") or []
+        if not dest_folder or not dest_uids:
+            return
+        self._register_move_undo(
+            status_label,
+            account_uid=account_uid,
+            source_folder=source_folder,
+            dest_folder=dest_folder,
+            dest_uids=dest_uids,
+        )
+        self._set_status(f"{status_label}  ·  Ctrl+Z to undo")
 
     def _on_accounts_loaded(self, account_uids: list[str]) -> None:
         self._sync_watcher.set_accounts(account_uids)
@@ -2197,6 +2222,9 @@ class MainWindow(Adw.ApplicationWindow):
             self._delete_queued_messages(uids)
             return
 
+        self._clear_move_undo()
+        self._suppress_sync_list_reload = (account_uid, folder_name)
+
         def worker() -> None:
             error: Exception | None = None
             result: dict | None = None
@@ -2214,7 +2242,9 @@ class MainWindow(Adw.ApplicationWindow):
                 error = exc
             GLib.idle_add(
                 self._on_messages_moved,
-                rows,
+                account_uid,
+                folder_name,
+                uids,
                 destination,
                 result,
                 error,
@@ -2222,7 +2252,6 @@ class MainWindow(Adw.ApplicationWindow):
 
         label = "Trash" if destination == "trash" else "Archive"
         self._set_status(f"Moving {len(uids)} message(s) to {label}…")
-        self._clear_move_undo()
         threading.Thread(target=worker, daemon=True).start()
 
     def _dismiss_undo_toast_only(self) -> None:
@@ -2340,102 +2369,74 @@ class MainWindow(Adw.ApplicationWindow):
         self._set_status("Move undone")
         return False
 
-    def _on_messages_moved(
-        self,
-        rows: list[Gtk.ListBoxRow],
-        destination: str,
-        result: dict | None,
-        error: Exception | None,
-    ) -> bool:
-        if error is not None:
-            show_error_toast(self, f"Could not move messages: {error}")
-            return False
-        if result is None:
-            return False
-
-        removed_count = 0
-        for row in list(rows):
-            uid = getattr(row, "message_uid", None)
-            if row.get_parent() is self._message_list:
-                self._message_list.remove(row)
-                removed_count += 1
-            if uid == self._current_message_uid:
-                self._clear_reader()
-                set_active_message_uid(None)
-                self._restore_message_folder = None
-
-        self._shown_message_count = max(0, self._shown_message_count - removed_count)
-        if self._message_total >= 0:
-            self._message_total = max(0, self._message_total - removed_count)
-
-        if removed_count == 0:
-            show_error_toast(self, "Messages moved, but the list could not be updated")
-            return False
-
-        remaining_rows = 0
-        child = self._message_list.get_first_child()
-        while child is not None:
-            if isinstance(child, Gtk.ListBoxRow):
-                remaining_rows += 1
-            child = child.get_next_sibling()
-        if remaining_rows == 0 and self._current_folder:
-            self._message_empty_label.set_label(
-                f"No Messages in {self._current_folder}"
-            )
-            self._message_stack.set_visible_child_name("empty")
-
-        if self._current_account and self._current_folder:
+    def _update_sidebar_from_move_result(
+        self, account_uid: str, result: dict
+    ) -> None:
+        source_folder = result.get("source_folder")
+        if source_folder:
             unread = result.get("source_folder_unread")
             total = result.get("source_folder_total")
             if unread is not None and total is not None:
                 self._sidebar.update_folder_row(
-                    self._current_account.uid,
-                    self._current_folder,
+                    account_uid,
+                    source_folder,
                     unread,
                     total,
                 )
 
-            dest_folder = result.get("destination_folder")
-            dest_unread = result.get("destination_folder_unread")
-            dest_total = result.get("destination_folder_total")
-            if (
-                dest_folder
-                and dest_unread is not None
-                and dest_total is not None
-            ):
-                self._sidebar.update_folder_row(
-                    self._current_account.uid,
-                    dest_folder,
-                    dest_unread,
-                    dest_total,
-                )
+        dest_folder = result.get("destination_folder")
+        dest_unread = result.get("destination_folder_unread")
+        dest_total = result.get("destination_folder_total")
+        if (
+            dest_folder
+            and dest_unread is not None
+            and dest_total is not None
+        ):
+            self._sidebar.update_folder_row(
+                account_uid,
+                dest_folder,
+                dest_unread,
+                dest_total,
+            )
 
+        if (
+            self._current_account
+            and self._current_account.uid == account_uid
+            and self._current_folder == source_folder
+        ):
             self._update_message_status(self._current_account, self._current_folder)
 
-            inbox_folder = self._sidebar.inbox_folder_for_account(
-                self._current_account.uid
-            )
+            inbox_folder = self._sidebar.inbox_folder_for_account(account_uid)
             if inbox_folder and self._current_folder == inbox_folder:
-                self._sidebar.refresh_inbox_counts(self._current_account.uid)
+                self._sidebar.refresh_inbox_counts(account_uid)
 
+    def _move_status_label(self, destination: str, moved_count: int) -> str:
         label = "Trash" if destination == "trash" else "Archive"
-        if removed_count > 1:
-            status_label = f"Moved {removed_count} messages to {label}"
-        else:
-            status_label = f"Moved message to {label}"
+        if moved_count > 1:
+            return f"Moved {moved_count} messages to {label}"
+        return f"Moved message to {label}"
+
+    def _finalize_move_status_and_undo(
+        self,
+        account_uid: str,
+        source_folder: str,
+        destination: str,
+        uids: list[str],
+        result: dict,
+        *,
+        status_label: str | None = None,
+    ) -> None:
+        moved_count = len(result.get("moved_uids") or uids)
+        if status_label is None:
+            status_label = self._move_status_label(destination, moved_count)
 
         dest_folder = result.get("destination_folder")
         dest_uids = result.get("destination_uids") or []
-        if (
-            self._current_account
-            and self._current_folder
-            and dest_folder
-            and dest_uids
-        ):
+        if dest_folder and dest_uids:
             self._register_move_undo(
                 status_label,
-                account_uid=self._current_account.uid,
-                source_folder=self._current_folder,
+                account_uid=account_uid,
+                source_folder=source_folder,
                 dest_folder=dest_folder,
                 dest_uids=dest_uids,
             )
@@ -2443,7 +2444,78 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             self._clear_move_undo()
             self._set_status(status_label)
+
+    def _on_messages_moved(
+        self,
+        account_uid: str,
+        folder_name: str,
+        uids: list[str],
+        destination: str,
+        result: dict | None,
+        error: Exception | None,
+    ) -> bool:
+        suppress_key = (account_uid, folder_name)
+
+        if error is not None:
+            if self._suppress_sync_list_reload == suppress_key:
+                self._suppress_sync_list_reload = None
+            show_error_toast(self, f"Could not move messages: {error}")
+            return False
+        if result is None:
+            if self._suppress_sync_list_reload == suppress_key:
+                self._suppress_sync_list_reload = None
+            return False
+
+        removed_count = 0
+        cleared_current = False
+        for uid in uids:
+            row = self._find_message_row(uid)
+            if row is not None and row.get_parent() is self._message_list:
+                self._message_list.remove(row)
+                removed_count += 1
+            if uid == self._current_message_uid:
+                cleared_current = True
+
+        if cleared_current:
+            self._clear_reader()
+            set_active_message_uid(None)
+            self._restore_message_folder = None
+
+        moved_count = len(result.get("moved_uids") or uids)
+        count_delta = removed_count if removed_count > 0 else moved_count
+        self._shown_message_count = max(0, self._shown_message_count - count_delta)
+        if self._message_total >= 0:
+            self._message_total = max(0, self._message_total - count_delta)
+
+        if removed_count == 0 and moved_count > 0:
+            if (
+                self._current_account
+                and self._current_folder
+                and self._current_account.uid == account_uid
+                and self._current_folder == folder_name
+            ):
+                self._load_messages(account_uid, folder_name, sync=False)
+        else:
+            remaining_rows = 0
+            child = self._message_list.get_first_child()
+            while child is not None:
+                if isinstance(child, Gtk.ListBoxRow):
+                    remaining_rows += 1
+                child = child.get_next_sibling()
+            if remaining_rows == 0 and folder_name:
+                self._message_empty_label.set_label(
+                    f"No Messages in {folder_name}"
+                )
+                self._message_stack.set_visible_child_name("empty")
+
+        self._update_sidebar_from_move_result(account_uid, result)
+        self._finalize_move_status_and_undo(
+            account_uid, folder_name, destination, uids, result
+        )
         self._update_message_toolbar()
+
+        if self._suppress_sync_list_reload == suppress_key:
+            self._suppress_sync_list_reload = None
         return False
 
     def _set_messages_seen(self, seen: bool) -> None:

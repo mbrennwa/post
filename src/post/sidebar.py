@@ -57,6 +57,8 @@ OnAccountsLoaded = Callable[[list[str]], None]
 OnSendOutbox = Callable[[], None]
 OnFolderTreeChanged = Callable[[str, str | None], None]
 OnFolderContentsChanged = Callable[[str, str], None]
+OnMoveStarted = Callable[[str, str], None]
+OnMoveUndoAvailable = Callable[[str, str, dict, str], None]
 
 
 class MailSidebar:
@@ -72,6 +74,8 @@ class MailSidebar:
         on_send_outbox: OnSendOutbox | None = None,
         on_folder_tree_changed: OnFolderTreeChanged | None = None,
         on_folder_contents_changed: OnFolderContentsChanged | None = None,
+        on_move_started: OnMoveStarted | None = None,
+        on_move_undo_available: OnMoveUndoAvailable | None = None,
     ) -> None:
         self._mail = mail
         self._on_folder_selected = on_folder_selected
@@ -82,6 +86,8 @@ class MailSidebar:
         self._on_send_outbox = on_send_outbox
         self._on_folder_tree_changed = on_folder_tree_changed
         self._on_folder_contents_changed = on_folder_contents_changed
+        self._on_move_started = on_move_started
+        self._on_move_undo_available = on_move_undo_available
 
         self._accounts: list[MailAccount] = []
         self._accounts_by_uid: dict[str, MailAccount] = {}
@@ -546,11 +552,14 @@ class MailSidebar:
             confirm_label="Archive",
         ):
             return
+        status_label = f"Archived {read_count} read {noun}"
+        if self._on_move_started is not None:
+            self._on_move_started(account_uid, folder_name)
         self._run_folder_operation(
             lambda: self._mail.archive_read_messages(account_uid, folder_name),
-            success_status=f"Archived {read_count} read {noun}",
-            on_success=lambda _result: self._after_folder_contents_changed(
-                account_uid, folder_name
+            success_status=status_label,
+            on_success=lambda result: self._after_bulk_archive(
+                account_uid, folder_name, result, status_label
             ),
             error_heading="Could not archive messages",
         )
@@ -589,15 +598,16 @@ class MailSidebar:
             confirm_label="Archive",
         ):
             return
+        status_label = f"Archived {read_unflagged_count} read and unflagged {noun}"
+        if self._on_move_started is not None:
+            self._on_move_started(account_uid, folder_name)
         self._run_folder_operation(
             lambda: self._mail.archive_read_unflagged_messages(
                 account_uid, folder_name
             ),
-            success_status=(
-                f"Archived {read_unflagged_count} read and unflagged {noun}"
-            ),
-            on_success=lambda _result: self._after_folder_contents_changed(
-                account_uid, folder_name
+            success_status=status_label,
+            on_success=lambda result: self._after_bulk_archive(
+                account_uid, folder_name, result, status_label
             ),
             error_heading="Could not archive messages",
         )
@@ -714,6 +724,24 @@ class MailSidebar:
         self.refresh_folder_row(account_uid, folder_name)
         if self._on_folder_contents_changed is not None:
             self._on_folder_contents_changed(account_uid, folder_name)
+
+    def _after_bulk_archive(
+        self,
+        account_uid: str,
+        folder_name: str,
+        result: object,
+        status_label: str,
+    ) -> None:
+        self._after_folder_contents_changed(account_uid, folder_name)
+        if not isinstance(result, dict):
+            return
+        archived_count = int(result.get("archived_count") or 0)
+        if archived_count <= 0:
+            return
+        if self._on_move_undo_available is not None:
+            self._on_move_undo_available(
+                account_uid, folder_name, result, status_label
+            )
 
     def _attach_refresh_menu(
         self,
