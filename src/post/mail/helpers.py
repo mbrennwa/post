@@ -127,6 +127,11 @@ def enrich_message_dict_from_mime(result: dict[str, Any], mime: Any) -> None:
         cc_header = mime.get_header("Cc")
         if cc_header:
             result["cc"] = cc_header
+    reply_to_header = mime.get_header("Reply-To")
+    if reply_to_header:
+        stripped = reply_to_header.strip()
+        if stripped:
+            result["reply_to"] = stripped
 
 
 def _valid_unix_timestamp(unix_time: float | int | None) -> float | None:

@@ -254,6 +254,17 @@ class EnrichMessageDictFromMimeTests(unittest.TestCase):
         enrich_message_dict_from_mime(result, mime)
         self.assertEqual(result["cc"], "Carol <carol@example.com>")
 
+    def test_fills_reply_to(self) -> None:
+        result = {"from": "List <list@example.com>"}
+        mime = MagicMock()
+        mime.get_header.side_effect = lambda name: {
+            "To": None,
+            "Cc": None,
+            "Reply-To": "Author <author@example.com>",
+        }.get(name)
+        enrich_message_dict_from_mime(result, mime)
+        self.assertEqual(result["reply_to"], "Author <author@example.com>")
+
 
 if __name__ == "__main__":
     unittest.main()

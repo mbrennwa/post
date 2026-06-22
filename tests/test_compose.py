@@ -14,6 +14,7 @@ from post.mail.compose import (
     build_reply_references,
     build_reply_subject,
     extract_reply_address,
+    extract_reply_target_addresses,
     format_address_list,
     normalize_email,
     parse_address_header,
@@ -79,6 +80,39 @@ class ExtractReplyAddressTests(unittest.TestCase):
         )
 
 
+class ExtractReplyTargetAddressesTests(unittest.TestCase):
+    def test_prefers_reply_to_over_from(self) -> None:
+        message = {
+            "from": "List <list@example.com>",
+            "reply_to": "Author <author@example.com>",
+        }
+        self.assertEqual(
+            extract_reply_target_addresses(message),
+            ["Author <author@example.com>"],
+        )
+
+    def test_multiple_reply_to_addresses(self) -> None:
+        message = {
+            "from": "List <list@example.com>",
+            "reply_to": "Alice <alice@example.com>, Bob <bob@example.com>",
+        }
+        self.assertEqual(
+            extract_reply_target_addresses(message),
+            ["Alice <alice@example.com>", "Bob <bob@example.com>"],
+        )
+
+    def test_falls_back_to_from_without_reply_to(self) -> None:
+        message = {"from": "Alice <alice@example.com>"}
+        self.assertEqual(
+            extract_reply_target_addresses(message),
+            ["Alice <alice@example.com>"],
+        )
+
+    def test_raises_without_from_or_reply_to(self) -> None:
+        with self.assertRaises(ValueError):
+            extract_reply_target_addresses({"from": "", "reply_to": ""})
+
+
 class QuotePlainReplyTests(unittest.TestCase):
     def test_quotes_body(self) -> None:
         original = {
@@ -93,6 +127,16 @@ class QuotePlainReplyTests(unittest.TestCase):
     def test_empty_body_placeholder(self) -> None:
         body = quote_plain_reply({"from": "a@b.com", "date_sent": "today"}, None)
         self.assertIn("(no message body)", body)
+
+    def test_quote_uses_from_not_reply_to(self) -> None:
+        original = {
+            "from": "List <list@example.com>",
+            "reply_to": "Author <author@example.com>",
+            "date_received": "2026-06-17 16:49:57",
+        }
+        body = quote_plain_reply(original, "Hello")
+        self.assertIn("On 2026-06-17 16:49:57, List <list@example.com> wrote:", body)
+        self.assertNotIn("author@example.com", body.split("wrote:")[0])
 
 
 class BuildForwardSubjectTests(unittest.TestCase):
@@ -391,6 +435,48 @@ class BuildReplyAllRecipientsTests(unittest.TestCase):
             own_addresses={normalize_email("me@example.com")},
         )
         self.assertEqual(to_addrs, ["Me <me@example.com>"])
+        self.assertEqual(cc_addrs, [])
+
+    def test_reply_all_uses_reply_to_and_all_original_to(self) -> None:
+        original = {
+            "from": "List <newsletters@list.example.com>",
+            "reply_to": "Author <author@example.com>",
+            "to": (
+                "List <newsletters@list.example.com>, "
+                "Alice <alice@example.com>, "
+                "Me <me@example.com>"
+            ),
+            "cc": "Carol <carol@example.com>",
+        }
+        to_addrs, cc_addrs = build_reply_all_recipients(
+            original,
+            own_addresses={normalize_email("me@example.com")},
+        )
+        self.assertEqual(
+            to_addrs,
+            [
+                "Author <author@example.com>",
+                "List <newsletters@list.example.com>",
+                "Alice <alice@example.com>",
+            ],
+        )
+        self.assertEqual(cc_addrs, ["Carol <carol@example.com>"])
+
+    def test_reply_all_multiple_reply_to_addresses(self) -> None:
+        original = {
+            "from": "List <list@example.com>",
+            "reply_to": "Alice <alice@example.com>, Bob <bob@example.com>",
+            "to": "Me <me@example.com>",
+            "cc": "",
+        }
+        to_addrs, cc_addrs = build_reply_all_recipients(
+            original,
+            own_addresses={normalize_email("me@example.com")},
+        )
+        self.assertEqual(
+            to_addrs,
+            ["Alice <alice@example.com>", "Bob <bob@example.com>"],
+        )
         self.assertEqual(cc_addrs, [])
 
     def test_no_recipients_raises_without_from(self) -> None:
