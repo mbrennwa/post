@@ -76,7 +76,4 @@ EOF
 
 install_desktop_integration
 
-# Uncomment to simulate a slow send (e.g. test quit while sending):
-# export POST_SEND_DELAY_SECONDS=10
-
 exec .venv/bin/post "$@"

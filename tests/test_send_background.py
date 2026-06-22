@@ -65,11 +65,10 @@ class RunOutboundSendTests(unittest.TestCase):
     )
     @mock.patch("post.compose_window.prepare_camel_worker_thread")
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
-    @mock.patch("post.compose_window.apply_send_debug_delay")
     @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_success_sets_message_sent(
-        self, _idle_add, _persist, _delay, _queue_id, _prepare, _io
+        self, _idle_add, _persist, _queue_id, _prepare, _io
     ) -> None:
         outbox_changed = mock.Mock()
         run_outbound_send(

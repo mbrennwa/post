@@ -121,29 +121,6 @@ def prepare_camel_worker_thread() -> None:
     _camel_worker_tls.transports = {}
 
 
-def _send_debug_delay_seconds() -> float:
-    """Optional sleep for manual testing (POST_SEND_DELAY_SECONDS)."""
-    raw = os.environ.get("POST_SEND_DELAY_SECONDS", "0").strip()
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return 0.0
-
-
-def apply_send_debug_delay() -> None:
-    delay = _send_debug_delay_seconds()
-    if not delay:
-        return
-    log.warning(
-        "POST_SEND_DELAY_SECONDS=%s: delaying background send for testing",
-        delay,
-    )
-    time.sleep(delay)
-
-
-_apply_send_debug_delay = apply_send_debug_delay  # backwards compat for tests
-
-
 def _run_on_gtk_thread(callback: Callable[[], None]) -> bool:
     callback()
     return False

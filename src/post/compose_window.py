@@ -45,7 +45,7 @@ from post.mail.correspondents import (
     current_address_token,
     match_correspondents,
 )
-from post.mail.eds import MailAccount, apply_send_debug_delay, prepare_camel_worker_thread
+from post.mail.eds import MailAccount, prepare_camel_worker_thread
 from post.mail.io_thread import get_mail_io_thread
 from post.mail.send_errors import SendQueued, user_send_error_message
 from post.mail.send_queue import new_outbound_queue_id, persist_outbound_send
@@ -141,7 +141,6 @@ def _run_outbound_send_worker(
         if on_outbox_changed is not None:
             GLib.idle_add(_notify_outbox_changed, on_outbox_changed)
 
-        apply_send_debug_delay()
         log.debug("Starting SMTP delivery for outbox item %s", queue_id)
 
         try:
