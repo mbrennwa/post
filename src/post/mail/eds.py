@@ -62,6 +62,7 @@ from .send_queue import (
     is_queueable_network_error,
     list_queued_outbound_messages,
     load_queued_attachments,
+    load_queued_outbound_message,
     remove_queued_outbound_message,
 )
 from post.preferences import get_show_evolution_local
@@ -204,6 +205,10 @@ class MailService:
     _pending_mail_ops_cond: threading.Condition = field(
         default_factory=threading.Condition, init=False, repr=False
     )
+    _outbound_sends_in_progress: int = field(default=0, init=False)
+    _outbound_sends_cond: threading.Condition = field(
+        default_factory=threading.Condition, init=False, repr=False
+    )
 
     def _enter_mail_op(self) -> None:
         with self._pending_mail_ops_cond:
@@ -223,6 +228,33 @@ class MailService:
         finally:
             self._leave_mail_op()
 
+    def outbound_sends_pending(self) -> bool:
+        with self._outbound_sends_cond:
+            return self._outbound_sends_in_progress > 0
+
+    def _begin_outbound_send(self) -> None:
+        with self._outbound_sends_cond:
+            self._outbound_sends_in_progress += 1
+
+    def _end_outbound_send(self) -> None:
+        with self._outbound_sends_cond:
+            self._outbound_sends_in_progress -= 1
+            if self._outbound_sends_in_progress == 0:
+                self._outbound_sends_cond.notify_all()
+
+    def wait_for_outbound_sends(self, timeout: float = 120.0) -> None:
+        deadline = time.monotonic() + timeout
+        with self._outbound_sends_cond:
+            while self._outbound_sends_in_progress > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.warning(
+                        "Timed out waiting for %d outbound send(s)",
+                        self._outbound_sends_in_progress,
+                    )
+                    return
+                self._outbound_sends_cond.wait(timeout=remaining)
+
     def wait_for_pending_mail_ops(self, timeout: float = 10.0) -> None:
         deadline = time.monotonic() + timeout
         with self._pending_mail_ops_cond:
@@ -238,6 +270,7 @@ class MailService:
 
     def shutdown_sync(self) -> None:
         """Wait for in-flight mail work and flush stores before exit."""
+        self.wait_for_outbound_sends()
         self.wait_for_pending_mail_ops()
         with self._lock:
             for store in self._stores.values():
@@ -563,6 +596,28 @@ class MailService:
                 from_queue=False,
             )
 
+    def send_outbound_queue_item(self, queue_id: str) -> None:
+        """Send a persisted outbox item and remove it on success."""
+        self._begin_outbound_send()
+        try:
+            with self._lock:
+                queued = load_queued_outbound_message(queue_id)
+                self._send_message_unlocked(
+                    queued.account_uid,
+                    to=queued.to,
+                    cc=queued.cc,
+                    bcc=queued.bcc,
+                    subject=queued.subject,
+                    body=queued.body,
+                    in_reply_to=queued.in_reply_to,
+                    references=queued.references,
+                    attachments=load_queued_attachments(queue_id, queued),
+                    from_queue=True,
+                    queue_id=queue_id,
+                )
+        finally:
+            self._end_outbound_send()
+
     def _send_message_unlocked(
         self,
         account_uid: str,
@@ -576,7 +631,21 @@ class MailService:
         references: str | None,
         attachments: Sequence[ComposeAttachment] | None = None,
         from_queue: bool = False,
+        queue_id: str | None = None,
     ) -> None:
+        send_start = time.monotonic()
+        log.info(
+            "Sending message account=%s to=%d cc=%d bcc=%d subject=%r",
+            account_uid,
+            len(to),
+            len(cc or []),
+            len(bcc or []),
+            subject or "",
+        )
+        log.debug("Recipients to=%s cc=%s bcc=%s", to, cc, bcc)
+        if queue_id:
+            log.debug("Sending outbox item %s", queue_id)
+
         account = self.get_account(account_uid)
         from_address = account.from_address or account.email
         if not from_address:
@@ -628,6 +697,13 @@ class MailService:
                             self._folder_indexes.pop(key, None)
                     self._correspondent_indexes.pop(account_uid, None)
                     self._append_to_sent_folder_unlocked(account_uid, sent_message)
+                    if queue_id:
+                        remove_queued_outbound_message(queue_id)
+                    log.info(
+                        "Send finished account=%s in %.2fs (local delivery)",
+                        account_uid,
+                        time.monotonic() - send_start,
+                    )
                     return
                 if not all_recipients_local(
                     to=to,
@@ -642,30 +718,48 @@ class MailService:
         timer.start()
         transport: Camel.Transport | None = None
         ok = False
+        smtp_start = time.monotonic()
         try:
             transport = self._get_transport_unlocked(account_uid, cancellable)
             ok, _user_stop = transport.send_to_sync(
                 message, sender, recipients, cancellable
             )
         except GLib.Error as exc:
+            log.debug(
+                "SMTP send finished in %.2fs cancelled=%s",
+                time.monotonic() - smtp_start,
+                cancellable.is_cancelled(),
+            )
             network_exc: BaseException = (
                 TimeoutError() if cancellable.is_cancelled() else exc
             )
-            if not from_queue and is_queueable_network_error(network_exc):
-                self._queue_outbound_message_unlocked(
-                    account_uid=account_uid,
-                    to=to,
-                    cc=cc,
-                    bcc=bcc,
-                    subject=subject,
-                    body=body,
-                    in_reply_to=in_reply_to,
-                    references=references,
-                    attachments=attachments,
-                )
+            if is_queueable_network_error(network_exc):
+                if queue_id is None and not from_queue:
+                    self._queue_outbound_message_unlocked(
+                        account_uid=account_uid,
+                        to=to,
+                        cc=cc,
+                        bcc=bcc,
+                        subject=subject,
+                        body=body,
+                        in_reply_to=in_reply_to,
+                        references=references,
+                        attachments=attachments,
+                    )
                 raise SendQueued(MESSAGE_QUEUED) from exc
             if cancellable.is_cancelled():
+                log.warning(
+                    "Send timed out after %ds account=%s",
+                    _SEND_TIMEOUT_SECONDS,
+                    account_uid,
+                )
                 raise SendError(user_send_error_message(TimeoutError())) from exc
+            log.warning(
+                "Send failed account=%s in %.2fs: %s",
+                account_uid,
+                time.monotonic() - send_start,
+                exc.message,
+            )
             raise SendError(user_send_error_message(exc)) from exc
         finally:
             timer.cancel()
@@ -676,10 +770,24 @@ class MailService:
                     log.debug("Failed to disconnect transport after send", exc_info=True)
             self._transports.pop(account.transport_uid or "", None)
 
+        log.debug("SMTP send finished in %.2fs ok=%s", time.monotonic() - smtp_start, ok)
+
         if not ok:
+            log.warning(
+                "Send failed account=%s in %.2fs: transport returned false",
+                account_uid,
+                time.monotonic() - send_start,
+            )
             raise SendError(user_send_error_message(RuntimeError("Could not send message")))
 
         self._append_to_sent_folder_unlocked(account_uid, sent_message)
+        if queue_id:
+            remove_queued_outbound_message(queue_id)
+        log.info(
+            "Send finished account=%s in %.2fs",
+            account_uid,
+            time.monotonic() - send_start,
+        )
 
     def _queue_outbound_message_unlocked(
         self,
@@ -711,34 +819,38 @@ class MailService:
     def _flush_send_queue_unlocked(self) -> int:
         sent = 0
         for queue_id, queued in list_queued_outbound_messages():
+            self._begin_outbound_send()
             try:
-                self._send_message_unlocked(
-                    queued.account_uid,
-                    to=queued.to,
-                    cc=queued.cc,
-                    bcc=queued.bcc,
-                    subject=queued.subject,
-                    body=queued.body,
-                    in_reply_to=queued.in_reply_to,
-                    references=queued.references,
-                    attachments=load_queued_attachments(queue_id, queued),
-                    from_queue=True,
-                )
-            except SendQueued:
-                break
-            except SendError as exc:
-                log.warning(
-                    "Queued message %s was not sent: %s",
-                    queue_id,
-                    exc.user_message,
-                )
-                break
-            except Exception:
-                log.exception("Failed to send queued message %s", queue_id)
-                break
-            else:
-                remove_queued_outbound_message(queue_id)
-                sent += 1
+                try:
+                    self._send_message_unlocked(
+                        queued.account_uid,
+                        to=queued.to,
+                        cc=queued.cc,
+                        bcc=queued.bcc,
+                        subject=queued.subject,
+                        body=queued.body,
+                        in_reply_to=queued.in_reply_to,
+                        references=queued.references,
+                        attachments=load_queued_attachments(queue_id, queued),
+                        from_queue=True,
+                        queue_id=queue_id,
+                    )
+                except SendQueued:
+                    break
+                except SendError as exc:
+                    log.warning(
+                        "Queued message %s was not sent: %s",
+                        queue_id,
+                        exc.user_message,
+                    )
+                    break
+                except Exception:
+                    log.exception("Failed to send queued message %s", queue_id)
+                    break
+                else:
+                    sent += 1
+            finally:
+                self._end_outbound_send()
         return sent
 
     def _sent_folder_name_unlocked(self, account_uid: str) -> str | None:
@@ -785,19 +897,38 @@ class MailService:
             )
             return
 
+        cancellable = Gio.Cancellable()
+        timer = threading.Timer(_SEND_TIMEOUT_SECONDS, cancellable.cancel)
+        timer.start()
+        append_start = time.monotonic()
         try:
-            ok, _uid = folder.append_message_sync(message, None, None)
+            ok, _uid = folder.append_message_sync(message, None, cancellable)
         except GLib.Error as exc:
-            log.warning(
-                "Failed to save a copy to Sent folder %r: %s",
-                folder_name,
-                exc.message,
-            )
+            if cancellable.is_cancelled():
+                log.warning(
+                    "Sent folder append timed out after %ds folder=%r",
+                    _SEND_TIMEOUT_SECONDS,
+                    folder_name,
+                )
+            else:
+                log.warning(
+                    "Failed to save a copy to Sent folder %r: %s",
+                    folder_name,
+                    exc.message,
+                )
             return
+        finally:
+            timer.cancel()
 
         if not ok:
             log.warning("Could not append message to Sent folder %r", folder_name)
             return
+
+        log.debug(
+            "Sent folder append finished in %.2fs folder=%r",
+            time.monotonic() - append_start,
+            folder_name,
+        )
 
         try:
             folder.refresh_info_sync(None)

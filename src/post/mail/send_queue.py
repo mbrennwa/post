@@ -213,6 +213,43 @@ def offline_status_text(*, queued_count: int) -> str:
     return "Offline"
 
 
+def load_queued_outbound_message(queue_id: str) -> QueuedOutboundMessage:
+    path = os.path.join(outbox_dir(), f"{queue_id}.json")
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid queued message: {queue_id}")
+    return QueuedOutboundMessage.from_dict(data)
+
+
+def persist_outbound_send(
+    *,
+    account_uid: str,
+    to: list[str],
+    cc: list[str] | None,
+    bcc: list[str] | None,
+    subject: str,
+    body: str,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+    attachments: Sequence[ComposeAttachment] | None = None,
+) -> str:
+    """Write an outbound message to the outbox before attempting delivery."""
+    return enqueue_outbound_message(
+        QueuedOutboundMessage(
+            account_uid=account_uid,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body=body,
+            in_reply_to=in_reply_to,
+            references=references,
+        ),
+        attachment_payloads=attachments,
+    )
+
+
 def enqueue_outbound_message(
     message: QueuedOutboundMessage,
     *,

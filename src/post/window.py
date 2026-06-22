@@ -64,7 +64,7 @@ from post.preferences import (
     set_window_state,
 )
 from post.sidebar import MailSidebar
-from post.toast import show_error_toast
+from post.toast import show_error_toast, show_toast
 
 log = logging.getLogger(__name__)
 
@@ -553,6 +553,15 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
     def _on_close_request(self, *_args) -> bool:
+        if self._mail.outbound_sends_pending():
+            self._set_status(
+                "Sending message… Post will close when sending finishes."
+            )
+            show_toast(
+                self,
+                "A message is still sending. Post will close when sending finishes.",
+                timeout=8,
+            )
         self._sync_watcher.stop()
         try:
             self._mail.shutdown_sync()
