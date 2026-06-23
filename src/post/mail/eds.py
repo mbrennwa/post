@@ -129,6 +129,18 @@ def _run_on_gtk_thread(callback: Callable[[], None]) -> bool:
     return False
 
 
+class MessageNotAvailableError(LookupError):
+    """Raised when Camel reports a listed UID is no longer fetchable."""
+
+    def __init__(self, message_uid: str, folder_name: str | None = None) -> None:
+        self.message_uid = message_uid
+        self.folder_name = folder_name
+        super().__init__(message_uid)
+
+    def user_message(self) -> str:
+        return "This message is no longer available."
+
+
 @dataclass
 class _FolderMessageIndex:
     messages: list[dict]
@@ -1949,6 +1961,27 @@ class MailService:
     def _is_missing_folder_error(self, exc: GLib.Error) -> bool:
         return exc.matches(Camel.store_error_quark(), Camel.StoreError.NO_FOLDER)
 
+    def _is_missing_message_error(self, exc: GLib.Error) -> bool:
+        return exc.matches(
+            Camel.folder_error_quark(), Camel.FolderError.INVALID_UID
+        )
+
+    def _get_message_mime_sync(
+        self,
+        folder: Camel.Folder,
+        folder_name: str,
+        message_uid: str,
+    ) -> Any:
+        try:
+            mime = folder.get_message_sync(message_uid, None)
+        except GLib.Error as exc:
+            if self._is_missing_message_error(exc):
+                raise MessageNotAvailableError(message_uid, folder_name) from exc
+            raise
+        if mime is None:
+            raise MessageNotAvailableError(message_uid, folder_name)
+        return mime
+
     def _open_folder_unlocked(
         self, account_uid: str, folder_name: str
     ) -> Camel.Folder | None:
@@ -2176,9 +2209,7 @@ class MailService:
             info.get_flags() & Camel.MessageFlags.SEEN
         )
 
-        mime = folder.get_message_sync(message_uid, None)
-        if mime is None:
-            raise ValueError(f"Message not found: {message_uid}")
+        mime = self._get_message_mime_sync(folder, folder_name, message_uid)
 
         result = message_info_to_dict(info) if info else {"uid": message_uid}
         enrich_message_dict_from_mime(result, mime)
@@ -2218,9 +2249,7 @@ class MailService:
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
 
-        mime = folder.get_message_sync(message_uid, None)
-        if mime is None:
-            raise ValueError(f"Message not found: {message_uid}")
+        mime = self._get_message_mime_sync(folder, folder_name, message_uid)
 
         return get_attachment_data(mime, attachment_index)
 
