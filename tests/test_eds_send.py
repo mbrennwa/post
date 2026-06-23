@@ -90,6 +90,14 @@ class OutboundSendTrackingTests(unittest.TestCase):
         self.assertTrue(done.is_set())
         self.assertFalse(service.outbound_sends_pending())
 
+    def test_wait_for_outbound_sends_times_out_and_resets_counter(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._begin_outbound_send()
+        completed = service.wait_for_outbound_sends(timeout=0.05)
+        self.assertFalse(completed)
+        service._reset_outbound_send_counter_after_timeout()
+        self.assertFalse(service.outbound_sends_pending())
+
     @mock.patch("post.mail.eds.GLib.idle_add", side_effect=lambda fn, *a: fn(*a) or 0)
     def test_when_outbound_sends_complete_runs_callback_after_send(
         self, _idle_add

@@ -28,7 +28,10 @@ from post.mail.eds import MailAccount
 from post.mail.sync_watcher import MailSyncWatcher
 from post.message_list_view import VirtualMessageList
 from post.mail.folders import POST_OUTBOX_FOLDER, is_post_outbox_folder
-from post.mail.folder_index_cache import has_cache as folder_index_has_cache
+from post.mail.folder_index_cache import (
+    has_cache as folder_index_has_cache,
+    load as load_folder_index_cache,
+)
 from post.mail.message_list_state import message_list_fingerprint
 from post.mail.search import MessageSearchQuery, parse_search_query
 from post.mail.send_queue import (
@@ -427,7 +430,11 @@ class MainWindow(Adw.ApplicationWindow):
         monitor = Gio.NetworkMonitor.get_default()
         monitor.connect("notify::network-available", self._on_network_available_changed)
         self._refresh_status_display()
-        GLib.idle_add(self._flush_send_queue_idle)
+        GLib.timeout_add_seconds(2, self._flush_send_queue_on_startup)
+
+    def _flush_send_queue_on_startup(self) -> bool:
+        self._flush_send_queue_idle()
+        return False
 
     def _on_network_available_changed(self, monitor: Gio.NetworkMonitor, *_args) -> None:
         online = monitor.get_network_available()
@@ -545,7 +552,12 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _continue_close_after_outbound_send(self) -> None:
         self._close_after_outbound_send = False
-        self.close()
+        GLib.idle_add(self._destroy_after_close_cleanup)
+
+    def _destroy_after_close_cleanup(self) -> bool:
+        self._finish_close()
+        self.destroy()
+        return False
 
     def _finish_close(self) -> bool:
         self._sync_watcher.stop()
@@ -1823,11 +1835,36 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_popover.popdown()
         self._message_list_view.clear()
         self._clear_reader()
-        self._message_loading_label.set_label(loading_label)
-        self._message_loading_spinner.start()
-        self._message_stack.set_visible_child_name("loading")
+
+        cache_snapshot: tuple[list[dict], int, int] | None = None
+        if not viewing_outbox and search_query is None:
+            cache_snapshot = load_folder_index_cache(account_uid, folder_name)
+
+        send_pending = self._mail.outbound_sends_pending()
+        defer_mail_io = send_pending and cache_snapshot is None
+        sync_after_send = use_background_sync and send_pending
+
+        if cache_snapshot is not None:
+            cached_messages, cached_unread, cached_total = cache_snapshot
+            self._on_messages_loaded(
+                load_id,
+                account_uid,
+                folder_name,
+                list(cached_messages),
+                cached_unread,
+                cached_total,
+                "disk_cache",
+                sync_after_send,
+                None,
+            )
+        else:
+            self._message_loading_label.set_label(loading_label)
+            self._message_loading_spinner.start()
+            self._message_stack.set_visible_child_name("loading")
 
         def worker_initial() -> None:
+            if cache_snapshot is not None and not (should_sync and not use_background_sync):
+                return
             error: Exception | None = None
             messages: list[dict] | None = None
             unread = -1
@@ -1860,18 +1897,44 @@ class MainWindow(Adw.ApplicationWindow):
                 unread,
                 total,
                 source,
-                use_background_sync,
+                use_background_sync and not send_pending,
                 error,
             )
 
-        threading.Thread(target=worker_initial, daemon=True).start()
-        if use_background_sync:
+        def start_initial_worker() -> None:
+            threading.Thread(target=worker_initial, daemon=True).start()
+
+        if defer_mail_io:
+
+            def start_after_send() -> None:
+                if load_id != self._messages_load_generation:
+                    return
+                start_initial_worker()
+
+            self._mail.when_outbound_sends_complete(start_after_send)
+        else:
+            start_initial_worker()
+
+        if use_background_sync and not send_pending:
             self._start_background_message_sync(
                 load_id,
                 account_uid,
                 folder_name,
                 fetch_messages,
             )
+        elif sync_after_send:
+
+            def sync_after_send() -> None:
+                if load_id != self._messages_load_generation:
+                    return
+                self._start_background_message_sync(
+                    load_id,
+                    account_uid,
+                    folder_name,
+                    fetch_messages,
+                )
+
+            self._mail.when_outbound_sends_complete(sync_after_send)
 
     def _on_messages_sync_finished(self, load_id: int, changed: bool) -> bool:
         if load_id != self._messages_load_generation:

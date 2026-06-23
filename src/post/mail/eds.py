@@ -268,9 +268,21 @@ class MailService:
 
     def _end_outbound_send(self) -> None:
         with self._outbound_sends_cond:
-            self._outbound_sends_in_progress -= 1
+            if self._outbound_sends_in_progress > 0:
+                self._outbound_sends_in_progress -= 1
             if self._outbound_sends_in_progress == 0:
                 self._outbound_sends_cond.notify_all()
+
+    def _reset_outbound_send_counter_after_timeout(self) -> None:
+        with self._outbound_sends_cond:
+            if self._outbound_sends_in_progress <= 0:
+                return
+            log.warning(
+                "Resetting stuck outbound send counter (%d) after wait timeout",
+                self._outbound_sends_in_progress,
+            )
+            self._outbound_sends_in_progress = 0
+            self._outbound_sends_cond.notify_all()
 
     def claim_outbound_delivery(self, queue_id: str) -> None:
         """Reserve an outbox item for an active compose delivery worker."""
@@ -291,7 +303,7 @@ class MailService:
     def end_outbound_send(self) -> None:
         self._end_outbound_send()
 
-    def wait_for_outbound_sends(self, timeout: float = 120.0) -> None:
+    def wait_for_outbound_sends(self, timeout: float = 120.0) -> bool:
         deadline = time.monotonic() + timeout
         with self._outbound_sends_cond:
             while self._outbound_sends_in_progress > 0:
@@ -301,8 +313,9 @@ class MailService:
                         "Timed out waiting for %d outbound send(s)",
                         self._outbound_sends_in_progress,
                     )
-                    return
+                    return False
                 self._outbound_sends_cond.wait(timeout=remaining)
+        return True
 
     def when_outbound_sends_complete(
         self,
@@ -316,7 +329,9 @@ class MailService:
         """
 
         def worker() -> None:
-            self.wait_for_outbound_sends(timeout=timeout)
+            completed = self.wait_for_outbound_sends(timeout=timeout)
+            if not completed:
+                self._reset_outbound_send_counter_after_timeout()
             GLib.idle_add(_run_on_gtk_thread, callback)
 
         threading.Thread(target=worker, daemon=True, name="post-send-wait").start()
@@ -1719,12 +1734,12 @@ class MailService:
                 sync=sync,
             )
 
-    def get_folder_messages(
+    def _get_folder_messages_unlocked(
         self,
         account_uid: str,
         folder_name: str,
         *,
-        sync: bool = True,
+        sync: bool,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
         with self._lock:
             index, source = self._get_folder_index_unlocked(
@@ -1732,13 +1747,45 @@ class MailService:
             )
             return list(index.messages), index.unread, index.total, source
 
-    def search_folder_messages(
+    def get_folder_messages(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        sync: bool = True,
+    ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        if not sync:
+            cached = folder_index_cache.load(account_uid, folder_name)
+            if cached is not None:
+                messages, unread, total = cached
+                key = (account_uid, folder_name)
+                with self._lock:
+                    if key not in self._folder_indexes:
+                        self._folder_indexes[key] = _FolderMessageIndex(
+                            messages=messages,
+                            unread=unread,
+                            total=total,
+                        )
+                return list(messages), unread, total, "disk_cache"
+
+        if is_mail_io_thread():
+            return self._get_folder_messages_unlocked(
+                account_uid, folder_name, sync=sync
+            )
+        return get_mail_io_thread().run_sync(
+            self._get_folder_messages_unlocked,
+            account_uid,
+            folder_name,
+            sync=sync,
+        )
+
+    def _search_folder_messages_unlocked(
         self,
         account_uid: str,
         folder_name: str,
         query: MessageSearchQuery,
         *,
-        sync: bool = True,
+        sync: bool,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
         with self._lock:
             index, source = self._get_folder_index_unlocked(
@@ -1749,6 +1796,36 @@ class MailService:
             ]
             match_count = len(filtered)
             return filtered, match_count, match_count, source
+
+    def search_folder_messages(
+        self,
+        account_uid: str,
+        folder_name: str,
+        query: MessageSearchQuery,
+        *,
+        sync: bool = True,
+    ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        if not sync:
+            cached = folder_index_cache.load(account_uid, folder_name)
+            if cached is not None:
+                messages, _unread, _total = cached
+                filtered = [
+                    msg for msg in messages if message_matches(msg, query)
+                ]
+                match_count = len(filtered)
+                return filtered, match_count, match_count, "disk_cache"
+
+        if is_mail_io_thread():
+            return self._search_folder_messages_unlocked(
+                account_uid, folder_name, query, sync=sync
+            )
+        return get_mail_io_thread().run_sync(
+            self._search_folder_messages_unlocked,
+            account_uid,
+            folder_name,
+            query,
+            sync=sync,
+        )
 
     def list_messages_with_stats(
         self,
