@@ -8,8 +8,14 @@
 from __future__ import annotations
 
 import ctypes
+import html
+import re
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from typing import Any
+
+_FORWARD_MARKER = "---------- Forwarded message ---------"
+_BLOCKQUOTE_RE = re.compile(r"<blockquote\b", re.IGNORECASE)
 
 
 class _CamelFolderInfoC(ctypes.Structure):
@@ -323,6 +329,77 @@ def paginate_messages(
     page = messages[offset : offset + limit]
     has_more = offset + len(page) < len(messages)
     return page, has_more
+
+
+def plain_body_looks_truncated(plain: str, html: str | None) -> bool:
+    """True when text/plain likely omits quoted history present in HTML."""
+    if not html:
+        return False
+    plain = plain.strip()
+    if not plain:
+        return True
+    if _FORWARD_MARKER in plain or " wrote:" in plain or re.search(r"^>", plain, re.MULTILINE):
+        return False
+    return _BLOCKQUOTE_RE.search(html) is not None
+
+
+class _QuotableHtmlParser(HTMLParser):
+    """Convert HTML message bodies into plain text with blockquote depth markers."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._blockquote_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag == "blockquote":
+            if self._parts and not self._parts[-1].endswith("\n"):
+                self._parts.append("\n")
+            self._blockquote_depth += 1
+        elif tag == "br":
+            self._parts.append("\n")
+        elif tag in ("p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6"):
+            if self._parts and not self._parts[-1].endswith("\n"):
+                self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "blockquote":
+            self._blockquote_depth = max(0, self._blockquote_depth - 1)
+            self._parts.append("\n")
+        elif tag in ("p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6"):
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not data:
+            return
+        if self._blockquote_depth <= 0:
+            self._parts.append(data)
+            return
+        prefix = ">" * self._blockquote_depth + " "
+        lines = data.splitlines()
+        if len(lines) == 1:
+            self._parts.append(f"{prefix}{lines[0]}")
+            return
+        prefixed = [f"{prefix}{line}" if line else ">" * self._blockquote_depth for line in lines]
+        self._parts.append("\n".join(prefixed))
+
+
+def html_to_quotable_plain(body_html: str) -> str:
+    """Best-effort HTML → plain text, preserving nested blockquotes as ``>`` lines."""
+    parser = _QuotableHtmlParser()
+    try:
+        parser.feed(body_html)
+        parser.close()
+    except Exception:
+        text = re.sub(r"<br\s*/?>", "\n", body_html, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", "", text)
+        return html.unescape(text).strip()
+    text = "".join(parser._parts)
+    text = html.unescape(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:

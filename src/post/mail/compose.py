@@ -268,13 +268,45 @@ def extract_reply_address(from_header: str) -> str:
     return address
 
 
+_QUOTE_LINE_RE = re.compile(r"^(>+)( ?)(.*)$")
+
+
+def _prefix_reply_quote_line(line: str) -> str:
+    """Increase quote depth by one per RFC 3676 (``>`` → ``>>``, not ``> >``)."""
+    if not line:
+        return ">"
+    match = _QUOTE_LINE_RE.match(line)
+    if match:
+        markers, space, rest = match.groups()
+        if not rest:
+            return f"{markers}>"
+        sep = space if space else " "
+        return f"{markers}>{sep}{rest}"
+    return f"> {line}"
+
+
+def body_text_for_quoting(message: dict[str, Any]) -> str | None:
+    """Return the best plain-text body to quote when replying or forwarding."""
+    from .helpers import html_to_quotable_plain, plain_body_looks_truncated
+
+    plain = (message.get("body_plain") or "").strip() or None
+    html = (message.get("body_html") or "").strip() or None
+    if plain and not plain_body_looks_truncated(plain, html):
+        return plain
+    if html:
+        converted = html_to_quotable_plain(html).strip()
+        if converted:
+            return converted
+    return plain
+
+
 def quote_plain_reply(original: dict[str, Any], body_plain: str | None) -> str:
     date = original.get("date_received") or original.get("date_sent") or ""
     sender = original.get("from") or ""
     text = (body_plain or "").strip()
     if not text:
         text = "(no message body)"
-    quoted = "\n".join(f"> {line}" if line else ">" for line in text.splitlines())
+    quoted = "\n".join(_prefix_reply_quote_line(line) for line in text.splitlines())
     return f"\n\nOn {date}, {sender} wrote:\n{quoted}\n"
 
 
