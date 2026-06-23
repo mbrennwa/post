@@ -2773,7 +2773,9 @@ class MainWindow(Adw.ApplicationWindow):
             flags = dict(updates_by_uid[uid])
             self._message_list_view.update_message_flags(uid, flags)
             if uid == self._current_message_uid and self._current_message is not None:
-                self._current_message["flags"] = dict(flags)
+                current_flags = dict(self._current_message.get("flags") or {})
+                current_flags.update(flags)
+                self._current_message["flags"] = current_flags
 
         if self._current_message_uid in updates_by_uid:
             self._update_reader_toggle_buttons()
