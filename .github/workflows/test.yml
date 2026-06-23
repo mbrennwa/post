@@ -23,9 +23,10 @@ jobs:
             gir1.2-camel-1.2 \
             gir1.2-edataserver-1.2 \
             gir1.2-glib-2.0 \
-            gir1.2-gtk-4.0
+            gir1.2-gtk-4.0 \
+            xvfb
 
       - name: Run checks
         run: |
           python3 -m venv .venv --system-site-packages
-          ./scripts/check.sh
+          xvfb-run -a ./scripts/check.sh
