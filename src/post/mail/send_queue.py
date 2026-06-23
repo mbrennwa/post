@@ -13,11 +13,10 @@ import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from .compose import ComposeAttachment
-from .helpers import paginate_messages
+from .helpers import format_message_datetime, paginate_messages
 
 import gi
 
@@ -380,8 +379,7 @@ def read_queued_message(
     message = QueuedOutboundMessage.from_dict(data)
     if message.account_uid != account_uid:
         raise ValueError("Queued message belongs to another account")
-    queued_at = datetime.fromtimestamp(message.queued_at, tz=timezone.utc)
-    date_str = queued_at.strftime("%Y-%m-%d %H:%M")
+    date_str = (format_message_datetime(message.queued_at) or "")[:16]
     return {
         "uid": queue_id,
         "subject": message.subject or "(No subject)",

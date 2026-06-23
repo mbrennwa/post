@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import os
+import time
 import unittest
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 from post.mail.helpers import (
@@ -25,6 +28,21 @@ from post.mail.helpers import (
     read_menu_label,
     sort_messages_newest_first,
 )
+
+
+@contextmanager
+def fixed_timezone(tz_name: str):
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = tz_name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
 
 
 class SortMessagesNewestFirstTests(unittest.TestCase):
@@ -125,10 +143,23 @@ class FormatMessageHeaderTests(unittest.TestCase):
 
 class FormatMessageDatetimeTests(unittest.TestCase):
     def test_space_separated(self) -> None:
-        # 2026-06-19 12:00:00 UTC
         value = format_message_datetime(1750324800)
         self.assertRegex(value, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
         self.assertNotIn("T", value or "")
+
+    def test_formats_in_local_timezone_summer(self) -> None:
+        with fixed_timezone("Europe/Zurich"):
+            self.assertEqual(
+                format_message_datetime(1750324800),
+                "2025-06-19 11:20:00",
+            )
+
+    def test_formats_in_local_timezone_winter(self) -> None:
+        with fixed_timezone("Europe/Zurich"):
+            self.assertEqual(
+                format_message_datetime(1704067200),
+                "2024-01-01 01:00:00",
+            )
 
     def test_invalid_timestamp_returns_none(self) -> None:
         self.assertIsNone(format_message_datetime(0))
@@ -199,6 +230,13 @@ class FormatMessageListDateTests(unittest.TestCase):
     def test_falls_back_to_sort_date(self) -> None:
         value = format_message_list_date({"sort_date": 1750324800})
         self.assertRegex(value, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+
+    def test_falls_back_to_sort_date_in_local_timezone(self) -> None:
+        with fixed_timezone("Europe/Zurich"):
+            self.assertEqual(
+                format_message_list_date({"sort_date": 1750324800}),
+                "2025-06-19 11:20",
+            )
 
 
 class FormatAttachmentSizeTests(unittest.TestCase):
