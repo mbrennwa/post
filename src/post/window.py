@@ -24,7 +24,7 @@ from post.compose_window import ComposeWindow
 from post.credentials import prompt_password_sync
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
-from post.mail.eds import MailAccount
+from post.mail.eds import MailAccount, MessageNotAvailableError
 from post.mail.sync_watcher import MailSyncWatcher
 from post.message_list_view import VirtualMessageList
 from post.mail.folders import POST_OUTBOX_FOLDER, is_post_outbox_folder
@@ -1038,6 +1038,13 @@ class MainWindow(Adw.ApplicationWindow):
             msg: dict | None = None
             try:
                 msg = self._mail.read_message(account_uid, folder_name, message_uid)
+            except MessageNotAvailableError as exc:
+                log.warning(
+                    "Message %s no longer available in %r",
+                    message_uid,
+                    folder_name,
+                )
+                error = exc
             except Exception as exc:
                 log.exception("Failed to load message for compose")
                 error = exc
@@ -1055,6 +1062,10 @@ class MainWindow(Adw.ApplicationWindow):
         mode: str,
     ) -> bool:
         if error is not None:
+            if isinstance(error, MessageNotAvailableError):
+                self._remove_vanished_message(error.message_uid)
+                show_error_toast(self, error.user_message())
+                return False
             action = "forward" if mode == "forward" else "reply"
             show_error_toast(self, f"Could not prepare {action}: {error}")
             return False
@@ -1313,6 +1324,54 @@ class MainWindow(Adw.ApplicationWindow):
                 set_active_message_uid(None)
         self._search_query = self._parse_search_from_entry()
         self._load_messages(account.uid, folder_name)
+
+    def _show_message_unavailable_reader(self, message: str) -> None:
+        self._reader_subject.set_label("Message unavailable")
+        self._reader_subject.set_visible(True)
+        self._reader_meta.set_label(message)
+        self._clear_attachments()
+        self._current_message = None
+        self._message_actions.set_visible(False)
+        self._set_message_actions_sensitive(False)
+        self._current_body = {"plain": None, "html": None}
+        self._reader_body_stack.set_visible_child_name("content")
+        error_color = "#aaaaaa" if self._app_prefers_dark() else "#666666"
+        self._web_view.load_html(
+            "<body style='font-family:sans-serif;"
+            f"color:{error_color};padding:1em'>"
+            f"{message}</body>",
+            None,
+        )
+
+    def _remove_vanished_message(self, uid: str) -> None:
+        if not self._current_account or not self._current_folder:
+            return
+
+        folder_name = self._current_folder
+        removed = self._message_list_view.remove_uids([uid])
+        if uid == self._current_message_uid:
+            self._current_message_uid = None
+            set_active_message_uid(None)
+            self._restore_message_folder = None
+
+        if self._current_folder_messages:
+            self._current_folder_messages = [
+                message
+                for message in self._current_folder_messages
+                if message.get("uid") != uid
+            ]
+
+        if removed and self._message_total >= 0:
+            self._message_total = max(0, self._message_total - 1)
+
+        if self._message_list_view.item_count() == 0 and folder_name:
+            self._message_empty_label.set_label(f"No Messages in {folder_name}")
+            self._message_stack.set_visible_child_name("empty")
+
+        self._mail.invalidate_folder_index(
+            self._current_account.uid, folder_name
+        )
+        self._update_message_status(self._current_account, folder_name)
 
     def _clear_reader(self) -> None:
         self._reader_subject.set_label("")
@@ -2836,6 +2895,13 @@ class MainWindow(Adw.ApplicationWindow):
                         uid,
                         mark_seen=mark_seen and not viewing_drafts,
                     )
+            except MessageNotAvailableError as exc:
+                log.warning(
+                    "Message %s no longer available in %r",
+                    uid,
+                    folder_name,
+                )
+                error = exc
             except Exception as exc:
                 log.exception("Failed to read message")
                 error = exc
@@ -2889,6 +2955,12 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> bool:
         if read_id != self._message_read_generation:
+            return False
+
+        if isinstance(error, MessageNotAvailableError):
+            self._remove_vanished_message(uid)
+            self._show_message_unavailable_reader(error.user_message())
+            show_error_toast(self, error.user_message())
             return False
 
         if error is not None:
