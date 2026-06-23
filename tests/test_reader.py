@@ -130,14 +130,24 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("background: #1e1e1e", doc)
         self.assertNotIn("message-body", doc)
 
-    def test_adapt_text_wraps_html_by_default(self) -> None:
+    def test_adapt_text_wraps_html_with_text_color_only(self) -> None:
+        doc = build_reader_document(
+            body_html='<p style="color:#000000">Hello</p>',
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("color: inherit !important", doc)
+
+    def test_adapt_text_does_not_wrap_plain_html(self) -> None:
         doc = build_reader_document(
             body_html="<p>Hello</p>",
             body_plain=None,
             allow_remote=False,
         )
-        self.assertIn('<div class="message-body">', doc)
-        self.assertIn("color: inherit !important", doc)
+        self.assertNotIn("message-body", doc)
+        self.assertNotIn("color: inherit !important", doc)
 
     def test_adapt_text_dark_shell_overrides_dark_inline_text(self) -> None:
         doc = build_reader_document(
@@ -188,6 +198,144 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn('name="color-scheme" content="dark"', doc)
         self.assertIn("background: #1e1e1e", doc)
         self.assertNotIn("message-body", doc)
+
+    def test_adapt_text_preserves_sender_colors_when_both_set(self) -> None:
+        doc = build_reader_document(
+            body_html='<div style="color:#000000;background:#ffffff"><p>Hello</p></div>',
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('style="color:#000000;background:#ffffff"', doc)
+        self.assertIn('name="color-scheme" content="dark"', doc)
+        self.assertIn("background: #1e1e1e", doc)
+        self.assertNotIn("message-body", doc)
+        self.assertNotIn("color: inherit !important", doc)
+
+    def test_adapt_background_preserves_sender_colors_when_both_set(self) -> None:
+        doc = build_reader_document(
+            body_html='<div style="color:#000000;background:#fffffe"><p>Hello</p></div>',
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_BACKGROUND,
+        )
+        self.assertIn('style="color:#000000;background:#fffffe"', doc)
+        self.assertIn('name="color-scheme" content="dark"', doc)
+        self.assertIn("background: #1e1e1e", doc)
+        self.assertNotIn("message-body", doc)
+
+    def test_adapt_skipped_for_bgcolor_and_font_color(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<table bgcolor="#ffffff"><tr><td>'
+                '<font color="#000000">Hello</font>'
+                "</td></tr></table>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertNotIn("message-body", doc)
+        self.assertNotIn("color: inherit !important", doc)
+
+    def test_adapt_skipped_for_colors_in_style_block(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                "<style>body { color: #111111; background-color: #fafafa; }</style>"
+                "<p>Hello</p>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_BACKGROUND,
+        )
+        self.assertIn('name="color-scheme" content="dark"', doc)
+        self.assertNotIn('name="color-scheme" content="light"', doc)
+
+    def test_adapt_text_skipped_for_background_only(self) -> None:
+        doc = build_reader_document(
+            body_html='<div style="background-color:#ffffff"><p>Hello</p></div>',
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertNotIn("message-body", doc)
+        self.assertNotIn("color: inherit !important", doc)
+
+    def test_adapt_text_skipped_for_body_text_and_bgcolor_attrs(self) -> None:
+        doc = build_reader_document(
+            body_html='<body bgcolor="#ffffff" text="#000000"><p>Hello</p></body>',
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertNotIn("message-body", doc)
+        self.assertNotIn("color: inherit !important", doc)
+
+    def test_adapt_text_applies_for_transparent_background(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<div style="color:rgb(0,0,0);background-color:transparent">'
+                "<p>Hi Matthias</p></div>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("color: inherit !important", doc)
+
+    def test_adapt_text_applies_for_style_block_transparent_background(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                "<style>body { color: #000000; background-color: transparent; }</style>"
+                "<p>Hello</p>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("color: inherit !important", doc)
+
+    def test_adapt_text_applies_when_only_quoted_history_has_background(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<div style="font-size: 12pt; color: rgb(0, 0, 0);">Hi Matthias,</div>'
+                '<div id="mail-editor-reference-message-container">'
+                '<span style="color: rgb(0, 0, 0); background-color: rgb(255, 255, 255);">'
+                "quoted text</span></div>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("color: inherit !important", doc)
+
+    def test_adapt_text_skipped_when_new_content_has_background(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<div style="color:#000000;background-color:#ffffff">New reply</div>'
+                '<div id="geary-quote"><blockquote>'
+                '<div style="color:#000000">quoted</div>'
+                "</blockquote></div>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertNotIn("message-body", doc)
+        self.assertNotIn("color: inherit !important", doc)
 
     def test_cid_images_are_embedded_as_data_urls(self) -> None:
         png = b"\x89PNG\r\n\x1a\n"

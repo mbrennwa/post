@@ -9,7 +9,11 @@ import base64
 import html
 import re
 
-from post.preferences import MessageAppearance, MESSAGE_APPEARANCE_ADAPT_TEXT
+from post.preferences import (
+    MESSAGE_APPEARANCE_ACCEPT_SENDER,
+    MESSAGE_APPEARANCE_ADAPT_TEXT,
+    MessageAppearance,
+)
 
 # Block http(s) images and trackers when remote content is disabled.
 _EXTERNAL_IMG = re.compile(
@@ -191,10 +195,179 @@ blockquote {
 """
 
 _ADAPT_TEXT_CSS = """
-.message-body :where(p, div, span, li, td, th, font, h1, h2, h3, h4, h5, h6) {
+.message-body :where(
+  p, div, span, li, td, th, font, blockquote, pre, a,
+  h1, h2, h3, h4, h5, h6
+) {
   color: inherit !important;
 }
 """
+
+_STYLE_BLOCK = re.compile(r"<style\b[^>]*>(.*?)</style>", re.IGNORECASE | re.DOTALL)
+_INLINE_STYLE = re.compile(
+    r"""style\s*=\s*(["'])(.*?)\1""",
+    re.IGNORECASE | re.DOTALL,
+)
+_DECL_TEXT_COLOR = re.compile(r"(?:^|[;{\s])color\s*:", re.IGNORECASE | re.MULTILINE)
+_DECL_BG_COLOR_VALUE = re.compile(
+    r"\bbackground-color\s*:\s*([^;}{]+)",
+    re.IGNORECASE,
+)
+_DECL_BACKGROUND_VALUE = re.compile(
+    r"(?:^|[;{\s])background\s*:\s*([^;}{]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_BGCOLOR_VALUE = re.compile(
+    r"""\bbgcolor\s*=\s*(["']?)([^"'\s>]+)\1""",
+    re.IGNORECASE,
+)
+_TRANSPARENT_COLOR_VALUES = frozenset(
+    {
+        "transparent",
+        "none",
+        "inherit",
+        "initial",
+        "unset",
+        "revert",
+        "revert-layer",
+    }
+)
+_RGBA_COLOR = re.compile(
+    r"rgba?\(\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*(?:,\s*([\d.]+)\s*)?\)",
+    re.IGNORECASE,
+)
+_HSLA_COLOR = re.compile(
+    r"hsla?\(\s*[\d.]+\s*,\s*[\d.]+%\s*,\s*[\d.]+%\s*(?:,\s*([\d.]+)\s*)?\)",
+    re.IGNORECASE,
+)
+_TEXT_ATTR = re.compile(r"""\btext\s*=\s*["']?[^"'\s>]+""", re.IGNORECASE)
+_FONT_COLOR_ATTR = re.compile(r"<font\b[^>]*\bcolor\s*=", re.IGNORECASE)
+_QUOTE_HISTORY_MARKERS = (
+    'id="mail-editor-reference-message-container"',
+    "id='mail-editor-reference-message-container'",
+    'id="geary-quote"',
+    "id='geary-quote'",
+    'class="gmail_quote"',
+    "class='gmail_quote'",
+    'id="appendonsend"',
+    "<blockquote",
+)
+
+
+def _html_for_adaptation_detection(body_html: str) -> str:
+    """Return the portion of HTML whose colors drive the adapt decision."""
+    lower = body_html.lower()
+    cut = len(body_html)
+    for marker in _QUOTE_HISTORY_MARKERS:
+        idx = lower.find(marker.lower())
+        if idx != -1:
+            cut = min(cut, idx)
+    return body_html[:cut]
+
+
+def _iter_style_sources(body_html: str):
+    for match in _STYLE_BLOCK.finditer(body_html):
+        yield match.group(1)
+    for match in _INLINE_STYLE.finditer(body_html):
+        yield match.group(2)
+
+
+def _normalize_css_declaration_value(value: str) -> str:
+    candidate = value.strip()
+    for delimiter in ('"', "'", ">"):
+        idx = candidate.find(delimiter)
+        if idx != -1:
+            candidate = candidate[:idx]
+    return candidate.strip()
+
+
+def _css_color_value_is_meaningful(value: str) -> bool:
+    """Return True when a CSS color value paints a visible background."""
+    candidate = _normalize_css_declaration_value(value).lower()
+    if not candidate:
+        return False
+    first_token = candidate.split()[0].rstrip(",")
+    if first_token in _TRANSPARENT_COLOR_VALUES:
+        return False
+    if first_token.startswith("url("):
+        return False
+    rgba_match = _RGBA_COLOR.search(candidate)
+    if rgba_match is not None:
+        alpha = rgba_match.group(1)
+        if alpha is not None:
+            try:
+                return float(alpha) > 0
+            except ValueError:
+                return True
+        return True
+    hsla_match = _HSLA_COLOR.search(candidate)
+    if hsla_match is not None:
+        alpha = hsla_match.group(1)
+        if alpha is not None:
+            try:
+                return float(alpha) > 0
+            except ValueError:
+                return True
+        return True
+    return True
+
+
+def _style_source_has_meaningful_background(source: str) -> bool:
+    for match in _DECL_BG_COLOR_VALUE.finditer(source):
+        if _css_color_value_is_meaningful(match.group(1)):
+            return True
+    for match in _DECL_BACKGROUND_VALUE.finditer(source):
+        if _css_color_value_is_meaningful(match.group(1)):
+            return True
+    return False
+
+
+def html_has_explicit_text_color(body_html: str) -> bool:
+    """Return True when HTML sets an explicit foreground/text color."""
+    if _FONT_COLOR_ATTR.search(body_html) or _TEXT_ATTR.search(body_html):
+        return True
+    return any(_DECL_TEXT_COLOR.search(source) for source in _iter_style_sources(body_html))
+
+
+def html_has_explicit_background_color(body_html: str) -> bool:
+    """Return True when HTML sets a visible/opaque background color."""
+    for match in _BGCOLOR_VALUE.finditer(body_html):
+        if _css_color_value_is_meaningful(match.group(2)):
+            return True
+    return any(
+        _style_source_has_meaningful_background(source)
+        for source in _iter_style_sources(body_html)
+    )
+
+
+def html_sender_defines_complete_colors(body_html: str) -> bool:
+    """Return True when the sender set both text and background colors."""
+    return (
+        html_has_explicit_text_color(body_html)
+        and html_has_explicit_background_color(body_html)
+    )
+
+
+def html_should_apply_adaptation(body_html: str) -> bool:
+    """Return True when adapt modes should adjust reader colors for this HTML."""
+    content = _html_for_adaptation_detection(body_html)
+    return (
+        html_has_explicit_text_color(content)
+        and not html_has_explicit_background_color(content)
+    )
+
+
+def _effective_message_appearance(
+    body_html: str | None,
+    appearance: MessageAppearance,
+) -> MessageAppearance:
+    if (
+        appearance != MESSAGE_APPEARANCE_ACCEPT_SENDER
+        and body_html is not None
+        and not html_should_apply_adaptation(body_html)
+    ):
+        return MESSAGE_APPEARANCE_ACCEPT_SENDER
+    return appearance
 
 
 def _effective_reader_dark(app_dark: bool, appearance: MessageAppearance) -> bool:
@@ -215,6 +388,7 @@ def build_reader_document(
     """Wrap message content in a safe HTML shell for WebKit."""
     blocked_notice = ""
     html_body = body_html is not None
+    effective_appearance = _effective_message_appearance(body_html, message_appearance)
     if body_html:
         content = body_html
         if inline_images:
@@ -229,7 +403,7 @@ def build_reader_document(
                     "Remote images are hidden. Enable “Load remote content” in Settings to show them."
                     "</p>"
                 )
-        if message_appearance == "adapt_text":
+        if effective_appearance == "adapt_text":
             content = f'<div class="message-body">{content}</div>'
     elif body_plain:
         content = f'<pre class="plain-body">{html.escape(body_plain)}</pre>'
@@ -250,10 +424,10 @@ def build_reader_document(
             "font-src data:;"
         )
 
-    reader_dark = _effective_reader_dark(dark, message_appearance)
+    reader_dark = _effective_reader_dark(dark, effective_appearance)
     color_scheme = "dark" if reader_dark else "light"
     reader_css = _READER_CSS_DARK if reader_dark else _READER_CSS_LIGHT
-    if message_appearance == "adapt_text" and html_body:
+    if effective_appearance == "adapt_text" and html_body:
         reader_css = f"{reader_css}\n{_ADAPT_TEXT_CSS}"
 
     return f"""<!DOCTYPE html>
