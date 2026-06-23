@@ -12,7 +12,9 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Sequence, Callable
+from typing import Any, Literal, Sequence, Callable
+
+FolderIndexSource = Literal["memory", "disk_cache", "local", "server"]
 
 import gi
 
@@ -22,6 +24,7 @@ gi.require_version("Gio", "2.0")
 
 from gi.repository import Camel, EDataServer, GLib, Gio
 
+from . import folder_index_cache
 from .helpers import (
     message_info_to_dict,
     message_is_read_unflagged,
@@ -1666,6 +1669,7 @@ class MailService:
         for old_name in old_folder_names:
             self._folder_indexes.pop((account_uid, old_name), None)
         self._correspondent_indexes.pop(account_uid, None)
+        folder_index_cache.invalidate_account(account_uid)
 
     def _get_folder_stats_unlocked(
         self, account_uid: str, folder_name: str
@@ -1715,6 +1719,37 @@ class MailService:
                 sync=sync,
             )
 
+    def get_folder_messages(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        sync: bool = True,
+    ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        with self._lock:
+            index, source = self._get_folder_index_unlocked(
+                account_uid, folder_name, sync=sync
+            )
+            return list(index.messages), index.unread, index.total, source
+
+    def search_folder_messages(
+        self,
+        account_uid: str,
+        folder_name: str,
+        query: MessageSearchQuery,
+        *,
+        sync: bool = True,
+    ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        with self._lock:
+            index, source = self._get_folder_index_unlocked(
+                account_uid, folder_name, sync=sync
+            )
+            filtered = [
+                msg for msg in index.messages if message_matches(msg, query)
+            ]
+            match_count = len(filtered)
+            return filtered, match_count, match_count, source
+
     def list_messages_with_stats(
         self,
         account_uid: str,
@@ -1759,10 +1794,9 @@ class MailService:
         key = (account_uid, folder_name)
         index = self._folder_indexes.get(key)
         if index is None or sync:
-            index = self._build_folder_index_unlocked(
+            index, _source = self._get_folder_index_unlocked(
                 account_uid, folder_name, sync=sync
             )
-            self._folder_indexes[key] = index
 
         filtered = [msg for msg in index.messages if message_matches(msg, query)]
         page, has_more = paginate_messages(filtered, offset, limit)
@@ -1778,30 +1812,62 @@ class MailService:
         limit: int,
         sync: bool,
     ) -> tuple[list[dict], int, int, bool]:
-        key = (account_uid, folder_name)
-        if offset == 0:
-            if sync:
-                index = self._build_folder_index_unlocked(
-                    account_uid, folder_name, sync=True
-                )
-                self._folder_indexes[key] = index
-            else:
-                index = self._folder_indexes.get(key)
-                if index is None:
-                    index = self._build_folder_index_unlocked(
-                        account_uid, folder_name, sync=False
-                    )
-                    self._folder_indexes[key] = index
-        else:
-            index = self._folder_indexes.get(key)
-            if index is None:
-                index = self._build_folder_index_unlocked(
-                    account_uid, folder_name, sync=sync
-                )
-                self._folder_indexes[key] = index
-
+        index, _source = self._get_folder_index_unlocked(
+            account_uid, folder_name, sync=sync
+        )
         page, has_more = paginate_messages(index.messages, offset, limit)
         return page, index.unread, index.total, has_more
+
+    def _get_folder_index_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        sync: bool,
+    ) -> tuple[_FolderMessageIndex, FolderIndexSource]:
+        key = (account_uid, folder_name)
+        if sync:
+            index = self._build_folder_index_unlocked(
+                account_uid, folder_name, sync=True
+            )
+            self._folder_indexes[key] = index
+            folder_index_cache.save(
+                account_uid,
+                folder_name,
+                index.messages,
+                index.unread,
+                index.total,
+            )
+            return index, "server"
+
+        index = self._folder_indexes.get(key)
+        if index is not None:
+            return index, "memory"
+
+        cached = folder_index_cache.load(account_uid, folder_name)
+        if cached is not None:
+            messages, unread, total = cached
+            index = _FolderMessageIndex(
+                messages=messages,
+                unread=unread,
+                total=total,
+            )
+            self._folder_indexes[key] = index
+            return index, "disk_cache"
+
+        index = self._build_folder_index_unlocked(
+            account_uid, folder_name, sync=False
+        )
+        self._folder_indexes[key] = index
+        if index.messages or index.total:
+            folder_index_cache.save(
+                account_uid,
+                folder_name,
+                index.messages,
+                index.unread,
+                index.total,
+            )
+        return index, "local"
 
     def _is_missing_folder_error(self, exc: GLib.Error) -> bool:
         return exc.matches(Camel.store_error_quark(), Camel.StoreError.NO_FOLDER)
@@ -2656,6 +2722,7 @@ class MailService:
         if folder_name:
             self._folder_indexes.pop((account_uid, folder_name), None)
             self._correspondent_indexes.pop(account_uid, None)
+            folder_index_cache.invalidate(account_uid, folder_name)
 
     @staticmethod
     def guess_inbox(folders: list[dict]) -> str | None:

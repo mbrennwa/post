@@ -395,6 +395,20 @@ def read_queued_message(
     }
 
 
+def list_queued_messages(
+    account_uid: str,
+    *,
+    from_label: str,
+) -> tuple[list[dict[str, Any]], int, int]:
+    items = list_queued_for_account(account_uid)
+    total = len(items)
+    messages = [
+        queued_to_list_dict(queue_id, message, from_label=from_label)
+        for queue_id, message in items
+    ]
+    return messages, 0, total
+
+
 def list_queued_messages_page(
     account_uid: str,
     *,
@@ -402,11 +416,9 @@ def list_queued_messages_page(
     offset: int = 0,
     limit: int = 50,
 ) -> tuple[list[dict[str, Any]], int, int, bool]:
-    items = list_queued_for_account(account_uid)
-    total = len(items)
-    messages = [
-        queued_to_list_dict(queue_id, message, from_label=from_label)
-        for queue_id, message in items
-    ]
+    messages, unread, total = list_queued_messages(
+        account_uid,
+        from_label=from_label,
+    )
     page, has_more = paginate_messages(messages, offset, limit)
-    return page, 0, total, has_more
+    return page, unread, total, has_more
