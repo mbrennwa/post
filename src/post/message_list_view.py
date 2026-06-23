@@ -19,8 +19,6 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, Gio, GObject, Gtk
 
 from post.mail.folders import is_post_outbox_folder
-from post.layout_debug import enabled as layout_debug_enabled
-from post.layout_debug import name_widget as name_layout_widget
 from post.wrap_label import WrappingLabel, configure_ellipsize_label
 from post.mail.helpers import (
     format_message_list_date,
@@ -272,14 +270,10 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         outer.set_margin_start(8)
         outer.set_margin_end(0)
-        if layout_debug_enabled():
-            name_layout_widget(outer, "list-row-outer")
 
         dot_column = Gtk.Box()
         dot_column.set_size_request(16, -1)
         dot_column.set_valign(Gtk.Align.CENTER)
-        if layout_debug_enabled():
-            name_layout_widget(dot_column, "list-row-dot-column")
         unread_dot = self._make_unread_dot(visible=False)
         dot_column.append(unread_dot)
         outer.append(dot_column)
@@ -289,8 +283,6 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         preview.set_margin_end(12)
         preview.set_margin_top(8)
         preview.set_margin_bottom(8)
-        if layout_debug_enabled():
-            name_layout_widget(preview, "list-row-preview")
 
         subject_label = WrappingLabel(xalign=0, wrap=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
         subject_label.set_hexpand(True)
@@ -303,8 +295,6 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         preview.append(date_label)
 
         bottom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        if layout_debug_enabled():
-            name_layout_widget(bottom_row, "list-row-bottom")
         meta = Gtk.Label(xalign=0, ellipsize=3)
         configure_ellipsize_label(meta)
         meta.add_css_class("dim-label")
