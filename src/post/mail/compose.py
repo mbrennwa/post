@@ -28,6 +28,46 @@ def bare_address_is_valid(address: str) -> bool:
     return bool(local.strip() and domain.strip())
 
 
+def format_parsed_address(name: str | None, address: str) -> str:
+    """Return a display string safe for headers and SMTP envelope parsing."""
+    name = (name or "").strip()
+    if not name:
+        return address
+    # Unquoted @ in display names break email.utils.getaddresses.
+    if "@" in name or name.casefold() == address.casefold():
+        return address
+    return f"{name} <{address}>"
+
+
+def envelope_recipient_addresses(
+    to: list[str],
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
+) -> list[str]:
+    """Collect bare email addresses for SMTP RCPT TO."""
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    addresses: list[str] = []
+    seen: set[str] = set()
+    for group in (to, cc or [], bcc or []):
+        for item in group:
+            single = Camel.InternetAddress.new()
+            single.unformat(item.strip())
+            for index in range(single.length()):
+                ok, _name, address = single.get(index)
+                if not ok or not address:
+                    continue
+                key = address.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                addresses.append(address)
+    return addresses
+
+
 def parse_address_list(text: str) -> list[str]:
     """Parse a comma-separated To/Cc/Bcc field into address strings."""
     import gi
@@ -54,10 +94,7 @@ def parse_address_list(text: str) -> list[str]:
                 continue
             if not bare_address_is_valid(address):
                 raise ValueError(f'The address "{part}" is not valid.')
-            if name:
-                addresses.append(f"{name} <{address}>")
-            else:
-                addresses.append(address)
+            addresses.append(format_parsed_address(name, address))
     if not addresses:
         raise ValueError("No valid addresses found")
     return addresses
@@ -156,10 +193,7 @@ def parse_address_header(text: str) -> list[str]:
             ok, name, bare = container.get(index)
             if not ok or not bare or "@" not in bare:
                 continue
-            if name:
-                addresses.append(f"{name} <{bare}>")
-            else:
-                addresses.append(bare)
+            addresses.append(format_parsed_address(name, bare))
     return addresses
 
 
@@ -263,9 +297,7 @@ def extract_reply_address(from_header: str) -> str:
     ok, name, address = container.get(0)
     if not ok or not address:
         return from_header
-    if name:
-        return f"{name} <{address}>"
-    return address
+    return format_parsed_address(name, address)
 
 
 _QUOTE_LINE_RE = re.compile(r"^(>+)( ?)(.*)$")

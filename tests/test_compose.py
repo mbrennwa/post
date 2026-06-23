@@ -64,6 +64,12 @@ class ParseAddressListTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not valid"):
             parse_address_list("user@")
 
+    def test_email_as_display_name_normalizes_to_bare(self) -> None:
+        self.assertEqual(
+            parse_address_list("mbrennwa@gmail.com <mbrennwa@gmail.com>"),
+            ["mbrennwa@gmail.com"],
+        )
+
 
 class BuildReplySubjectTests(unittest.TestCase):
     def test_adds_re_prefix(self) -> None:

@@ -12,8 +12,6 @@ import socket
 import ssl
 import time
 from dataclasses import dataclass
-from email.utils import getaddresses
-
 import gi
 
 gi.require_version("EDataServer", "1.2")
@@ -26,6 +24,7 @@ from .auth import (
     ensure_goa_credentials,
     lookup_stored_password,
 )
+from .compose import envelope_recipient_addresses
 from .send_errors import SendError, user_send_error_message
 
 log = logging.getLogger(__name__)
@@ -77,12 +76,7 @@ def read_smtp_transport_config(
 def _recipient_addresses(
     to: list[str], cc: list[str] | None, bcc: list[str] | None
 ) -> list[str]:
-    addresses: list[str] = []
-    for header in (to, cc or [], bcc or []):
-        for _name, addr in getaddresses(header):
-            if addr:
-                addresses.append(addr)
-    return addresses
+    return envelope_recipient_addresses(to, cc, bcc)
 
 
 def _oauth2_auth_string(username: str, access_token: str) -> str:

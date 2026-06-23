@@ -26,6 +26,14 @@ class RecipientAddressTests(unittest.TestCase):
             ["alice@example.com", "bob@example.com", "bcc@example.com"],
         )
 
+    def test_email_as_display_name(self) -> None:
+        addresses = _recipient_addresses(
+            ["mbrennwa@gmail.com <mbrennwa@gmail.com>"],
+            None,
+            None,
+        )
+        self.assertEqual(addresses, ["mbrennwa@gmail.com"])
+
 
 class ReadSmtpTransportConfigTests(unittest.TestCase):
     def test_reads_host_port_and_security(self) -> None:
