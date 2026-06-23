@@ -54,7 +54,7 @@ path = [
     ".gitignore",
     "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post-sketch.svg",
     "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post_old.svg",
-    ".github/issue-assets/30-long-subject-reader-width.png",
+    ".github/issue-assets/*.png",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 mbrennwa"
