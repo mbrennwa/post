@@ -97,7 +97,9 @@ class WrappingLabelTests(unittest.TestCase):
         meta = Gtk.Label(xalign=0, ellipsize=3, label="sender@example.com")
         configure_ellipsize_label(meta)
         row.append(meta)
-        row.append(Gtk.Image.new_from_icon_name("mail-attachment-symbolic"))
+        attachment = Gtk.Box()
+        attachment.set_size_request(16, 16)
+        row.append(attachment)
         minimum, natural, _, _ = row.measure(Gtk.Orientation.HORIZONTAL, 649)
         self.assertGreaterEqual(natural, minimum)
 
