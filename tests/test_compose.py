@@ -7,6 +7,7 @@ import unittest
 
 from post.mail.compose import (
     ComposeAttachment,
+    body_text_for_quoting,
     build_draft_mime_message,
     build_plain_mime_message,
     build_forward_subject,
@@ -23,7 +24,13 @@ from post.mail.compose import (
     quote_plain_reply,
     read_compose_attachments_from_message,
 )
-from post.mail.helpers import _mime_message_raw_bytes, extract_attachments, get_attachment_data
+from post.mail.helpers import (
+    _mime_message_raw_bytes,
+    extract_attachments,
+    get_attachment_data,
+    html_to_quotable_plain,
+    plain_body_looks_truncated,
+)
 
 
 class ParseAddressListTests(unittest.TestCase):
@@ -137,6 +144,89 @@ class QuotePlainReplyTests(unittest.TestCase):
         body = quote_plain_reply(original, "Hello")
         self.assertIn("On 2026-06-17 16:49:57, List <list@example.com> wrote:", body)
         self.assertNotIn("author@example.com", body.split("wrote:")[0])
+
+    def test_increases_existing_quote_depth(self) -> None:
+        original = {"from": "Bob <bob@example.com>", "date_received": "today"}
+        body = quote_plain_reply(
+            original,
+            "Thanks\n\nOn Mon, Alice wrote:\n> Original message",
+        )
+        self.assertIn(">> Original message", body)
+        self.assertNotIn("> > Original message", body)
+
+    def test_increases_multilevel_quote_depth(self) -> None:
+        original = {"from": "Carol <carol@example.com>", "date_received": "today"}
+        body = quote_plain_reply(original, ">> Already quoted")
+        self.assertIn(">>> Already quoted", body)
+
+
+class BodyTextForQuotingTests(unittest.TestCase):
+    def test_prefers_plain_when_complete(self) -> None:
+        message = {
+            "body_plain": "On Mon, Alice wrote:\n> Hello",
+            "body_html": "<blockquote>Hello</blockquote>",
+        }
+        self.assertEqual(body_text_for_quoting(message), message["body_plain"])
+
+    def test_uses_html_when_plain_is_truncated(self) -> None:
+        message = {
+            "body_plain": "Thanks for the update",
+            "body_html": (
+                "<p>Thanks for the update</p>"
+                "<blockquote><p>Original message</p></blockquote>"
+            ),
+        }
+        text = body_text_for_quoting(message)
+        self.assertIsNotNone(text)
+        assert text is not None
+        self.assertIn("Thanks for the update", text)
+        self.assertIn("> Original message", text)
+
+    def test_uses_html_when_plain_missing(self) -> None:
+        message = {
+            "body_plain": None,
+            "body_html": "<p>Hello</p><blockquote><p>Nested</p></blockquote>",
+        }
+        text = body_text_for_quoting(message)
+        self.assertIsNotNone(text)
+        assert text is not None
+        self.assertIn("Hello", text)
+        self.assertIn("> Nested", text)
+
+
+class HtmlToQuotablePlainTests(unittest.TestCase):
+    def test_blockquote_becomes_quote_lines(self) -> None:
+        text = html_to_quotable_plain(
+            "<p>Reply text</p><blockquote><p>Quoted body</p></blockquote>"
+        )
+        self.assertIn("Reply text", text)
+        self.assertIn("> Quoted body", text)
+
+    def test_nested_blockquotes_increase_depth(self) -> None:
+        text = html_to_quotable_plain(
+            "<blockquote><p>Level one</p>"
+            "<blockquote><p>Level two</p></blockquote></blockquote>"
+        )
+        self.assertIn("> Level one", text)
+        self.assertIn(">> Level two", text)
+
+
+class PlainBodyLooksTruncatedTests(unittest.TestCase):
+    def test_detects_missing_quotes_in_plain(self) -> None:
+        self.assertTrue(
+            plain_body_looks_truncated(
+                "Thanks",
+                "<p>Thanks</p><blockquote>Older text</blockquote>",
+            )
+        )
+
+    def test_plain_with_existing_quotes_is_complete(self) -> None:
+        self.assertFalse(
+            plain_body_looks_truncated(
+                "On Mon, Alice wrote:\n> Hello",
+                "<blockquote>Hello</blockquote>",
+            )
+        )
 
 
 class BuildForwardSubjectTests(unittest.TestCase):

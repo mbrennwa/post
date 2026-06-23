@@ -25,6 +25,7 @@ from post.mail import MailService
 from post.mail.compose import (
     ComposeAttachment,
     body_is_unedited_signature_template,
+    body_text_for_quoting,
     build_forward_subject,
     build_reply_all_recipients,
     build_reply_references,
@@ -919,7 +920,7 @@ class ComposeWindow(Adw.Window):
             )
             quoted = quote_plain_reply(
                 self._reply_to,
-                self._reply_to.get("body_plain"),
+                body_text_for_quoting(self._reply_to),
             )
             body = compose_body_with_signature(
                 mode=self._mode,
@@ -933,7 +934,7 @@ class ComposeWindow(Adw.Window):
             )
             quoted = quote_plain_forward(
                 self._reply_to,
-                self._reply_to.get("body_plain"),
+                body_text_for_quoting(self._reply_to),
             )
             body = compose_body_with_signature(
                 mode=self._mode,
