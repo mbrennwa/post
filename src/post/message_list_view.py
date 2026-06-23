@@ -19,6 +19,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, Gio, GObject, Gtk
 
 from post.mail.folders import is_post_outbox_folder
+from post.wrap_label import WrappingLabel
 from post.mail.helpers import (
     format_message_list_date,
     message_has_attachments,
@@ -284,7 +285,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         preview.set_margin_bottom(8)
 
         top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        subject_label = Gtk.Label(xalign=0, wrap=True)
+        subject_label = WrappingLabel(xalign=0, wrap=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
         subject_label.set_hexpand(True)
         top_row.append(subject_label)
 
