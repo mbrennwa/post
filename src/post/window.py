@@ -357,10 +357,10 @@ class MainWindow(Adw.ApplicationWindow):
         subject_box.set_hexpand(True)
         subject_box.append(self._reader_subject)
         header_row.append(subject_box)
-        message_actions = self._build_message_action_buttons()
-        message_actions.set_valign(Gtk.Align.START)
-        message_actions.set_halign(Gtk.Align.END)
-        header_row.append(message_actions)
+        self._message_actions = self._build_message_action_buttons()
+        self._message_actions.set_valign(Gtk.Align.START)
+        self._message_actions.set_halign(Gtk.Align.END)
+        header_row.append(self._message_actions)
         reader.append(header_row)
 
         self._reader_meta = Gtk.Label(
@@ -432,6 +432,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._setup_delete_shortcut()
         self._setup_search_shortcuts()
         self._setup_send_queue_flush()
+        self._clear_reader()
 
     def _setup_send_queue_flush(self) -> None:
         self._mail.set_network_available(self._network_available)
@@ -1318,6 +1319,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._reader_meta.set_label("")
         self._current_message_uid = None
         self._current_message = None
+        self._message_actions.set_visible(False)
         self._set_message_actions_sensitive(False)
         self._update_message_toolbar()
         self._clear_attachments()
@@ -2894,6 +2896,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._reader_meta.set_label(str(error))
             self._clear_attachments()
             self._current_message = None
+            self._message_actions.set_visible(False)
             self._set_message_actions_sensitive(False)
             self._current_body = {"plain": None, "html": None}
             self._reader_body_stack.set_visible_child_name("content")
@@ -2931,6 +2934,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._reader_subject.set_visible(True)
         self._reader_meta.set_label(format_message_header(msg))
         self._current_message = msg
+        self._message_actions.set_visible(True)
         self._set_message_actions_sensitive(True)
         self._show_attachments(msg.get("attachments") or [])
         self._current_body = {
