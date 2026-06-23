@@ -360,9 +360,13 @@ class MainWindow(Adw.ApplicationWindow):
         header_row.append(message_actions)
         reader.append(header_row)
 
-        self._reader_meta = Gtk.Label(label="", xalign=0, wrap=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        self._reader_meta = WrappingLabel(
+            label="",
+            xalign=0,
+            wrap=True,
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+        )
         self._reader_meta.add_css_class("dim-label")
-        self._reader_meta.set_width_chars(1)
         self._reader_meta.set_hexpand(True)
         self._reader_meta.set_halign(Gtk.Align.FILL)
         reader.append(self._reader_meta)
@@ -1330,8 +1334,9 @@ class MainWindow(Adw.ApplicationWindow):
         heading.add_css_class("heading")
         self._reader_attachments.append(heading)
 
-        list_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        list_row.set_halign(Gtk.Align.START)
+        list_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        list_column.set_hexpand(True)
+        list_column.set_halign(Gtk.Align.FILL)
 
         for attachment in attachments:
             index = attachment.get("index", 0)
@@ -1343,6 +1348,8 @@ class MainWindow(Adw.ApplicationWindow):
             btn = Gtk.Button()
             btn.add_css_class("flat")
             btn.set_tooltip_text("Open Attachment")
+            btn.set_hexpand(True)
+            btn.set_halign(Gtk.Align.FILL)
             btn.connect("clicked", self._on_attachment_clicked, index)
 
             menu_gesture = Gtk.GestureClick()
@@ -1360,12 +1367,14 @@ class MainWindow(Adw.ApplicationWindow):
             icon = Gtk.Image.new_from_icon_name("mail-attachment-symbolic")
             icon.add_css_class("dim-label")
             label = Gtk.Label(label=label_text, xalign=0, ellipsize=3)
+            label.set_hexpand(True)
+            label.set_halign(Gtk.Align.FILL)
             row.append(icon)
             row.append(label)
             btn.set_child(row)
-            list_row.append(btn)
+            list_column.append(btn)
 
-        self._reader_attachments.append(list_row)
+        self._reader_attachments.append(list_column)
         self._reader_attachments.set_visible(True)
 
     def _on_attachment_menu_pressed(
