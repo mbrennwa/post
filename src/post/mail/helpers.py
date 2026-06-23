@@ -150,14 +150,18 @@ def _valid_unix_timestamp(unix_time: float | int | None) -> float | None:
     return value
 
 
+def _format_unix_timestamp_local(unix_time: float, fmt: str) -> str:
+    return datetime.fromtimestamp(unix_time, tz=timezone.utc).astimezone().strftime(
+        fmt
+    )
+
+
 def format_message_datetime(unix_time: float | int | None) -> str | None:
     value = _valid_unix_timestamp(unix_time)
     if value is None:
         return None
     try:
-        return datetime.fromtimestamp(value, tz=timezone.utc).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        return _format_unix_timestamp_local(value, "%Y-%m-%d %H:%M:%S")
     except (OSError, OverflowError, ValueError):
         return None
 
@@ -268,9 +272,7 @@ def format_message_list_date(msg: dict[str, Any]) -> str:
     valid_sort = _valid_unix_timestamp(sort_date)
     if valid_sort is not None:
         try:
-            return datetime.fromtimestamp(valid_sort, tz=timezone.utc).strftime(
-                "%Y-%m-%d %H:%M"
-            )
+            return _format_unix_timestamp_local(valid_sort, "%Y-%m-%d %H:%M")
         except (OSError, OverflowError, ValueError):
             return ""
     return ""
