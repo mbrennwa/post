@@ -1652,12 +1652,13 @@ class MainWindow(Adw.ApplicationWindow):
 
     @staticmethod
     def _load_source_label(source: str) -> str:
-        return {
-            "disk_cache": "from cache",
-            "local": "from mail store",
-            "server": "from server",
-            "outbox": "from Outbox",
-        }.get(source, "")
+        if source == "server":
+            return "from server"
+        if source in {"disk_cache", "local", "memory"}:
+            return "from local cache"
+        if source == "outbox":
+            return "from Outbox"
+        return ""
 
     def _predict_initial_load_source(
         self,
