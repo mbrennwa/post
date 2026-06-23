@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 
 import gi
@@ -28,8 +29,18 @@ from post.mail.eds import MailAccount
 from post.mail.sync_watcher import MailSyncWatcher
 from post.mail.folders import POST_OUTBOX_FOLDER, is_post_outbox_folder
 from post.mail.folder_index_cache import has_cache as folder_index_has_cache
+from post.mail.message_list_state import (
+    DEFAULT_FOLDER_LIST_CACHE_SIZE,
+    FolderListSnapshot,
+    folder_cache_matches,
+    folder_list_ready_to_cache,
+    invalidate_lru_cache,
+    message_list_fingerprint,
+    touch_lru_cache,
+)
 from post.mail.search import MessageSearchQuery, parse_search_query
 from post.mail.send_queue import (
+    OFFLINE_CACHED_LIST_STATUS,
     OFFLINE_MAIL_MESSAGE,
     is_network_unavailable_error,
     list_queued_messages,
@@ -164,6 +175,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._search_entry_updating = False
         self._status_hint = ""
         self._network_available = Gio.NetworkMonitor.get_default().get_network_available()
+        self._folder_list_cache: OrderedDict[
+            tuple[str, str], FolderListSnapshot
+        ] = OrderedDict()
+        self._displayed_folder: tuple[str, str] | None = None
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.set_vexpand(True)
@@ -963,6 +978,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._sync_watcher.stop()
 
     def _on_sync_folder_changed(self, account_uid: str, folder_name: str) -> None:
+        self._invalidate_folder_list_cache_entry(account_uid, folder_name)
         self._mail.invalidate_folder_index(account_uid, folder_name)
         self._refresh_folder_view(account_uid, folder_name)
 
@@ -1293,6 +1309,10 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         self._search_query = query
+        if self._current_account and self._current_folder:
+            self._invalidate_folder_list_cache_entry(
+                self._current_account.uid, self._current_folder
+            )
         self._load_messages(
             self._current_account.uid, self._current_folder, offset=0
         )
@@ -1647,8 +1667,210 @@ class MainWindow(Adw.ApplicationWindow):
             child = next_child
 
     @staticmethod
-    def _message_list_fingerprint(messages: list[dict]) -> tuple[str, ...]:
-        return tuple(str(message.get("uid")) for message in messages)
+    def _detach_listbox_rows(listbox: Gtk.ListBox) -> list[Gtk.ListBoxRow]:
+        rows: list[Gtk.ListBoxRow] = []
+        child = listbox.get_first_child()
+        while child is not None:
+            next_child = child.get_next_sibling()
+            if isinstance(child, Gtk.ListBoxRow):
+                listbox.remove(child)
+                rows.append(child)
+            child = next_child
+        return rows
+
+    def _invalidate_folder_list_cache_entry(
+        self, account_uid: str, folder_name: str
+    ) -> None:
+        key = (account_uid, folder_name)
+        invalidate_lru_cache(self._folder_list_cache, key)
+        if self._displayed_folder == key:
+            self._displayed_folder = None
+
+    def _stash_displayed_folder_list_if_needed(
+        self, target_key: tuple[str, str]
+    ) -> None:
+        if self._displayed_folder is None or self._displayed_folder == target_key:
+            return
+        if self._search_query is not None:
+            return
+        displayed_account_uid, displayed_folder_name = self._displayed_folder
+        if is_post_outbox_folder(displayed_folder_name):
+            return
+        if not folder_list_ready_to_cache(
+            self._shown_message_count,
+            self._message_total,
+            self._message_list_populating,
+            self._current_folder_messages,
+        ):
+            return
+
+        rows = self._detach_listbox_rows(self._message_list)
+        if not rows:
+            return
+
+        messages = self._current_folder_messages
+        assert messages is not None
+
+        vadjustment = self._message_scroll.get_vadjustment()
+        scroll_value = vadjustment.get_value() if vadjustment is not None else 0.0
+        selected_row = self._message_list.get_selected_row()
+        selected_uid = (
+            getattr(selected_row, "message_uid", None)
+            if isinstance(selected_row, Gtk.ListBoxRow)
+            else None
+        )
+
+        snapshot = FolderListSnapshot(
+            rows=rows,
+            fingerprint=message_list_fingerprint(messages),
+            messages=list(messages),
+            shown_count=self._shown_message_count,
+            total=self._message_total,
+            source=self._message_list_source,
+            scroll_value=scroll_value,
+            selected_uid=selected_uid,
+        )
+        touch_lru_cache(
+            self._folder_list_cache,
+            self._displayed_folder,
+            snapshot,
+            max_size=DEFAULT_FOLDER_LIST_CACHE_SIZE,
+        )
+        self._displayed_folder = None
+
+    def _start_background_message_sync(
+        self,
+        load_id: int,
+        account_uid: str,
+        folder_name: str,
+        fetch_messages: Callable[[bool], tuple[list[dict], int, int, str]],
+    ) -> None:
+        def worker_sync() -> None:
+            error: Exception | None = None
+            messages: list[dict] | None = None
+            unread = -1
+            total = -1
+            try:
+                messages, unread, total, _source = fetch_messages(True)
+            except Exception as exc:
+                if is_network_unavailable_error(exc):
+                    GLib.idle_add(
+                        self._on_messages_sync_finished,
+                        load_id,
+                        False,
+                    )
+                    return
+                log_mail_error(log, "Failed to refresh messages", exc)
+                error = exc
+            GLib.idle_add(
+                self._on_messages_refreshed,
+                load_id,
+                account_uid,
+                folder_name,
+                messages,
+                unread,
+                total,
+                error,
+            )
+
+        threading.Thread(target=worker_sync, daemon=True).start()
+
+    def _restore_reader_for_uid(
+        self, uid: str, row: Gtk.ListBoxRow | None
+    ) -> None:
+        if row is None:
+            self._clear_reader()
+            return
+        self._current_message_uid = uid
+        self._load_message_body_for_uid(uid, row, mark_seen=False)
+
+    def _try_restore_folder_list_from_cache(
+        self,
+        load_id: int,
+        account_uid: str,
+        folder_name: str,
+        account: MailAccount,
+        *,
+        search_query: MessageSearchQuery | None,
+        viewing_outbox: bool,
+        use_background_sync: bool,
+        fetch_messages: Callable[[bool], tuple[list[dict], int, int, str]],
+    ) -> bool:
+        if search_query is not None or viewing_outbox:
+            return False
+
+        key = (account_uid, folder_name)
+        snapshot = self._folder_list_cache.get(key)
+        if snapshot is None:
+            return False
+
+        self._folder_list_cache.move_to_end(key)
+
+        try:
+            messages, unread, total, source = self._mail.get_folder_messages(
+                account_uid,
+                folder_name,
+                sync=False,
+            )
+        except Exception:
+            invalidate_lru_cache(self._folder_list_cache, key)
+            return False
+
+        if not folder_cache_matches(messages, total, snapshot.fingerprint):
+            invalidate_lru_cache(self._folder_list_cache, key)
+            return False
+
+        self._message_popover.popdown()
+        self._clear_listbox(self._message_list)
+        for row in snapshot.rows:
+            self._message_list.append(row)
+
+        self._current_folder_messages = messages
+        self._shown_message_count = snapshot.shown_count
+        self._message_total = total
+        self._message_list_source = source
+        self._message_list_populating = False
+        self._message_sync_in_progress = use_background_sync
+        self._displayed_folder = key
+
+        if not self._search_query:
+            if is_post_outbox_folder(folder_name):
+                self._sidebar.refresh_outbox_row(account_uid)
+            else:
+                self._sidebar.update_folder_row(account_uid, folder_name, unread, total)
+
+        self._message_stack.set_visible_child_name("list")
+        self._message_loading_spinner.stop()
+        self._update_message_status(account, folder_name)
+
+        vadjustment = self._message_scroll.get_vadjustment()
+        if vadjustment is not None:
+            vadjustment.set_value(snapshot.scroll_value)
+
+        restore_uid = self._pending_restore_message_uid or snapshot.selected_uid
+        restore_row: Gtk.ListBoxRow | None = None
+        if restore_uid:
+            restore_row = self._find_message_row(restore_uid)
+            if restore_row is not None:
+                self._restoring_selection = True
+                self._message_list.select_row(restore_row)
+                self._restoring_selection = False
+                self._pending_restore_message_uid = None
+                self._restore_reader_for_uid(restore_uid, restore_row)
+            else:
+                self._clear_reader()
+        else:
+            self._clear_reader()
+
+        if use_background_sync:
+            self._start_background_message_sync(
+                load_id,
+                account_uid,
+                folder_name,
+                fetch_messages,
+            )
+
+        return True
 
     @staticmethod
     def _load_source_label(source: str) -> str:
@@ -1694,12 +1916,18 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _message_load_status_detail(self) -> str:
         parts: list[str] = []
+        if (
+            not self._network_available
+            and self._message_list_source in {"disk_cache", "local", "memory"}
+            and (self._shown_message_count > 0 or self._message_total > 0)
+        ):
+            parts.append(OFFLINE_CACHED_LIST_STATUS)
         if self._message_list_populating or self._message_sync_in_progress:
             source_label = self._load_source_label(self._message_list_source)
             if source_label:
                 parts.append(source_label)
         if self._message_sync_in_progress:
-            parts.append("syncing with server")
+            parts.append("Syncing with Server")
         return " · ".join(parts)
 
     def _with_load_status_detail(self, text: str) -> str:
@@ -1727,12 +1955,16 @@ class MainWindow(Adw.ApplicationWindow):
         if not self._network_available:
             sync = False
 
+        target_key = (account_uid, folder_name)
+        force_reload = sync is True
+        if force_reload:
+            self._invalidate_folder_list_cache_entry(account_uid, folder_name)
+
+        self._stash_displayed_folder_list_if_needed(target_key)
+
         self._messages_load_generation += 1
-        self._shown_message_count = 0
-        self._message_total = -1
-        self._current_folder_messages = None
-        self._message_sync_in_progress = False
-        self._message_list_populating = False
+        load_id = self._messages_load_generation
+
         display_folder = (
             "Outbox" if is_post_outbox_folder(folder_name) else folder_name
         )
@@ -1743,7 +1975,49 @@ class MainWindow(Adw.ApplicationWindow):
             should_sync
             and self._network_available
             and not viewing_outbox
+            and search_query is None
         )
+        from_label = account.email or account.display_label
+
+        def fetch_messages(sync_flag: bool) -> tuple[list[dict], int, int, str]:
+            if viewing_outbox:
+                messages, unread, total = list_queued_messages(
+                    account_uid,
+                    from_label=from_label,
+                )
+                return messages, unread, total, "outbox"
+            if search_query is not None:
+                messages, unread, total, source = self._mail.search_folder_messages(
+                    account_uid,
+                    folder_name,
+                    search_query,
+                    sync=sync_flag,
+                )
+                return messages, unread, total, source
+            messages, unread, total, source = self._mail.get_folder_messages(
+                account_uid,
+                folder_name,
+                sync=sync_flag,
+            )
+            return messages, unread, total, source
+
+        if not force_reload and self._try_restore_folder_list_from_cache(
+            load_id,
+            account_uid,
+            folder_name,
+            account,
+            search_query=search_query,
+            viewing_outbox=viewing_outbox,
+            use_background_sync=use_background_sync,
+            fetch_messages=fetch_messages,
+        ):
+            return
+
+        self._shown_message_count = 0
+        self._message_total = -1
+        self._current_folder_messages = None
+        self._message_sync_in_progress = False
+        self._message_list_populating = False
         initial_source = self._predict_initial_load_source(
             account_uid,
             folder_name,
@@ -1774,31 +2048,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_loading_label.set_label(loading_label)
         self._message_loading_spinner.start()
         self._message_stack.set_visible_child_name("loading")
-
-        load_id = self._messages_load_generation
-        from_label = account.email or account.display_label
-
-        def fetch_messages(sync_flag: bool) -> tuple[list[dict], int, int, str]:
-            if viewing_outbox:
-                messages, unread, total = list_queued_messages(
-                    account_uid,
-                    from_label=from_label,
-                )
-                return messages, unread, total, "outbox"
-            if search_query is not None:
-                messages, unread, total, source = self._mail.search_folder_messages(
-                    account_uid,
-                    folder_name,
-                    search_query,
-                    sync=sync_flag,
-                )
-                return messages, unread, total, source
-            messages, unread, total, source = self._mail.get_folder_messages(
-                account_uid,
-                folder_name,
-                sync=sync_flag,
-            )
-            return messages, unread, total, source
 
         def worker_initial() -> None:
             error: Exception | None = None
@@ -1837,39 +2086,14 @@ class MainWindow(Adw.ApplicationWindow):
                 error,
             )
 
-        def worker_sync() -> None:
-            if not use_background_sync:
-                return
-            error: Exception | None = None
-            messages: list[dict] | None = None
-            unread = -1
-            total = -1
-            try:
-                messages, unread, total, _source = fetch_messages(True)
-            except Exception as exc:
-                if is_network_unavailable_error(exc):
-                    GLib.idle_add(
-                        self._on_messages_sync_finished,
-                        load_id,
-                        False,
-                    )
-                    return
-                log_mail_error(log, "Failed to refresh messages", exc)
-                error = exc
-            GLib.idle_add(
-                self._on_messages_refreshed,
+        threading.Thread(target=worker_initial, daemon=True).start()
+        if use_background_sync:
+            self._start_background_message_sync(
                 load_id,
                 account_uid,
                 folder_name,
-                messages,
-                unread,
-                total,
-                error,
+                fetch_messages,
             )
-
-        threading.Thread(target=worker_initial, daemon=True).start()
-        if use_background_sync:
-            threading.Thread(target=worker_sync, daemon=True).start()
 
     def _on_messages_sync_finished(self, load_id: int, changed: bool) -> bool:
         if load_id != self._messages_load_generation:
@@ -1901,6 +2125,33 @@ class MainWindow(Adw.ApplicationWindow):
 
         if error is not None:
             if is_network_unavailable_error(error):
+                if (
+                    self._search_query is None
+                    and not is_post_outbox_folder(folder_name)
+                    and folder_index_has_cache(account_uid, folder_name)
+                ):
+                    try:
+                        messages, unread, total, source = self._mail.get_folder_messages(
+                            account_uid,
+                            folder_name,
+                            sync=False,
+                        )
+                    except Exception:
+                        messages = None
+                    else:
+                        GLib.idle_add(
+                            self._on_messages_loaded,
+                            load_id,
+                            account_uid,
+                            folder_name,
+                            messages,
+                            unread,
+                            total,
+                            source,
+                            False,
+                            None,
+                        )
+                        return False
                 self._message_empty_label.set_label(OFFLINE_MAIL_MESSAGE)
                 self._message_stack.set_visible_child_name("empty")
             else:
@@ -1936,6 +2187,7 @@ class MainWindow(Adw.ApplicationWindow):
             else:
                 self._message_empty_label.set_label(f"No Messages in {folder_label}")
             self._message_stack.set_visible_child_name("empty")
+            self._displayed_folder = (account_uid, folder_name)
             self._update_message_status(account, folder_name)
             return False
 
@@ -1983,12 +2235,13 @@ class MainWindow(Adw.ApplicationWindow):
 
         current = self._current_folder_messages or []
         if (
-            self._message_list_fingerprint(messages) == self._message_list_fingerprint(current)
+            message_list_fingerprint(messages) == message_list_fingerprint(current)
             and self._message_total == total
         ):
             GLib.idle_add(self._on_messages_sync_finished, load_id, False)
             return False
 
+        self._invalidate_folder_list_cache_entry(account_uid, folder_name)
         self._current_folder_messages = messages
         self._message_total = total
         self._message_list_source = "server"
@@ -2118,6 +2371,7 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         self._message_list_populating = False
+        self._displayed_folder = (account.uid, folder_name)
         if self._search_query is None:
             self._try_restore_selected_message(account.uid, folder_name)
         return False
@@ -2669,6 +2923,16 @@ class MainWindow(Adw.ApplicationWindow):
         if self._message_total >= 0:
             self._message_total = max(0, self._message_total - count_delta)
 
+        if removed_count > 0:
+            self._invalidate_folder_list_cache_entry(account_uid, folder_name)
+            if self._current_folder_messages:
+                moved_uids = set(uids)
+                self._current_folder_messages = [
+                    message
+                    for message in self._current_folder_messages
+                    if message.get("uid") not in moved_uids
+                ]
+
         if removed_count == 0 and moved_count > 0:
             if (
                 self._current_account
@@ -2833,19 +3097,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._header_trash_btn.set_sensitive(can_trash)
         return False
 
-    def _on_message_selected(
-        self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None
+    def _load_message_body_for_uid(
+        self,
+        uid: str,
+        row: Gtk.ListBoxRow,
+        *,
+        mark_seen: bool,
     ) -> None:
-        if self._restoring_selection:
-            return
-        mark_seen = self._user_message_click_pending
-        self._user_message_click_pending = False
-        if row is None or not self._current_account or not self._current_folder:
-            return
-        if len(self._message_list.get_selected_rows()) != 1:
-            return
-        uid = getattr(row, "message_uid", None)
-        if not uid:
+        if not self._current_account or not self._current_folder:
             return
 
         account = self._current_account
@@ -2896,6 +3155,24 @@ class MainWindow(Adw.ApplicationWindow):
                 )
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_message_selected(
+        self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None
+    ) -> None:
+        if self._restoring_selection:
+            return
+        mark_seen = self._user_message_click_pending
+        self._user_message_click_pending = False
+        if row is None or not self._current_account or not self._current_folder:
+            return
+        if len(self._message_list.get_selected_rows()) != 1:
+            return
+        uid = getattr(row, "message_uid", None)
+        if not uid:
+            return
+
+        self._current_message_uid = uid
+        self._load_message_body_for_uid(uid, row, mark_seen=mark_seen)
 
     def _on_draft_message_loaded(
         self,
