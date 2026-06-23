@@ -170,7 +170,9 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         if not isinstance(item, MessageListItem):
             return
         message = dict(item.message)
-        message["flags"] = dict(flags)
+        merged_flags = dict(message.get("flags") or {})
+        merged_flags.update(flags)
+        message["flags"] = merged_flags
         item.set_message(message)
 
     def get_message(self, uid: str) -> dict[str, Any] | None:
@@ -365,11 +367,14 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         list_item.attach_icon = attach_icon
         list_item.flag_icon = flag_icon
 
-    def _on_list_item_bind(self, _factory: Gtk.ListItemFactory, list_item: Gtk.ListItem) -> None:
-        item = list_item.get_item()
-        if not isinstance(item, MessageListItem):
+    def _populate_list_item_row(
+        self,
+        list_item: Gtk.ListItem,
+        store_item: MessageListItem,
+    ) -> None:
+        message = store_item.message
+        if not isinstance(message, dict):
             return
-        message = item.message
         folder_name = self._folder_name
         subject = message.get("subject") or "(no subject)"
         if is_post_outbox_folder(folder_name):
@@ -408,9 +413,31 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         if isinstance(flag_icon, Gtk.Image):
             flag_icon.set_visible(message_is_flagged(message))
 
-        list_item.message_uid = item.uid
+        list_item.message_uid = store_item.uid
         list_item.message_flags = dict(flags)
 
+    def _on_list_item_bind(self, _factory: Gtk.ListItemFactory, list_item: Gtk.ListItem) -> None:
+        item = list_item.get_item()
+        if not isinstance(item, MessageListItem):
+            return
+        self._populate_list_item_row(list_item, item)
+
+        def on_message_changed(
+            store_item: MessageListItem,
+            _pspec: GObject.ParamSpec,
+        ) -> None:
+            self._populate_list_item_row(list_item, store_item)
+
+        handler_id = item.connect("notify::message", on_message_changed)
+        list_item.message_notify_item = item
+        list_item.message_notify_handler_id = handler_id
+
     def _on_list_item_unbind(self, _factory: Gtk.ListItemFactory, list_item: Gtk.ListItem) -> None:
+        store_item = getattr(list_item, "message_notify_item", None)
+        handler_id = getattr(list_item, "message_notify_handler_id", None)
+        if isinstance(store_item, MessageListItem) and handler_id is not None:
+            store_item.disconnect(handler_id)
+        list_item.message_notify_item = None
+        list_item.message_notify_handler_id = None
         list_item.message_uid = None
         list_item.message_flags = {}
