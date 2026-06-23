@@ -21,6 +21,9 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, WebKit
 
 from post.compose_window import ComposeWindow
+from post.layout_debug import enabled as layout_debug_enabled
+from post.layout_debug import name_widget as name_layout_widget
+from post.layout_debug import schedule_probe as schedule_layout_probe
 from post.credentials import prompt_password_sync
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
@@ -55,7 +58,7 @@ from post.mail.helpers import (
     read_menu_label,
 )
 from post.reader import build_reader_document
-from post.wrap_label import WrappingLabel
+from post.wrap_label import WrappingLabel, configure_ellipsize_label
 from post.preferences import (
     MessageAppearance,
     get_auto_sync,
@@ -77,6 +80,9 @@ _MESSAGE_LIST_CSS = f"""
 listview.message-list row {{
   padding-top: 0;
   padding-bottom: 0;
+}}
+listview.message-list label {{
+  min-width: 0;
 }}
 list.navigation-sidebar {{
   margin-top: 0;
@@ -166,6 +172,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.set_vexpand(True)
+        if layout_debug_enabled():
+            name_layout_widget(outer, "main-outer")
 
         header = Adw.HeaderBar()
 
@@ -223,6 +231,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         content_panes = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         content_panes.set_vexpand(True)
+        if layout_debug_enabled():
+            name_layout_widget(content_panes, "content-panes")
         outer.append(content_panes)
 
         self._sidebar = MailSidebar(
@@ -280,6 +290,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._setup_message_shortcuts()
 
         message_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        if layout_debug_enabled():
+            name_layout_widget(message_panel, "message-panel")
         message_panel.append(self._message_list_view)
 
         self._message_stack.add_named(message_panel, "list")
@@ -333,6 +345,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         reader = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         reader.set_hexpand(True)
+        if layout_debug_enabled():
+            name_layout_widget(reader, "reader-pane")
         reader.set_margin_start(16)
         reader.set_margin_end(16)
         reader.set_margin_bottom(12)
@@ -350,23 +364,31 @@ class MainWindow(Adw.ApplicationWindow):
 
         header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header_row.set_hexpand(True)
+        if layout_debug_enabled():
+            name_layout_widget(header_row, "reader-header-row")
+        self._reader_header_row = header_row
         subject_box = Gtk.Box()
         subject_box.set_hexpand(True)
+        if layout_debug_enabled():
+            name_layout_widget(subject_box, "reader-subject-box")
         subject_box.append(self._reader_subject)
         header_row.append(subject_box)
         message_actions = self._build_message_action_buttons()
+        if layout_debug_enabled():
+            name_layout_widget(message_actions, "reader-message-actions")
         message_actions.set_valign(Gtk.Align.START)
         message_actions.set_halign(Gtk.Align.END)
         header_row.append(message_actions)
         reader.append(header_row)
 
-        self._reader_meta = WrappingLabel(
+        self._reader_meta = Gtk.Label(
             label="",
             xalign=0,
             wrap=True,
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
         )
         self._reader_meta.add_css_class("dim-label")
+        self._reader_meta.set_width_chars(1)
         self._reader_meta.set_hexpand(True)
         self._reader_meta.set_halign(Gtk.Align.FILL)
         reader.append(self._reader_meta)
@@ -428,6 +450,12 @@ class MainWindow(Adw.ApplicationWindow):
         self._setup_delete_shortcut()
         self._setup_search_shortcuts()
         self._setup_send_queue_flush()
+
+        if layout_debug_enabled():
+            log.info(
+                "POST_DEBUG_LAYOUT schema v2 — probes registered GtkBox roots "
+                "and descendants at for_size=649 after message selection and load"
+            )
 
     def _setup_send_queue_flush(self) -> None:
         self._mail.set_network_available(self._network_available)
@@ -1337,6 +1365,8 @@ class MainWindow(Adw.ApplicationWindow):
         list_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         list_column.set_hexpand(True)
         list_column.set_halign(Gtk.Align.FILL)
+        if layout_debug_enabled():
+            name_layout_widget(list_column, "reader-attachments-column")
 
         for attachment in attachments:
             index = attachment.get("index", 0)
@@ -1367,7 +1397,7 @@ class MainWindow(Adw.ApplicationWindow):
             icon = Gtk.Image.new_from_icon_name("mail-attachment-symbolic")
             icon.add_css_class("dim-label")
             label = Gtk.Label(label=label_text, xalign=0, ellipsize=3)
-            label.set_hexpand(True)
+            configure_ellipsize_label(label)
             label.set_halign(Gtk.Align.FILL)
             row.append(icon)
             row.append(label)
@@ -2756,6 +2786,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._user_message_click_pending = False
         self._current_message_uid = uid
         self._load_message_body_for_uid(uid, mark_seen=mark_seen)
+        if layout_debug_enabled():
+            schedule_layout_probe(context=f"selection uid={uid}")
         return False
 
     def _on_message_list_item_activated(self, uid: str) -> None:
@@ -2934,6 +2966,8 @@ class MainWindow(Adw.ApplicationWindow):
             "html": msg.get("body_html"),
         }
         self._show_reader_document()
+        if layout_debug_enabled():
+            schedule_layout_probe(context=f"message-read uid={uid}")
         return False
 
     def _app_prefers_dark(self) -> bool:
