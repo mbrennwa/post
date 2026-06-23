@@ -20,6 +20,15 @@ _GTK_TO_PANGO_WRAP = {
 }
 
 
+def configure_ellipsize_label(label: Gtk.Label) -> Gtk.Label:
+    """Keep ellipsized labels from forcing invalid GtkBox measure results."""
+    if label.get_ellipsize() == Pango.EllipsizeMode.NONE:
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+    label.set_max_width_chars(1)
+    label.set_hexpand(True)
+    return label
+
+
 class WrappingLabel(Gtk.Label):
     """A label that wraps without forcing its parent layout to grow horizontally."""
 

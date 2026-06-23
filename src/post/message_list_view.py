@@ -19,7 +19,9 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, Gio, GObject, Gtk
 
 from post.mail.folders import is_post_outbox_folder
-from post.wrap_label import WrappingLabel
+from post.layout_debug import enabled as layout_debug_enabled
+from post.layout_debug import name_widget as name_layout_widget
+from post.wrap_label import WrappingLabel, configure_ellipsize_label
 from post.mail.helpers import (
     format_message_list_date,
     message_has_attachments,
@@ -270,33 +272,41 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         outer.set_margin_start(8)
         outer.set_margin_end(0)
+        if layout_debug_enabled():
+            name_layout_widget(outer, "list-row-outer")
 
         dot_column = Gtk.Box()
         dot_column.set_size_request(16, -1)
         dot_column.set_valign(Gtk.Align.CENTER)
+        if layout_debug_enabled():
+            name_layout_widget(dot_column, "list-row-dot-column")
         unread_dot = self._make_unread_dot(visible=False)
         dot_column.append(unread_dot)
         outer.append(dot_column)
 
-        preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         preview.set_margin_start(4)
         preview.set_margin_end(12)
         preview.set_margin_top(8)
         preview.set_margin_bottom(8)
+        if layout_debug_enabled():
+            name_layout_widget(preview, "list-row-preview")
 
-        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         subject_label = WrappingLabel(xalign=0, wrap=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
         subject_label.set_hexpand(True)
-        top_row.append(subject_label)
+        subject_label.set_halign(Gtk.Align.FILL)
+        preview.append(subject_label)
 
-        date_label = Gtk.Label(xalign=1)
+        date_label = Gtk.Label(xalign=0)
         date_label.add_css_class("dim-label")
-        top_row.append(date_label)
-        preview.append(top_row)
+        date_label.set_halign(Gtk.Align.START)
+        preview.append(date_label)
 
         bottom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        if layout_debug_enabled():
+            name_layout_widget(bottom_row, "list-row-bottom")
         meta = Gtk.Label(xalign=0, ellipsize=3)
-        meta.set_hexpand(True)
+        configure_ellipsize_label(meta)
         meta.add_css_class("dim-label")
         bottom_row.append(meta)
 
