@@ -2212,16 +2212,16 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         event = gesture.get_current_event()
-        if event is None:
-            return
-
-        if Gdk.Event.triggers_context_menu(event):
+        is_context = (
+            event is not None and Gdk.Event.triggers_context_menu(event)
+        ) or gesture.get_current_button() == Gdk.BUTTON_SECONDARY
+        if is_context:
             self._popup_message_menu(item.uid, x, y)
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
             return
 
         self._user_message_click_pending = True
-        GLib.idle_add(self._update_message_toolbar)
+        self._message_list_view.select_uid(item.uid)
 
     def _on_message_menu_mark_read(self, *_args) -> None:
         self._set_messages_seen(True)
@@ -2670,14 +2670,39 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _on_message_list_selection_changed(self) -> None:
-        GLib.idle_add(self._update_message_toolbar)
+        GLib.idle_add(self._on_message_list_selection_changed_idle)
+
+    def _on_message_list_selection_changed_idle(self) -> bool:
+        self._update_message_toolbar()
+        if self._message_list_view.is_restoring_selection():
+            return False
+        if not self._current_account or not self._current_folder:
+            return False
+
+        selected = self._message_list_view.get_selected_uids()
+        if len(selected) != 1:
+            return False
+
+        uid = selected[0]
+        if uid == self._current_message_uid and self._current_message is not None:
+            return False
+
+        mark_seen = self._user_message_click_pending
+        self._user_message_click_pending = False
+        self._current_message_uid = uid
+        self._load_message_body_for_uid(uid, mark_seen=mark_seen)
+        return False
 
     def _on_message_list_item_activated(self, uid: str) -> None:
+        if self._message_list_view.is_restoring_selection():
+            return
         mark_seen = self._user_message_click_pending
         self._user_message_click_pending = False
         if not self._current_account or not self._current_folder:
             return
         if len(self._message_list_view.get_selected_uids()) != 1:
+            return
+        if uid == self._current_message_uid and self._current_message is not None:
             return
         self._current_message_uid = uid
         self._load_message_body_for_uid(uid, mark_seen=mark_seen)
