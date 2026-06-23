@@ -28,7 +28,10 @@ from post.mail.eds import MailAccount
 from post.mail.sync_watcher import MailSyncWatcher
 from post.message_list_view import VirtualMessageList
 from post.mail.folders import POST_OUTBOX_FOLDER, is_post_outbox_folder
-from post.mail.folder_index_cache import has_cache as folder_index_has_cache
+from post.mail.folder_index_cache import (
+    has_cache as folder_index_has_cache,
+    load as load_folder_index_cache,
+)
 from post.mail.message_list_state import message_list_fingerprint
 from post.mail.search import MessageSearchQuery, parse_search_query
 from post.mail.send_queue import (
@@ -271,12 +274,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_list_view.set_callbacks(
             on_selection_changed=self._on_message_list_selection_changed,
             on_item_activated=self._on_message_list_item_activated,
+            on_item_pressed=self._on_message_list_item_pressed,
+            on_item_context_menu=self._on_message_list_context_menu,
         )
-        context_gesture = Gtk.GestureClick()
-        context_gesture.set_button(0)
-        context_gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        context_gesture.connect("pressed", self._on_message_list_pressed)
-        self._message_list_view.list_view.add_controller(context_gesture)
         self._setup_message_shortcuts()
 
         message_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -430,7 +430,11 @@ class MainWindow(Adw.ApplicationWindow):
         monitor = Gio.NetworkMonitor.get_default()
         monitor.connect("notify::network-available", self._on_network_available_changed)
         self._refresh_status_display()
-        GLib.idle_add(self._flush_send_queue_idle)
+        GLib.timeout_add_seconds(2, self._flush_send_queue_on_startup)
+
+    def _flush_send_queue_on_startup(self) -> bool:
+        self._flush_send_queue_idle()
+        return False
 
     def _on_network_available_changed(self, monitor: Gio.NetworkMonitor, *_args) -> None:
         online = monitor.get_network_available()
@@ -548,7 +552,12 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _continue_close_after_outbound_send(self) -> None:
         self._close_after_outbound_send = False
-        self.close()
+        GLib.idle_add(self._destroy_after_close_cleanup)
+
+    def _destroy_after_close_cleanup(self) -> bool:
+        self._finish_close()
+        self.destroy()
+        return False
 
     def _finish_close(self) -> bool:
         self._sync_watcher.stop()
@@ -1139,6 +1148,10 @@ class MainWindow(Adw.ApplicationWindow):
         reply_all_action = Gio.SimpleAction.new("message-reply-all", None)
         reply_all_action.connect("activate", self._on_message_menu_reply_all)
         self.add_action(reply_all_action)
+
+        forward_action = Gio.SimpleAction.new("message-forward", None)
+        forward_action.connect("activate", self._on_message_menu_forward)
+        self.add_action(forward_action)
 
         self._message_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
         self._message_popover.set_parent(self._message_scroll)
@@ -1822,11 +1835,36 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_popover.popdown()
         self._message_list_view.clear()
         self._clear_reader()
-        self._message_loading_label.set_label(loading_label)
-        self._message_loading_spinner.start()
-        self._message_stack.set_visible_child_name("loading")
+
+        cache_snapshot: tuple[list[dict], int, int] | None = None
+        if not viewing_outbox and search_query is None:
+            cache_snapshot = load_folder_index_cache(account_uid, folder_name)
+
+        send_pending = self._mail.outbound_sends_pending()
+        defer_mail_io = send_pending and cache_snapshot is None
+        sync_after_send = use_background_sync and send_pending
+
+        if cache_snapshot is not None:
+            cached_messages, cached_unread, cached_total = cache_snapshot
+            self._on_messages_loaded(
+                load_id,
+                account_uid,
+                folder_name,
+                list(cached_messages),
+                cached_unread,
+                cached_total,
+                "disk_cache",
+                sync_after_send,
+                None,
+            )
+        else:
+            self._message_loading_label.set_label(loading_label)
+            self._message_loading_spinner.start()
+            self._message_stack.set_visible_child_name("loading")
 
         def worker_initial() -> None:
+            if cache_snapshot is not None and not (should_sync and not use_background_sync):
+                return
             error: Exception | None = None
             messages: list[dict] | None = None
             unread = -1
@@ -1859,18 +1897,44 @@ class MainWindow(Adw.ApplicationWindow):
                 unread,
                 total,
                 source,
-                use_background_sync,
+                use_background_sync and not send_pending,
                 error,
             )
 
-        threading.Thread(target=worker_initial, daemon=True).start()
-        if use_background_sync:
+        def start_initial_worker() -> None:
+            threading.Thread(target=worker_initial, daemon=True).start()
+
+        if defer_mail_io:
+
+            def start_after_send() -> None:
+                if load_id != self._messages_load_generation:
+                    return
+                start_initial_worker()
+
+            self._mail.when_outbound_sends_complete(start_after_send)
+        else:
+            start_initial_worker()
+
+        if use_background_sync and not send_pending:
             self._start_background_message_sync(
                 load_id,
                 account_uid,
                 folder_name,
                 fetch_messages,
             )
+        elif sync_after_send:
+
+            def sync_after_send() -> None:
+                if load_id != self._messages_load_generation:
+                    return
+                self._start_background_message_sync(
+                    load_id,
+                    account_uid,
+                    folder_name,
+                    fetch_messages,
+                )
+
+            self._mail.when_outbound_sends_complete(sync_after_send)
 
     def _on_messages_sync_finished(self, load_id: int, changed: bool) -> bool:
         if load_id != self._messages_load_generation:
@@ -2135,7 +2199,7 @@ class MainWindow(Adw.ApplicationWindow):
         return [uid]
 
     def _popup_message_menu(
-        self, uid: str, x: float, y: float
+        self, uid: str, x: float, y: float, popup_widget: Gtk.Widget | None = None
     ) -> None:
         uids = self._uids_for_menu(uid)
         self._context_message_uids = uids
@@ -2174,6 +2238,7 @@ class MainWindow(Adw.ApplicationWindow):
             if count == 1:
                 menu.append("Reply", "win.message-reply")
                 menu.append("Reply All", "win.message-reply-all")
+                menu.append("Forward", "win.message-forward")
         if can_archive:
             menu.append(
                 self._count_menu_label("Archive", count), "win.message-archive"
@@ -2184,7 +2249,12 @@ class MainWindow(Adw.ApplicationWindow):
             )
         self._message_popover.set_menu_model(menu)
 
-        coords = self._message_list_view.translate_to_scroll(x, y)
+        parent = self._message_popover.get_parent()
+        coords: tuple[float, float] | None = None
+        if popup_widget is not None and parent is not None:
+            coords = popup_widget.translate_coordinates(parent, x, y)
+        if coords is None:
+            coords = self._message_list_view.translate_to_scroll(x, y)
         if coords is not None:
             menu_x, menu_y = coords
         else:
@@ -2197,31 +2267,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_popover.set_pointing_to(rect)
         self._message_popover.popup()
 
-    def _on_message_list_pressed(
-        self,
-        gesture: Gtk.GestureClick,
-        n_press: int,
-        x: float,
-        y: float,
-    ) -> None:
-        if n_press != 1:
-            return
-
-        item = self._message_list_view.pick_item_at(x, y)
-        if item is None or not item.uid:
-            return
-
-        event = gesture.get_current_event()
-        is_context = (
-            event is not None and Gdk.Event.triggers_context_menu(event)
-        ) or gesture.get_current_button() == Gdk.BUTTON_SECONDARY
-        if is_context:
-            self._popup_message_menu(item.uid, x, y)
-            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-            return
-
+    def _on_message_list_item_pressed(self, uid: str) -> None:
         self._user_message_click_pending = True
-        self._message_list_view.select_uid(item.uid)
+        self._message_list_view.select_uid(uid)
+
+    def _on_message_list_context_menu(
+        self, uid: str, widget: Gtk.Widget, x: float, y: float
+    ) -> None:
+        self._popup_message_menu(uid, x, y, widget)
 
     def _on_message_menu_mark_read(self, *_args) -> None:
         self._set_messages_seen(True)
@@ -2246,6 +2299,9 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_message_menu_reply_all(self, *_args) -> None:
         self._open_compose_on_message("reply-all")
+
+    def _on_message_menu_forward(self, *_args) -> None:
+        self._open_compose_on_message("forward")
 
     def _move_selected_messages(self, destination: str) -> None:
         uids = self._message_list_view.get_selected_uids()
