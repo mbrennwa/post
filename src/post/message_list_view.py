@@ -30,6 +30,14 @@ OnSelectionChanged = Callable[[], None]
 OnItemActivated = Callable[[str], None]
 
 
+def _list_scroll_to_flags() -> Gtk.ListScrollFlags:
+    flags = Gtk.ListScrollFlags.FOCUS
+    align_center = getattr(Gtk.ListScrollFlags, "ALIGN_CENTER", None)
+    if align_center is not None:
+        flags |= align_center
+    return flags
+
+
 class MessageListItem(GObject.Object):
     __gtype_name__ = "MessageListItem"
 
@@ -98,6 +106,9 @@ class VirtualMessageList(Gtk.ScrolledWindow):
 
     def set_restoring_selection(self, restoring: bool) -> None:
         self._restoring_selection = restoring
+
+    def is_restoring_selection(self) -> bool:
+        return self._restoring_selection
 
     def clear(self) -> None:
         self._uid_positions.clear()
@@ -181,7 +192,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self._selection.select_item(position, False)
         self._list_view.scroll_to(
             position,
-            Gtk.ListScrollFlags.FOCUS | Gtk.ListScrollFlags.ALIGN_CENTER,
+            _list_scroll_to_flags(),
             None,
         )
         return True
