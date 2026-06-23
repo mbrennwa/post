@@ -843,7 +843,7 @@ class MailService:
         queue_id: str | None = None,
     ) -> None:
         send_start = time.monotonic()
-        log.info(
+        log.debug(
             "Sending message account=%s to=%d cc=%d bcc=%d subject=%r",
             account_uid,
             len(to),
@@ -898,7 +898,7 @@ class MailService:
                 raise SendError(user_send_error_message(exc)) from exc
             if queue_id:
                 remove_queued_outbound_message(queue_id)
-            log.info(
+            log.debug(
                 "Send finished account=%s in %.2fs",
                 account_uid,
                 time.monotonic() - send_start,
@@ -945,7 +945,7 @@ class MailService:
                         self._append_to_sent_folder_unlocked(account_uid, sent_message)
                     if queue_id:
                         remove_queued_outbound_message(queue_id)
-                    log.info(
+                    log.debug(
                         "Send finished account=%s in %.2fs (local delivery)",
                         account_uid,
                         time.monotonic() - send_start,
@@ -1068,7 +1068,7 @@ class MailService:
         append(account_uid, sent_message)
         if queue_id:
             remove_queued_outbound_message(queue_id)
-        log.info(
+        log.debug(
             "Send finished account=%s in %.2fs",
             account_uid,
             time.monotonic() - send_start,

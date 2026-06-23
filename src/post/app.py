@@ -22,9 +22,12 @@ from post.window import MainWindow
 
 
 def main() -> int:
-    # POST_LOG_LEVEL=DEBUG enables verbose send-phase logging in post.mail.eds.
-    log_level = os.environ.get("POST_LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(level=getattr(logging, log_level, logging.INFO))
+    # POST_LOG_LEVEL=DEBUG enables send-phase tracing in post.mail.eds (default: quiet).
+    log_level_name = os.environ.get("POST_LOG_LEVEL")
+    if log_level_name:
+        logging.basicConfig(
+            level=getattr(logging, log_level_name.upper(), logging.DEBUG)
+        )
     # PyGObject adds an extra ref when Python vfuncs return GObjects; harmless at exit.
     warnings.filterwarnings(
         "ignore",
