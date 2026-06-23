@@ -28,6 +28,8 @@ from post.mail.helpers import (
 
 OnSelectionChanged = Callable[[], None]
 OnItemActivated = Callable[[str], None]
+OnItemPressed = Callable[[str], None]
+OnItemContextMenu = Callable[[str, Gtk.Widget, float, float], None]
 
 
 def _list_scroll_to_flags() -> Gtk.ListScrollFlags:
@@ -38,24 +40,31 @@ def _list_scroll_to_flags() -> Gtk.ListScrollFlags:
     return flags
 
 
+def _list_pick_flags() -> Gtk.PickFlags:
+    flags = getattr(Gtk.PickFlags, "DEFAULT", Gtk.PickFlags(0))
+    insensitive = getattr(Gtk.PickFlags, "INSENSITIVE", None)
+    if insensitive is not None:
+        flags |= insensitive
+    return flags
+
+
 class MessageListItem(GObject.Object):
     __gtype_name__ = "MessageListItem"
 
-    def __init__(self, message: dict[str, Any]) -> None:
-        super().__init__()
-        self._message = message
+    message = GObject.Property(type=object)
 
-    @property
-    def message(self) -> dict[str, Any]:
-        return self._message
+    def __init__(self, message: dict[str, Any]) -> None:
+        super().__init__(message=message)
 
     @property
     def uid(self) -> str:
-        return str(self._message.get("uid") or "")
+        msg = self.message
+        if not isinstance(msg, dict):
+            return ""
+        return str(msg.get("uid") or "")
 
     def set_message(self, message: dict[str, Any]) -> None:
-        self._message = message
-        self.notify("message")
+        self.message = message
 
 
 class VirtualMessageList(Gtk.ScrolledWindow):
@@ -70,6 +79,8 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self._uid_positions: dict[str, int] = {}
         self._on_selection_changed: OnSelectionChanged | None = None
         self._on_item_activated: OnItemActivated | None = None
+        self._on_item_pressed: OnItemPressed | None = None
+        self._on_item_context_menu: OnItemContextMenu | None = None
         self._restoring_selection = False
 
         self._store = Gio.ListStore(item_type=MessageListItem)
@@ -100,9 +111,13 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         *,
         on_selection_changed: OnSelectionChanged | None = None,
         on_item_activated: OnItemActivated | None = None,
+        on_item_pressed: OnItemPressed | None = None,
+        on_item_context_menu: OnItemContextMenu | None = None,
     ) -> None:
         self._on_selection_changed = on_selection_changed
         self._on_item_activated = on_item_activated
+        self._on_item_pressed = on_item_pressed
+        self._on_item_context_menu = on_item_context_menu
 
     def set_restoring_selection(self, restoring: bool) -> None:
         self._restoring_selection = restoring
@@ -198,7 +213,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         return True
 
     def pick_item_at(self, x: float, y: float) -> MessageListItem | None:
-        widget = self._list_view.pick(x, y, Gtk.PickFlags.DEFAULT)
+        widget = self._list_view.pick(x, y, _list_pick_flags())
         while widget is not None:
             if isinstance(widget, Gtk.ListItem):
                 position = widget.get_position()
@@ -297,6 +312,49 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         bottom_row.append(flag_icon)
         preview.append(bottom_row)
         outer.append(preview)
+
+        outer.set_can_target(True)
+
+        def on_row_primary_pressed(
+            gesture: Gtk.GestureClick, n_press: int, x: float, y: float
+        ) -> None:
+            if n_press != 1:
+                return
+            uid = getattr(list_item, "message_uid", None)
+            if not uid:
+                return
+            event = gesture.get_current_event()
+            if (
+                event is not None
+                and Gdk.Event.triggers_context_menu(event)
+                and self._on_item_context_menu is not None
+            ):
+                self._on_item_context_menu(uid, outer, x, y)
+                gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+                return
+            if self._on_item_pressed is not None:
+                self._on_item_pressed(uid)
+
+        def on_row_context_pressed(
+            gesture: Gtk.GestureClick, n_press: int, x: float, y: float
+        ) -> None:
+            if n_press != 1:
+                return
+            uid = getattr(list_item, "message_uid", None)
+            if not uid or self._on_item_context_menu is None:
+                return
+            self._on_item_context_menu(uid, outer, x, y)
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+        primary_gesture = Gtk.GestureClick()
+        primary_gesture.set_button(Gdk.BUTTON_PRIMARY)
+        primary_gesture.connect("pressed", on_row_primary_pressed)
+        outer.add_controller(primary_gesture)
+
+        context_gesture = Gtk.GestureClick()
+        context_gesture.set_button(Gdk.BUTTON_SECONDARY)
+        context_gesture.connect("pressed", on_row_context_pressed)
+        outer.add_controller(context_gesture)
 
         list_item.set_child(outer)
         list_item.unread_dot = unread_dot
