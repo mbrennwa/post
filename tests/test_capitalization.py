@@ -81,6 +81,7 @@ _SENTENCE_CONSTANTS = frozenset(
     {
         "OFFLINE_MAIL_MESSAGE",
         "OFFLINE_FOLDER_MESSAGE",
+        "OFFLINE_CACHED_LIST_STATUS",
     }
 )
 
@@ -423,6 +424,7 @@ class SentenceCapitalizationHelperTests(unittest.TestCase):
             "Moved message to Trash",
             "Could not save settings",
             "You're offline. Messages will load when you reconnect.",
+            "Offline · showing cached list",
         )
         for sample in samples:
             with self.subTest(sample=sample):

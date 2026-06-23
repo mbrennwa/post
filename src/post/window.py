@@ -24,14 +24,18 @@ from post.compose_window import ComposeWindow
 from post.credentials import prompt_password_sync
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
-from post.mail.eds import DEFAULT_MESSAGE_PAGE_SIZE, MailAccount
+from post.mail.eds import MailAccount
 from post.mail.sync_watcher import MailSyncWatcher
+from post.message_list_view import VirtualMessageList
 from post.mail.folders import POST_OUTBOX_FOLDER, is_post_outbox_folder
+from post.mail.folder_index_cache import has_cache as folder_index_has_cache
+from post.mail.message_list_state import message_list_fingerprint
 from post.mail.search import MessageSearchQuery, parse_search_query
 from post.mail.send_queue import (
+    OFFLINE_CACHED_LIST_STATUS,
     OFFLINE_MAIL_MESSAGE,
     is_network_unavailable_error,
-    list_queued_messages_page,
+    list_queued_messages,
     list_queued_outbound_messages,
     log_mail_error,
     offline_status_text,
@@ -44,10 +48,6 @@ from post.mail.helpers import (
     flag_menu_label,
     format_attachment_size,
     format_message_header,
-    format_message_list_date,
-    message_has_attachments,
-    message_is_flagged,
-    message_is_unread,
     read_menu_items,
     read_menu_label,
 )
@@ -71,7 +71,7 @@ log = logging.getLogger(__name__)
 _SIDEBAR_TOP_INSET = 12
 
 _MESSAGE_LIST_CSS = f"""
-list.message-list row {{
+listview.message-list row {{
   padding-top: 0;
   padding-bottom: 0;
 }}
@@ -139,13 +139,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._current_body: dict[str, str | None] = {"plain": None, "html": None}
         self._messages_load_generation = 0
         self._message_read_generation = 0
-        self._shown_message_count = 0
         self._message_total = -1
-        self._message_has_more = False
+        self._current_folder_messages: list[dict] | None = None
+        self._message_list_source = ""
+        self._message_sync_in_progress = False
         self._context_attachment_index: int | None = None
         self._context_attachment_mime: str | None = None
         self._context_attachment_name: str | None = None
-        self._context_message_rows: list[Gtk.ListBoxRow] = []
+        self._context_message_uids: list[str] = []
         self._pending_move_undo: dict | None = None
         self._undo_toast: Adw.Toast | None = None
         self._settings_dialog: SettingsWindow | None = None
@@ -153,7 +154,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_appearance = get_message_appearance()
         self._restore_message_folder: tuple[str, str] | None = None
         self._pending_restore_message_uid: str | None = None
-        self._restoring_selection = False
         self._suppress_sync_list_reload: tuple[str, str] | None = None
         self._user_message_click_pending = False
         self._search_query: MessageSearchQuery | None = None
@@ -266,34 +266,21 @@ class MainWindow(Adw.ApplicationWindow):
         loading_box.append(self._message_loading_label)
         self._message_stack.add_named(loading_box, "loading")
 
-        message_scroll = Gtk.ScrolledWindow()
-        message_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        message_scroll.set_vexpand(True)
-        self._message_scroll = message_scroll
-        self._message_list = Gtk.ListBox()
-        self._message_list.add_css_class("message-list")
-        self._message_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
-        self._message_list.set_activate_on_single_click(False)
-        self._message_list.connect("row-selected", self._on_message_list_selection_changed)
-        self._message_list.connect("row-selected", self._on_message_selected)
+        self._message_list_view = VirtualMessageList()
+        self._message_scroll = self._message_list_view
+        self._message_list_view.set_callbacks(
+            on_selection_changed=self._on_message_list_selection_changed,
+            on_item_activated=self._on_message_list_item_activated,
+        )
         context_gesture = Gtk.GestureClick()
         context_gesture.set_button(0)
         context_gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         context_gesture.connect("pressed", self._on_message_list_pressed)
-        self._message_list.add_controller(context_gesture)
+        self._message_list_view.list_view.add_controller(context_gesture)
         self._setup_message_shortcuts()
-        message_scroll.set_child(self._message_list)
 
         message_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        message_panel.append(message_scroll)
-        self._load_more_btn = Gtk.Button(label="Load More")
-        self._load_more_btn.set_margin_start(12)
-        self._load_more_btn.set_margin_end(12)
-        self._load_more_btn.set_margin_top(6)
-        self._load_more_btn.set_margin_bottom(6)
-        self._load_more_btn.set_visible(False)
-        self._load_more_btn.connect("clicked", self._on_load_more)
-        message_panel.append(self._load_more_btn)
+        message_panel.append(self._message_list_view)
 
         self._message_stack.add_named(message_panel, "list")
 
@@ -515,21 +502,6 @@ class MainWindow(Adw.ApplicationWindow):
                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
             )
 
-    @staticmethod
-    def _make_unread_dot(*, visible: bool) -> Gtk.Box:
-        dot = Gtk.Box()
-        dot.add_css_class("message-unread-dot")
-        dot.set_halign(Gtk.Align.CENTER)
-        dot.set_valign(Gtk.Align.CENTER)
-        dot.set_visible(visible)
-        return dot
-
-    @staticmethod
-    def _set_row_unread_indicator(row: Gtk.ListBoxRow, unread: bool) -> None:
-        dot = getattr(row, "unread_dot", None)
-        if isinstance(dot, Gtk.Widget):
-            dot.set_visible(unread)
-
     def _on_window_size_changed(self, *_args) -> None:
         if self.is_maximized():
             return
@@ -588,7 +560,7 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _setup_delete_shortcut(self) -> None:
-        for widget in (self, self._message_list):
+        for widget in (self, self._message_list_view.list_view):
             controller = Gtk.EventControllerKey()
             controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
             controller.connect("key-pressed", self._on_delete_key_pressed)
@@ -615,8 +587,9 @@ class MainWindow(Adw.ApplicationWindow):
         _widget: Gtk.Widget,
         _args: GLib.Variant | None = None,
     ) -> bool:
-        rows = self._message_list.get_selected_rows()
-        if not rows or not self._current_account or not self._current_folder:
+        if not self._message_list_view.get_selected_uids():
+            return False
+        if not self._current_account or not self._current_folder:
             return False
         state = self._sidebar.get_move_menu_state(
             self._current_account.uid, self._current_folder
@@ -685,7 +658,7 @@ class MainWindow(Adw.ApplicationWindow):
             return False
         if not self._header_search_entry.get_sensitive():
             return False
-        if self._message_list.get_selected_rows():
+        if self._message_list_view.get_selected_uids():
             return False
 
         char = self._typing_targets_search(keyval, state, focus)
@@ -769,12 +742,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _reader_message_flags(self) -> dict:
         if self._current_message_uid is None:
             return {}
-        row = self._find_message_row(self._current_message_uid)
-        if row is not None:
-            return dict(getattr(row, "message_flags", {}) or {})
-        if self._current_message is not None:
-            return dict(self._current_message.get("flags") or {})
-        return {}
+        return self._message_flags_for_uid(self._current_message_uid)
 
     def _update_reader_toggle_buttons(self) -> None:
         flags = self._reader_message_flags()
@@ -797,51 +765,41 @@ class MainWindow(Adw.ApplicationWindow):
             self._flag_toggle_btn.remove_css_class("message-flagged")
             self._flag_toggle_btn.set_tooltip_text("Flag")
 
-    def _reader_action_row(self) -> Gtk.ListBoxRow | None:
+    def _reader_action_uid(self) -> str | None:
         if self._current_message_uid is None:
             return None
-        rows = self._message_list.get_selected_rows()
-        if len(rows) != 1:
+        selected = self._message_list_view.get_selected_uids()
+        if len(selected) != 1 or selected[0] != self._current_message_uid:
             return None
-        row = rows[0]
-        if getattr(row, "message_uid", None) != self._current_message_uid:
-            return None
-        return row
+        return self._current_message_uid
 
-    def _ensure_row_selected(self, row: Gtk.ListBoxRow) -> None:
-        if row in self._message_list.get_selected_rows():
-            return
-        uid = getattr(row, "message_uid", None)
-        skip_read = uid is not None and uid == self._current_message_uid
-        if skip_read:
-            self._restoring_selection = True
-        self._message_list.select_row(row)
-        if skip_read:
-            self._restoring_selection = False
+    def _ensure_uid_selected(self, uid: str) -> None:
+        if uid not in self._message_list_view.get_selected_uids():
+            self._message_list_view.select_uid(uid)
 
-    def _ensure_row_selected_idle(self, row: Gtk.ListBoxRow) -> bool:
-        self._ensure_row_selected(row)
+    def _ensure_uid_selected_idle(self, uid: str) -> bool:
+        self._ensure_uid_selected(uid)
         return False
 
     def _on_read_toggle_clicked(self, *_args) -> None:
-        row = self._reader_action_row()
-        if row is None:
+        uid = self._reader_action_uid()
+        if uid is None:
             return
-        flags = dict(getattr(row, "message_flags", {}) or {})
-        self._set_message_flags("seen", seen=not flags.get("seen", True), rows=[row])
-        GLib.idle_add(self._ensure_row_selected_idle, row)
+        flags = self._message_flags_for_uid(uid)
+        self._set_message_flags("seen", seen=not flags.get("seen", True), uids=[uid])
+        GLib.idle_add(self._ensure_uid_selected_idle, uid)
 
     def _on_flag_toggle_clicked(self, *_args) -> None:
-        row = self._reader_action_row()
-        if row is None:
+        uid = self._reader_action_uid()
+        if uid is None:
             return
-        flags = dict(getattr(row, "message_flags", {}) or {})
+        flags = self._message_flags_for_uid(uid)
         self._set_message_flags(
             "flagged",
             flagged=not flags.get("flagged", False),
-            rows=[row],
+            uids=[uid],
         )
-        GLib.idle_add(self._ensure_row_selected_idle, row)
+        GLib.idle_add(self._ensure_uid_selected_idle, uid)
 
     def _setup_compose_action(self) -> None:
         compose_action = Gio.SimpleAction.new("compose-new", None)
@@ -1191,21 +1149,20 @@ class MainWindow(Adw.ApplicationWindow):
             trigger = Gtk.ShortcutTrigger.parse_string(accelerator)
             action = Gtk.CallbackAction.new(self._on_message_context_shortcut)
             controller.add_shortcut(Gtk.Shortcut.new(trigger, action))
-        self._message_list.add_controller(controller)
+        self._message_list_view.list_view.add_controller(controller)
 
     def _on_message_context_shortcut(
         self,
         _widget: Gtk.Widget,
         _args: GLib.Variant | None = None,
     ) -> bool:
-        row = self._message_list.get_selected_row()
-        if row is None:
-            rows = self._message_list.get_selected_rows()
-            row = rows[0] if rows else None
-        if not isinstance(row, Gtk.ListBoxRow):
+        uid = self._message_list_view.get_primary_selected_uid()
+        if uid is None:
+            uids = self._message_list_view.get_selected_uids()
+            uid = uids[0] if uids else None
+        if uid is None:
             return False
-        allocation = row.get_allocation()
-        self._popup_message_menu(row, allocation.width / 2, allocation.height / 2)
+        self._popup_message_menu(uid, 8, 8)
         return True
 
     def _ensure_popover_parent(
@@ -1244,7 +1201,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._sync_watcher.set_current_folder(None, None)
         self._clear_reader()
         self._message_popover.popdown()
-        self._clear_listbox(self._message_list)
+        self._message_list_view.clear()
         self._current_account = None
         self._current_folder = None
         self._search_query = None
@@ -1641,14 +1598,141 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             GLib.idle_add(self._reload_sidebar)
 
+    def _apply_folder_messages(
+        self,
+        messages: list[dict],
+        folder_name: str,
+        *,
+        account: MailAccount | None = None,
+    ) -> None:
+        self._message_list_view.set_messages(messages, folder_name=folder_name)
+        if account is not None:
+            self._update_message_status(account, folder_name)
+
+    def _message_flags_for_uid(self, uid: str) -> dict:
+        message = self._message_list_view.get_message(uid)
+        if message is not None:
+            return dict(message.get("flags") or {})
+        if self._current_message_uid == uid and self._current_message is not None:
+            return dict(self._current_message.get("flags") or {})
+        return {}
+
     @staticmethod
-    def _clear_listbox(listbox: Gtk.ListBox) -> None:
-        child = listbox.get_first_child()
-        while child is not None:
-            next_child = child.get_next_sibling()
-            if isinstance(child, Gtk.ListBoxRow):
-                listbox.remove(child)
-            child = next_child
+    def _message_seen_states_for_uids(
+        uids: list[str], flags_for_uid: Callable[[str], dict]
+    ) -> list[bool]:
+        return [flags_for_uid(uid).get("seen", True) for uid in uids]
+
+    @staticmethod
+    def _message_flagged_states_for_uids(
+        uids: list[str], flags_for_uid: Callable[[str], dict]
+    ) -> list[bool]:
+        return [flags_for_uid(uid).get("flagged", False) for uid in uids]
+
+    @staticmethod
+    def _count_menu_label(base: str, count: int) -> str:
+        suffix = f" ({count})" if count > 1 else ""
+        return f"{base}{suffix}"
+
+    def _start_background_message_sync(
+        self,
+        load_id: int,
+        account_uid: str,
+        folder_name: str,
+        fetch_messages: Callable[[bool], tuple[list[dict], int, int, str]],
+    ) -> None:
+        def worker_sync() -> None:
+            error: Exception | None = None
+            messages: list[dict] | None = None
+            unread = -1
+            total = -1
+            try:
+                messages, unread, total, _source = fetch_messages(True)
+            except Exception as exc:
+                if is_network_unavailable_error(exc):
+                    GLib.idle_add(
+                        self._on_messages_sync_finished,
+                        load_id,
+                        False,
+                    )
+                    return
+                log_mail_error(log, "Failed to refresh messages", exc)
+                error = exc
+            GLib.idle_add(
+                self._on_messages_refreshed,
+                load_id,
+                account_uid,
+                folder_name,
+                messages,
+                unread,
+                total,
+                error,
+            )
+
+        threading.Thread(target=worker_sync, daemon=True).start()
+
+    @staticmethod
+    def _load_source_label(source: str) -> str:
+        if source == "server":
+            return "from server"
+        if source in {"disk_cache", "local", "memory"}:
+            return "from local cache"
+        if source == "outbox":
+            return "from Outbox"
+        return ""
+
+    def _predict_initial_load_source(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        viewing_outbox: bool,
+        should_sync: bool,
+        use_background_sync: bool,
+    ) -> str:
+        if viewing_outbox:
+            return "outbox"
+        if use_background_sync:
+            return "disk_cache" if folder_index_has_cache(account_uid, folder_name) else "local"
+        if should_sync:
+            return "server"
+        if folder_index_has_cache(account_uid, folder_name):
+            return "disk_cache"
+        return "local"
+
+    def _loading_progress_text(
+        self,
+        display_folder: str,
+        *,
+        searching: bool,
+        source: str,
+    ) -> str:
+        action = "Searching" if searching else "Loading"
+        detail = self._load_source_label(source)
+        if detail:
+            return f"{action} {display_folder} {detail}…"
+        return f"{action} {display_folder}…"
+
+    def _message_load_status_detail(self) -> str:
+        parts: list[str] = []
+        if (
+            not self._network_available
+            and self._message_list_source in {"disk_cache", "local", "memory"}
+            and (self._message_list_view.item_count() > 0 or self._message_total > 0)
+        ):
+            parts.append(OFFLINE_CACHED_LIST_STATUS)
+        if self._message_sync_in_progress:
+            source_label = self._load_source_label(self._message_list_source)
+            if source_label:
+                parts.append(source_label)
+            parts.append("Syncing with Server")
+        return " · ".join(parts)
+
+    def _with_load_status_detail(self, text: str) -> str:
+        detail = self._message_load_status_detail()
+        if detail:
+            return f"{text} · {detail}"
+        return text
 
     def _load_messages(
         self,
@@ -1661,104 +1745,105 @@ class MainWindow(Adw.ApplicationWindow):
         account = self._current_account
         if account is None or account.uid != account_uid:
             return
+        if offset != 0:
+            return
 
         if sync is None:
             sync = get_auto_sync()
         if not self._network_available:
             sync = False
 
-        if offset == 0:
-            self._messages_load_generation += 1
-            self._shown_message_count = 0
-            self._message_total = -1
-            self._message_has_more = False
-            self._load_more_btn.set_visible(False)
-            display_folder = (
-                "Outbox" if is_post_outbox_folder(folder_name) else folder_name
-            )
-            if self._search_query is not None:
-                self._set_status(f"Searching {display_folder}…")
-            else:
-                self._set_status(f"Loading {display_folder}…")
-            if (
-                not self._pending_restore_message_uid
-                and self._current_message_uid
-                and self._current_account
-                and self._current_folder
-                and self._current_account.uid == account_uid
-                and self._current_folder == folder_name
-            ):
-                self._pending_restore_message_uid = self._current_message_uid
-                self._restore_message_folder = (account_uid, folder_name)
-            self._message_popover.popdown()
-            self._clear_listbox(self._message_list)
-            self._clear_reader()
-            loading_label = (
-                f"Searching {display_folder}…"
-                if self._search_query is not None
-                else f"Loading {display_folder}…"
-            )
-            self._message_loading_label.set_label(loading_label)
-            self._message_loading_spinner.start()
-            self._message_stack.set_visible_child_name("loading")
-        else:
-            self._load_more_btn.set_sensitive(False)
-            self._load_more_btn.set_label("Loading…")
-
+        self._messages_load_generation += 1
         load_id = self._messages_load_generation
+
+        display_folder = (
+            "Outbox" if is_post_outbox_folder(folder_name) else folder_name
+        )
         search_query = self._search_query
         viewing_outbox = is_post_outbox_folder(folder_name)
-        from_label = account.email or account.display_label
         should_sync = sync
+        use_background_sync = (
+            should_sync
+            and self._network_available
+            and not viewing_outbox
+            and search_query is None
+        )
+        from_label = account.email or account.display_label
 
-        def worker() -> None:
+        def fetch_messages(sync_flag: bool) -> tuple[list[dict], int, int, str]:
+            if viewing_outbox:
+                messages, unread, total = list_queued_messages(
+                    account_uid,
+                    from_label=from_label,
+                )
+                return messages, unread, total, "outbox"
+            if search_query is not None:
+                messages, unread, total, source = self._mail.search_folder_messages(
+                    account_uid,
+                    folder_name,
+                    search_query,
+                    sync=sync_flag,
+                )
+                return messages, unread, total, source
+            messages, unread, total, source = self._mail.get_folder_messages(
+                account_uid,
+                folder_name,
+                sync=sync_flag,
+            )
+            return messages, unread, total, source
+
+        self._message_total = -1
+        self._current_folder_messages = None
+        self._message_sync_in_progress = False
+        initial_source = self._predict_initial_load_source(
+            account_uid,
+            folder_name,
+            viewing_outbox=viewing_outbox,
+            should_sync=should_sync,
+            use_background_sync=use_background_sync,
+        )
+        self._message_list_source = initial_source
+        loading_label = self._loading_progress_text(
+            display_folder,
+            searching=search_query is not None,
+            source=initial_source,
+        )
+        self._set_status(loading_label)
+        if (
+            not self._pending_restore_message_uid
+            and self._current_message_uid
+            and self._current_account
+            and self._current_folder
+            and self._current_account.uid == account_uid
+            and self._current_folder == folder_name
+        ):
+            self._pending_restore_message_uid = self._current_message_uid
+            self._restore_message_folder = (account_uid, folder_name)
+        self._message_popover.popdown()
+        self._message_list_view.clear()
+        self._clear_reader()
+        self._message_loading_label.set_label(loading_label)
+        self._message_loading_spinner.start()
+        self._message_stack.set_visible_child_name("loading")
+
+        def worker_initial() -> None:
             error: Exception | None = None
             messages: list[dict] | None = None
             unread = -1
             total = -1
-            has_more = False
+            source = initial_source
+            initial_sync = should_sync and not use_background_sync
             try:
-                if viewing_outbox:
-                    messages, unread, total, has_more = list_queued_messages_page(
-                        account_uid,
-                        from_label=from_label,
-                        offset=offset,
-                        limit=DEFAULT_MESSAGE_PAGE_SIZE,
-                    )
-                elif search_query is not None:
-                    messages, unread, total, has_more = self._mail.search_messages_page(
-                        account_uid,
-                        folder_name,
-                        search_query,
-                        offset=offset,
-                        limit=DEFAULT_MESSAGE_PAGE_SIZE,
-                        sync=should_sync,
-                    )
-                else:
-                    messages, unread, total, has_more = self._mail.list_messages_page(
-                        account_uid,
-                        folder_name,
-                        offset=offset,
-                        limit=DEFAULT_MESSAGE_PAGE_SIZE,
-                        sync=should_sync,
-                    )
+                messages, unread, total, source = fetch_messages(initial_sync)
             except Exception as exc:
                 if (
                     not viewing_outbox
                     and search_query is None
-                    and should_sync
+                    and initial_sync
                     and is_network_unavailable_error(exc)
                 ):
                     try:
-                        messages, unread, total, has_more = (
-                            self._mail.list_messages_page(
-                                account_uid,
-                                folder_name,
-                                offset=offset,
-                                limit=DEFAULT_MESSAGE_PAGE_SIZE,
-                                sync=False,
-                            )
-                        )
+                        messages, unread, total, source = fetch_messages(False)
                     except Exception as retry_exc:
                         log_mail_error(log, "Failed to list messages", retry_exc)
                         error = retry_exc
@@ -1770,57 +1855,86 @@ class MainWindow(Adw.ApplicationWindow):
                 load_id,
                 account_uid,
                 folder_name,
-                offset,
                 messages,
                 unread,
                 total,
-                has_more,
+                source,
+                use_background_sync,
                 error,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker_initial, daemon=True).start()
+        if use_background_sync:
+            self._start_background_message_sync(
+                load_id,
+                account_uid,
+                folder_name,
+                fetch_messages,
+            )
 
-    def _on_load_more(self, *_args) -> None:
-        if (
-            not self._current_account
-            or not self._current_folder
-            or not self._message_has_more
-        ):
-            return
-        self._load_messages(
-            self._current_account.uid,
-            self._current_folder,
-            offset=self._shown_message_count,
-        )
+    def _on_messages_sync_finished(self, load_id: int, changed: bool) -> bool:
+        if load_id != self._messages_load_generation:
+            return False
+        self._message_sync_in_progress = False
+        if changed:
+            return False
+        account = self._current_account
+        if account is not None and self._current_folder is not None:
+            self._update_message_status(account, self._current_folder)
+        return False
 
     def _on_messages_loaded(
         self,
         load_id: int,
         account_uid: str,
         folder_name: str,
-        offset: int,
         messages: list[dict] | None,
         unread: int,
         total: int,
-        has_more: bool,
+        source: str,
+        sync_pending: bool,
         error: Exception | None,
     ) -> bool:
         if load_id != self._messages_load_generation:
             return False
 
         self._message_loading_spinner.stop()
-        self._load_more_btn.set_sensitive(True)
-        self._load_more_btn.set_label("Load More")
 
         if error is not None:
             if is_network_unavailable_error(error):
+                if (
+                    self._search_query is None
+                    and not is_post_outbox_folder(folder_name)
+                    and folder_index_has_cache(account_uid, folder_name)
+                ):
+                    try:
+                        messages, unread, total, source = self._mail.get_folder_messages(
+                            account_uid,
+                            folder_name,
+                            sync=False,
+                        )
+                    except Exception:
+                        messages = None
+                    else:
+                        GLib.idle_add(
+                            self._on_messages_loaded,
+                            load_id,
+                            account_uid,
+                            folder_name,
+                            messages,
+                            unread,
+                            total,
+                            source,
+                            False,
+                            None,
+                        )
+                        return False
                 self._message_empty_label.set_label(OFFLINE_MAIL_MESSAGE)
                 self._message_stack.set_visible_child_name("empty")
             else:
                 self._message_error_label.set_label(str(error))
                 self._message_stack.set_visible_child_name("error")
                 show_error_toast(self, f"Could not load {folder_name}")
-            self._load_more_btn.set_visible(False)
             return False
 
         assert messages is not None
@@ -1829,16 +1943,18 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_stack.set_visible_child_name("list")
             return False
 
-        if offset == 0 and not self._search_query:
+        if not self._search_query:
             if is_post_outbox_folder(folder_name):
                 self._sidebar.refresh_outbox_row(account_uid)
             else:
                 self._sidebar.update_folder_row(account_uid, folder_name, unread, total)
 
+        self._current_folder_messages = messages
         self._message_total = total
-        self._message_has_more = has_more
+        self._message_list_source = source
+        self._message_sync_in_progress = sync_pending
 
-        if offset == 0 and not messages:
+        if not messages:
             folder_label = "Outbox" if is_post_outbox_folder(folder_name) else folder_name
             if is_post_outbox_folder(folder_name):
                 self._message_empty_label.set_label("No Queued Messages")
@@ -1851,127 +1967,76 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         self._message_stack.set_visible_child_name("list")
-        self._populate_message_rows(
-            load_id,
-            messages,
-            0,
-            account,
-            folder_name,
-            page_offset=offset,
-        )
-        return False
-
-    def _populate_message_rows(
-        self,
-        load_id: int,
-        messages: list[dict],
-        row_offset: int,
-        account: MailAccount,
-        folder_name: str,
-        page_offset: int,
-        batch_size: int = 25,
-    ) -> bool:
-        if load_id != self._messages_load_generation:
-            return False
-
-        end = min(row_offset + batch_size, len(messages))
-        for msg in messages[row_offset:end]:
-            subject = msg.get("subject") or "(no subject)"
-            if is_post_outbox_folder(folder_name):
-                sender = msg.get("preview_to") or msg.get("to") or ""
-            else:
-                sender = msg.get("from") or ""
-            unread = message_is_unread(msg)
-
-            outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-            outer.set_margin_start(8)
-            outer.set_margin_end(0)
-
-            dot_column = Gtk.Box()
-            dot_column.set_size_request(16, -1)
-            dot_column.set_valign(Gtk.Align.CENTER)
-            unread_dot = self._make_unread_dot(visible=unread)
-            dot_column.append(unread_dot)
-            outer.append(dot_column)
-
-            preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            preview.set_margin_start(4)
-            preview.set_margin_end(12)
-            preview.set_margin_top(8)
-            preview.set_margin_bottom(8)
-
-            top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            subject_label = Gtk.Label(label=subject, xalign=0, wrap=True)
-            subject_label.set_hexpand(True)
-            top_row.append(subject_label)
-
-            date_text = format_message_list_date(msg)
-            if date_text:
-                date_label = Gtk.Label(label=date_text, xalign=1)
-                date_label.add_css_class("dim-label")
-                top_row.append(date_label)
-            preview.append(top_row)
-
-            bottom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            meta = Gtk.Label(label=sender, xalign=0, ellipsize=3)
-            meta.set_hexpand(True)
-            meta.add_css_class("dim-label")
-            bottom_row.append(meta)
-
-            if message_has_attachments(msg):
-                attach_icon = Gtk.Image.new_from_icon_name("mail-attachment-symbolic")
-                attach_icon.add_css_class("dim-label")
-                attach_icon.set_tooltip_text("Has Attachments")
-                bottom_row.append(attach_icon)
-
-            flag_icon = Gtk.Image.new_from_icon_name("mail-flag-symbolic")
-            flag_icon.add_css_class("message-flagged-icon")
-            flag_icon.set_tooltip_text("Flagged")
-            flag_icon.set_visible(message_is_flagged(msg))
-            bottom_row.append(flag_icon)
-            preview.append(bottom_row)
-            outer.append(preview)
-
-            row = Gtk.ListBoxRow()
-            row.set_child(outer)
-            row.message_uid = msg.get("uid")
-            row.message_flags = dict(msg.get("flags") or {})
-            row.subject_label = subject_label
-            row.unread_dot = unread_dot
-            row.flag_icon = flag_icon
-
-            self._message_list.append(row)
-
-        if end < len(messages):
-            GLib.idle_add(
-                self._populate_message_rows,
-                load_id,
-                messages,
-                end,
-                account,
-                folder_name,
-                page_offset,
-                batch_size,
-            )
-            return False
-
-        self._shown_message_count = page_offset + len(messages)
-        self._load_more_btn.set_visible(self._message_has_more)
-        self._update_message_status(account, folder_name)
+        self._apply_folder_messages(messages, folder_name, account=account)
         if self._search_query is None:
             self._try_restore_selected_message(account.uid, folder_name)
         return False
 
-    def _find_message_row(self, message_uid: str) -> Gtk.ListBoxRow | None:
-        child = self._message_list.get_first_child()
-        while child is not None:
-            if (
-                isinstance(child, Gtk.ListBoxRow)
-                and getattr(child, "message_uid", None) == message_uid
-            ):
-                return child
-            child = child.get_next_sibling()
-        return None
+    def _on_messages_refreshed(
+        self,
+        load_id: int,
+        account_uid: str,
+        folder_name: str,
+        messages: list[dict] | None,
+        unread: int,
+        total: int,
+        error: Exception | None,
+    ) -> bool:
+        if load_id != self._messages_load_generation:
+            return False
+        if error is not None:
+            self._message_sync_in_progress = False
+            if account := self._current_account:
+                if self._current_folder == folder_name:
+                    self._update_message_status(account, folder_name)
+            return False
+
+        assert messages is not None
+        account = self._current_account
+        if account is None or account.uid != account_uid:
+            return False
+        if self._current_folder != folder_name:
+            return False
+
+        if not self._search_query:
+            if is_post_outbox_folder(folder_name):
+                self._sidebar.refresh_outbox_row(account_uid)
+            else:
+                self._sidebar.update_folder_row(account_uid, folder_name, unread, total)
+
+        current = self._current_folder_messages or []
+        if (
+            message_list_fingerprint(messages) == message_list_fingerprint(current)
+            and self._message_total == total
+        ):
+            GLib.idle_add(self._on_messages_sync_finished, load_id, False)
+            return False
+
+        self._current_folder_messages = messages
+        self._message_total = total
+        self._message_list_source = "server"
+        self._message_sync_in_progress = False
+        self._messages_load_generation += 1
+        self._set_status(f"Refreshing {folder_name} from server…")
+
+        if not messages:
+            folder_label = "Outbox" if is_post_outbox_folder(folder_name) else folder_name
+            if is_post_outbox_folder(folder_name):
+                self._message_empty_label.set_label("No Queued Messages")
+            elif self._search_query is not None:
+                self._message_empty_label.set_label(f"No Matches in {folder_label}")
+            else:
+                self._message_empty_label.set_label(f"No Messages in {folder_label}")
+            self._message_list_view.clear()
+            self._message_stack.set_visible_child_name("empty")
+            self._update_message_status(account, folder_name)
+            return False
+
+        self._message_stack.set_visible_child_name("list")
+        self._apply_folder_messages(messages, folder_name, account=account)
+        if self._search_query is None:
+            self._try_restore_selected_message(account.uid, folder_name)
+        return False
 
     def _try_restore_selected_message(self, account_uid: str, folder_name: str) -> None:
         uid = self._pending_restore_message_uid
@@ -1984,94 +2049,96 @@ class MainWindow(Adw.ApplicationWindow):
             self._pending_restore_message_uid = None
             return
 
-        row = self._find_message_row(uid)
-        if row is not None:
+        self._message_list_view.set_restoring_selection(True)
+        if self._message_list_view.select_uid(uid):
             self._pending_restore_message_uid = None
-            self._message_list.select_row(row)
-            return
-
-        if self._message_has_more:
-            self._load_messages(account_uid, folder_name, offset=self._shown_message_count)
-            return
-
-        self._pending_restore_message_uid = None
-        set_active_message_uid(None)
+            self._current_message_uid = uid
+            self._load_message_body_for_uid(uid, mark_seen=False)
+        else:
+            self._pending_restore_message_uid = None
+            set_active_message_uid(None)
+        self._message_list_view.set_restoring_selection(False)
 
     def _update_message_status(self, account: MailAccount, folder_name: str) -> None:
-        shown = self._shown_message_count
+        shown = self._message_list_view.item_count()
         total = self._message_total
         label = account.display_label
         if is_post_outbox_folder(folder_name):
             if total == 0:
-                self._set_status(f"No queued messages for {label}")
+                self._set_status(self._with_load_status_detail(f"No queued messages for {label}"))
             elif total >= 0 and shown < total:
                 self._set_status(
-                    f"Showing {shown} of {total} queued for {label}"
+                    self._with_load_status_detail(
+                        f"Showing {shown} of {total} queued for {label}"
+                    )
                 )
             elif total >= 0:
-                self._set_status(f"{total} queued for {label}")
+                self._set_status(self._with_load_status_detail(f"{total} queued for {label}"))
             else:
-                self._set_status(f"{shown} queued for {label}")
+                self._set_status(self._with_load_status_detail(f"{shown} queued for {label}"))
             return
         if self._search_query is not None:
             if total == 0:
-                self._set_status(f"No matches in {label} / {folder_name}")
+                self._set_status(
+                    self._with_load_status_detail(
+                        f"No matches in {label} / {folder_name}"
+                    )
+                )
             elif total >= 0 and shown < total:
                 self._set_status(
-                    f"Showing {shown} of {total} matches in {label} / {folder_name}"
+                    self._with_load_status_detail(
+                        f"Showing {shown} of {total} matches in {label} / {folder_name}"
+                    )
                 )
             elif total >= 0:
-                self._set_status(f"{total} matches in {label} / {folder_name}")
+                self._set_status(
+                    self._with_load_status_detail(
+                        f"{total} matches in {label} / {folder_name}"
+                    )
+                )
             else:
                 self._set_status(
-                    f"{shown} matches in {label} / {folder_name}"
+                    self._with_load_status_detail(
+                        f"{shown} matches in {label} / {folder_name}"
+                    )
                 )
             return
         if total >= 0 and shown < total:
-            self._set_status(f"Showing {shown} of {total} in {label} / {folder_name}")
+            self._set_status(
+                self._with_load_status_detail(
+                    f"Showing {shown} of {total} in {label} / {folder_name}"
+                )
+            )
         elif total >= 0:
-            self._set_status(f"{total} messages in {label} / {folder_name}")
+            self._set_status(
+                self._with_load_status_detail(
+                    f"{total} messages in {label} / {folder_name}"
+                )
+            )
         else:
-            self._set_status(f"{shown} messages in {label} / {folder_name}")
+            self._set_status(
+                self._with_load_status_detail(
+                    f"{shown} messages in {label} / {folder_name}"
+                )
+            )
 
-    def _mark_row_read(self, row: Gtk.ListBoxRow) -> None:
-        self._set_row_unread_indicator(row, False)
-        flags = dict(getattr(row, "message_flags", {}) or {})
+    def _mark_message_read(self, uid: str) -> None:
+        flags = self._message_flags_for_uid(uid)
         flags["seen"] = True
-        row.message_flags = flags
+        self._message_list_view.update_message_flags(uid, flags)
 
-    def _message_rows_for_menu(self, row: Gtk.ListBoxRow) -> list[Gtk.ListBoxRow]:
-        selected = self._message_list.get_selected_rows()
-        if row in selected:
+    def _uids_for_menu(self, uid: str) -> list[str]:
+        selected = self._message_list_view.get_selected_uids()
+        if uid in selected:
             return selected
-        self._message_list.unselect_all()
-        self._message_list.select_row(row)
-        return [row]
-
-    @staticmethod
-    def _message_seen_states(rows: list[Gtk.ListBoxRow]) -> list[bool]:
-        return [
-            (getattr(row, "message_flags", {}) or {}).get("seen", True) for row in rows
-        ]
-
-    @staticmethod
-    def _message_flagged_states(rows: list[Gtk.ListBoxRow]) -> list[bool]:
-        return [
-            (getattr(row, "message_flags", {}) or {}).get("flagged", False)
-            for row in rows
-        ]
-
-    @staticmethod
-    def _count_menu_label(base: str, rows: list[Gtk.ListBoxRow]) -> str:
-        count = len(rows)
-        suffix = f" ({count})" if count > 1 else ""
-        return f"{base}{suffix}"
+        self._message_list_view.select_uid(uid)
+        return [uid]
 
     def _popup_message_menu(
-        self, row: Gtk.ListBoxRow, x: float, y: float
+        self, uid: str, x: float, y: float
     ) -> None:
-        rows = self._message_rows_for_menu(row)
-        self._context_message_rows = rows
+        uids = self._uids_for_menu(uid)
+        self._context_message_uids = uids
 
         can_archive = False
         can_trash = False
@@ -2086,35 +2153,38 @@ class MainWindow(Adw.ApplicationWindow):
         self._trash_action.set_enabled(can_trash)
 
         menu = Gio.Menu()
-        count = len(rows)
+        count = len(uids)
         viewing_outbox = is_post_outbox_folder(self._current_folder or "")
+        flags_for_uid = self._message_flags_for_uid
         if not viewing_outbox:
-            for action in read_menu_items(self._message_seen_states(rows)):
+            for action in read_menu_items(
+                self._message_seen_states_for_uids(uids, flags_for_uid)
+            ):
                 menu.append(
                     read_menu_label(action, count),
                     f"win.message-mark-{action}",
                 )
-            for action in flag_menu_items(self._message_flagged_states(rows)):
+            for action in flag_menu_items(
+                self._message_flagged_states_for_uids(uids, flags_for_uid)
+            ):
                 menu.append(
                     flag_menu_label(action, count),
                     f"win.message-{action}",
                 )
-            if len(rows) == 1:
+            if count == 1:
                 menu.append("Reply", "win.message-reply")
                 menu.append("Reply All", "win.message-reply-all")
         if can_archive:
             menu.append(
-                self._count_menu_label("Archive", rows), "win.message-archive"
+                self._count_menu_label("Archive", count), "win.message-archive"
             )
         if can_trash:
             menu.append(
-                self._count_menu_label("Move to Trash", rows), "win.message-move-trash"
+                self._count_menu_label("Move to Trash", count), "win.message-move-trash"
             )
         self._message_popover.set_menu_model(menu)
 
-        coords = self._message_list.translate_coordinates(
-            self._message_scroll, x, y
-        )
+        coords = self._message_list_view.translate_to_scroll(x, y)
         if coords is not None:
             menu_x, menu_y = coords
         else:
@@ -2137,8 +2207,8 @@ class MainWindow(Adw.ApplicationWindow):
         if n_press != 1:
             return
 
-        row = self._message_list.get_row_at_y(int(y))
-        if not isinstance(row, Gtk.ListBoxRow):
+        item = self._message_list_view.pick_item_at(x, y)
+        if item is None or not item.uid:
             return
 
         event = gesture.get_current_event()
@@ -2146,7 +2216,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         if Gdk.Event.triggers_context_menu(event):
-            self._popup_message_menu(row, x, y)
+            self._popup_message_menu(item.uid, x, y)
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
             return
 
@@ -2178,13 +2248,13 @@ class MainWindow(Adw.ApplicationWindow):
         self._open_compose_on_message("reply-all")
 
     def _move_selected_messages(self, destination: str) -> None:
-        rows = self._message_list.get_selected_rows()
-        if not rows:
+        uids = self._message_list_view.get_selected_uids()
+        if not uids:
             return
-        self._move_messages(destination, list(rows))
+        self._move_messages(destination, uids)
 
     def _move_context_messages(self, destination: str) -> None:
-        self._move_messages(destination, list(self._context_message_rows))
+        self._move_messages(destination, list(self._context_message_uids))
 
     def _delete_queued_messages(self, queue_ids: list[str]) -> None:
         if not self._current_account:
@@ -2198,8 +2268,8 @@ class MainWindow(Adw.ApplicationWindow):
             self._set_status(f"Removed {count} queued messages")
         self._on_outbox_changed()
 
-    def _move_messages(self, destination: str, rows: list[Gtk.ListBoxRow]) -> None:
-        if not rows or not self._current_account or not self._current_folder:
+    def _move_messages(self, destination: str, uids: list[str]) -> None:
+        if not uids or not self._current_account or not self._current_folder:
             return
 
         state = self._sidebar.get_move_menu_state(
@@ -2210,10 +2280,7 @@ class MainWindow(Adw.ApplicationWindow):
         if destination == "trash" and not state.get("can_trash"):
             return
 
-        uids = [uid for row in rows if (uid := getattr(row, "message_uid", None))]
-        if not uids:
-            return
-
+        uids = list(uids)
         account_uid = self._current_account.uid
         folder_name = self._current_folder
         self._message_popover.popdown()
@@ -2466,15 +2533,8 @@ class MainWindow(Adw.ApplicationWindow):
                 self._suppress_sync_list_reload = None
             return False
 
-        removed_count = 0
-        cleared_current = False
-        for uid in uids:
-            row = self._find_message_row(uid)
-            if row is not None and row.get_parent() is self._message_list:
-                self._message_list.remove(row)
-                removed_count += 1
-            if uid == self._current_message_uid:
-                cleared_current = True
+        removed_count = self._message_list_view.remove_uids(uids)
+        cleared_current = any(uid == self._current_message_uid for uid in uids)
 
         if cleared_current:
             self._clear_reader()
@@ -2483,9 +2543,16 @@ class MainWindow(Adw.ApplicationWindow):
 
         moved_count = len(result.get("moved_uids") or uids)
         count_delta = removed_count if removed_count > 0 else moved_count
-        self._shown_message_count = max(0, self._shown_message_count - count_delta)
         if self._message_total >= 0:
             self._message_total = max(0, self._message_total - count_delta)
+
+        if removed_count > 0 and self._current_folder_messages:
+            moved_uids = set(uids)
+            self._current_folder_messages = [
+                message
+                for message in self._current_folder_messages
+                if message.get("uid") not in moved_uids
+            ]
 
         if removed_count == 0 and moved_count > 0:
             if (
@@ -2495,18 +2562,11 @@ class MainWindow(Adw.ApplicationWindow):
                 and self._current_folder == folder_name
             ):
                 self._load_messages(account_uid, folder_name, sync=False)
-        else:
-            remaining_rows = 0
-            child = self._message_list.get_first_child()
-            while child is not None:
-                if isinstance(child, Gtk.ListBoxRow):
-                    remaining_rows += 1
-                child = child.get_next_sibling()
-            if remaining_rows == 0 and folder_name:
-                self._message_empty_label.set_label(
-                    f"No Messages in {folder_name}"
-                )
-                self._message_stack.set_visible_child_name("empty")
+        elif self._message_list_view.item_count() == 0 and folder_name:
+            self._message_empty_label.set_label(
+                f"No Messages in {folder_name}"
+            )
+            self._message_stack.set_visible_child_name("empty")
 
         self._update_sidebar_from_move_result(account_uid, result)
         self._finalize_move_status_and_undo(
@@ -2530,15 +2590,11 @@ class MainWindow(Adw.ApplicationWindow):
         *,
         seen: bool | None = None,
         flagged: bool | None = None,
-        rows: list[Gtk.ListBoxRow] | None = None,
+        uids: list[str] | None = None,
     ) -> None:
-        if rows is None:
-            rows = list(self._context_message_rows)
-        if not rows or not self._current_account or not self._current_folder:
-            return
-
-        uids = [uid for row in rows if (uid := getattr(row, "message_uid", None))]
-        if not uids:
+        if uids is None:
+            uids = list(self._context_message_uids)
+        if not uids or not self._current_account or not self._current_folder:
             return
 
         account_uid = self._current_account.uid
@@ -2560,11 +2616,11 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception as exc:
             log.exception("Failed to update message %s", flag_name)
             error = exc
-        self._on_messages_flag_toggled(rows, flag_name, result, error)
+        self._on_messages_flag_toggled(uids, flag_name, result, error)
 
     def _on_messages_flag_toggled(
         self,
-        rows: list[Gtk.ListBoxRow],
+        uids: list[str],
         flag_name: str,
         result: dict | None,
         error: Exception | None,
@@ -2580,14 +2636,11 @@ class MainWindow(Adw.ApplicationWindow):
             for item in result.get("updates") or []
             if item.get("uid")
         }
-        for row in rows:
-            uid = getattr(row, "message_uid", None)
-            if not uid or uid not in updates_by_uid:
+        for uid in uids:
+            if uid not in updates_by_uid:
                 continue
-            flags = dict(getattr(row, "message_flags", {}) or {})
-            flags.update(updates_by_uid[uid])
-            row.message_flags = flags
-            self._apply_row_flags(row, flags)
+            flags = dict(updates_by_uid[uid])
+            self._message_list_view.update_message_flags(uid, flags)
             if uid == self._current_message_uid and self._current_message is not None:
                 self._current_message["flags"] = dict(flags)
 
@@ -2616,28 +2669,29 @@ class MainWindow(Adw.ApplicationWindow):
             self._set_status(f"Updated {count} messages")
         return False
 
-    def _apply_row_flags(self, row: Gtk.ListBoxRow, flags: dict) -> None:
-        self._set_row_unread_indicator(row, not flags.get("seen", True))
-
-        flag_icon = getattr(row, "flag_icon", None)
-        if isinstance(flag_icon, Gtk.Image):
-            flag_icon.set_visible(bool(flags.get("flagged")))
-
-    def _on_message_list_selection_changed(
-        self, _listbox: Gtk.ListBox, _row: Gtk.ListBoxRow | None
-    ) -> None:
+    def _on_message_list_selection_changed(self) -> None:
         GLib.idle_add(self._update_message_toolbar)
 
+    def _on_message_list_item_activated(self, uid: str) -> None:
+        mark_seen = self._user_message_click_pending
+        self._user_message_click_pending = False
+        if not self._current_account or not self._current_folder:
+            return
+        if len(self._message_list_view.get_selected_uids()) != 1:
+            return
+        self._current_message_uid = uid
+        self._load_message_body_for_uid(uid, mark_seen=mark_seen)
+
     def _update_message_toolbar(self) -> bool:
-        rows = self._message_list.get_selected_rows()
+        selected = self._message_list_view.get_selected_uids()
         can_use_reader_actions = (
-            len(rows) == 1
+            len(selected) == 1
             and self._current_message_uid is not None
-            and getattr(rows[0], "message_uid", None) == self._current_message_uid
+            and selected[0] == self._current_message_uid
         )
         self._set_message_actions_sensitive(can_use_reader_actions)
 
-        has_selection = bool(rows)
+        has_selection = bool(selected)
         can_archive = False
         can_trash = False
         if has_selection and self._current_account and self._current_folder:
@@ -2651,19 +2705,13 @@ class MainWindow(Adw.ApplicationWindow):
         self._header_trash_btn.set_sensitive(can_trash)
         return False
 
-    def _on_message_selected(
-        self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None
+    def _load_message_body_for_uid(
+        self,
+        uid: str,
+        *,
+        mark_seen: bool,
     ) -> None:
-        if self._restoring_selection:
-            return
-        mark_seen = self._user_message_click_pending
-        self._user_message_click_pending = False
-        if row is None or not self._current_account or not self._current_folder:
-            return
-        if len(self._message_list.get_selected_rows()) != 1:
-            return
-        uid = getattr(row, "message_uid", None)
-        if not uid:
+        if not self._current_account or not self._current_folder:
             return
 
         account = self._current_account
@@ -2707,7 +2755,6 @@ class MainWindow(Adw.ApplicationWindow):
                 GLib.idle_add(
                     self._on_message_read,
                     read_id,
-                    row,
                     uid,
                     msg,
                     error,
@@ -2740,7 +2787,6 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_message_read(
         self,
         read_id: int,
-        row: Gtk.ListBoxRow,
         uid: str,
         msg: dict | None,
         error: Exception | None,
@@ -2785,7 +2831,7 @@ class MainWindow(Adw.ApplicationWindow):
                 msg["folder_total"],
             )
         if (msg.get("flags") or {}).get("seen"):
-            self._mark_row_read(row)
+            self._mark_message_read(uid)
 
         self._reader_subject.set_label(msg.get("subject") or "(no subject)")
         self._reader_subject.set_visible(True)
