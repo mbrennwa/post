@@ -338,6 +338,7 @@ class MainWindow(Adw.ApplicationWindow):
         reader.set_hexpand(True)
         reader.set_margin_start(16)
         reader.set_margin_end(16)
+        reader.set_margin_top(_SIDEBAR_TOP_INSET)
         reader.set_margin_bottom(12)
 
         self._reader_subject = WrappingLabel(
