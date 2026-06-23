@@ -1140,6 +1140,10 @@ class MainWindow(Adw.ApplicationWindow):
         reply_all_action.connect("activate", self._on_message_menu_reply_all)
         self.add_action(reply_all_action)
 
+        forward_action = Gio.SimpleAction.new("message-forward", None)
+        forward_action.connect("activate", self._on_message_menu_forward)
+        self.add_action(forward_action)
+
         self._message_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
         self._message_popover.set_parent(self._message_scroll)
 
@@ -2174,6 +2178,7 @@ class MainWindow(Adw.ApplicationWindow):
             if count == 1:
                 menu.append("Reply", "win.message-reply")
                 menu.append("Reply All", "win.message-reply-all")
+                menu.append("Forward", "win.message-forward")
         if can_archive:
             menu.append(
                 self._count_menu_label("Archive", count), "win.message-archive"
@@ -2246,6 +2251,9 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_message_menu_reply_all(self, *_args) -> None:
         self._open_compose_on_message("reply-all")
+
+    def _on_message_menu_forward(self, *_args) -> None:
+        self._open_compose_on_message("forward")
 
     def _move_selected_messages(self, destination: str) -> None:
         uids = self._message_list_view.get_selected_uids()
