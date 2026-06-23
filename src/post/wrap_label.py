@@ -12,12 +12,14 @@ gi.require_version("Pango", "1.0")
 
 from gi.repository import Gtk, Pango
 
-_GTK_TO_PANGO_WRAP = {
-    Gtk.WrapMode.NONE: Pango.WrapMode.NONE,
+_GTK_TO_PANGO_WRAP: dict[Gtk.WrapMode, Pango.WrapMode] = {
     Gtk.WrapMode.WORD: Pango.WrapMode.WORD,
     Gtk.WrapMode.CHAR: Pango.WrapMode.CHAR,
     Gtk.WrapMode.WORD_CHAR: Pango.WrapMode.WORD_CHAR,
 }
+_pango_wrap_none = getattr(Pango.WrapMode, "NONE", None)
+if _pango_wrap_none is not None:
+    _GTK_TO_PANGO_WRAP[Gtk.WrapMode.NONE] = _pango_wrap_none
 
 
 def configure_ellipsize_label(label: Gtk.Label) -> Gtk.Label:
