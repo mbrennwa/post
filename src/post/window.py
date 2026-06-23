@@ -271,12 +271,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_list_view.set_callbacks(
             on_selection_changed=self._on_message_list_selection_changed,
             on_item_activated=self._on_message_list_item_activated,
+            on_item_pressed=self._on_message_list_item_pressed,
+            on_item_context_menu=self._on_message_list_context_menu,
         )
-        context_gesture = Gtk.GestureClick()
-        context_gesture.set_button(0)
-        context_gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        context_gesture.connect("pressed", self._on_message_list_pressed)
-        self._message_list_view.list_view.add_controller(context_gesture)
         self._setup_message_shortcuts()
 
         message_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2139,7 +2136,7 @@ class MainWindow(Adw.ApplicationWindow):
         return [uid]
 
     def _popup_message_menu(
-        self, uid: str, x: float, y: float
+        self, uid: str, x: float, y: float, popup_widget: Gtk.Widget | None = None
     ) -> None:
         uids = self._uids_for_menu(uid)
         self._context_message_uids = uids
@@ -2189,7 +2186,12 @@ class MainWindow(Adw.ApplicationWindow):
             )
         self._message_popover.set_menu_model(menu)
 
-        coords = self._message_list_view.translate_to_scroll(x, y)
+        parent = self._message_popover.get_parent()
+        coords: tuple[float, float] | None = None
+        if popup_widget is not None and parent is not None:
+            coords = popup_widget.translate_coordinates(parent, x, y)
+        if coords is None:
+            coords = self._message_list_view.translate_to_scroll(x, y)
         if coords is not None:
             menu_x, menu_y = coords
         else:
@@ -2202,31 +2204,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_popover.set_pointing_to(rect)
         self._message_popover.popup()
 
-    def _on_message_list_pressed(
-        self,
-        gesture: Gtk.GestureClick,
-        n_press: int,
-        x: float,
-        y: float,
-    ) -> None:
-        if n_press != 1:
-            return
-
-        item = self._message_list_view.pick_item_at(x, y)
-        if item is None or not item.uid:
-            return
-
-        event = gesture.get_current_event()
-        is_context = (
-            event is not None and Gdk.Event.triggers_context_menu(event)
-        ) or gesture.get_current_button() == Gdk.BUTTON_SECONDARY
-        if is_context:
-            self._popup_message_menu(item.uid, x, y)
-            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-            return
-
+    def _on_message_list_item_pressed(self, uid: str) -> None:
         self._user_message_click_pending = True
-        self._message_list_view.select_uid(item.uid)
+        self._message_list_view.select_uid(uid)
+
+    def _on_message_list_context_menu(
+        self, uid: str, widget: Gtk.Widget, x: float, y: float
+    ) -> None:
+        self._popup_message_menu(uid, x, y, widget)
 
     def _on_message_menu_mark_read(self, *_args) -> None:
         self._set_messages_seen(True)
