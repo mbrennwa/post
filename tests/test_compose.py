@@ -7,8 +7,11 @@ import unittest
 
 from post.mail.compose import (
     ComposeAttachment,
+    body_html_for_quoting,
     body_text_for_quoting,
     build_draft_mime_message,
+    build_outbound_email_bytes,
+    build_outbound_html_for_compose,
     build_plain_mime_message,
     build_forward_subject,
     build_reply_all_recipients,
@@ -20,13 +23,16 @@ from post.mail.compose import (
     normalize_email,
     parse_address_header,
     parse_address_list,
+    quote_html_forward,
     quote_plain_forward,
     quote_plain_reply,
     read_compose_attachments_from_message,
+    split_compose_body_at_quote,
 )
 from post.mail.helpers import (
     _mime_message_raw_bytes,
     extract_attachments,
+    extract_message_bodies,
     get_attachment_data,
     html_to_quotable_plain,
     plain_body_looks_truncated,
@@ -674,6 +680,109 @@ class SignatureComposeTests(unittest.TestCase):
             ),
             quoted,
         )
+
+
+class HtmlForwardReplyTests(unittest.TestCase):
+    def test_body_html_for_quoting_returns_original_html(self) -> None:
+        message = {"body_html": "<p><b>Hello</b></p>", "body_plain": "Hello"}
+        self.assertEqual(body_html_for_quoting(message), "<p><b>Hello</b></p>")
+
+    def test_quote_html_forward_preserves_source_html(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "to": "Bob <bob@example.com>",
+            "date_received": "2026-06-17 16:49:57",
+        }
+        source = '<p style="color:#000000">Newsletter</p>'
+        quoted = quote_html_forward(original, source)
+        self.assertIn('class="post_quote"', quoted)
+        self.assertIn(source, quoted)
+        self.assertIn("---------- Forwarded message ---------", quoted)
+
+    def test_build_plain_mime_message_with_html_is_multipart_alternative(self) -> None:
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Fwd: Hi",
+            body="See below\n",
+            body_html='<blockquote class="post_quote"><p>Hi</p></blockquote>',
+        )
+        content_type = message.get_content_type()
+        self.assertIsNotNone(content_type)
+        self.assertEqual(content_type.simple(), "multipart/alternative")
+
+    def test_build_outbound_email_bytes_with_html_is_multipart_alternative(self) -> None:
+        payload = build_outbound_email_bytes(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Fwd: Hi",
+            body="See below\n",
+            body_html='<blockquote class="post_quote"><p>Hi</p></blockquote>',
+        )
+        import email
+        import email.policy
+
+        parsed = email.message_from_bytes(payload, policy=email.policy.default)
+        self.assertTrue(parsed.is_multipart())
+        self.assertEqual(parsed.get_content_type(), "multipart/alternative")
+        plain_part = parsed.get_body(preferencelist=("plain",))
+        html_part = parsed.get_body(preferencelist=("html",))
+        self.assertIsNotNone(plain_part)
+        self.assertIsNotNone(html_part)
+        self.assertIn("See below", str(plain_part.get_content()))
+        self.assertIn("post_quote", str(html_part.get_content()))
+
+    def test_unchanged_plain_quote_uses_original_html(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "to": "Bob <bob@example.com>",
+            "date_received": "2026-06-17",
+        }
+        source = '<p style="color:#000000">Original</p>'
+        quoted_plain = quote_plain_forward(original, "Plain fallback")
+        body_plain = f"My note{quoted_plain}"
+        html = build_outbound_html_for_compose(
+            body_plain=body_plain,
+            mode="forward",
+            reply_to=original,
+            quoted_html_source=source,
+            quoted_plain_expected=quoted_plain,
+        )
+        self.assertIsNotNone(html)
+        assert html is not None
+        self.assertIn(source, html)
+        self.assertIn("My note", html)
+
+    def test_edited_plain_quote_falls_back_to_escaped_plain(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "to": "Bob <bob@example.com>",
+            "date_received": "2026-06-17",
+        }
+        source = "<p>Original</p>"
+        quoted_plain = quote_plain_forward(original, "Plain fallback")
+        user_plain, quoted_part = split_compose_body_at_quote(
+            f"Edited intro{quoted_plain}edited quote",
+            "forward",
+        )
+        self.assertEqual(user_plain, "Edited intro")
+        html = build_outbound_html_for_compose(
+            body_plain=f"{user_plain}{quoted_part}",
+            mode="forward",
+            reply_to=original,
+            quoted_html_source=source,
+            quoted_plain_expected=quoted_plain,
+        )
+        self.assertIsNotNone(html)
+        assert html is not None
+        self.assertNotIn(source, html)
+        self.assertIn("edited quote", html)
 
 
 if __name__ == "__main__":

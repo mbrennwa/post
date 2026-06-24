@@ -24,9 +24,11 @@ from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.compose import (
     ComposeAttachment,
+    body_html_for_quoting,
     body_is_unedited_signature_template,
     body_text_for_quoting,
     build_forward_subject,
+    build_outbound_html_for_compose,
     build_reply_all_recipients,
     build_reply_references,
     build_reply_subject,
@@ -36,6 +38,7 @@ from post.mail.compose import (
     guess_attachment_mime_type,
     normalize_email,
     parse_address_list,
+    plain_to_simple_html,
     quote_plain_forward,
     quote_plain_reply,
 )
@@ -68,9 +71,10 @@ class OutboundSendRequest:
     bcc: list[str] | None
     subject: str
     body: str
-    in_reply_to: str | None
-    references: str | None
-    attachments: list[ComposeAttachment] | None
+    body_html: str | None = None
+    in_reply_to: str | None = None
+    references: str | None = None
+    attachments: list[ComposeAttachment] | None = None
     draft_folder: str | None = None
     draft_uid: str | None = None
     queue_id: str | None = None
@@ -123,6 +127,7 @@ def _run_outbound_send_worker(
                 bcc=request.bcc,
                 subject=request.subject,
                 body=request.body,
+                body_html=request.body_html,
                 in_reply_to=request.in_reply_to,
                 references=request.references,
                 attachments=request.attachments,
@@ -311,6 +316,12 @@ class ComposeWindow(Adw.Window):
         self._unsaved_dialog: Adw.AlertDialog | None = None
         self._user_edited = False
         self._tracking_edits = False
+        self._quoted_html_source: str | None = None
+        self._quoted_plain_expected = ""
+        self._draft_body_html: str | None = None
+        self._draft_body_plain_snapshot = ""
+        self._pending_draft_body = ""
+        self._pending_draft_body_html: str | None = None
         self._send_accounts = mail.list_sendable_accounts()
         if not self._send_accounts and not (account.from_address or account.email):
             raise ValueError("No mail account configured for sending")
@@ -922,6 +933,8 @@ class ComposeWindow(Adw.Window):
                 self._reply_to,
                 body_text_for_quoting(self._reply_to),
             )
+            self._quoted_html_source = body_html_for_quoting(self._reply_to)
+            self._quoted_plain_expected = quoted
             body = compose_body_with_signature(
                 mode=self._mode,
                 quoted_body=quoted,
@@ -936,6 +949,8 @@ class ComposeWindow(Adw.Window):
                 self._reply_to,
                 body_text_for_quoting(self._reply_to),
             )
+            self._quoted_html_source = body_html_for_quoting(self._reply_to)
+            self._quoted_plain_expected = quoted
             body = compose_body_with_signature(
                 mode=self._mode,
                 quoted_body=quoted,
@@ -954,7 +969,12 @@ class ComposeWindow(Adw.Window):
                 self._bcc_entry.set_can_focus(True)
                 self._bcc_toggle_btn.set_label("Hide Bcc")
             self._subject_entry.set_text(str(msg.get("subject") or ""))
-            self._body_view.get_buffer().set_text(str(msg.get("body_plain") or ""))
+            plain_body = str(msg.get("body_plain") or "")
+            self._body_view.get_buffer().set_text(plain_body)
+            self._draft_body_html = (msg.get("body_html") or "").strip() or None
+            self._draft_body_plain_snapshot = plain_body
+            self._quoted_html_source = None
+            self._quoted_plain_expected = ""
         else:
             body = compose_body_with_signature(
                 mode="new",
@@ -1073,9 +1093,35 @@ class ComposeWindow(Adw.Window):
     def _on_save_draft_clicked(self, *_args) -> None:
         self._begin_save_draft(close_when_done=False)
 
+    def _resolve_outbound_body_html(self, body_plain: str) -> str | None:
+        if self._mode in ("reply", "reply-all", "forward"):
+            return build_outbound_html_for_compose(
+                body_plain=body_plain,
+                mode=self._mode,
+                reply_to=self._reply_to,
+                quoted_html_source=self._quoted_html_source,
+                quoted_plain_expected=self._quoted_plain_expected,
+            )
+        if self._mode == "draft":
+            if body_plain == self._draft_body_plain_snapshot and self._draft_body_html:
+                return self._draft_body_html
+            if body_plain.strip():
+                return plain_to_simple_html(body_plain)
+            return None
+        return None
+
     def _collect_draft_fields(
         self,
-    ) -> tuple[list[str], list[str], list[str], str, str, str | None, str | None]:
+    ) -> tuple[
+        list[str],
+        list[str],
+        list[str],
+        str,
+        str,
+        str | None,
+        str | None,
+        str | None,
+    ]:
         to_addrs = parse_address_list(self._to_entry.get_text())
         cc_addrs = parse_address_list(self._cc_entry.get_text())
         bcc_addrs = parse_address_list(self._bcc_entry.get_text())
@@ -1083,6 +1129,7 @@ class ComposeWindow(Adw.Window):
         buffer = self._body_view.get_buffer()
         start, end = buffer.get_bounds()
         body = buffer.get_text(start, end, False)
+        body_html = self._resolve_outbound_body_html(body)
 
         in_reply_to = None
         references = None
@@ -1102,6 +1149,7 @@ class ComposeWindow(Adw.Window):
             bcc_addrs,
             subject,
             body,
+            body_html,
             in_reply_to,
             references,
         )
@@ -1117,6 +1165,7 @@ class ComposeWindow(Adw.Window):
                 bcc_addrs,
                 subject,
                 body,
+                body_html,
                 in_reply_to,
                 references,
             ) = self._collect_draft_fields()
@@ -1135,6 +1184,8 @@ class ComposeWindow(Adw.Window):
         self._saving_draft = True
         self._set_compose_actions_sensitive(False)
         self._set_status("Saving draft…")
+        self._pending_draft_body = body
+        self._pending_draft_body_html = body_html
 
         account_uid = account.uid
         existing_uid = self._draft_message_uid
@@ -1152,6 +1203,7 @@ class ComposeWindow(Adw.Window):
                     bcc=bcc_addrs or None,
                     subject=subject,
                     body=body,
+                    body_html=body_html,
                     in_reply_to=in_reply_to,
                     references=references,
                     existing_uid=existing_uid,
@@ -1181,6 +1233,8 @@ class ComposeWindow(Adw.Window):
         assert result is not None
         self._draft_folder_name, self._draft_message_uid = result
         self._user_edited = False
+        self._draft_body_plain_snapshot = self._pending_draft_body
+        self._draft_body_html = self._pending_draft_body_html
         self._set_status("Draft saved")
         if self._on_draft_saved is not None:
             self._on_draft_saved()
@@ -1196,6 +1250,7 @@ class ComposeWindow(Adw.Window):
                 bcc_addrs,
                 subject,
                 body,
+                body_html,
                 in_reply_to,
                 references,
             ) = self._collect_draft_fields()
@@ -1224,6 +1279,7 @@ class ComposeWindow(Adw.Window):
             bcc=bcc_addrs or None,
             subject=subject,
             body=body,
+            body_html=body_html,
             in_reply_to=in_reply_to,
             references=references,
             attachments=list(self._attachments) or None,

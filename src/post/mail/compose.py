@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 import uuid
 from dataclasses import dataclass
@@ -140,7 +141,134 @@ def quote_plain_forward(original: dict[str, Any], body_plain: str | None) -> str
 
     header = format_message_header(original)
     text = (body_plain or "").strip() or "(no message body)"
-    return f"\n\n---------- Forwarded message ---------\n{header}\n\n{text}\n"
+    return f"\n\n{FORWARD_QUOTE_MARKER}\n{header}\n\n{text}\n"
+
+
+FORWARD_QUOTE_MARKER = "---------- Forwarded message ---------"
+
+
+def body_html_for_quoting(message: dict[str, Any]) -> str | None:
+    """Return original MIME HTML to embed when forwarding or replying."""
+    content = (message.get("body_html") or "").strip()
+    return content or None
+
+
+def _strip_html_document_wrappers(body_html: str) -> str:
+    """Return inner HTML, dropping outer document wrappers when present."""
+    text = body_html.strip()
+    body_match = re.search(r"<body\b[^>]*>(.*)</body>", text, re.IGNORECASE | re.DOTALL)
+    if body_match:
+        return body_match.group(1).strip()
+    html_match = re.search(r"<html\b[^>]*>(.*)</html>", text, re.IGNORECASE | re.DOTALL)
+    if html_match:
+        return html_match.group(1).strip()
+    return text
+
+
+def quote_html_forward(original: dict[str, Any], body_html: str) -> str:
+    from .helpers import format_message_header
+
+    header_lines = format_message_header(original).splitlines()
+    header_html = "<br>\n".join(html.escape(line) for line in header_lines)
+    content = _strip_html_document_wrappers(body_html)
+    return (
+        f"<div>{FORWARD_QUOTE_MARKER}</div>"
+        f"<div>{header_html}</div>"
+        f'<blockquote class="post_quote">{content}</blockquote>'
+    )
+
+
+def quote_html_reply(original: dict[str, Any], body_html: str) -> str:
+    date = original.get("date_received") or original.get("date_sent") or ""
+    sender = html.escape(str(original.get("from") or ""))
+    content = _strip_html_document_wrappers(body_html)
+    return (
+        f"<div>On {html.escape(str(date))}, {sender} wrote:</div>"
+        f'<blockquote class="post_quote">{content}</blockquote>'
+    )
+
+
+def plain_to_simple_html(plain: str) -> str:
+    """Convert plain text into a minimal HTML fragment."""
+    text = plain.rstrip("\n")
+    if not text:
+        return ""
+    return f'<div style="white-space:pre-wrap">{html.escape(text)}</div>'
+
+
+def plain_quoted_as_html(quoted_plain: str) -> str:
+    """Wrap edited plain-text quotes for the HTML body."""
+    text = quoted_plain.strip()
+    if not text:
+        return ""
+    return (
+        f'<blockquote class="post_quote">'
+        f'<div style="white-space:pre-wrap">{html.escape(text)}</div>'
+        f"</blockquote>"
+    )
+
+
+_REPLY_QUOTE_MARKER_RE = re.compile(r"\n\nOn .+ wrote:\n", re.DOTALL)
+
+
+def split_compose_body_at_quote(body_plain: str, mode: str) -> tuple[str, str]:
+    """Split compose body into user content and the quoted section."""
+    if mode == "forward":
+        marker = f"\n\n{FORWARD_QUOTE_MARKER}"
+        idx = body_plain.find(marker)
+        if idx == -1:
+            return body_plain, ""
+        return body_plain[:idx], body_plain[idx:]
+    if mode in ("reply", "reply-all"):
+        match = _REPLY_QUOTE_MARKER_RE.search(body_plain)
+        if not match:
+            return body_plain, ""
+        return body_plain[: match.start()], body_plain[match.start() :]
+    return body_plain, ""
+
+
+def build_outbound_html_body(
+    *,
+    user_plain: str,
+    quoted_html: str | None,
+) -> str | None:
+    """Assemble the outbound text/html body from user text and quoted HTML."""
+    parts: list[str] = []
+    if user_plain.strip():
+        parts.append(plain_to_simple_html(user_plain.rstrip()))
+    if quoted_html:
+        parts.append(quoted_html)
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
+def build_outbound_html_for_compose(
+    *,
+    body_plain: str,
+    mode: str,
+    reply_to: dict[str, Any] | None,
+    quoted_html_source: str | None,
+    quoted_plain_expected: str,
+) -> str | None:
+    """Build text/html for reply/forward using original MIME HTML when unchanged."""
+    if mode not in ("reply", "reply-all", "forward"):
+        return None
+    user_plain, quoted_plain = split_compose_body_at_quote(body_plain, mode)
+    quoted_html: str | None = None
+    if quoted_plain.strip():
+        if (
+            quoted_plain == quoted_plain_expected
+            and quoted_html_source
+            and reply_to is not None
+        ):
+            if mode == "forward":
+                quoted_html = quote_html_forward(reply_to, quoted_html_source)
+            else:
+                quoted_html = quote_html_reply(reply_to, quoted_html_source)
+        else:
+            quoted_html = plain_quoted_as_html(quoted_plain)
+    return build_outbound_html_body(user_plain=user_plain, quoted_html=quoted_html)
 
 
 def normalize_email(address: str) -> str:
@@ -481,30 +609,72 @@ def _apply_compose_headers(
         message.set_header("References", references)
 
 
+def _encode_html_body(body_html: str) -> bytes:
+    encoded = (body_html or "").encode("utf-8")
+    return encoded if encoded else b"\n"
+
+
+def _build_alternative_multipart(
+    encoded_plain: bytes,
+    encoded_html: bytes,
+) -> Any:
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    alternative = Camel.Multipart.new()
+    alternative.set_boundary(f"----post-alt-{uuid.uuid4().hex}")
+
+    plain_part = Camel.MimePart.new()
+    plain_part.set_content(encoded_plain, "text/plain; charset=utf-8")
+    plain_part.set_encoding(Camel.TransferEncoding.ENCODING_7BIT)
+    alternative.add_part(plain_part)
+
+    html_part = Camel.MimePart.new()
+    html_part.set_content(encoded_html, "text/html; charset=utf-8")
+    html_part.set_encoding(Camel.TransferEncoding.ENCODING_7BIT)
+    alternative.add_part(html_part)
+
+    return alternative
+
+
 def _set_message_body(
     message: Any,
     body: str,
     attachments: Sequence[ComposeAttachment] | None,
+    body_html: str | None = None,
 ) -> None:
     import gi
 
     gi.require_version("Camel", "1.2")
     from gi.repository import Camel
 
-    encoded_body = _encode_plain_body(body)
-    if not attachments:
-        message.set_content(encoded_body, "text/plain; charset=utf-8")
+    encoded_plain = _encode_plain_body(body)
+    encoded_html = _encode_html_body(body_html) if body_html else None
+
+    if not encoded_html and not attachments:
+        message.set_content(encoded_plain, "text/plain; charset=utf-8")
+        return
+
+    if encoded_html and not attachments:
+        alternative = _build_alternative_multipart(encoded_plain, encoded_html)
+        message.props.content = alternative
+        message.set_mime_type("multipart/alternative")
         return
 
     multipart = Camel.Multipart.new()
     multipart.set_boundary(f"----post-{uuid.uuid4().hex}")
 
-    body_part = Camel.MimePart.new()
-    body_part.set_content(encoded_body, "text/plain; charset=utf-8")
-    body_part.set_encoding(Camel.TransferEncoding.ENCODING_7BIT)
-    multipart.add_part(body_part)
+    if encoded_html:
+        multipart.add_part(_build_alternative_multipart(encoded_plain, encoded_html))
+    else:
+        body_part = Camel.MimePart.new()
+        body_part.set_content(encoded_plain, "text/plain; charset=utf-8")
+        body_part.set_encoding(Camel.TransferEncoding.ENCODING_7BIT)
+        multipart.add_part(body_part)
 
-    for attachment in attachments:
+    for attachment in attachments or ():
         part = Camel.MimePart.new()
         part.set_content(attachment.data, attachment.mime_type)
         part.set_disposition("attachment")
@@ -525,6 +695,7 @@ def build_outbound_email_bytes(
     bcc: list[str] | None,
     subject: str,
     body: str,
+    body_html: str | None = None,
     in_reply_to: str | None = None,
     references: str | None = None,
     attachments: Sequence[ComposeAttachment] | None = None,
@@ -552,21 +723,20 @@ def build_outbound_email_bytes(
         message["References"] = references
 
     text = body if body else "\n"
-    if not attachments:
-        message.set_content(text, charset="utf-8")
-        return message.as_bytes()
-
     message.set_content(text, charset="utf-8")
-    for attachment in attachments:
-        maintype, _, subtype = attachment.mime_type.partition("/")
-        if not subtype:
-            maintype, subtype = "application", "octet-stream"
-        message.add_attachment(
-            attachment.data,
-            maintype=maintype,
-            subtype=subtype,
-            filename=attachment.filename,
-        )
+    if body_html:
+        message.add_alternative(body_html, subtype="html", charset="utf-8")
+    if attachments:
+        for attachment in attachments:
+            maintype, _, subtype = attachment.mime_type.partition("/")
+            if not subtype:
+                maintype, subtype = "application", "octet-stream"
+            message.add_attachment(
+                attachment.data,
+                maintype=maintype,
+                subtype=subtype,
+                filename=attachment.filename,
+            )
     return message.as_bytes()
 
 
@@ -579,6 +749,7 @@ def build_plain_mime_message(
     bcc: list[str] | None,
     subject: str,
     body: str,
+    body_html: str | None = None,
     in_reply_to: str | None = None,
     references: str | None = None,
     attachments: Sequence[ComposeAttachment] | None = None,
@@ -604,7 +775,7 @@ def build_plain_mime_message(
         references=references,
         require_to=True,
     )
-    _set_message_body(message, body, attachments)
+    _set_message_body(message, body, attachments, body_html=body_html)
     return message
 
 
@@ -617,6 +788,7 @@ def build_draft_mime_message(
     bcc: list[str] | None,
     subject: str,
     body: str,
+    body_html: str | None = None,
     in_reply_to: str | None = None,
     references: str | None = None,
     attachments: Sequence[ComposeAttachment] | None = None,
@@ -640,5 +812,5 @@ def build_draft_mime_message(
         references=references,
         require_to=False,
     )
-    _set_message_body(message, body, attachments)
+    _set_message_body(message, body, attachments, body_html=body_html)
     return message

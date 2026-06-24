@@ -373,7 +373,8 @@ class BuildReaderDocumentTests(unittest.TestCase):
             dark=True,
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
-        self.assertEqual(doc.count('class="post-adapt-text"'), 2)
+        self.assertEqual(doc.count('class="post-adapt-text"'), 1)
+        self.assertIn('class="post-keep-color"', doc)
         self.assertIn('class="post-painted"', doc)
 
     def test_adapt_text_preserves_sender_colors_with_background_shorthand(self) -> None:
@@ -498,6 +499,188 @@ class BuildReaderDocumentTests(unittest.TestCase):
         )
         expected = base64.b64encode(png).decode("ascii")
         self.assertIn(f"url(data:image/png;base64,{expected})", doc)
+
+    def test_adapt_text_adapts_forwarded_black_text_on_dark_theme(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<div dir="ltr">See below<br></div>'
+                '<div class="gmail_quote">'
+                '<p style="color:#000000">Original newsletter content</p>'
+                "</div>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertNotIn("post-quoted-history", doc)
+        self.assertIn("post-adapt-text", doc)
+        self.assertIn("color: inherit !important", doc)
+
+    def test_adapt_text_keeps_readable_grey_on_dark_shell(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                "<div>Neue Antwort</div>"
+                '<blockquote type="cite">'
+                '<div style="color:#aaaaaa">Am 22.06.2026 schrieb Adrian:</div>'
+                '<div style="color:#cccccc">Hoi Matthias</div>'
+                "</blockquote>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertNotIn("post-quoted-history", doc)
+        self.assertIn("post-keep-color", doc)
+
+    def test_adapt_text_adapts_unstyled_blockquote_reply_on_dark_theme(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                "<div>Hoi Matthias</div>"
+                '<blockquote type="cite">'
+                "<div>Am 22.06.2026 schrieb Adrian Wicki:</div>"
+                "<div>Die Boxen sind in Arbeit</div>"
+                "</blockquote>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertNotIn("post-quoted-history", doc)
+        self.assertIn('name="color-scheme" content="dark"', doc)
+
+    def test_adapt_text_splits_gmail_quote_container(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<div>Intro</div>'
+                '<div class="gmail_quote gmail_quote_container">'
+                '<p style="color:#000000">Quoted</p>'
+                "</div>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertNotIn("post-quoted-history", doc)
+        self.assertIn("gmail_quote_container", doc)
+        self.assertIn("post-adapt-text", doc)
+
+    def test_adapt_text_wraps_blockquote_only_body(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<blockquote type="cite">'
+                '<p style="color:#000000">Quoted only</p>'
+                "</blockquote>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertNotIn("post-quoted-history", doc)
+        self.assertIn("post-adapt-text", doc)
+
+    def test_adapt_text_preserves_reader_link_color_for_plain_mailto(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<p style="color:#000000">Contact '
+                '<a href="mailto:info@klotzholz.com">info@klotzholz.com</a></p>'
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn("a { color: #62a0ea; }", doc)
+        self.assertNotRegex(doc, r"<a\b[^>]*post-adapt-text")
+        self.assertIn("mailto:info@klotzholz.com", doc)
+
+    def test_adapt_text_adapts_low_contrast_link_color(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<a href="https://example.com" style="color:#000000">'
+                "dark link</a>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('class="post-adapt-text"', doc)
+        self.assertIn(".message-body a.post-adapt-text", doc)
+
+    def test_adapt_text_renders_attachment_placeholder_with_brackets(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<p style="color:#000000">See <IMG_9838.jpg> attached</p>'
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn(
+            '<span class="post-bracketed">&#x3C;IMG_9838.jpg&#x3E;</span>', doc
+        )
+        self.assertNotIn("<IMG_9838.jpg>", doc)
+
+    def test_adapt_text_preserves_email_address_brackets(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<p style="color:#000000">Am 22.06.2026 schrieb Adrian Wicki '
+                "&lt;info@klotzholz.com&gt;:</p>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn(
+            '<span class="post-bracketed">&#x3C;info@klotzholz.com&#x3E;</span>',
+            doc,
+        )
+        self.assertNotIn("&lt;info@klotzholz.com&gt;", doc)
+        self.assertNotIn("<info@klotzholz.com>", doc)
+
+    def test_adapt_text_preserves_brackets_around_mailto_link(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<div style="color:#aaaaaa">Am 22.06.2026 um 14:58 schrieb Adrian Wicki '
+                '&lt;<a href="mailto:info@klotzholz.com">info@klotzholz.com</a>&gt;:</div>'
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn(
+            '<span class="post-bracketed">&#x3C;<a href="mailto:info@klotzholz.com">'
+            "info@klotzholz.com</a>&#x3E;</span>",
+            doc,
+        )
+        self.assertNotRegex(doc, r"schrieb Adrian Wicki <a\b")
+
+    def test_accept_sender_renders_attachment_placeholder_with_brackets(self) -> None:
+        doc = build_reader_document(
+            body_html="<p>See <IMG_9838.jpg> attached</p>",
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ACCEPT_SENDER,
+        )
+        self.assertIn(
+            '<span class="post-bracketed">&#x3C;IMG_9838.jpg&#x3E;</span>', doc
+        )
+        self.assertNotIn("<IMG_9838.jpg>", doc)
 
 
 class ResolveCidImagesTests(unittest.TestCase):
