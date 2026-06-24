@@ -118,26 +118,38 @@ def format_recipient_header(value: Any) -> str:
                 return str(formatted).strip()
         except (TypeError, ValueError):
             pass
+        return ""
     return (_safe_str(value) or "").strip()
 
 
+def _recipient_field_from_mime(mime: Any, field: str) -> str:
+    """Return a formatted To/Cc/Bcc value from a Camel MIME message."""
+    if hasattr(mime, "get_recipients"):
+        formatted = format_recipient_header(mime.get_recipients(field))
+        if formatted:
+            return formatted
+    if hasattr(mime, "get_header"):
+        header_name = {"to": "To", "cc": "Cc", "bcc": "Bcc"}[field]
+        header = mime.get_header(header_name)
+        if header:
+            formatted = format_recipient_header(header)
+            if formatted:
+                return formatted
+    return ""
+
+
 def enrich_message_dict_from_mime(result: dict[str, Any], mime: Any) -> None:
-    """Fill To/Cc from MIME when Camel MessageInfo summary omitted them."""
-    if not hasattr(mime, "get_header"):
-        return
-    if not (result.get("to") or "").strip():
-        to_header = mime.get_header("To")
-        if to_header:
-            result["to"] = to_header
-    if not (result.get("cc") or "").strip():
-        cc_header = mime.get_header("Cc")
-        if cc_header:
-            result["cc"] = cc_header
-    reply_to_header = mime.get_header("Reply-To")
-    if reply_to_header:
-        stripped = reply_to_header.strip()
-        if stripped:
-            result["reply_to"] = stripped
+    """Prefer full To/Cc/Bcc from MIME over Camel MessageInfo summaries."""
+    for field in ("to", "cc", "bcc"):
+        value = _recipient_field_from_mime(mime, field)
+        if value:
+            result[field] = value
+    if hasattr(mime, "get_header"):
+        reply_to_header = mime.get_header("Reply-To")
+        if reply_to_header:
+            stripped = format_recipient_header(reply_to_header)
+            if stripped:
+                result["reply_to"] = stripped
 
 
 def _valid_unix_timestamp(unix_time: float | int | None) -> float | None:
@@ -314,6 +326,9 @@ def format_message_header(msg: dict[str, Any]) -> str:
     cc = (msg.get("cc") or "").strip()
     if cc:
         lines.append(f"CC: {cc}")
+    bcc = (msg.get("bcc") or "").strip()
+    if bcc:
+        lines.append(f"Bcc: {bcc}")
     date = msg.get("date_received") or msg.get("date_sent") or ""
     lines.append(f"Date: {date}")
     return "\n".join(lines)

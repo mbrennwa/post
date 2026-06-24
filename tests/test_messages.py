@@ -140,6 +140,23 @@ class FormatMessageHeaderTests(unittest.TestCase):
         )
         self.assertNotIn("Reply-To:", header)
 
+    def test_includes_bcc_when_present(self) -> None:
+        header = format_message_header(
+            {
+                "from": "Alice",
+                "to": "Bob",
+                "bcc": "Dave <dave@example.com>",
+                "date_sent": "2026-06-19 14:30:00",
+            }
+        )
+        self.assertIn("Bcc: Dave <dave@example.com>", header)
+
+    def test_omits_bcc_when_empty(self) -> None:
+        header = format_message_header(
+            {"from": "Alice", "to": "Bob", "bcc": "  ", "date_sent": "2026-06-19 14:30:00"}
+        )
+        self.assertNotIn("Bcc:", header)
+
 
 class FormatMessageDatetimeTests(unittest.TestCase):
     def test_space_separated(self) -> None:
@@ -293,6 +310,14 @@ class FormatRecipientHeaderTests(unittest.TestCase):
             "Carol <carol@example.com>, Dave <dave@example.com>",
         )
 
+    def test_empty_camel_internet_address(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        self.assertEqual(format_recipient_header(Camel.InternetAddress.new()), "")
+
 
 class MessageInfoToDictTests(unittest.TestCase):
     def test_formats_camel_cc_address(self) -> None:
@@ -321,19 +346,76 @@ class EnrichMessageDictFromMimeTests(unittest.TestCase):
     def test_fills_missing_cc(self) -> None:
         result = {"to": "Bob <bob@example.com>"}
         mime = MagicMock()
+        mime.get_recipients.return_value = None
         mime.get_header.side_effect = lambda name: {
             "To": None,
             "Cc": "Carol <carol@example.com>",
+            "Bcc": None,
         }.get(name)
         enrich_message_dict_from_mime(result, mime)
         self.assertEqual(result["cc"], "Carol <carol@example.com>")
 
+    def test_overwrites_partial_to_from_mime(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        mime = Camel.MimeMessage()
+        to = Camel.InternetAddress.new()
+        to.add("Alice", "alice@example.com")
+        to.add("Bob", "bob@example.com")
+        mime.set_recipients("to", to)
+
+        result = {"to": "alice@example.com"}
+        enrich_message_dict_from_mime(result, mime)
+        self.assertEqual(
+            result["to"],
+            "Alice <alice@example.com>, Bob <bob@example.com>",
+        )
+
+    def test_fills_bcc_from_mime(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        mime = Camel.MimeMessage()
+        bcc = Camel.InternetAddress.new()
+        bcc.add("Dave", "dave@example.com")
+        mime.set_recipients("bcc", bcc)
+
+        result: dict[str, str] = {}
+        enrich_message_dict_from_mime(result, mime)
+        self.assertEqual(result["bcc"], "Dave <dave@example.com>")
+
+    def test_ignores_empty_recipient_containers(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        mime = Camel.MimeMessage()
+        to = Camel.InternetAddress.new()
+        to.add("Alice", "alice@example.com")
+        mime.set_recipients("to", to)
+        mime.set_recipients("cc", Camel.InternetAddress.new())
+        mime.set_recipients("bcc", Camel.InternetAddress.new())
+
+        result = {"cc": "stale", "bcc": "stale"}
+        enrich_message_dict_from_mime(result, mime)
+        self.assertEqual(result["to"], "Alice <alice@example.com>")
+        self.assertEqual(result["cc"], "stale")
+        self.assertEqual(result["bcc"], "stale")
+
     def test_fills_reply_to(self) -> None:
         result = {"from": "List <list@example.com>"}
         mime = MagicMock()
+        mime.get_recipients.return_value = None
         mime.get_header.side_effect = lambda name: {
             "To": None,
             "Cc": None,
+            "Bcc": None,
             "Reply-To": "Author <author@example.com>",
         }.get(name)
         enrich_message_dict_from_mime(result, mime)
