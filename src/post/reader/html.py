@@ -161,6 +161,9 @@ blockquote {
   padding-left: 1rem;
   border-left: 3px solid #ccc;
 }
+span.post-bracketed {
+  display: inline;
+}
 """
 
 _READER_CSS_DARK = """
@@ -193,19 +196,25 @@ blockquote {
   padding-left: 1rem;
   border-left: 3px solid #555555;
 }
+span.post-bracketed {
+  display: inline;
+}
 """
 
 _ADAPT_TEXT_CSS = """
 .message-body :where(
-  p, div, span, li, td, th, font, blockquote, pre, a,
+  p, div, span, li, td, th, font, blockquote, pre,
   h1, h2, h3, h4, h5, h6
 ):not(.post-painted):not(.post-keep-color) {
   color: inherit !important;
 }
 .message-body .post-painted :where(
-  p, div, span, li, td, th, font, blockquote, pre, a,
+  p, div, span, li, td, th, font, blockquote, pre,
   h1, h2, h3, h4, h5, h6
 ):not(.post-keep-color) {
+  color: inherit !important;
+}
+.message-body a.post-adapt-text {
   color: inherit !important;
 }
 """
@@ -405,27 +414,60 @@ _NAMED_CSS_COLORS: dict[str, tuple[int, int, int]] = {
     "yellow": (255, 255, 0),
     "yellowgreen": (154, 205, 50),
 }
-_QUOTE_HISTORY_MARKERS = (
-    'id="mail-editor-reference-message-container"',
-    "id='mail-editor-reference-message-container'",
-    'id="geary-quote"',
-    "id='geary-quote'",
-    'class="gmail_quote"',
-    "class='gmail_quote'",
-    'id="appendonsend"',
-    "<blockquote",
+_QUOTE_HISTORY_REGEXES = (
+    re.compile(
+        r'\bid\s*=\s*["\']mail-editor-reference-message-container["\']',
+        re.IGNORECASE,
+    ),
+    re.compile(r'\bid\s*=\s*["\']geary-quote["\']', re.IGNORECASE),
+    re.compile(
+        r'\bclass\s*=\s*["\'][^"\']*\bgmail_quote\b[^"\']*["\']',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bclass\s*=\s*['\"][^'\"]*\bgmail_quote\b[^'\"]*['\"]",
+        re.IGNORECASE,
+    ),
+    re.compile(r'\bclass\s*=\s*["\'][^"\']*\bpost_quote\b[^"\']*["\']', re.IGNORECASE),
+    re.compile(
+        r"\bclass\s*=\s*['\"][^'\"]*\bpost_quote\b[^'\"]*['\"]",
+        re.IGNORECASE,
+    ),
+    re.compile(r'\bid\s*=\s*["\']appendonsend["\']', re.IGNORECASE),
+    re.compile(r"<blockquote\b", re.IGNORECASE),
 )
+
+
+def _quote_history_boundary_start(body_html: str, match: re.Match[str]) -> int:
+    """Return the index where quoted history begins for a marker match."""
+    if match.group(0).lstrip().lower().startswith("<blockquote"):
+        return match.start()
+    boundary = body_html.rfind("<", 0, match.start())
+    if boundary == -1:
+        return match.start()
+    return boundary
+
+
+def _split_html_at_quote_history(body_html: str) -> tuple[str, str | None]:
+    """Split HTML into content before quoted history and the quoted suffix."""
+    cut = len(body_html)
+    for pattern in _QUOTE_HISTORY_REGEXES:
+        match = pattern.search(body_html)
+        if match is not None:
+            cut = min(cut, _quote_history_boundary_start(body_html, match))
+    if cut >= len(body_html):
+        return body_html, None
+    prefix = body_html[:cut]
+    quoted = body_html[cut:]
+    if not quoted.strip():
+        return body_html, None
+    return prefix, quoted
 
 
 def _html_for_adaptation_detection(body_html: str) -> str:
     """Return the portion of HTML whose colors drive the adapt decision."""
-    lower = body_html.lower()
-    cut = len(body_html)
-    for marker in _QUOTE_HISTORY_MARKERS:
-        idx = lower.find(marker.lower())
-        if idx != -1:
-            cut = min(cut, idx)
-    return body_html[:cut]
+    prefix, _quoted = _split_html_at_quote_history(body_html)
+    return prefix
 
 
 def _iter_style_sources(body_html: str):
@@ -670,6 +712,49 @@ def _element_has_meaningful_background(
     return _style_source_has_meaningful_background(attrs.get("style", ""))
 
 
+def _declarations_text_color_value(declarations: dict[str, str]) -> str | None:
+    color = declarations.get("color", "")
+    if color and _normalize_css_declaration_value(color):
+        return _normalize_css_declaration_value(color)
+    return None
+
+
+def _element_text_color_value(
+    tag: str,
+    attrs: dict[str, str],
+    class_styles: dict[str, dict[str, str]] | None = None,
+) -> str | None:
+    if class_styles is not None:
+        value = _declarations_text_color_value(
+            _merge_element_declarations(attrs, class_styles)
+        )
+        if value:
+            return value
+    for match in _DECL_TEXT_COLOR_VALUE.finditer(attrs.get("style", "")):
+        value = _normalize_css_declaration_value(match.group(1))
+        if value:
+            return value
+    tag_lower = tag.lower()
+    if tag_lower == "font" and "color" in attrs:
+        return _normalize_css_declaration_value(attrs["color"])
+    if tag_lower == "body" and "text" in attrs:
+        return _normalize_css_declaration_value(attrs["text"])
+    return None
+
+
+def _colors_have_adequate_contrast(foreground: str, background: str) -> bool:
+    """Return True when foreground/background meet a relaxed readability ratio."""
+    fg = _parse_css_color_rgb(foreground)
+    bg = _parse_css_color_rgb(background)
+    if fg is None or bg is None:
+        return True
+    l1 = _relative_luminance(*fg)
+    l2 = _relative_luminance(*bg)
+    lighter = max(l1, l2)
+    darker = min(l1, l2)
+    return (lighter + 0.05) / (darker + 0.05) >= 3.0
+
+
 def _append_style_declaration(
     attrs: list[tuple[str, str | None]], name: str, value: str
 ) -> list[tuple[str, str | None]]:
@@ -707,6 +792,40 @@ _VOID_HTML_ELEMENTS = frozenset(
         "wbr",
     }
 )
+_BRACKETED_LITERAL = re.compile(
+    r"(?:&lt;|<)"
+    r"([A-Za-z][\w.-]*\.[A-Za-z0-9]{2,8}|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"
+    r"(?:&gt;|>)"
+)
+_BRACKETED_MAILTO_LINK = re.compile(
+    r"(?:&lt;|<)\s*"
+    r"(<a\b[^>]*\bhref=[\"']mailto:[^\"']+[\"'][^>]*>.*?</a>)"
+    r"\s*(?:&gt;|>)",
+    re.IGNORECASE | re.DOTALL,
+)
+_BRACKETED_SPAN = re.compile(r'<span class="post-bracketed">(.*?)</span>', re.DOTALL)
+
+
+def _normalize_bracketed_literals(body_html: str) -> str:
+    """Preserve ``<file.jpg>`` and ``<email@host>`` through HTML adaptation."""
+    body_html = _BRACKETED_MAILTO_LINK.sub(
+        lambda match: f'<span class="post-bracketed">{match.group(1)}</span>',
+        body_html,
+    )
+    return _BRACKETED_LITERAL.sub(
+        lambda match: f'<span class="post-bracketed">{match.group(1)}</span>',
+        body_html,
+    )
+
+
+def _embed_bracketed_span_literals(body_html: str) -> str:
+    """Insert visible ``<``/``>`` around normalized bracket spans for WebKit."""
+    return _BRACKETED_SPAN.sub(
+        lambda match: (
+            f'<span class="post-bracketed">&#x3C;{match.group(1)}&#x3E;</span>'
+        ),
+        body_html,
+    )
 
 
 def _attrs_list_to_dict(attrs: list[tuple[str, str | None]]) -> dict[str, str]:
@@ -755,9 +874,15 @@ def _format_start_tag(tag: str, attrs: list[tuple[str, str | None]]) -> str:
 class _AdaptationClassMarker(HTMLParser):
     """Mark elements that should keep sender colors or receive adapted text."""
 
-    def __init__(self, class_styles: dict[str, dict[str, str]]) -> None:
+    def __init__(
+        self,
+        class_styles: dict[str, dict[str, str]],
+        *,
+        shell_background: str,
+    ) -> None:
         super().__init__(convert_charrefs=False)
         self._class_styles = class_styles
+        self._shell_background = shell_background
         self._inside_painted_depth = 0
         self._parts: list[str] = []
 
@@ -773,13 +898,22 @@ class _AdaptationClassMarker(HTMLParser):
         has_sender_color = _element_has_explicit_text_color(
             tag_lower, attrs_dict, self._class_styles
         )
+        text_color_value = _element_text_color_value(
+            tag_lower, attrs_dict, self._class_styles
+        )
         extra_classes: list[str] = []
         if inside_painted or self_painted:
             extra_classes.append("post-painted")
             if has_sender_color:
                 extra_classes.append("post-keep-color")
         elif has_sender_color:
-            extra_classes.append("post-adapt-text")
+            background = _declarations_background_value(merged) or self._shell_background
+            if text_color_value and _colors_have_adequate_contrast(
+                text_color_value, background
+            ):
+                extra_classes.append("post-keep-color")
+            else:
+                extra_classes.append("post-adapt-text")
         updated_attrs = attrs
         if extra_classes:
             updated_attrs = _add_classes_to_attrs(updated_attrs, extra_classes)
@@ -820,10 +954,15 @@ class _AdaptationClassMarker(HTMLParser):
         self._parts.append(f"<?{data}>")
 
 
-def mark_adaptation_classes(body_html: str) -> str:
+def mark_adaptation_classes(
+    body_html: str,
+    *,
+    shell_background: str = "#ffffff",
+) -> str:
     """Add classes that drive per-element adapt-text overrides."""
+    body_html = _normalize_bracketed_literals(body_html)
     class_styles = _parse_class_styles(body_html)
-    marker = _AdaptationClassMarker(class_styles)
+    marker = _AdaptationClassMarker(class_styles, shell_background=shell_background)
     try:
         marker.feed(body_html)
         marker.close()
@@ -875,7 +1014,12 @@ def html_message_needs_adaptation(body_html: str) -> bool:
         return False
     if _style_blocks_have_text_without_background(content):
         return True
-    return "post-adapt-text" in mark_adaptation_classes(content)
+    for shell_background in ("#1e1e1e", "#ffffff"):
+        if "post-adapt-text" in mark_adaptation_classes(
+            content, shell_background=shell_background
+        ):
+            return True
+    return False
 
 
 def html_should_apply_adaptation(body_html: str) -> bool:
@@ -887,11 +1031,16 @@ def _effective_message_appearance(
     body_html: str | None,
     appearance: MessageAppearance,
 ) -> MessageAppearance:
-    if (
-        appearance != MESSAGE_APPEARANCE_ACCEPT_SENDER
-        and body_html is not None
-        and not html_message_needs_adaptation(body_html)
-    ):
+    if appearance == MESSAGE_APPEARANCE_ACCEPT_SENDER or body_html is None:
+        return appearance
+    prefix, quoted = _split_html_at_quote_history(body_html)
+    if quoted is not None:
+        if not prefix.strip():
+            return appearance
+        if html_sender_defines_complete_colors(prefix):
+            return MESSAGE_APPEARANCE_ACCEPT_SENDER
+        return appearance
+    if not html_message_needs_adaptation(body_html):
         return MESSAGE_APPEARANCE_ACCEPT_SENDER
     return appearance
 
@@ -915,8 +1064,10 @@ def build_reader_document(
     blocked_notice = ""
     html_body = body_html is not None
     effective_appearance = _effective_message_appearance(body_html, message_appearance)
+    reader_dark = _effective_reader_dark(dark, effective_appearance)
+    shell_background = "#1e1e1e" if reader_dark else "#ffffff"
     if body_html:
-        content = body_html
+        content = _normalize_bracketed_literals(body_html)
         if inline_images:
             content = resolve_cid_images(content, inline_images)
         if not allow_remote:
@@ -930,8 +1081,11 @@ def build_reader_document(
                     "</p>"
                 )
         if effective_appearance == "adapt_text":
-            content = mark_adaptation_classes(content)
+            content = mark_adaptation_classes(
+                content, shell_background=shell_background
+            )
             content = f'<div class="message-body">{content}</div>'
+        content = _embed_bracketed_span_literals(content)
     elif body_plain:
         content = f'<pre class="plain-body">{html.escape(body_plain)}</pre>'
     else:
@@ -951,12 +1105,11 @@ def build_reader_document(
             "font-src data:;"
         )
 
-    reader_dark = _effective_reader_dark(dark, effective_appearance)
-    color_scheme = "dark" if reader_dark else "light"
     reader_css = _READER_CSS_DARK if reader_dark else _READER_CSS_LIGHT
     if effective_appearance == "adapt_text" and html_body:
         reader_css = f"{reader_css}\n{_ADAPT_TEXT_CSS}"
 
+    color_scheme = "dark" if reader_dark else "light"
     return f"""<!DOCTYPE html>
 <html>
 <head>

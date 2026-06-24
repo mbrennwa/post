@@ -41,6 +41,7 @@ class QueuedOutboundMessage:
     bcc: list[str] | None
     subject: str
     body: str
+    body_html: str | None = None
     in_reply_to: str | None = None
     references: str | None = None
     queued_at: float = 0.0
@@ -74,6 +75,9 @@ class QueuedOutboundMessage:
             bcc=list(data["bcc"]) if data.get("bcc") is not None else None,
             subject=str(data.get("subject") or ""),
             body=str(data.get("body") or ""),
+            body_html=(
+                str(data["body_html"]) if data.get("body_html") is not None else None
+            ),
             in_reply_to=data.get("in_reply_to"),
             references=data.get("references"),
             queued_at=float(data.get("queued_at") or 0.0),
@@ -234,6 +238,7 @@ def persist_outbound_send(
     bcc: list[str] | None,
     subject: str,
     body: str,
+    body_html: str | None = None,
     in_reply_to: str | None = None,
     references: str | None = None,
     attachments: Sequence[ComposeAttachment] | None = None,
@@ -248,6 +253,7 @@ def persist_outbound_send(
             bcc=bcc,
             subject=subject,
             body=body,
+            body_html=body_html,
             in_reply_to=in_reply_to,
             references=references,
         ),
@@ -389,7 +395,7 @@ def read_queued_message(
         "bcc": _format_address_field(message.bcc),
         "date_sent": date_str,
         "body_plain": message.body or "",
-        "body_html": None,
+        "body_html": message.body_html,
         "flags": {"seen": True, "queued": True},
     }
 
