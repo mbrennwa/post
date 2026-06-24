@@ -138,6 +138,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
             dark=True,
         )
         self.assertIn('<div class="message-body">', doc)
+        self.assertIn('class="post-adapt-text"', doc)
         self.assertIn("color: inherit !important", doc)
 
     def test_adapt_text_does_not_wrap_plain_html(self) -> None:
@@ -319,6 +320,93 @@ class BuildReaderDocumentTests(unittest.TestCase):
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
         self.assertIn('<div class="message-body">', doc)
+        self.assertIn('class="post-adapt-text"', doc)
+        self.assertIn('class="post-painted"', doc)
+        self.assertIn("color: inherit !important", doc)
+
+    def test_adapt_text_adapts_unstyled_sections_in_mixed_message(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<p style="color:#000000">Intro dark text</p>'
+                '<p style="color:#666666">Subtitle gray text</p>'
+                '<div style="background-color:#1d1d1d;padding:16px">'
+                '<p style="color:#ffffff">Bright text in dark box</p></div>'
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn('class="post-adapt-text"', doc)
+        self.assertIn('class="post-painted"', doc)
+        self.assertIn("color: inherit !important", doc)
+        self.assertIn('name="color-scheme" content="dark"', doc)
+
+    def test_adapt_background_applies_for_mixed_message_with_unstyled_text(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<p style="color:#333333">Intro dark text</p>'
+                '<div style="background:#ffffff;color:#000000">'
+                "<p>Dark on white box</p></div>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_BACKGROUND,
+        )
+        self.assertIn('name="color-scheme" content="light"', doc)
+        self.assertIn("background: #ffffff", doc)
+        self.assertNotIn("message-body", doc)
+
+    def test_adapt_text_preserves_bright_text_outside_painted_regions(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<p style="color:#000000">Dark intro</p>'
+                '<p style="color:#ffffff">Bright line</p>'
+                '<div style="background-color:#1d1d1d;color:#ffffff">'
+                "<p>CTA</p></div>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertEqual(doc.count('class="post-adapt-text"'), 2)
+        self.assertIn('class="post-painted"', doc)
+
+    def test_adapt_text_preserves_sender_colors_with_background_shorthand(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<div style="background:url(https://example.com/bg.png) #ffffff no-repeat">'
+                '<p style="color:#000000">Dark on white</p></div>'
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertNotIn("message-body", doc)
+        self.assertNotIn("color: inherit !important", doc)
+
+    def test_adapt_text_handles_class_based_white_boxes(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                "<style>.whitebox { background-color: #ffffff; padding: 12px; }</style>"
+                '<p style="color:#ffffff">Legible intro on dark shell</p>'
+                '<div class="whitebox"><p>Dear Gasometrix Sales Team,</p>'
+                "<ul><li>Noble / Inert Gases: Helium (He), Argon (Ar)</li></ul></div>"
+                '<p style="color:#ffffff">Legible outro</p>'
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("post-painted", doc)
+        self.assertIn("whitebox", doc)
+        self.assertIn("color:#1e1e1e", doc.replace(" ", ""))
         self.assertIn("color: inherit !important", doc)
 
     def test_adapt_text_skipped_when_new_content_has_background(self) -> None:
