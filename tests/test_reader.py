@@ -320,8 +320,9 @@ class BuildReaderDocumentTests(unittest.TestCase):
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
         self.assertIn('<div class="message-body">', doc)
-        self.assertIn('class="post-adapt-text"', doc)
-        self.assertIn('class="post-painted"', doc)
+        self.assertIn("post-adapt-text", doc)
+        self.assertIn("post-painted", doc)
+        self.assertIn("post-keep-color", doc)
         self.assertIn("color: inherit !important", doc)
 
     def test_adapt_text_adapts_unstyled_sections_in_mixed_message(self) -> None:
@@ -408,6 +409,54 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("whitebox", doc)
         self.assertIn("color:#1e1e1e", doc.replace(" ", ""))
         self.assertIn("color: inherit !important", doc)
+
+    def test_adapt_text_keeps_sender_color_on_children_of_painted_ancestor(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<div class="elementToProof" style="color: black; font-size: 12pt;">'
+                "Intro on dark shell</div>"
+                '<ul style="background-color: rgb(255, 255, 255);">'
+                '<li style="color: black; font-size: 12pt;">'
+                '<div class="elementToProof" role="presentation">'
+                "<b>Noble / Inert Gases:</b> Helium (He), Argon (Ar)</div>"
+                "</li>"
+                '<li style="color: black; font-size: 12pt;">'
+                '<div class="elementToProof" role="presentation">'
+                "<b>Hydrocarbons:</b> Acetylene (C2H2)</div>"
+                "</li>"
+                "</ul>"
+                '<div class="elementToProof" style="background-color: rgb(255, 255, 255); '
+                'color: black; font-size: 12pt;">White box paragraph</div>'
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("post-keep-color", doc)
+        self.assertIn("post-adapt-text", doc)
+        self.assertIn('style="color: black', doc)
+        self.assertNotIn("color: revert !important", doc)
+
+    def test_adapt_text_keeps_sender_color_on_painted_div_with_inline_color(self) -> None:
+        """Outlook pattern: white background and black text on the same div."""
+        doc = build_reader_document(
+            body_html=(
+                '<div class="elementToProof" style="background-color: rgb(255, 255, 255); '
+                'font-size: 12pt; color: black;">Dear Gasometrix Sales Team,</div>'
+                '<div class="elementToProof" style="font-size: 12pt; color: black;">'
+                "Body on dark shell</div>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn("post-painted post-keep-color", doc)
+        self.assertIn('color: black', doc)
+        self.assertIn("post-adapt-text", doc)
+        self.assertNotIn("color: revert !important", doc)
 
     def test_adapt_text_skipped_when_new_content_has_background(self) -> None:
         doc = build_reader_document(

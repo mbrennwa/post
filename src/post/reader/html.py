@@ -199,13 +199,13 @@ _ADAPT_TEXT_CSS = """
 .message-body :where(
   p, div, span, li, td, th, font, blockquote, pre, a,
   h1, h2, h3, h4, h5, h6
-):not(.post-painted) {
+):not(.post-painted):not(.post-keep-color) {
   color: inherit !important;
 }
 .message-body .post-painted :where(
   p, div, span, li, td, th, font, blockquote, pre, a,
   h1, h2, h3, h4, h5, h6
-) {
+):not(.post-keep-color) {
   color: inherit !important;
 }
 """
@@ -731,6 +731,15 @@ def _add_class_to_attrs(
     return updated
 
 
+def _add_classes_to_attrs(
+    attrs: list[tuple[str, str | None]], class_names: list[str]
+) -> list[tuple[str, str | None]]:
+    updated = attrs
+    for class_name in class_names:
+        updated = _add_class_to_attrs(updated, class_name)
+    return updated
+
+
 def _format_start_tag(tag: str, attrs: list[tuple[str, str | None]]) -> str:
     if not attrs:
         return f"<{tag}>"
@@ -761,14 +770,19 @@ class _AdaptationClassMarker(HTMLParser):
         merged = _merge_element_declarations(attrs_dict, self._class_styles)
         inside_painted = self._inside_painted_depth > 0
         self_painted = _element_has_meaningful_background(attrs_dict, self._class_styles)
-        extra_class: str | None = None
+        has_sender_color = _element_has_explicit_text_color(
+            tag_lower, attrs_dict, self._class_styles
+        )
+        extra_classes: list[str] = []
         if inside_painted or self_painted:
-            extra_class = "post-painted"
-        elif _element_has_explicit_text_color(tag_lower, attrs_dict, self._class_styles):
-            extra_class = "post-adapt-text"
+            extra_classes.append("post-painted")
+            if has_sender_color:
+                extra_classes.append("post-keep-color")
+        elif has_sender_color:
+            extra_classes.append("post-adapt-text")
         updated_attrs = attrs
-        if extra_class is not None:
-            updated_attrs = _add_class_to_attrs(updated_attrs, extra_class)
+        if extra_classes:
+            updated_attrs = _add_classes_to_attrs(updated_attrs, extra_classes)
         if self_painted and not inside_painted and not _declarations_have_text_color(merged):
             background = _declarations_background_value(merged)
             if background is not None:
