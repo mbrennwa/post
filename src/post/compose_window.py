@@ -41,6 +41,7 @@ from post.mail.compose import (
     plain_to_simple_html,
     quote_plain_forward,
     quote_plain_reply,
+    validate_compose_mime_fields,
 )
 from post.mail.helpers import format_attachment_size
 from post.mail.correspondents import (
@@ -51,8 +52,16 @@ from post.mail.correspondents import (
 )
 from post.mail.eds import MailAccount, prepare_camel_worker_thread
 from post.mail.io_thread import get_mail_io_thread
-from post.mail.send_errors import SendQueued, user_send_error_message
-from post.mail.send_queue import new_outbound_queue_id, persist_outbound_send
+from post.mail.send_errors import (
+    SendQueued,
+    is_compose_validation_error,
+    user_send_error_message,
+)
+from post.mail.send_queue import (
+    new_outbound_queue_id,
+    persist_outbound_send,
+    remove_queued_outbound_message,
+)
 from post.preferences import get_account_signature, get_account_signatures
 from post.toast import show_error_toast
 
@@ -120,6 +129,17 @@ def _run_outbound_send_worker(
     try:
         mail.claim_outbound_delivery(queue_id)
         try:
+            account = mail.get_account(request.account_uid)
+            validate_compose_mime_fields(
+                from_name=account.from_name,
+                subject=request.subject,
+                to=request.to,
+                cc=request.cc,
+                bcc=request.bcc,
+                in_reply_to=request.in_reply_to,
+                references=request.references,
+                attachments=request.attachments,
+            )
             persist_outbound_send(
                 account_uid=request.account_uid,
                 to=request.to,
@@ -133,6 +153,15 @@ def _run_outbound_send_worker(
                 attachments=request.attachments,
                 queue_id=queue_id,
             )
+        except ValueError as exc:
+            log.warning("Outbound compose validation failed: %s", exc)
+            if parent is not None:
+                GLib.idle_add(
+                    _show_send_error_toast,
+                    parent,
+                    user_send_error_message(exc),
+                )
+            return
         except OSError as exc:
             log.error("Could not persist outbound message to outbox: %s", exc)
             if parent is not None:
@@ -220,7 +249,10 @@ def _finish_outbound_send(
     if error is not None:
         message = user_send_error_message(error)
         if request.queue_id:
-            message = f"{message}{_OUTBOX_FAILURE_SUFFIX}"
+            if is_compose_validation_error(error):
+                remove_queued_outbound_message(request.queue_id)
+            else:
+                message = f"{message}{_OUTBOX_FAILURE_SUFFIX}"
         if parent is not None:
             show_error_toast(parent, message)
         else:
@@ -1269,6 +1301,21 @@ class ComposeWindow(Adw.Window):
         account = self._selected_account()
         if not account.can_send:
             self._show_error("This account has no mail transport configured")
+            return
+
+        try:
+            validate_compose_mime_fields(
+                from_name=account.from_name,
+                subject=subject,
+                to=to_addrs,
+                cc=cc_addrs,
+                bcc=bcc_addrs,
+                in_reply_to=in_reply_to,
+                references=references,
+                attachments=list(self._attachments) or None,
+            )
+        except ValueError as exc:
+            self._show_error(str(exc))
             return
 
         parent = self.get_transient_for()

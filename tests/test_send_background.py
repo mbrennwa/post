@@ -58,6 +58,7 @@ class RunOutboundSendTests(unittest.TestCase):
         self.status_messages: list[str] = []
         self.set_status = self.status_messages.append
         self.mail = mock.Mock()
+        self.mail.get_account.return_value = mock.Mock(from_name="Alice")
 
     @mock.patch(
         "post.compose_window.get_mail_io_thread",
@@ -144,6 +145,47 @@ class RunOutboundSendTests(unittest.TestCase):
         )
         self.assertEqual(self.status_messages, [])
         outbox_changed.assert_called()
+
+    @mock.patch(
+        "post.compose_window.get_mail_io_thread",
+        return_value=_ImmediateMailIoThread(),
+    )
+    @mock.patch("post.compose_window.prepare_camel_worker_thread")
+    @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
+    @mock.patch("post.compose_window.show_error_toast")
+    @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
+    @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
+    def test_compose_validation_skips_outbox(
+        self, _idle_add, persist, show_error_toast, _queue_id, _prepare, _io
+    ) -> None:
+        parent = mock.Mock()
+        request = OutboundSendRequest(
+            account_uid="acct-1",
+            to=["user@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hello\r\nBcc: evil@example.com",
+            body="Body",
+            in_reply_to=None,
+            references=None,
+            attachments=None,
+        )
+
+        run_outbound_send(
+            mail=self.mail,
+            parent=parent,
+            set_status=self.set_status,
+            on_outbox_changed=None,
+            on_draft_saved=None,
+            request=request,
+        )
+
+        persist.assert_not_called()
+        self.mail.deliver_outbound_queue_item.assert_not_called()
+        show_error_toast.assert_called_once_with(
+            parent,
+            "Subject must not contain line breaks.",
+        )
 
     @mock.patch(
         "post.compose_window.get_mail_io_thread",
@@ -251,6 +293,42 @@ class FinishOutboundSendTests(unittest.TestCase):
         )
         set_status.assert_not_called()
         outbox_changed.assert_called_once()
+
+    @mock.patch("post.compose_window.remove_queued_outbound_message")
+    @mock.patch("post.compose_window.show_error_toast")
+    def test_finish_validation_error_omits_outbox_suffix(
+        self, show_error_toast, remove_queued
+    ) -> None:
+        parent = mock.Mock()
+        request = OutboundSendRequest(
+            account_uid="acct-1",
+            to=["user@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hello",
+            body="Body",
+            in_reply_to=None,
+            references=None,
+            attachments=None,
+            queue_id="queue-1",
+        )
+
+        _finish_outbound_send(
+            parent,
+            mock.Mock(),
+            None,
+            mock.Mock(),
+            mock.Mock(),
+            request,
+            SendError("Subject must not contain line breaks."),
+            None,
+        )
+
+        show_error_toast.assert_called_once_with(
+            parent,
+            "Subject must not contain line breaks.",
+        )
+        remove_queued.assert_called_once_with("queue-1")
 
 
 if __name__ == "__main__":

@@ -106,6 +106,8 @@ def user_send_error_message(exc: BaseException) -> str:
             or "to address" in lowered
         ):
             return "Add a recipient in the To field."
+        if "line break" in lowered:
+            return text
 
     text = _raw_error_text(exc)
     lowered = text.lower()
@@ -150,3 +152,19 @@ def user_send_error_message(exc: BaseException) -> str:
         return "Add a recipient in the To field."
 
     return _GENERIC_SEND_FAILED
+
+
+def is_compose_validation_error(exc: BaseException) -> bool:
+    """Return True when send failed due to invalid compose input, not the network."""
+    if isinstance(exc, ValueError):
+        text = str(exc).strip().lower()
+    elif isinstance(exc, SendError):
+        text = exc.user_message.lower()
+    else:
+        return False
+    return (
+        "line break" in text
+        or "not valid" in text
+        or "invalid address" in text
+        or "no valid addresses" in text
+    )

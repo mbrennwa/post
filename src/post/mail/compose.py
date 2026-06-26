@@ -20,6 +20,20 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Gio
 
 _ADDRESS_SPLIT = re.compile(r",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)")
+_HEADER_NEWLINES = re.compile(r"[\r\n]+")
+
+
+def _sanitize_header_field(value: str, *, field: str) -> str:
+    """Reject header values that would inject extra MIME header lines."""
+    if _HEADER_NEWLINES.search(value):
+        raise ValueError(f"{field} must not contain line breaks.")
+    return value
+
+
+def _sanitize_optional_header_field(value: str | None, *, field: str) -> str | None:
+    if value is None:
+        return None
+    return _sanitize_header_field(value, field=field)
 
 
 def bare_address_is_valid(address: str) -> bool:
@@ -33,7 +47,7 @@ def bare_address_is_valid(address: str) -> bool:
 
 def format_parsed_address(name: str | None, address: str) -> str:
     """Return a display string safe for headers and SMTP envelope parsing."""
-    name = (name or "").strip()
+    name = _sanitize_header_field((name or "").strip(), field="Display name")
     if not name:
         return address
     # Unquoted @ in display names break email.utils.getaddresses.
@@ -119,7 +133,8 @@ def addresses_to_internet_address(addresses: list[str]) -> Any | None:
         for index in range(single.length()):
             ok, name, address = single.get(index)
             if ok and address:
-                container.add(name or "", address)
+                safe_name = _sanitize_optional_header_field(name, field="Display name")
+                container.add(safe_name or "", address)
     return container if container.length() > 0 else None
 
 
@@ -537,6 +552,28 @@ class ComposeAttachment:
     data: bytes
 
 
+def validate_compose_mime_fields(
+    *,
+    from_name: str | None,
+    subject: str,
+    to: list[str] | None = None,
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+    attachments: Sequence[ComposeAttachment] | None = None,
+) -> None:
+    """Reject user-controlled header fields before outbox queue or MIME build."""
+    _sanitize_optional_header_field(from_name, field="From name")
+    _sanitize_header_field(subject or "", field="Subject")
+    _sanitize_optional_header_field(in_reply_to, field="In-Reply-To")
+    _sanitize_optional_header_field(references, field="References")
+    for group in (to or [], cc or [], bcc or []):
+        addresses_to_internet_address(group)
+    for attachment in attachments or ():
+        _sanitize_header_field(attachment.filename, field="Attachment filename")
+
+
 def guess_attachment_mime_type(filename: str, data: bytes) -> str:
     """Guess a MIME type for a compose attachment."""
     guessed, _certain = Gio.content_type_guess(filename, data)
@@ -586,10 +623,13 @@ def _apply_compose_headers(
     gi.require_version("Camel", "1.2")
     from gi.repository import Camel
 
-    message.set_subject(subject or "")
+    message.set_subject(
+        _sanitize_header_field(subject or "", field="Subject")
+    )
 
     sender = Camel.InternetAddress.new()
-    sender.add(from_name or "", from_address)
+    safe_from_name = _sanitize_optional_header_field(from_name, field="From name")
+    sender.add(safe_from_name or "", from_address)
     message.set_from(sender)
 
     to_addrs = addresses_to_internet_address(to or [])
@@ -609,10 +649,14 @@ def _apply_compose_headers(
         if bcc_addrs is not None:
             message.set_recipients("Bcc", bcc_addrs)
 
-    if in_reply_to:
-        message.set_header("In-Reply-To", in_reply_to)
-    if references:
-        message.set_header("References", references)
+    safe_in_reply_to = _sanitize_optional_header_field(
+        in_reply_to, field="In-Reply-To"
+    )
+    if safe_in_reply_to:
+        message.set_header("In-Reply-To", safe_in_reply_to)
+    safe_references = _sanitize_optional_header_field(references, field="References")
+    if safe_references:
+        message.set_header("References", safe_references)
 
     if message_id:
         message.set_message_id(message_id.strip().strip("<>"))
@@ -678,22 +722,29 @@ def build_outbound_email_message(
     resolved_message_id = message_id or identifiers.message_id
     resolved_date = date or identifiers.date
 
+    safe_from_name = _sanitize_optional_header_field(from_name, field="From name")
+    safe_subject = _sanitize_header_field(subject or "", field="Subject")
+    safe_in_reply_to = _sanitize_optional_header_field(
+        in_reply_to, field="In-Reply-To"
+    )
+    safe_references = _sanitize_optional_header_field(references, field="References")
+
     message = EmailMessage(policy=_outbound_smtp_policy())
     message["From"] = (
-        formataddr((from_name, from_address)) if from_name else from_address
+        formataddr((safe_from_name, from_address)) if safe_from_name else from_address
     )
     message["To"] = ", ".join(to)
     if cc:
         message["Cc"] = ", ".join(cc)
     if include_bcc_header and bcc:
         message["Bcc"] = ", ".join(bcc)
-    message["Subject"] = subject or ""
+    message["Subject"] = safe_subject
     message["Message-ID"] = resolved_message_id
     message["Date"] = resolved_date
-    if in_reply_to:
-        message["In-Reply-To"] = in_reply_to
-    if references:
-        message["References"] = references
+    if safe_in_reply_to:
+        message["In-Reply-To"] = safe_in_reply_to
+    if safe_references:
+        message["References"] = safe_references
 
     text = body if body else "\n"
     message.set_content(text, charset="utf-8")
@@ -708,7 +759,9 @@ def build_outbound_email_message(
                 attachment.data,
                 maintype=maintype,
                 subtype=subtype,
-                filename=attachment.filename,
+                filename=_sanitize_header_field(
+                    attachment.filename, field="Attachment filename"
+                ),
             )
     return message
 
@@ -844,7 +897,9 @@ def _set_message_body(
         part = Camel.MimePart.new()
         part.set_content(attachment.data, attachment.mime_type)
         part.set_disposition("attachment")
-        part.set_filename(attachment.filename)
+        part.set_filename(
+            _sanitize_header_field(attachment.filename, field="Attachment filename")
+        )
         part.set_encoding(Camel.TransferEncoding.ENCODING_BASE64)
         multipart.add_part(part)
 

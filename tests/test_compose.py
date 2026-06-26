@@ -388,6 +388,97 @@ class BuildPlainMimeMessageTests(unittest.TestCase):
         self.assertEqual(round_tripped[1].data, b"\x00\x01")
 
 
+class HeaderInjectionTests(unittest.TestCase):
+    _BASE = {
+        "from_address": "alice@example.com",
+        "to": ["bob@example.com"],
+        "cc": None,
+        "bcc": None,
+        "body": "Hello",
+    }
+    _INJECT = "\r\nBcc: evil@example.com"
+
+    def _assert_rejects_plain(self, **overrides: object) -> None:
+        kwargs = {**self._BASE, "from_name": "Alice", "subject": "Hi", **overrides}
+        with self.assertRaises(ValueError):
+            build_plain_mime_message(**kwargs)
+
+    def _assert_rejects_draft(self, **overrides: object) -> None:
+        kwargs = {
+            **self._BASE,
+            "from_name": "Alice",
+            "subject": "Hi",
+            "to": None,
+            **overrides,
+        }
+        with self.assertRaises(ValueError):
+            build_draft_mime_message(**kwargs)
+
+    def _assert_rejects_outbound(self, **overrides: object) -> None:
+        kwargs = {**self._BASE, "from_name": "Alice", "subject": "Hi", **overrides}
+        with self.assertRaises(ValueError):
+            build_outbound_email_bytes(**kwargs)
+
+    def test_rejects_subject_injection_plain(self) -> None:
+        self._assert_rejects_plain(subject=f"Hi{self._INJECT}")
+
+    def test_rejects_subject_injection_draft(self) -> None:
+        self._assert_rejects_draft(subject=f"Hi{self._INJECT}")
+
+    def test_rejects_subject_injection_outbound(self) -> None:
+        self._assert_rejects_outbound(subject=f"Hi{self._INJECT}")
+
+    def test_rejects_from_name_injection_plain(self) -> None:
+        self._assert_rejects_plain(from_name=f"Alice{self._INJECT}")
+
+    def test_rejects_from_name_injection_draft(self) -> None:
+        self._assert_rejects_draft(from_name=f"Alice{self._INJECT}")
+
+    def test_rejects_in_reply_to_injection_plain(self) -> None:
+        self._assert_rejects_plain(in_reply_to=f"<orig@example.com>{self._INJECT}")
+
+    def test_rejects_in_reply_to_injection_draft(self) -> None:
+        self._assert_rejects_draft(in_reply_to=f"<orig@example.com>{self._INJECT}")
+
+    def test_rejects_to_display_name_injection(self) -> None:
+        with self.assertRaises(ValueError):
+            build_plain_mime_message(
+                from_address="alice@example.com",
+                from_name="Alice",
+                subject="Hi",
+                body="Hello",
+                cc=None,
+                bcc=None,
+                to=[f"Evil{self._INJECT} <bob@example.com>"],
+            )
+
+    def test_rejects_attachment_filename_injection(self) -> None:
+        with self.assertRaises(ValueError):
+            build_plain_mime_message(
+                **self._BASE,
+                from_name="Alice",
+                subject="Hi",
+                attachments=[
+                    ComposeAttachment(
+                        filename=f"doc.pdf{self._INJECT}",
+                        mime_type="application/pdf",
+                        data=b"x",
+                    )
+                ],
+            )
+
+    def test_clean_message_serializes_without_extra_headers(self) -> None:
+        message = build_plain_mime_message(
+            **self._BASE,
+            from_name="Alice",
+            subject="Hi",
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        header_block = raw.split(b"\r\n\r\n", 1)[0]
+        self.assertNotIn(b"Bcc: evil@example.com", header_block)
+
+
 class BuildDraftMimeMessageAttachmentTests(unittest.TestCase):
     def test_draft_with_attachments(self) -> None:
         message = build_draft_mime_message(
