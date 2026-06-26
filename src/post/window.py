@@ -53,6 +53,7 @@ from post.mail.helpers import (
     format_message_header,
     read_menu_items,
     read_menu_label,
+    reader_toggle_button_state,
 )
 from post.reader import build_reader_document
 from post.wrap_label import WrappingLabel, configure_ellipsize_label
@@ -109,6 +110,9 @@ separator.header-divider {{
 }}
 button.message-flagged {{
   color: @error_color;
+}}
+button.message-read-action {{
+  opacity: 1;
 }}
 """
 
@@ -701,15 +705,17 @@ class MainWindow(Adw.ApplicationWindow):
         flag_group.add_css_class("linked")
 
         self._read_toggle_btn = self._make_message_action_button(
-            "mail-read-symbolic",
+            "mail-mark-read-symbolic",
             "Mark as Read",
             self._on_read_toggle_clicked,
         )
+        self._read_toggle_btn.add_css_class("message-read-action")
         self._flag_toggle_btn = self._make_message_action_button(
-            "mail-unflag-symbolic",
+            "mail-flag-symbolic",
             "Flag",
             self._on_flag_toggle_clicked,
         )
+        self._flag_toggle_btn.add_css_class("message-flagged")
         flag_group.append(self._read_toggle_btn)
         flag_group.append(self._flag_toggle_btn)
         outer.append(flag_group)
@@ -764,25 +770,17 @@ class MainWindow(Adw.ApplicationWindow):
         return self._message_flags_for_uid(self._current_message_uid)
 
     def _update_reader_toggle_buttons(self) -> None:
-        flags = self._reader_message_flags()
-        seen = flags.get("seen", True)
-        flagged = flags.get("flagged", False)
-
-        if seen:
-            self._read_toggle_btn.set_icon_name("mail-unread-symbolic")
-            self._read_toggle_btn.set_tooltip_text("Mark as Unread")
-        else:
-            self._read_toggle_btn.set_icon_name("mail-read-symbolic")
-            self._read_toggle_btn.set_tooltip_text("Mark as Read")
-
-        if flagged:
-            self._flag_toggle_btn.set_icon_name("mail-flag-symbolic")
-            self._flag_toggle_btn.add_css_class("message-flagged")
-            self._flag_toggle_btn.set_tooltip_text("Unflag")
-        else:
-            self._flag_toggle_btn.set_icon_name("mail-unflag-symbolic")
-            self._flag_toggle_btn.remove_css_class("message-flagged")
-            self._flag_toggle_btn.set_tooltip_text("Flag")
+        toggles = reader_toggle_button_state(self._reader_message_flags())
+        for button, state in (
+            (self._read_toggle_btn, toggles["read"]),
+            (self._flag_toggle_btn, toggles["flag"]),
+        ):
+            button.set_icon_name(state["icon"])
+            button.set_tooltip_text(state["tooltip"])
+            if state["styled_action"]:
+                button.add_css_class(state["action_class"])
+            else:
+                button.remove_css_class(state["action_class"])
 
     def _reader_action_uid(self) -> str | None:
         if self._current_message_uid is None:

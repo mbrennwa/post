@@ -26,6 +26,7 @@ from post.mail.helpers import (
     paginate_messages,
     read_menu_items,
     read_menu_label,
+    reader_toggle_button_state,
     sort_messages_newest_first,
 )
 
@@ -235,6 +236,26 @@ class MessageMenuItemsTests(unittest.TestCase):
     def test_flag_menu_labels_include_count(self) -> None:
         self.assertEqual(flag_menu_label("flag", 2), "Flag (2)")
         self.assertEqual(flag_menu_label("unflag", 1), "Unflag")
+
+
+class ReaderToggleButtonStateTests(unittest.TestCase):
+    def test_read_flagged_shows_unread_and_unflag_actions(self) -> None:
+        state = reader_toggle_button_state({"seen": True, "flagged": True})
+        self.assertEqual(state["read"]["icon"], "mail-unread-symbolic")
+        self.assertEqual(state["read"]["tooltip"], "Mark as Unread")
+        self.assertFalse(state["read"]["styled_action"])
+        self.assertEqual(state["flag"]["icon"], "mail-flag-symbolic")
+        self.assertEqual(state["flag"]["tooltip"], "Unflag")
+        self.assertFalse(state["flag"]["styled_action"])
+
+    def test_unread_unflagged_shows_read_and_flag_actions(self) -> None:
+        state = reader_toggle_button_state({"seen": False, "flagged": False})
+        self.assertEqual(state["read"]["icon"], "mail-mark-read-symbolic")
+        self.assertEqual(state["read"]["tooltip"], "Mark as Read")
+        self.assertTrue(state["read"]["styled_action"])
+        self.assertEqual(state["flag"]["icon"], "mail-flag-symbolic")
+        self.assertEqual(state["flag"]["tooltip"], "Flag")
+        self.assertTrue(state["flag"]["styled_action"])
 
 
 class FormatMessageListDateTests(unittest.TestCase):
