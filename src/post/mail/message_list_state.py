@@ -20,6 +20,21 @@ def message_list_fingerprint(messages: list[dict[str, Any]]) -> tuple[str, ...]:
     return tuple(str(message.get("uid")) for message in messages)
 
 
+def prepended_message_count(
+    current: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+) -> int:
+    """Return how many messages were added at the front, or 0 if not a pure prepend."""
+    old = message_list_fingerprint(current)
+    new = message_list_fingerprint(messages)
+    if len(new) <= len(old):
+        return 0
+    extra = len(new) - len(old)
+    if new[extra:] == old:
+        return extra
+    return 0
+
+
 def folder_list_ready_to_cache(
     shown: int,
     total: int,

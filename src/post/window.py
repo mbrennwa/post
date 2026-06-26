@@ -32,7 +32,7 @@ from post.mail.folder_index_cache import (
     has_cache as folder_index_has_cache,
     load as load_folder_index_cache,
 )
-from post.mail.message_list_state import message_list_fingerprint
+from post.mail.message_list_state import message_list_fingerprint, prepended_message_count
 from post.mail.search import MessageSearchQuery, parse_search_query
 from post.mail.send_queue import (
     OFFLINE_CACHED_LIST_STATUS,
@@ -1695,6 +1695,17 @@ class MainWindow(Adw.ApplicationWindow):
         if account is not None:
             self._update_message_status(account, folder_name)
 
+    def _apply_prepended_folder_messages(
+        self,
+        prepended: list[dict],
+        folder_name: str,
+        *,
+        account: MailAccount | None = None,
+    ) -> None:
+        self._message_list_view.prepend_messages(prepended, folder_name=folder_name)
+        if account is not None:
+            self._update_message_status(account, folder_name)
+
     def _message_flags_for_uid(self, uid: str) -> dict:
         message = self._message_list_view.get_message(uid)
         if message is not None:
@@ -2170,7 +2181,15 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         self._message_stack.set_visible_child_name("list")
-        self._apply_folder_messages(messages, folder_name, account=account)
+        prepended = prepended_message_count(current, messages)
+        if prepended > 0:
+            self._apply_prepended_folder_messages(
+                messages[:prepended],
+                folder_name,
+                account=account,
+            )
+        else:
+            self._apply_folder_messages(messages, folder_name, account=account)
         if self._search_query is None:
             self._try_restore_selected_message(account.uid, folder_name)
         return False
