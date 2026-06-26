@@ -253,6 +253,29 @@ def flag_menu_items(flagged_states: list[bool]) -> list[str]:
     return items
 
 
+def reader_toggle_button_state(flags: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return reader toolbar read/flag toggle presentation for *flags*.
+
+    Buttons show the action that will run on click, not the current state.
+    """
+    seen = flags.get("seen", True)
+    flagged = flags.get("flagged", False)
+    return {
+        "read": {
+            "icon": "mail-unread-symbolic" if seen else "mail-mark-read-symbolic",
+            "tooltip": "Mark as Unread" if seen else "Mark as Read",
+            "action_class": "message-read-action",
+            "styled_action": not seen,
+        },
+        "flag": {
+            "icon": "mail-flag-symbolic",
+            "tooltip": "Unflag" if flagged else "Flag",
+            "action_class": "message-flagged",
+            "styled_action": not flagged,
+        },
+    }
+
+
 def read_menu_label(action: str, count: int) -> str:
     suffix = message_menu_count_suffix(count)
     if action == "read":
