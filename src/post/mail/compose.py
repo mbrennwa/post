@@ -575,6 +575,7 @@ def _apply_compose_headers(
     in_reply_to: str | None,
     references: str | None,
     require_to: bool,
+    include_bcc_header: bool = True,
 ) -> None:
     import gi
 
@@ -599,9 +600,10 @@ def _apply_compose_headers(
     if cc_addrs is not None:
         message.set_recipients("Cc", cc_addrs)
 
-    bcc_addrs = addresses_to_internet_address(bcc or [])
-    if bcc_addrs is not None:
-        message.set_recipients("Bcc", bcc_addrs)
+    if include_bcc_header:
+        bcc_addrs = addresses_to_internet_address(bcc or [])
+        if bcc_addrs is not None:
+            message.set_recipients("Bcc", bcc_addrs)
 
     if in_reply_to:
         message.set_header("In-Reply-To", in_reply_to)
@@ -700,7 +702,11 @@ def build_outbound_email_bytes(
     references: str | None = None,
     attachments: Sequence[ComposeAttachment] | None = None,
 ) -> bytes:
-    """Build a MIME message for SMTP without Camel/GObject."""
+    """Build a MIME message for SMTP/local delivery without Camel/GObject.
+
+    Bcc addresses are omitted from MIME headers; callers must still pass them
+    for SMTP RCPT TO / local recipient resolution.
+    """
     from email.message import EmailMessage
     from email.utils import formataddr
 
@@ -714,8 +720,6 @@ def build_outbound_email_bytes(
     message["To"] = ", ".join(to)
     if cc:
         message["Cc"] = ", ".join(cc)
-    if bcc:
-        message["Bcc"] = ", ".join(bcc)
     message["Subject"] = subject or ""
     if in_reply_to:
         message["In-Reply-To"] = in_reply_to
@@ -753,6 +757,7 @@ def build_plain_mime_message(
     in_reply_to: str | None = None,
     references: str | None = None,
     attachments: Sequence[ComposeAttachment] | None = None,
+    include_bcc_header: bool = True,
 ) -> Any:
     import gi
 
@@ -774,6 +779,7 @@ def build_plain_mime_message(
         in_reply_to=in_reply_to,
         references=references,
         require_to=True,
+        include_bcc_header=include_bcc_header,
     )
     _set_message_body(message, body, attachments, body_html=body_html)
     return message

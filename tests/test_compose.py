@@ -738,6 +738,54 @@ class HtmlForwardReplyTests(unittest.TestCase):
         self.assertIn("See below", str(plain_part.get_content()))
         self.assertIn("post_quote", str(html_part.get_content()))
 
+    def test_build_outbound_email_bytes_omits_bcc_from_wire(self) -> None:
+        payload = build_outbound_email_bytes(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=["carol@example.com"],
+            bcc=["secret@example.com"],
+            subject="Hi",
+            body="Hello",
+        )
+        import email
+        import email.policy
+
+        parsed = email.message_from_bytes(payload, policy=email.policy.default)
+        self.assertEqual(parsed["To"], "bob@example.com")
+        self.assertEqual(parsed["Cc"], "carol@example.com")
+        self.assertNotIn("Bcc", parsed)
+        self.assertNotIn(b"Bcc:", payload)
+
+    def test_build_plain_mime_message_omits_bcc_when_requested(self) -> None:
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=["secret@example.com"],
+            subject="Hi",
+            body="Hello",
+            include_bcc_header=False,
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertNotIn(b"Bcc:", raw)
+
+    def test_build_plain_mime_message_includes_bcc_by_default(self) -> None:
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=["secret@example.com"],
+            subject="Hi",
+            body="Hello",
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertIn(b"Bcc:", raw)
+
     def test_unchanged_plain_quote_uses_original_html(self) -> None:
         original = {
             "from": "Alice <alice@example.com>",

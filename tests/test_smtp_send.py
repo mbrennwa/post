@@ -131,6 +131,46 @@ class SendViaSmtpTests(unittest.TestCase):
         )
         smtp.quit.assert_called_once()
 
+    @mock.patch("post.mail.smtp_send._authenticate_smtp")
+    @mock.patch("post.mail.smtp_send._connect_smtp")
+    @mock.patch("post.mail.smtp_send.read_smtp_transport_config")
+    def test_sendmail_includes_bcc_in_recipients(
+        self,
+        read_config,
+        connect_smtp,
+        _authenticate,
+    ) -> None:
+        transport_source = mock.Mock()
+        read_config.return_value = (
+            transport_source,
+            SmtpTransportConfig(
+                host="smtp.example.com",
+                port=465,
+                username="user@example.com",
+                security="ssl-on-alternate-port",
+                auth_method="plain",
+            ),
+        )
+        smtp = mock.Mock()
+        connect_smtp.return_value = smtp
+        registry = mock.Mock()
+
+        send_via_smtp(
+            registry=registry,
+            transport_uid="transport-1",
+            payload=b"raw",
+            envelope_from="user@example.com",
+            to=["dest@example.com"],
+            cc=["cc@example.com"],
+            bcc=["bcc@example.com"],
+        )
+
+        smtp.sendmail.assert_called_once_with(
+            "user@example.com",
+            ["dest@example.com", "cc@example.com", "bcc@example.com"],
+            b"raw",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
