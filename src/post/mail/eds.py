@@ -58,6 +58,7 @@ from .send_errors import (
     SYSTEM_MAIL_EXTERNAL_RECIPIENTS,
     SendError,
     SendQueued,
+    is_compose_validation_error,
     user_send_error_message,
 )
 from .send_queue import (
@@ -1156,6 +1157,8 @@ class MailService:
                 except SendQueued:
                     break
                 except SendError as exc:
+                    if is_compose_validation_error(exc):
+                        remove_queued_outbound_message(queue_id)
                     log.warning(
                         "Queued message %s was not sent: %s",
                         queue_id,

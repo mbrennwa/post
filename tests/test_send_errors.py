@@ -10,6 +10,7 @@ from gi.repository import GLib
 from post.mail.send_errors import (
     SendError,
     SYSTEM_MAIL_EXTERNAL_RECIPIENTS,
+    is_compose_validation_error,
     user_send_error_message,
 )
 
@@ -56,6 +57,20 @@ class SendErrorMessageTests(unittest.TestCase):
             user_send_error_message(exc),
             "Add a recipient in the To field.",
         )
+
+    def test_header_line_break_value_error(self) -> None:
+        exc = ValueError("Subject must not contain line breaks.")
+        self.assertEqual(user_send_error_message(exc), "Subject must not contain line breaks.")
+
+    def test_is_compose_validation_error(self) -> None:
+        self.assertTrue(
+            is_compose_validation_error(ValueError("Subject must not contain line breaks."))
+        )
+        self.assertTrue(
+            is_compose_validation_error(SendError("Subject must not contain line breaks."))
+        )
+        self.assertFalse(is_compose_validation_error(SendError("SMTP failed")))
+        self.assertFalse(is_compose_validation_error(TimeoutError()))
 
     def test_send_queued_message(self) -> None:
         from post.mail.send_errors import MESSAGE_QUEUED, SendQueued
