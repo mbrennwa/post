@@ -139,9 +139,9 @@ def build_forward_subject(subject: str) -> str:
 
 
 def quote_plain_forward(original: dict[str, Any], body_plain: str | None) -> str:
-    from .helpers import format_message_header
+    from .helpers import format_forward_quote_header
 
-    header = format_message_header(original)
+    header = format_forward_quote_header(original)
     text = (body_plain or "").strip() or "(no message body)"
     return f"\n\n{FORWARD_QUOTE_MARKER}\n{header}\n\n{text}\n"
 
@@ -168,9 +168,9 @@ def _strip_html_document_wrappers(body_html: str) -> str:
 
 
 def quote_html_forward(original: dict[str, Any], body_html: str) -> str:
-    from .helpers import format_message_header
+    from .helpers import format_forward_quote_header
 
-    header_lines = format_message_header(original).splitlines()
+    header_lines = format_forward_quote_header(original).splitlines()
     header_html = "<br>\n".join(html.escape(line) for line in header_lines)
     content = _strip_html_document_wrappers(body_html)
     return (

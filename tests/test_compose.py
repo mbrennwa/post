@@ -426,6 +426,17 @@ class QuotePlainForwardTests(unittest.TestCase):
         self.assertIn("From: Alice <alice@example.com>", body)
         self.assertIn("Hello there", body)
 
+    def test_omits_bcc_from_quoted_header(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "to": "Bob <bob@example.com>",
+            "bcc": "Dave <dave@example.com>",
+            "date_received": "2026-06-17 16:49:57",
+        }
+        body = quote_plain_forward(original, "Hello there")
+        self.assertNotIn("Bcc:", body)
+        self.assertNotIn("dave@example.com", body)
+
 
 class BuildReplyAllRecipientsTests(unittest.TestCase):
     def test_includes_sender_and_other_recipients(self) -> None:
@@ -699,6 +710,37 @@ class HtmlForwardReplyTests(unittest.TestCase):
         self.assertIn('class="post_quote"', quoted)
         self.assertIn(source, quoted)
         self.assertIn("---------- Forwarded message ---------", quoted)
+
+    def test_quote_html_forward_omits_bcc_from_header(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "to": "Bob <bob@example.com>",
+            "bcc": "Dave <dave@example.com>",
+            "date_received": "2026-06-17 16:49:57",
+        }
+        quoted = quote_html_forward(original, "<p>Newsletter</p>")
+        self.assertNotIn("Bcc:", quoted)
+        self.assertNotIn("dave@example.com", quoted)
+
+    def test_build_outbound_html_for_forward_omits_bcc_in_quote(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "to": "Bob <bob@example.com>",
+            "bcc": "Dave <dave@example.com>",
+            "date_received": "2026-06-17 16:49:57",
+            "body_html": "<p>Newsletter</p>",
+        }
+        quoted_plain = quote_plain_forward(original, "Newsletter")
+        html = build_outbound_html_for_compose(
+            body_plain=f"See below{quoted_plain}",
+            mode="forward",
+            reply_to=original,
+            quoted_html_source=original["body_html"],
+            quoted_plain_expected=quoted_plain,
+        )
+        assert html is not None
+        self.assertNotIn("Bcc:", html)
+        self.assertNotIn("dave@example.com", html)
 
     def test_build_plain_mime_message_with_html_is_multipart_alternative(self) -> None:
         message = build_plain_mime_message(

@@ -50,7 +50,7 @@ from post.mail.helpers import (
     flag_menu_items,
     flag_menu_label,
     format_attachment_size,
-    format_message_header,
+    format_reader_header,
     read_menu_items,
     read_menu_label,
     reader_toggle_button_state,
@@ -3024,7 +3024,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._reader_subject.set_label(msg.get("subject") or "(no subject)")
         self._reader_subject.set_visible(True)
-        self._reader_meta.set_label(format_message_header(msg))
+        self._reader_meta.set_label(format_reader_header(msg))
         self._current_message = msg
         self._message_actions.set_visible(True)
         self._set_message_actions_sensitive(True)
