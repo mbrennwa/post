@@ -16,7 +16,7 @@ gi.require_version("GLib", "2.0")
 gi.require_version("GObject", "2.0")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Gdk, Gio, GObject, Gtk
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
 from post.mail.folders import is_post_outbox_folder
 from post.wrap_label import WrappingLabel, configure_ellipsize_label
@@ -135,6 +135,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         return self._store.get_n_items()
 
     def set_messages(self, messages: Iterable[dict[str, Any]], *, folder_name: str) -> None:
+        at_top = self._is_scrolled_to_top()
         self._folder_name = folder_name
         items = [MessageListItem(message) for message in messages]
         self._uid_positions.clear()
@@ -145,6 +146,24 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         elif items:
             self._store.splice(0, 0, items)
         self._rebuild_uid_positions()
+        if at_top and self._store.get_n_items() > 0:
+            self._scroll_to_top_after_layout()
+
+    def prepend_messages(
+        self,
+        messages: Iterable[dict[str, Any]],
+        *,
+        folder_name: str,
+    ) -> None:
+        items = [MessageListItem(message) for message in messages]
+        if not items:
+            return
+        at_top = self._is_scrolled_to_top()
+        self._folder_name = folder_name
+        self._store.splice(0, 0, items)
+        self._rebuild_uid_positions()
+        if at_top:
+            self._scroll_to_top_after_layout()
 
     def remove_uids(self, uids: Iterable[str]) -> int:
         uid_set = set(uids)
@@ -231,6 +250,20 @@ class VirtualMessageList(Gtk.ScrolledWindow):
 
     def translate_to_scroll(self, x: float, y: float) -> tuple[float, float] | None:
         return self._list_view.translate_coordinates(self, x, y)
+
+    def _is_scrolled_to_top(self, *, epsilon: float = 1.0) -> bool:
+        adj = self.get_vadjustment()
+        if adj is None:
+            return True
+        return adj.get_value() <= epsilon
+
+    def _scroll_to_top_after_layout(self) -> None:
+        def _do_scroll() -> bool:
+            if self._store.get_n_items() > 0:
+                self._list_view.scroll_to(0, Gtk.ListScrollFlags.NONE, None)
+            return False
+
+        GLib.idle_add(_do_scroll)
 
     def _rebuild_uid_positions(self) -> None:
         self._uid_positions.clear()

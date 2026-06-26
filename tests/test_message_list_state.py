@@ -11,6 +11,7 @@ from post.mail.message_list_state import (
     folder_cache_matches,
     folder_list_ready_to_cache,
     message_list_fingerprint,
+    prepended_message_count,
     touch_lru_cache,
 )
 
@@ -37,6 +38,32 @@ class MessageListFingerprintTests(unittest.TestCase):
             message_list_fingerprint(first),
             message_list_fingerprint(second),
         )
+
+
+class PrependedMessageCountTests(unittest.TestCase):
+    def test_detects_single_prepend(self) -> None:
+        current = [_msg("2"), _msg("1")]
+        updated = [_msg("3"), _msg("2"), _msg("1")]
+        self.assertEqual(prepended_message_count(current, updated), 1)
+
+    def test_detects_multiple_prepends(self) -> None:
+        current = [_msg("2"), _msg("1")]
+        updated = [_msg("4"), _msg("3"), _msg("2"), _msg("1")]
+        self.assertEqual(prepended_message_count(current, updated), 2)
+
+    def test_rejects_reorder(self) -> None:
+        current = [_msg("2"), _msg("1")]
+        updated = [_msg("1"), _msg("2")]
+        self.assertEqual(prepended_message_count(current, updated), 0)
+
+    def test_rejects_removal(self) -> None:
+        current = [_msg("2"), _msg("1")]
+        updated = [_msg("2")]
+        self.assertEqual(prepended_message_count(current, updated), 0)
+
+    def test_empty_current_treats_all_as_prepended(self) -> None:
+        updated = [_msg("1"), _msg("2")]
+        self.assertEqual(prepended_message_count([], updated), 2)
 
 
 class FolderListReadyToCacheTests(unittest.TestCase):
