@@ -338,7 +338,7 @@ def _reply_to_differs_from_from(from_header: str, reply_to_header: str) -> bool:
     return reply_addrs != from_addrs
 
 
-def format_message_header(msg: dict[str, Any]) -> str:
+def _format_header_lines(msg: dict[str, Any], *, include_bcc: bool) -> list[str]:
     lines = [
         f"From: {msg.get('from', '')}",
     ]
@@ -349,12 +349,23 @@ def format_message_header(msg: dict[str, Any]) -> str:
     cc = (msg.get("cc") or "").strip()
     if cc:
         lines.append(f"CC: {cc}")
-    bcc = (msg.get("bcc") or "").strip()
-    if bcc:
-        lines.append(f"Bcc: {bcc}")
+    if include_bcc:
+        bcc = (msg.get("bcc") or "").strip()
+        if bcc:
+            lines.append(f"Bcc: {bcc}")
     date = msg.get("date_received") or msg.get("date_sent") or ""
     lines.append(f"Date: {date}")
-    return "\n".join(lines)
+    return lines
+
+
+def format_reader_header(msg: dict[str, Any]) -> str:
+    """Reader meta line; includes Bcc when present (Sent/Drafts)."""
+    return "\n".join(_format_header_lines(msg, include_bcc=True))
+
+
+def format_forward_quote_header(msg: dict[str, Any]) -> str:
+    """Forwarded-message preamble; never includes Bcc."""
+    return "\n".join(_format_header_lines(msg, include_bcc=False))
 
 
 def sort_messages_newest_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -15,7 +15,8 @@ from post.mail.helpers import (
     flag_menu_label,
     format_attachment_size,
     format_message_datetime,
-    format_message_header,
+    format_forward_quote_header,
+    format_reader_header,
     format_message_list_date,
     format_recipient_header,
     message_has_attachments,
@@ -71,9 +72,9 @@ class SortMessagesNewestFirstTests(unittest.TestCase):
         self.assertEqual(messages, original)
 
 
-class FormatMessageHeaderTests(unittest.TestCase):
+class FormatReaderHeaderTests(unittest.TestCase):
     def test_includes_to_and_date(self) -> None:
-        header = format_message_header(
+        header = format_reader_header(
             {
                 "from": "Alice <alice@example.com>",
                 "to": "Bob <bob@example.com>",
@@ -89,7 +90,7 @@ class FormatMessageHeaderTests(unittest.TestCase):
         )
 
     def test_includes_cc_when_present(self) -> None:
-        header = format_message_header(
+        header = format_reader_header(
             {
                 "from": "Alice",
                 "to": "Bob",
@@ -100,13 +101,13 @@ class FormatMessageHeaderTests(unittest.TestCase):
         self.assertIn("CC: Carol <carol@example.com>", header)
 
     def test_omits_cc_when_empty(self) -> None:
-        header = format_message_header(
+        header = format_reader_header(
             {"from": "Alice", "to": "Bob", "cc": "  ", "date_sent": "2026-06-19 14:30:00"}
         )
         self.assertNotIn("CC:", header)
 
     def test_includes_reply_to_when_different_from_from(self) -> None:
-        header = format_message_header(
+        header = format_reader_header(
             {
                 "from": "Newsletters <mbrennwa@gmail.com>",
                 "reply_to": "Test Author <matthias@brennwald.org>",
@@ -121,7 +122,7 @@ class FormatMessageHeaderTests(unittest.TestCase):
         self.assertEqual(lines[1], "Reply-To: Test Author <matthias@brennwald.org>")
 
     def test_omits_reply_to_when_same_address_as_from(self) -> None:
-        header = format_message_header(
+        header = format_reader_header(
             {
                 "from": "Alice <alice@example.com>",
                 "reply_to": "Alice <alice@example.com>",
@@ -132,7 +133,7 @@ class FormatMessageHeaderTests(unittest.TestCase):
         self.assertNotIn("Reply-To:", header)
 
     def test_omits_reply_to_when_absent(self) -> None:
-        header = format_message_header(
+        header = format_reader_header(
             {
                 "from": "Alice <alice@example.com>",
                 "to": "Bob <bob@example.com>",
@@ -142,7 +143,7 @@ class FormatMessageHeaderTests(unittest.TestCase):
         self.assertNotIn("Reply-To:", header)
 
     def test_includes_bcc_when_present(self) -> None:
-        header = format_message_header(
+        header = format_reader_header(
             {
                 "from": "Alice",
                 "to": "Bob",
@@ -153,10 +154,37 @@ class FormatMessageHeaderTests(unittest.TestCase):
         self.assertIn("Bcc: Dave <dave@example.com>", header)
 
     def test_omits_bcc_when_empty(self) -> None:
-        header = format_message_header(
+        header = format_reader_header(
             {"from": "Alice", "to": "Bob", "bcc": "  ", "date_sent": "2026-06-19 14:30:00"}
         )
         self.assertNotIn("Bcc:", header)
+
+
+class FormatForwardQuoteHeaderTests(unittest.TestCase):
+    def test_omits_bcc_when_present(self) -> None:
+        header = format_forward_quote_header(
+            {
+                "from": "Alice",
+                "to": "Bob",
+                "bcc": "Dave <dave@example.com>",
+                "date_sent": "2026-06-19 14:30:00",
+            }
+        )
+        self.assertNotIn("Bcc:", header)
+        self.assertNotIn("dave@example.com", header)
+        self.assertIn("From: Alice", header)
+        self.assertIn("To: Bob", header)
+
+    def test_includes_cc_when_present(self) -> None:
+        header = format_forward_quote_header(
+            {
+                "from": "Alice",
+                "to": "Bob",
+                "cc": "Carol <carol@example.com>",
+                "date_sent": "2026-06-19 14:30:00",
+            }
+        )
+        self.assertIn("CC: Carol <carol@example.com>", header)
 
 
 class FormatMessageDatetimeTests(unittest.TestCase):
