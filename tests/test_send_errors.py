@@ -69,8 +69,24 @@ class SendErrorMessageTests(unittest.TestCase):
         self.assertTrue(
             is_compose_validation_error(SendError("Subject must not contain line breaks."))
         )
+        self.assertTrue(
+            is_compose_validation_error(
+                ValueError(
+                    "Header values may not contain linefeed or carriage return characters"
+                )
+            )
+        )
         self.assertFalse(is_compose_validation_error(SendError("SMTP failed")))
         self.assertFalse(is_compose_validation_error(TimeoutError()))
+
+    def test_stdlib_header_newline_value_error(self) -> None:
+        exc = ValueError(
+            "Header values may not contain linefeed or carriage return characters"
+        )
+        self.assertEqual(
+            user_send_error_message(exc),
+            "Recipient addresses must not contain line breaks.",
+        )
 
     def test_send_queued_message(self) -> None:
         from post.mail.send_errors import MESSAGE_QUEUED, SendQueued

@@ -108,6 +108,8 @@ def user_send_error_message(exc: BaseException) -> str:
             return "Add a recipient in the To field."
         if "line break" in lowered:
             return text
+        if "linefeed" in lowered or "carriage return" in lowered:
+            return "Recipient addresses must not contain line breaks."
 
     text = _raw_error_text(exc)
     lowered = text.lower()
@@ -164,6 +166,8 @@ def is_compose_validation_error(exc: BaseException) -> bool:
         return False
     return (
         "line break" in text
+        or "linefeed" in text
+        or "carriage return" in text
         or "not valid" in text
         or "invalid address" in text
         or "no valid addresses" in text

@@ -452,6 +452,22 @@ class HeaderInjectionTests(unittest.TestCase):
                 to=[f"Evil{self._INJECT} <bob@example.com>"],
             )
 
+    def test_rejects_bare_to_address_injection(self) -> None:
+        with self.assertRaises(ValueError):
+            build_plain_mime_message(
+                from_address="alice@example.com",
+                from_name="Alice",
+                subject="Hi",
+                body="Hello",
+                cc=None,
+                bcc=None,
+                to=[f"bob@example.com{self._INJECT}"],
+            )
+
+    def test_parse_address_list_rejects_newline_in_bare_address(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_address_list("bob@example.com\r\nBcc: evil@example.com")
+
     def test_rejects_attachment_filename_injection(self) -> None:
         with self.assertRaises(ValueError):
             build_plain_mime_message(
