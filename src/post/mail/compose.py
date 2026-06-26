@@ -47,6 +47,7 @@ def bare_address_is_valid(address: str) -> bool:
 
 def format_parsed_address(name: str | None, address: str) -> str:
     """Return a display string safe for headers and SMTP envelope parsing."""
+    address = _sanitize_header_field(address.strip(), field="Recipient address")
     name = _sanitize_header_field((name or "").strip(), field="Display name")
     if not name:
         return address
@@ -134,7 +135,8 @@ def addresses_to_internet_address(addresses: list[str]) -> Any | None:
             ok, name, address = single.get(index)
             if ok and address:
                 safe_name = _sanitize_optional_header_field(name, field="Display name")
-                container.add(safe_name or "", address)
+                safe_address = _sanitize_header_field(address, field="Recipient address")
+                container.add(safe_name or "", safe_address)
     return container if container.length() > 0 else None
 
 
@@ -568,6 +570,13 @@ def validate_compose_mime_fields(
     _sanitize_header_field(subject or "", field="Subject")
     _sanitize_optional_header_field(in_reply_to, field="In-Reply-To")
     _sanitize_optional_header_field(references, field="References")
+    for field, group in (
+        ("To", to),
+        ("Cc", cc),
+        ("Bcc", bcc),
+    ):
+        for item in group or []:
+            _sanitize_header_field(item.strip(), field=field)
     for group in (to or [], cc or [], bcc or []):
         addresses_to_internet_address(group)
     for attachment in attachments or ():
@@ -728,16 +737,25 @@ def build_outbound_email_message(
         in_reply_to, field="In-Reply-To"
     )
     safe_references = _sanitize_optional_header_field(references, field="References")
+    safe_to = [_sanitize_header_field(item.strip(), field="To") for item in to]
+    safe_cc = (
+        [_sanitize_header_field(item.strip(), field="Cc") for item in cc] if cc else None
+    )
+    safe_bcc = (
+        [_sanitize_header_field(item.strip(), field="Bcc") for item in bcc]
+        if bcc
+        else None
+    )
 
     message = EmailMessage(policy=_outbound_smtp_policy())
     message["From"] = (
         formataddr((safe_from_name, from_address)) if safe_from_name else from_address
     )
-    message["To"] = ", ".join(to)
-    if cc:
-        message["Cc"] = ", ".join(cc)
-    if include_bcc_header and bcc:
-        message["Bcc"] = ", ".join(bcc)
+    message["To"] = ", ".join(safe_to)
+    if safe_cc:
+        message["Cc"] = ", ".join(safe_cc)
+    if include_bcc_header and safe_bcc:
+        message["Bcc"] = ", ".join(safe_bcc)
     message["Subject"] = safe_subject
     message["Message-ID"] = resolved_message_id
     message["Date"] = resolved_date
