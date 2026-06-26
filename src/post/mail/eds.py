@@ -923,7 +923,7 @@ class MailService:
             self._append_sent_copy_from_compose(account_uid, compose_kwargs)
             return
 
-        message = build_plain_mime_message(**compose_kwargs)
+        message = build_plain_mime_message(**compose_kwargs, include_bcc_header=False)
         sent_message = build_plain_mime_message(**compose_kwargs)
 
         sender = Camel.InternetAddress.new()
