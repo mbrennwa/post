@@ -76,8 +76,9 @@ from .compose import (
     ComposeAttachment,
     addresses_to_internet_address,
     build_draft_mime_message,
-    build_outbound_email_bytes,
+    build_outbound_mime_package,
     build_plain_mime_message,
+    new_outbound_mime_identifiers,
     normalize_email,
 )
 from .correspondents import Correspondent, collect_correspondents
@@ -889,17 +890,18 @@ class MailService:
             "references": references,
             "attachments": attachments,
         }
+        outbound_ids = new_outbound_mime_identifiers(from_address)
 
         if from_queue and account_uid != POST_LOCAL_ACCOUNT_UID:
             transport_uid = account.transport_uid
             if not transport_uid:
                 raise ValueError("No mail transport configured for this account")
             try:
-                payload = build_outbound_email_bytes(**compose_kwargs)
+                package = build_outbound_mime_package(**compose_kwargs)
                 send_via_smtp(
                     registry=self.registry,
                     transport_uid=transport_uid,
-                    payload=payload,
+                    payload=package.wire_bytes,
                     envelope_from=from_address,
                     to=to,
                     cc=cc,
@@ -920,11 +922,21 @@ class MailService:
                 account_uid,
                 time.monotonic() - send_start,
             )
-            self._append_sent_copy_from_compose(account_uid, compose_kwargs)
+            prepare_camel_worker_thread()
+            self._append_to_sent_folder_worker(account_uid, package.sent_message)
             return
 
-        message = build_plain_mime_message(**compose_kwargs, include_bcc_header=False)
-        sent_message = build_plain_mime_message(**compose_kwargs)
+        message = build_plain_mime_message(
+            **compose_kwargs,
+            include_bcc_header=False,
+            message_id=outbound_ids.message_id,
+            date=outbound_ids.date,
+        )
+        sent_message = build_plain_mime_message(
+            **compose_kwargs,
+            message_id=outbound_ids.message_id,
+            date=outbound_ids.date,
+        )
 
         sender = Camel.InternetAddress.new()
         sender.add(account.from_name or "", from_address)
@@ -1186,13 +1198,6 @@ class MailService:
         if sent_info is None:
             return None
         return sent_info.get("full_name")
-
-    def _append_sent_copy_from_compose(
-        self, account_uid: str, compose_kwargs: dict[str, Any]
-    ) -> None:
-        prepare_camel_worker_thread()
-        sent_message = build_plain_mime_message(**compose_kwargs)
-        self._append_to_sent_folder_worker(account_uid, sent_message)
 
     def _append_to_sent_folder_unlocked(
         self, account_uid: str, message: Camel.MimeMessage

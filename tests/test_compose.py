@@ -11,6 +11,7 @@ from post.mail.compose import (
     body_text_for_quoting,
     build_draft_mime_message,
     build_outbound_email_bytes,
+    build_outbound_mime_package,
     build_outbound_html_for_compose,
     build_plain_mime_message,
     build_forward_subject,
@@ -831,6 +832,94 @@ class HtmlForwardReplyTests(unittest.TestCase):
         assert html is not None
         self.assertNotIn(source, html)
         self.assertIn("edited quote", html)
+
+
+class OutboundMimeParityTests(unittest.TestCase):
+    def test_build_outbound_email_bytes_includes_message_id_and_date(self) -> None:
+        import email
+        import email.policy
+
+        payload = build_outbound_email_bytes(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hi",
+            body="Hello",
+        )
+        parsed = email.message_from_bytes(payload, policy=email.policy.SMTP)
+        self.assertIsNotNone(parsed["Message-ID"])
+        self.assertIsNotNone(parsed["Date"])
+        self.assertTrue(str(parsed["Message-ID"]).startswith("<"))
+        self.assertIn(b"\r\n", payload)
+
+    def test_build_outbound_mime_package_wire_and_sent_share_identifiers(self) -> None:
+        import email
+        import email.policy
+
+        package = build_outbound_mime_package(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=["carol@example.com"],
+            bcc=["secret@example.com"],
+            subject="Thread test",
+            body="Hello",
+            in_reply_to="<parent@example.com>",
+            references="<parent@example.com>",
+        )
+        wire = email.message_from_bytes(
+            package.wire_bytes, policy=email.policy.SMTP
+        )
+        sent_raw = _mime_message_raw_bytes(package.sent_message)
+        assert sent_raw is not None
+
+        self.assertEqual(wire["Message-ID"], package.message_id)
+        self.assertEqual(wire["Date"], package.date)
+        self.assertIn(f"Message-ID: {package.message_id}".encode(), sent_raw)
+        self.assertIn(f"Date: {package.date}".encode(), sent_raw)
+        self.assertEqual(wire["In-Reply-To"], "<parent@example.com>")
+        self.assertEqual(wire["References"], "<parent@example.com>")
+        self.assertNotIn("Bcc", wire)
+        self.assertIn(b"Bcc:", sent_raw)
+
+    def test_explicit_identifiers_are_shared_between_builders(self) -> None:
+        import email
+        import email.policy
+
+        message_id = "<fixed-id@example.com>"
+        date = "Mon, 01 Jan 2024 00:00:00 +0000"
+        wire_bytes = build_outbound_email_bytes(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hi",
+            body="Hello",
+            message_id=message_id,
+            date=date,
+        )
+        sent = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hi",
+            body="Hello",
+            message_id=message_id,
+            date=date,
+        )
+        wire = email.message_from_bytes(wire_bytes, policy=email.policy.SMTP)
+        sent_raw = _mime_message_raw_bytes(sent)
+        assert sent_raw is not None
+
+        self.assertEqual(wire["Message-ID"], message_id)
+        self.assertEqual(wire["Date"], date)
+        self.assertIn(f"Message-ID: {message_id}".encode(), sent_raw)
+        self.assertIn(f"Date: {date}".encode(), sent_raw)
 
 
 if __name__ == "__main__":
