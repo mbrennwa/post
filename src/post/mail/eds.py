@@ -60,7 +60,7 @@ from .message_flags import (
     persist_folder_flags as _persist_folder_flags,
 )
 from .local_delivery import all_recipients_local, can_deliver_locally, deliver_local_message
-from .io_thread import get_mail_io_thread, is_mail_io_thread
+from .io_thread import get_mail_io_thread, is_mail_io_thread, run_on_mail_thread
 from .smtp_send import send_via_smtp
 from .send_errors import (
     MESSAGE_QUEUED,
@@ -1543,8 +1543,9 @@ class MailService:
         self, account_uid: str, folder_name: str
     ) -> tuple[int, int]:
         """Return live (unread, total) counts by opening the folder."""
-        with self._lock:
-            return self._get_folder_stats_unlocked(account_uid, folder_name)
+        return run_on_mail_thread(
+            self._get_folder_stats_unlocked, account_uid, folder_name
+        )
 
     def create_folder(
         self,
@@ -1728,12 +1729,13 @@ class MailService:
     def _get_folder_stats_unlocked(
         self, account_uid: str, folder_name: str
     ) -> tuple[int, int]:
-        store = self._get_store_unlocked(account_uid)
-        folder = store.get_folder_sync(folder_name, 0, None)
-        if folder is None:
-            raise ValueError(f"Folder not found: {folder_name}")
-        folder.refresh_info_sync(None)
-        return folder.get_unread_message_count(), folder.get_message_count()
+        with self._lock:
+            store = self._get_store_unlocked(account_uid)
+            folder = store.get_folder_sync(folder_name, 0, None)
+            if folder is None:
+                raise ValueError(f"Folder not found: {folder_name}")
+            folder.refresh_info_sync(None)
+            return folder.get_unread_message_count(), folder.get_message_count()
 
     @staticmethod
     def pick_default_account(accounts: list[MailAccount]) -> MailAccount | None:
@@ -1895,15 +1897,15 @@ class MailService:
         limit: int = DEFAULT_MESSAGE_PAGE_SIZE,
         sync: bool = True,
     ) -> tuple[list[dict], int, int, bool]:
-        with self._lock:
-            return self._search_messages_page_unlocked(
-                account_uid,
-                folder_name,
-                query,
-                offset=offset,
-                limit=limit,
-                sync=sync,
-            )
+        return run_on_mail_thread(
+            self._search_messages_page_unlocked,
+            account_uid,
+            folder_name,
+            query,
+            offset=offset,
+            limit=limit,
+            sync=sync,
+        )
 
     def _search_messages_page_unlocked(
         self,
@@ -1915,17 +1917,18 @@ class MailService:
         limit: int,
         sync: bool,
     ) -> tuple[list[dict], int, int, bool]:
-        key = (account_uid, folder_name)
-        index = self._folder_indexes.get(key)
-        if index is None or sync:
-            index, _source = self._get_folder_index_unlocked(
-                account_uid, folder_name, sync=sync
-            )
+        with self._lock:
+            key = (account_uid, folder_name)
+            index = self._folder_indexes.get(key)
+            if index is None or sync:
+                index, _source = self._get_folder_index_unlocked(
+                    account_uid, folder_name, sync=sync
+                )
 
-        filtered = [msg for msg in index.messages if message_matches(msg, query)]
-        page, has_more = paginate_messages(filtered, offset, limit)
-        match_count = len(filtered)
-        return page, match_count, match_count, has_more
+            filtered = [msg for msg in index.messages if message_matches(msg, query)]
+            page, has_more = paginate_messages(filtered, offset, limit)
+            match_count = len(filtered)
+            return page, match_count, match_count, has_more
 
     def _list_messages_page_unlocked(
         self,
@@ -2097,10 +2100,12 @@ class MailService:
         *,
         mark_seen: bool = True,
     ) -> dict:
-        return self._with_mail_op(
-            lambda: self._read_message_unlocked(
-                account_uid, folder_name, message_uid, mark_seen=mark_seen
-            )
+        return run_on_mail_thread(
+            self._read_message_unlocked,
+            account_uid,
+            folder_name,
+            message_uid,
+            mark_seen=mark_seen,
         )
 
     def read_attachment_data(
