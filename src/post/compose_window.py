@@ -32,6 +32,7 @@ from post.mail.compose import (
     build_outbound_html_for_compose,
     build_reply_all_recipients,
     build_reply_references,
+    normalize_in_reply_to,
     build_reply_subject,
     compose_body_with_signature,
     extract_reply_target_addresses,
@@ -1200,13 +1201,13 @@ class ComposeWindow(Adw.Window):
         in_reply_to = None
         references = None
         if self._mode in ("reply", "reply-all") and self._reply_to is not None:
-            in_reply_to = self._reply_to.get("message_id")
+            in_reply_to = normalize_in_reply_to(self._reply_to.get("message_id"))
             references = build_reply_references(
                 in_reply_to,
                 self._reply_to.get("references"),
             )
         elif self._mode == "draft" and self._draft_message is not None:
-            in_reply_to = self._draft_message.get("message_id")
+            in_reply_to = normalize_in_reply_to(self._draft_message.get("message_id"))
             references = self._draft_message.get("references")
 
         return (

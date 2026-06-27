@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 from post.mail.helpers import (
+    _decode_header_value,
     enrich_message_dict_from_mime,
     flag_menu_items,
     flag_menu_label,
@@ -368,6 +369,45 @@ class FormatRecipientHeaderTests(unittest.TestCase):
         self.assertEqual(format_recipient_header(Camel.InternetAddress.new()), "")
 
 
+class DecodeHeaderValueTests(unittest.TestCase):
+    def test_rfc2047_encoded_word_as_str(self) -> None:
+        self.assertEqual(
+            _decode_header_value("=?ISO-8859-1?Q?Gr=FC=DFe?="),
+            "Grüße",
+        )
+
+    def test_rfc2047_encoded_word_as_bytes(self) -> None:
+        self.assertEqual(
+            _decode_header_value(b"=?ISO-8859-1?Q?Gr=FC=DFe?="),
+            "Grüße",
+        )
+
+    def test_already_decoded_unicode_unchanged(self) -> None:
+        self.assertEqual(_decode_header_value("Grüße"), "Grüße")
+        self.assertEqual(_decode_header_value("Hello"), "Hello")
+
+    def test_raw_latin1_bytes_without_encoded_word(self) -> None:
+        self.assertEqual(
+            _decode_header_value("Gr\xfc\xdfe".encode("latin-1")),
+            "Grüße",
+        )
+
+    def test_attachment_filename_encoded_word(self) -> None:
+        self.assertEqual(
+            _decode_header_value(b"=?ISO-8859-1?Q?r=E9sum=E9.pdf?="),
+            "résumé.pdf",
+        )
+
+    def test_ascii_message_id_bytes(self) -> None:
+        self.assertEqual(
+            _decode_header_value(b"<abc@example.com>"),
+            "<abc@example.com>",
+        )
+
+    def test_none_returns_none(self) -> None:
+        self.assertIsNone(_decode_header_value(None))
+
+
 class MessageInfoToDictTests(unittest.TestCase):
     def test_formats_camel_cc_address(self) -> None:
         import gi
@@ -389,6 +429,20 @@ class MessageInfoToDictTests(unittest.TestCase):
         info.get_size.return_value = 100
         result = message_info_to_dict(info)
         self.assertEqual(result["cc"], "Carol <carol@example.com>")
+
+    def test_decodes_rfc2047_subject_bytes(self) -> None:
+        info = MagicMock()
+        info.get_uid.return_value = "1"
+        info.get_subject.return_value = b"=?ISO-8859-1?Q?Gr=FC=DFe?="
+        info.get_from.return_value = "Alice <alice@example.com>"
+        info.get_to.return_value = "Bob <bob@example.com>"
+        info.get_cc.return_value = None
+        info.get_date_sent.return_value = 1_700_000_000
+        info.get_date_received.return_value = 1_700_000_100
+        info.get_flags.return_value = 0
+        info.get_size.return_value = 100
+        result = message_info_to_dict(info)
+        self.assertEqual(result["subject"], "Grüße")
 
 
 class EnrichMessageDictFromMimeTests(unittest.TestCase):

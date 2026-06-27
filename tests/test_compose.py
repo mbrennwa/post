@@ -17,6 +17,7 @@ from post.mail.compose import (
     build_forward_subject,
     build_reply_all_recipients,
     build_reply_references,
+    normalize_in_reply_to,
     parse_references_header,
     build_reply_subject,
     extract_reply_address,
@@ -833,6 +834,31 @@ class FormatAddressListTests(unittest.TestCase):
         )
 
 
+class NormalizeInReplyToTests(unittest.TestCase):
+    def test_none_and_empty(self) -> None:
+        self.assertIsNone(normalize_in_reply_to(None))
+        self.assertIsNone(normalize_in_reply_to(""))
+        self.assertIsNone(normalize_in_reply_to("   "))
+
+    def test_bare_numeric(self) -> None:
+        self.assertEqual(
+            normalize_in_reply_to("18137428606209368569"),
+            "<18137428606209368569>",
+        )
+
+    def test_already_bracketed(self) -> None:
+        self.assertEqual(
+            normalize_in_reply_to("<parent@example.com>"),
+            "<parent@example.com>",
+        )
+
+    def test_bare_addr_spec(self) -> None:
+        self.assertEqual(
+            normalize_in_reply_to("parent@example.com"),
+            "<parent@example.com>",
+        )
+
+
 class BuildReplyReferencesTests(unittest.TestCase):
     def test_message_id_only(self) -> None:
         self.assertEqual(
@@ -1185,6 +1211,30 @@ class OutboundMimeParityTests(unittest.TestCase):
         self.assertEqual(wire["References"], "<parent@example.com>")
         self.assertNotIn("Bcc", wire)
         self.assertIn(b"Bcc:", sent_raw)
+
+    def test_build_outbound_mime_package_normalizes_bare_in_reply_to(self) -> None:
+        import email
+        import email.policy
+
+        package = build_outbound_mime_package(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Thread test",
+            body="Hello",
+            in_reply_to="18137428606209368569",
+            references="<18137428606209368569>",
+        )
+        wire = email.message_from_bytes(
+            package.wire_bytes, policy=email.policy.SMTP
+        )
+        sent_raw = _mime_message_raw_bytes(package.sent_message)
+        assert sent_raw is not None
+
+        self.assertEqual(wire["In-Reply-To"], "<18137428606209368569>")
+        self.assertIn(b"In-Reply-To: <18137428606209368569>", sent_raw)
 
     def test_explicit_identifiers_are_shared_between_builders(self) -> None:
         import email

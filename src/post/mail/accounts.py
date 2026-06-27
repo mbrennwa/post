@@ -154,6 +154,15 @@ def is_builtin_local_store_empty(registry: EDataServer.SourceRegistry) -> bool:
     return is_maildir_empty(path)
 
 
+def _backend_settings_path(source: EDataServer.Source, ext_name: str) -> str:
+    if not source.has_extension(ext_name):
+        return ""
+    ext = source.get_extension(ext_name)
+    settings = ext.get_settings()
+    path = settings.get_path() if hasattr(settings, "get_path") else None
+    return str(path).strip() if path else ""
+
+
 def get_local_backend_path(source: EDataServer.Source) -> str | None:
     """Return the configured spool/Maildir path for a local mail source."""
     mail_ext = source.get_extension("Mail Account")
@@ -162,16 +171,39 @@ def get_local_backend_path(source: EDataServer.Source) -> str | None:
         return None
 
     ext_name = "Spool Backend" if backend == "spool" else "Maildir Backend"
-    if not source.has_extension(ext_name):
-        return None
-
-    ext = source.get_extension(ext_name)
-    settings = ext.get_settings()
-    path = settings.get_path() if hasattr(settings, "get_path") else None
-    if not path:
-        return None
-    path = str(path).strip()
+    path = _backend_settings_path(source, ext_name)
     return path or None
+
+
+def get_mismatched_backend_path(source: EDataServer.Source) -> str:
+    """Return a path stored under the wrong backend section, if any."""
+    mail_ext = source.get_extension("Mail Account")
+    backend = mail_ext.get_backend_name()
+    if backend not in LOCAL_BACKENDS:
+        return ""
+    wrong_ext = "Maildir Backend" if backend == "spool" else "Spool Backend"
+    return _backend_settings_path(source, wrong_ext)
+
+
+def infer_spool_path_from_hint(hint: str) -> str:
+    """Map a legacy or misconfigured path hint to a user mbox file."""
+    hint = hint.strip()
+    if not hint:
+        return default_spool_path()
+    if os.path.isfile(hint):
+        return hint
+    if os.path.isdir(hint):
+        user = os.environ.get("USER") or getpass.getuser()
+        user_file = os.path.join(hint, user)
+        if os.path.isfile(user_file):
+            return user_file
+        parent = os.path.dirname(user_file)
+        if parent and os.path.isdir(parent):
+            return user_file
+    parent = os.path.dirname(hint)
+    if parent and os.path.isdir(parent):
+        return hint
+    return default_spool_path()
 
 
 def is_local_account_usable(source: EDataServer.Source) -> bool:
@@ -218,10 +250,7 @@ def read_local_mail_config(
     backend_ext = (
         "Spool Backend" if backend == "spool" else "Maildir Backend"
     )
-    if source.has_extension(backend_ext):
-        ext = source.get_extension(backend_ext)
-        settings = ext.get_settings()
-        path = settings.get_path() or ""
+    path = _backend_settings_path(source, backend_ext)
 
     from_name = ""
     from_address = ""
@@ -446,10 +475,56 @@ def _local_transport_is_configured(
     return backend == "smtp"
 
 
+def repair_local_mail_config(registry: EDataServer.SourceRegistry) -> bool:
+    """Rewrite a broken Post local mail source. Returns True when repaired."""
+    source = registry.ref_source(POST_LOCAL_ACCOUNT_UID)
+    if source is None or not source.get_enabled():
+        return False
+    if is_local_account_usable(source):
+        return False
+
+    config = read_local_mail_config(registry)
+    if config is None:
+        return False
+
+    path = config.path.strip()
+    if not path:
+        hint = get_mismatched_backend_path(source)
+        if config.mail_type == "spool":
+            path = infer_spool_path_from_hint(hint)
+        elif hint and os.path.isdir(hint):
+            path = hint
+        else:
+            path = default_local_mail_config().path
+    elif config.mail_type == "spool" and os.path.isdir(path):
+        path = infer_spool_path_from_hint(path)
+
+    repaired = LocalMailConfig(
+        enabled=config.enabled,
+        mail_type=config.mail_type,
+        path=path,
+        from_name=config.from_name,
+        from_address=config.from_address,
+    )
+    error = validate_local_mail_config(repaired)
+    if error:
+        log.warning("Cannot repair local mail config: %s", error)
+        return False
+
+    log.info("Repairing broken local mail source (path=%s)", path)
+    apply_local_mail_config(repaired)
+    return True
+
+
 def ensure_post_local_mail_transport(
     registry: EDataServer.SourceRegistry,
 ) -> None:
     """Ensure enabled system mail has a local SMTP transport configured."""
+    if repair_local_mail_config(registry):
+        fresh = EDataServer.SourceRegistry.new_sync(None)
+        if fresh is not None:
+            registry = fresh
+
     config = read_local_mail_config(registry)
     if config is None or not config.enabled:
         return

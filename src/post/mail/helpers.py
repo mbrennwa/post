@@ -96,11 +96,24 @@ def _walk_folder_ptr(ptr: int, results: list[dict[str, Any]]) -> None:
         ptr = node.next
 
 
-def _safe_str(value: Any) -> str | None:
+def _decode_header_value(value: Any) -> str | None:
+    """Decode inbound header metadata (RFC 2047 encoded-words, legacy charsets)."""
+    from email.header import decode_header, make_header
+
     if value is None:
         return None
+    if isinstance(value, str):
+        try:
+            return str(make_header(decode_header(value)))
+        except (TypeError, ValueError, UnicodeError):
+            return value
     if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
+        try:
+            return str(make_header(decode_header(value.decode("ascii"))))
+        except UnicodeDecodeError:
+            return _decode_text_bytes(value, None)
+        except (TypeError, ValueError, UnicodeError):
+            return _decode_text_bytes(value, None)
     return str(value)
 
 
@@ -109,7 +122,7 @@ def format_recipient_header(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
-        return value.strip()
+        return (_decode_header_value(value) or "").strip()
     formatter = getattr(value, "format", None)
     if callable(formatter):
         try:
@@ -119,7 +132,7 @@ def format_recipient_header(value: Any) -> str:
         except (TypeError, ValueError):
             pass
         return ""
-    return (_safe_str(value) or "").strip()
+    return (_decode_header_value(value) or "").strip()
 
 
 def _recipient_field_from_mime(mime: Any, field: str) -> str:
@@ -199,12 +212,12 @@ def message_info_to_dict(info: Any) -> dict[str, Any]:
         or 0
     )
     return {
-        "uid": _safe_str(info.get_uid()),
-        "subject": _safe_str(info.get_subject()) or "(no subject)",
+        "uid": _decode_header_value(info.get_uid()),
+        "subject": _decode_header_value(info.get_subject()) or "(no subject)",
         "from": format_recipient_header(info.get_from()),
         "to": format_recipient_header(info.get_to()),
         "cc": format_recipient_header(info.get_cc()),
-        "message_id": _safe_str(info.get_message_id())
+        "message_id": _decode_header_value(info.get_message_id())
         if hasattr(info, "get_message_id")
         else None,
         "sort_date": sort_date,
@@ -769,7 +782,7 @@ def _walk_attachment_parts(
     size = part.get_size() if hasattr(part, "get_size") else None
     attachments.append(
         {
-            "filename": _safe_str(filename) or "attachment",
+            "filename": _decode_header_value(filename) or "attachment",
             "mime_type": mime_type,
             "size": size if isinstance(size, int) else None,
         }
