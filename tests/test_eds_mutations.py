@@ -9,7 +9,41 @@ from unittest import mock
 from post.mail.eds import MailService
 
 
-class MutationDispatchTests(unittest.TestCase):
+class DraftDispatchTests(unittest.TestCase):
+    @mock.patch("post.mail.eds.run_on_mail_thread")
+    def test_save_draft_uses_mail_thread(self, run_on_mail_thread) -> None:
+        run_on_mail_thread.return_value = ("Drafts", "7")
+        service = MailService(registry=mock.Mock())
+
+        result = service.save_draft(
+            "acct-1",
+            subject="Hi",
+            body="Body",
+        )
+
+        run_on_mail_thread.assert_called_once()
+        self.assertEqual(
+            run_on_mail_thread.call_args.args[0].__name__,
+            "_save_draft_unlocked",
+        )
+        self.assertEqual(result, ("Drafts", "7"))
+
+    @mock.patch("post.mail.eds.run_on_mail_thread")
+    def test_read_attachment_data_uses_mail_thread(self, run_on_mail_thread) -> None:
+        run_on_mail_thread.return_value = ("file.txt", b"data")
+        service = MailService(registry=mock.Mock())
+
+        result = service.read_attachment_data("acct-1", "INBOX", "1", 0)
+
+        run_on_mail_thread.assert_called_once_with(
+            service._read_attachment_data_unlocked,
+            "acct-1",
+            "INBOX",
+            "1",
+            0,
+        )
+        self.assertEqual(result, ("file.txt", b"data"))
+
     @mock.patch("post.mail.eds.run_on_mail_thread")
     def test_toggle_message_seen_uses_mail_thread(self, run_on_mail_thread) -> None:
         run_on_mail_thread.return_value = {"updates": []}

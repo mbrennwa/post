@@ -1411,21 +1411,21 @@ class MailService:
         attachments: Sequence[ComposeAttachment] | None = None,
     ) -> tuple[str, str]:
         """Save or update a draft. Returns (drafts_folder_name, message_uid)."""
-        with self._lock:
-            return self._save_draft_unlocked(
-                account_uid,
-                to=to,
-                cc=cc,
-                bcc=bcc,
-                subject=subject,
-                body=body,
-                body_html=body_html,
-                in_reply_to=in_reply_to,
-                references=references,
-                existing_uid=existing_uid,
-                drafts_folder_name=drafts_folder_name,
-                attachments=attachments,
-            )
+        return run_on_mail_thread(
+            self._save_draft_unlocked,
+            account_uid,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body=body,
+            body_html=body_html,
+            in_reply_to=in_reply_to,
+            references=references,
+            existing_uid=existing_uid,
+            drafts_folder_name=drafts_folder_name,
+            attachments=attachments,
+        )
 
     def _save_draft_unlocked(
         self,
@@ -1479,10 +1479,23 @@ class MailService:
     def delete_draft(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> None:
+        run_on_mail_thread(
+            self._delete_draft_unlocked,
+            account_uid,
+            folder_name,
+            message_uid,
+        )
+
+    def _delete_draft_unlocked(
+        self, account_uid: str, folder_name: str, message_uid: str
+    ) -> None:
         with self._lock:
             self._delete_message_unlocked(account_uid, folder_name, message_uid)
 
     def get_correspondents(self, account_uid: str) -> list[Correspondent]:
+        return run_on_mail_thread(self._get_correspondents_unlocked, account_uid)
+
+    def _get_correspondents_unlocked(self, account_uid: str) -> list[Correspondent]:
         with self._lock:
             cached = self._correspondent_indexes.get(account_uid)
             if cached is not None:
@@ -2118,10 +2131,13 @@ class MailService:
         message_uid: str,
         attachment_index: int,
     ) -> tuple[str, bytes]:
-        with self._lock:
-            return self._read_attachment_data_unlocked(
-                account_uid, folder_name, message_uid, attachment_index
-            )
+        return run_on_mail_thread(
+            self._read_attachment_data_unlocked,
+            account_uid,
+            folder_name,
+            message_uid,
+            attachment_index,
+        )
 
     def toggle_message_seen(
         self, account_uid: str, folder_name: str, message_uid: str
