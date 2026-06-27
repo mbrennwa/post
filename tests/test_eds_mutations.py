@@ -71,3 +71,40 @@ class DraftDispatchTests(unittest.TestCase):
             "INBOX",
             ["1"],
         )
+
+
+class FolderIndexInvalidationTests(unittest.TestCase):
+    def test_invalidate_folder_index_keeps_correspondent_cache(self) -> None:
+        service = MailService(registry=mock.Mock())
+        cached = [mock.Mock()]
+        service._correspondent_indexes["acct-1"] = cached
+
+        service.invalidate_folder_index("acct-1", "Drafts")
+
+        self.assertIs(service._correspondent_indexes.get("acct-1"), cached)
+
+    def test_invalidate_correspondent_index_clears_cache(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._correspondent_indexes["acct-1"] = [mock.Mock()]
+
+        service.invalidate_correspondent_index("acct-1")
+
+        self.assertNotIn("acct-1", service._correspondent_indexes)
+
+
+class InboxFolderNameTests(unittest.TestCase):
+    def test_get_inbox_folder_name_uses_cached_tree(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._folder_tree_cache["acct-1"] = [
+            {
+                "full_name": "[Gmail]/Inbox",
+                "display_name": "Inbox",
+                "folder_type": 1,
+            }
+        ]
+
+        with mock.patch.object(service, "list_folders") as list_folders:
+            inbox = service.get_inbox_folder_name("acct-1")
+
+        list_folders.assert_not_called()
+        self.assertEqual(inbox, "[Gmail]/Inbox")

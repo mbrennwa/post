@@ -368,6 +368,10 @@ class ComposeWindow(Adw.Window):
     ) -> None:
         super().__init__(transient_for=parent, modal=False)
         apply_window_icon(self)
+        if parent is not None:
+            application = parent.get_application()
+            if application is not None:
+                self.set_application(application)
         self._mail = mail
         self._set_status = set_status
         self._on_outbox_changed = on_outbox_changed
@@ -547,6 +551,7 @@ class ComposeWindow(Adw.Window):
         self._update_save_draft_enabled()
         self.connect("close-request", self._on_close_request)
         GLib.idle_add(self._set_initial_focus)
+        GLib.idle_add(self._preflight_account_credentials)
         if self._mode == "draft":
             GLib.idle_add(self._begin_load_draft_attachments)
 
@@ -680,6 +685,17 @@ class ComposeWindow(Adw.Window):
         if attachments:
             self._attachments = attachments
             self._refresh_attachments_ui()
+        return False
+
+    def _preflight_account_credentials(self) -> bool:
+        try:
+            self._mail.prepare_account_credentials(self._account.uid)
+        except Exception:
+            log.debug(
+                "Could not preflight credentials for %s",
+                self._account.uid,
+                exc_info=True,
+            )
         return False
 
     def _set_initial_focus(self) -> bool:
@@ -1243,8 +1259,17 @@ class ComposeWindow(Adw.Window):
         account = self._selected_account()
 
         self._close_when_saved = close_when_done
+        try:
+            self._mail.prepare_account_credentials(account.uid)
+        except Exception:
+            log.debug(
+                "Could not preflight credentials for %s",
+                account.uid,
+                exc_info=True,
+            )
         self._saving_draft = True
         self._set_compose_actions_sensitive(False)
+        self._set_status("Saving draft…")
         self._pending_draft_body = body
         self._pending_draft_body_html = body_html
 
@@ -1256,30 +1281,59 @@ class ComposeWindow(Adw.Window):
         if self._on_draft_save_started is not None:
             self._on_draft_save_started(account_uid, drafts_folder_name)
 
-        def worker() -> None:
-            error: Exception | None = None
-            result: tuple[str, str] | None = None
-            try:
-                result = self._mail.save_draft(
-                    account_uid,
-                    to=to_addrs or None,
-                    cc=cc_addrs or None,
-                    bcc=bcc_addrs or None,
-                    subject=subject,
-                    body=body,
-                    body_html=body_html,
-                    in_reply_to=in_reply_to,
-                    references=references,
-                    existing_uid=existing_uid,
-                    drafts_folder_name=drafts_folder_name,
-                    attachments=attachments or None,
-                )
-            except Exception as exc:
-                log.warning("Save draft failed: %s", exc)
-                error = exc
-            GLib.idle_add(self._on_save_draft_finished, error, result)
+        get_mail_io_thread().submit(
+            self._run_save_draft_on_mail_thread,
+            account_uid=account_uid,
+            to_addrs=to_addrs,
+            cc_addrs=cc_addrs,
+            bcc_addrs=bcc_addrs,
+            subject=subject,
+            body=body,
+            body_html=body_html,
+            in_reply_to=in_reply_to,
+            references=references,
+            existing_uid=existing_uid,
+            drafts_folder_name=drafts_folder_name,
+            attachments=attachments,
+        )
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _run_save_draft_on_mail_thread(
+        self,
+        *,
+        account_uid: str,
+        to_addrs: list[str],
+        cc_addrs: list[str],
+        bcc_addrs: list[str],
+        subject: str,
+        body: str,
+        body_html: str | None,
+        in_reply_to: str | None,
+        references: str | None,
+        existing_uid: str | None,
+        drafts_folder_name: str | None,
+        attachments: list[ComposeAttachment],
+    ) -> None:
+        error: Exception | None = None
+        result: tuple[str, str] | None = None
+        try:
+            result = self._mail.save_draft(
+                account_uid,
+                to=to_addrs or None,
+                cc=cc_addrs or None,
+                bcc=bcc_addrs or None,
+                subject=subject,
+                body=body,
+                body_html=body_html,
+                in_reply_to=in_reply_to,
+                references=references,
+                existing_uid=existing_uid,
+                drafts_folder_name=drafts_folder_name,
+                attachments=attachments or None,
+            )
+        except Exception as exc:
+            log.warning("Save draft failed: %s", exc)
+            error = exc
+        GLib.idle_add(self._on_save_draft_finished, error, result)
 
     def _on_save_draft_finished(
         self,
@@ -1291,6 +1345,7 @@ class ComposeWindow(Adw.Window):
         close_when_done = self._close_when_saved
         self._close_when_saved = False
         if error is not None:
+            self._set_status("Could not save draft")
             self._show_error(str(error))
             return False
 
@@ -1301,6 +1356,7 @@ class ComposeWindow(Adw.Window):
         self._draft_body_plain_snapshot = self._pending_draft_body
         self._draft_body_html = self._pending_draft_body_html
         self._update_save_draft_enabled()
+        self._set_status("Draft saved")
         show_toast(self, "Draft saved")
         if self._on_draft_saved is not None:
             account = self._selected_account()

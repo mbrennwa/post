@@ -80,7 +80,7 @@ from .send_queue import (
     remove_queued_outbound_message,
 )
 from post.preferences import get_show_evolution_local
-from .auth import PasswordPromptCallback, authenticate_service_sync
+from .auth import PasswordPromptCallback, authenticate_service_sync, ensure_goa_credentials
 from .compose import (
     ComposeAttachment,
     addresses_to_internet_address,
@@ -131,6 +131,29 @@ def prepare_camel_worker_thread() -> None:
     _camel_worker_tls.session = None
     _camel_worker_tls.stores = {}
     _camel_worker_tls.transports = {}
+
+
+def _ensure_worker_tls_initialized() -> None:
+    """Initialize per-thread Camel worker caches.
+
+    On the dedicated mail I/O thread the thread-default GLib context is already
+    set up in ``io_thread``; only the TLS dicts need initializing.  Ad-hoc worker
+    threads still call ``prepare_camel_worker_thread()`` for their own context.
+    """
+    if getattr(_camel_worker_tls, "ready", False):
+        return
+    if is_mail_io_thread():
+        _camel_worker_tls.ready = True
+        _camel_worker_tls.session = None
+        _camel_worker_tls.stores = {}
+        _camel_worker_tls.transports = {}
+        return
+    prepare_camel_worker_thread()
+
+
+def _queue_send_uses_worker_session(from_queue: bool) -> bool:
+    """True when outbox SMTP runs on an ad-hoc thread (legacy worker session)."""
+    return from_queue and not is_mail_io_thread()
 
 
 def _run_on_gtk_thread(callback: Callable[[], None]) -> bool:
@@ -560,7 +583,7 @@ class MailService:
         return self._session
 
     def _ensure_worker_session(self) -> Camel.Session:
-        prepare_camel_worker_thread()
+        _ensure_worker_tls_initialized()
         session = _camel_worker_tls.session
         if session is not None:
             session.set_online(self._network_available)
@@ -581,6 +604,7 @@ class MailService:
         return session
 
     def _get_worker_store_unlocked(self, account_uid: str) -> Camel.Store:
+        _ensure_worker_tls_initialized()
         stores: dict[str, Camel.Store] = _camel_worker_tls.stores
         if account_uid in stores:
             store = stores[account_uid]
@@ -627,6 +651,7 @@ class MailService:
         mail_transport = transport_source.get_extension("Mail Transport")
         expected_backend = mail_transport.get_backend_name()
 
+        _ensure_worker_tls_initialized()
         transports: dict[str, Camel.Transport] = _camel_worker_tls.transports
         if transport_uid in transports:
             transport = transports[transport_uid]
@@ -687,6 +712,33 @@ class MailService:
         with self._lock:
             self._invalidate_folder_index(account_uid, folder_name)
 
+    def invalidate_correspondent_index(self, account_uid: str) -> None:
+        with self._lock:
+            self._correspondent_indexes.pop(account_uid, None)
+
+    def get_inbox_folder_name(self, account_uid: str) -> str | None:
+        """Return INBOX folder name, using the cached folder tree when available."""
+        with self._lock:
+            cached = self._folder_tree_cache.get(account_uid)
+        if cached is not None:
+            return guess_inbox_name(cached)
+        return guess_inbox_name(self.list_folders(account_uid))
+
+    def prepare_account_credentials(self, account_uid: str) -> None:
+        """Refresh GOA tokens before mail I/O (may show account sign-in UI)."""
+        source = self.registry.ref_source(account_uid)
+        if source is None:
+            return
+        if source.has_extension("GNOME Online Accounts"):
+            ensure_goa_credentials(self.registry, source, None)
+
+    def _prepare_account_credentials_unlocked(self, account_uid: str) -> None:
+        source = self.registry.ref_source(account_uid)
+        if source is None:
+            return
+        if source.has_extension("GNOME Online Accounts"):
+            ensure_goa_credentials(self.registry, source, None)
+
     def _get_store_unlocked(self, account_uid: str) -> Camel.Store:
         if account_uid in self._stores:
             store = self._stores[account_uid]
@@ -700,6 +752,7 @@ class MailService:
         if source is None:
             raise ValueError(f"Unknown mail account: {account_uid}")
 
+        self._prepare_account_credentials_unlocked(account_uid)
         session = self._ensure_session()
         mail_ext = source.get_extension("Mail Account")
         service = session.add_service(
@@ -758,6 +811,7 @@ class MailService:
                 return transport
             del self._transports[transport_uid]
 
+        self._prepare_account_credentials_unlocked(account_uid)
         session = self._ensure_session()
         backend = expected_backend
 
@@ -969,13 +1023,14 @@ class MailService:
         ok = False
         smtp_start = time.monotonic()
         transport_uid = ""
+        use_worker_session = _queue_send_uses_worker_session(from_queue)
         get_transport = (
             self._get_worker_transport_unlocked
-            if from_queue
+            if use_worker_session
             else self._get_transport_unlocked
         )
         try:
-            if from_queue:
+            if use_worker_session:
                 transport = get_transport(account_uid, cancellable)
             else:
                 with self._lock:
@@ -1029,7 +1084,7 @@ class MailService:
                 except Exception:
                     log.debug("Failed to disconnect transport after send", exc_info=True)
             if transport_uid:
-                if from_queue:
+                if use_worker_session:
                     worker_transports = getattr(_camel_worker_tls, "transports", None)
                     if isinstance(worker_transports, dict):
                         worker_transports.pop(transport_uid, None)
@@ -1064,9 +1119,10 @@ class MailService:
         send_start: float,
         from_queue: bool = False,
     ) -> None:
+        use_worker_session = _queue_send_uses_worker_session(from_queue)
         append = (
             self._append_to_sent_folder_worker
-            if from_queue
+            if use_worker_session
             else self._append_to_sent_folder_unlocked
         )
         append(account_uid, sent_message)
@@ -1164,6 +1220,18 @@ class MailService:
         if folder_name:
             return folder_name
 
+        with self._lock:
+            cached = self._folder_tree_cache.get(account_uid)
+        if cached is not None:
+            sent_info = find_folder_by_type(
+                cached,
+                Camel.FolderInfoFlags.TYPE_OUTBOX,
+                type_mask=Camel.FOLDER_TYPE_MASK,
+                name_fallbacks=frozenset({"sent", "sent mail", "sent messages"}),
+            )
+            if sent_info is not None:
+                return sent_info.get("full_name")
+
         folders = self._list_folders_unlocked(account_uid)
         sent_info = find_folder_by_type(
             folders,
@@ -1233,8 +1301,7 @@ class MailService:
     def _append_to_sent_folder_worker(
         self, account_uid: str, message: Camel.MimeMessage
     ) -> None:
-        with self._lock:
-            folder_name = self._sent_folder_name_unlocked(account_uid)
+        folder_name = self._sent_folder_name_unlocked(account_uid)
         if not folder_name:
             return
 
@@ -1463,9 +1530,50 @@ class MailService:
             cached = self._correspondent_indexes.get(account_uid)
             if cached is not None:
                 return cached
-            correspondents = self._build_correspondents_index_unlocked(account_uid)
+        correspondents = self._build_correspondents_index_unlocked(account_uid)
+        with self._lock:
             self._correspondent_indexes[account_uid] = correspondents
-            return correspondents
+        return correspondents
+
+    def _folders_for_correspondents_unlocked(
+        self, account_uid: str
+    ) -> list[dict]:
+        folders = self._list_folders_unlocked(account_uid)
+        selected: list[dict] = []
+        seen: set[str] = set()
+        for folder_type, fallbacks in (
+            (Camel.FolderInfoFlags.TYPE_INBOX, frozenset({"inbox"})),
+            (
+                Camel.FolderInfoFlags.TYPE_SENT,
+                frozenset({"sent", "sent mail", "sent messages"}),
+            ),
+        ):
+            info = find_folder_by_type(
+                folders,
+                folder_type,
+                type_mask=Camel.FOLDER_TYPE_MASK,
+                name_fallbacks=fallbacks,
+            )
+            if info is None:
+                continue
+            full_name = info.get("full_name")
+            if not full_name or full_name in seen:
+                continue
+            seen.add(full_name)
+            selected.append(info)
+        if selected:
+            return selected
+        for folder in folders:
+            if not folder_can_contain_messages(folder):
+                continue
+            full_name = folder.get("full_name")
+            if not full_name or full_name in seen:
+                continue
+            seen.add(full_name)
+            selected.append(folder)
+            if len(selected) >= 3:
+                break
+        return selected
 
     def _build_correspondents_index_unlocked(
         self, account_uid: str
@@ -1476,12 +1584,12 @@ class MailService:
             if raw:
                 exclude_emails.add(normalize_email(raw))
 
-        folders = self._list_folders_unlocked(account_uid)
+        folders = self._folders_for_correspondents_unlocked(account_uid)
         messages: list[dict] = []
         for folder in folders:
-            if not folder_can_contain_messages(folder):
-                continue
             full_name = folder.get("full_name")
+            if not full_name:
+                continue
             index = self._build_folder_index_unlocked(account_uid, full_name)
             messages.extend(index.messages)
 
@@ -1490,13 +1598,16 @@ class MailService:
         return correspondents[:_MAX_CORRESPONDENTS]
 
     def list_folders(self, account_uid: str) -> list[dict]:
-        with self._lock:
+        if is_mail_io_thread():
             return self._list_folders_unlocked(account_uid)
+        return run_on_mail_thread(self._list_folders_unlocked, account_uid)
 
     def _list_folders_unlocked(self, account_uid: str) -> list[dict]:
-        cached = self._folder_tree_cache.get(account_uid)
+        with self._lock:
+            cached = self._folder_tree_cache.get(account_uid)
         try:
-            store = self._get_store_unlocked(account_uid)
+            with self._lock:
+                store = self._get_store_unlocked(account_uid)
             root = store.get_folder_info_sync(
                 None, Camel.StoreGetFolderInfoFlags.RECURSIVE, None
             )
@@ -1504,7 +1615,8 @@ class MailService:
             if root is not None:
                 walk_folder_info(root, folders)
             result = [f for f in folders if f.get("full_name")]
-            self._folder_tree_cache[account_uid] = result
+            with self._lock:
+                self._folder_tree_cache[account_uid] = result
             return result
         except GLib.Error as exc:
             if cached is not None and is_network_unavailable_error(exc):
@@ -2877,7 +2989,6 @@ class MailService:
     ) -> None:
         if folder_name:
             self._folder_indexes.pop((account_uid, folder_name), None)
-            self._correspondent_indexes.pop(account_uid, None)
             folder_index_cache.invalidate(account_uid, folder_name)
 
     @staticmethod

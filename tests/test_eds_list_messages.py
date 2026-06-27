@@ -58,6 +58,37 @@ class ListMessagesPageDispatchTests(unittest.TestCase):
         self.assertEqual(result, expected)
 
 
+class ListFoldersDispatchTests(unittest.TestCase):
+    @mock.patch("post.mail.eds.is_mail_io_thread", return_value=False)
+    @mock.patch("post.mail.eds.run_on_mail_thread")
+    def test_dispatches_to_mail_thread(self, run_on_mail_thread, _is_mail_io) -> None:
+        run_on_mail_thread.return_value = [{"full_name": "INBOX"}]
+        service = MailService(registry=mock.Mock())
+
+        result = service.list_folders("acct-1")
+
+        run_on_mail_thread.assert_called_once_with(
+            service._list_folders_unlocked,
+            "acct-1",
+        )
+        self.assertEqual(result, [{"full_name": "INBOX"}])
+
+    @mock.patch("post.mail.eds.is_mail_io_thread", return_value=True)
+    def test_runs_inline_on_mail_thread(self, _is_mail_io) -> None:
+        service = MailService(registry=mock.Mock())
+        expected = [{"full_name": "INBOX"}]
+
+        with mock.patch.object(
+            service,
+            "_list_folders_unlocked",
+            return_value=expected,
+        ) as unlocked:
+            result = service.list_folders("acct-1")
+
+        unlocked.assert_called_once_with("acct-1")
+        self.assertEqual(result, expected)
+
+
 class ReadPathDispatchTests(unittest.TestCase):
     @mock.patch("post.mail.eds.run_on_mail_thread")
     def test_read_message_uses_mail_thread(self, run_on_mail_thread) -> None:

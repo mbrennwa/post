@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 
 import gi
@@ -13,6 +14,8 @@ gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, GLib, Gtk
+
+log = logging.getLogger(__name__)
 
 PasswordPrompt = Gtk.Window | Adw.ApplicationWindow | Adw.Window
 
@@ -38,6 +41,9 @@ def prompt_password_sync(parent: PasswordPrompt, account_label: str) -> str | No
 def _show_password_dialog(parent: PasswordPrompt, account_label: str) -> str | None:
     result: dict[str, str | None] = {"password": None}
     loop = GLib.MainLoop()
+
+    parent.present()
+    log.info("Showing password sign-in dialog for %s", account_label)
 
     entry = Gtk.PasswordEntry()
     entry.props.placeholder_text = "Password"

@@ -170,6 +170,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._pending_move_undo: dict | None = None
         self._undo_toast: Adw.Toast | None = None
         self._settings_dialog: SettingsWindow | None = None
+        self._compose_windows: list[ComposeWindow] = []
         self._load_remote_content = get_load_remote_content()
         self._message_appearance = get_message_appearance()
         self._restore_message_folder: tuple[str, str] | None = None
@@ -1169,6 +1170,13 @@ class MainWindow(Adw.ApplicationWindow):
             draft_message_uid=draft_message_uid,
             draft_message=draft_message,
         )
+        self._compose_windows.append(window)
+        window.connect(
+            "destroy",
+            lambda *_args, w=window: self._compose_windows.remove(w)
+            if w in self._compose_windows
+            else None,
+        )
         window.present()
 
     def _on_draft_save_started(
@@ -1409,10 +1417,20 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self._status.set_label(self._status_hint)
 
+    def _interaction_parent_window(self) -> Gtk.Window:
+        """Prefer a visible compose window for modal prompts over the main window."""
+        for window in reversed(self._compose_windows):
+            if window.get_visible() and window.is_active():
+                return window
+        for window in reversed(self._compose_windows):
+            if window.get_visible():
+                return window
+        return self
+
     def _prompt_account_password(
         self, account_label: str, _mechanism: str | None
     ) -> str | None:
-        return prompt_password_sync(self, account_label)
+        return prompt_password_sync(self._interaction_parent_window(), account_label)
 
     def _reload_sidebar(self) -> bool:
         self._sync_watcher.set_current_folder(None, None)
