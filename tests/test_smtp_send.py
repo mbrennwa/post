@@ -6,8 +6,12 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+from post.mail.compose import build_outbound_email_bytes
 from post.mail.smtp_send import (
     SmtpTransportConfig,
+    _payload_has_8bit_parts,
+    _prepare_smtp_payload,
+    _reencode_8bit_parts_for_7bit_smtp,
     _recipient_addresses,
     read_smtp_transport_config,
     send_via_smtp,
@@ -128,6 +132,7 @@ class SendViaSmtpTests(unittest.TestCase):
             "user@example.com",
             ["dest@example.com"],
             b"raw",
+            mail_options=[],
         )
         smtp.quit.assert_called_once()
 
@@ -169,6 +174,190 @@ class SendViaSmtpTests(unittest.TestCase):
             "user@example.com",
             ["dest@example.com", "cc@example.com", "bcc@example.com"],
             b"raw",
+            mail_options=[],
+        )
+
+
+class EightBitMimeTests(unittest.TestCase):
+    def test_payload_has_8bit_parts_detects_non_ascii_wire_bytes(self) -> None:
+        payload = build_outbound_email_bytes(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Unicode",
+            body="Café",
+        )
+        self.assertTrue(_payload_has_8bit_parts(payload))
+
+    def test_payload_has_8bit_parts_false_for_ascii(self) -> None:
+        payload = build_outbound_email_bytes(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="ASCII",
+            body="Hello",
+        )
+        self.assertFalse(_payload_has_8bit_parts(payload))
+
+    def test_reencode_8bit_parts_uses_quoted_printable(self) -> None:
+        payload = build_outbound_email_bytes(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Unicode",
+            body="Café",
+        )
+        reencoded = _reencode_8bit_parts_for_7bit_smtp(payload)
+        self.assertNotIn(b"Content-Transfer-Encoding: 8bit", reencoded)
+        self.assertIn(b"Content-Transfer-Encoding: quoted-printable", reencoded)
+        self.assertIn(b"Caf=C3=A9", reencoded)
+
+    def test_prepare_smtp_payload_requests_body_8bitmime(self) -> None:
+        payload = build_outbound_email_bytes(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Unicode",
+            body="Café",
+        )
+        smtp = mock.Mock()
+        smtp.has_extn.return_value = True
+
+        wire_payload, mail_options = _prepare_smtp_payload(smtp, payload)
+
+        self.assertIs(wire_payload, payload)
+        self.assertEqual(mail_options, ["BODY=8BITMIME"])
+        smtp.has_extn.assert_called_once_with("8bitmime")
+
+    def test_prepare_smtp_payload_reencodes_without_8bitmime(self) -> None:
+        payload = build_outbound_email_bytes(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Unicode",
+            body="Café",
+        )
+        smtp = mock.Mock()
+        smtp.has_extn.return_value = False
+
+        wire_payload, mail_options = _prepare_smtp_payload(smtp, payload)
+
+        self.assertIsNot(wire_payload, payload)
+        self.assertNotIn(b"Content-Transfer-Encoding: 8bit", wire_payload)
+        self.assertEqual(mail_options, [])
+
+    @mock.patch("post.mail.smtp_send._authenticate_smtp")
+    @mock.patch("post.mail.smtp_send._connect_smtp")
+    @mock.patch("post.mail.smtp_send.read_smtp_transport_config")
+    def test_sendmail_uses_body_8bitmime_for_non_ascii(
+        self,
+        read_config,
+        connect_smtp,
+        _authenticate,
+    ) -> None:
+        transport_source = mock.Mock()
+        read_config.return_value = (
+            transport_source,
+            SmtpTransportConfig(
+                host="smtp.example.com",
+                port=465,
+                username="user@example.com",
+                security="ssl-on-alternate-port",
+                auth_method="plain",
+            ),
+        )
+        smtp = mock.Mock()
+        smtp.has_extn.return_value = True
+        connect_smtp.return_value = smtp
+        registry = mock.Mock()
+        payload = build_outbound_email_bytes(
+            from_name=None,
+            from_address="user@example.com",
+            to=["dest@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Unicode",
+            body="Café",
+        )
+
+        send_via_smtp(
+            registry=registry,
+            transport_uid="transport-1",
+            payload=payload,
+            envelope_from="user@example.com",
+            to=["dest@example.com"],
+            cc=None,
+            bcc=None,
+        )
+
+        smtp.sendmail.assert_called_once_with(
+            "user@example.com",
+            ["dest@example.com"],
+            payload,
+            mail_options=["BODY=8BITMIME"],
+        )
+
+    @mock.patch("post.mail.smtp_send._authenticate_smtp")
+    @mock.patch("post.mail.smtp_send._connect_smtp")
+    @mock.patch("post.mail.smtp_send.read_smtp_transport_config")
+    def test_sendmail_reencodes_when_server_lacks_8bitmime(
+        self,
+        read_config,
+        connect_smtp,
+        _authenticate,
+    ) -> None:
+        transport_source = mock.Mock()
+        read_config.return_value = (
+            transport_source,
+            SmtpTransportConfig(
+                host="smtp.example.com",
+                port=465,
+                username="user@example.com",
+                security="ssl-on-alternate-port",
+                auth_method="plain",
+            ),
+        )
+        smtp = mock.Mock()
+        smtp.has_extn.return_value = False
+        connect_smtp.return_value = smtp
+        registry = mock.Mock()
+        payload = build_outbound_email_bytes(
+            from_name=None,
+            from_address="user@example.com",
+            to=["dest@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Unicode",
+            body="Café",
+        )
+
+        send_via_smtp(
+            registry=registry,
+            transport_uid="transport-1",
+            payload=payload,
+            envelope_from="user@example.com",
+            to=["dest@example.com"],
+            cc=None,
+            bcc=None,
+        )
+
+        sent_payload = smtp.sendmail.call_args.args[2]
+        self.assertNotIn(b"Content-Transfer-Encoding: 8bit", sent_payload)
+        smtp.sendmail.assert_called_once_with(
+            "user@example.com",
+            ["dest@example.com"],
+            sent_payload,
+            mail_options=[],
         )
 
 
