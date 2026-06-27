@@ -53,7 +53,7 @@ from post.mail.correspondents import (
     current_address_token,
     match_correspondents,
 )
-from post.mail.eds import MailAccount, prepare_camel_worker_thread
+from post.mail.eds import MailAccount
 from post.mail.io_thread import get_mail_io_thread
 from post.mail.send_errors import (
     SendQueued,
@@ -143,7 +143,6 @@ def _run_outbound_send_worker(
     on_draft_saved: OnDraftSaved | None,
     request: OutboundSendRequest,
 ) -> None:
-    prepare_camel_worker_thread()
     queue_id = request.queue_id or new_outbound_queue_id()
     mail.begin_outbound_send()
     try:
