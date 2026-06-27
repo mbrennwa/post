@@ -25,6 +25,23 @@ where = ["src"]
 [tool.setuptools.package-data]
 post = ["icons/**/*.png", "icons/**/*.svg"]
 
+[tool.deb]
+# Debian/Ubuntu packages provided by the distro (not PyPI).
+# Dev venv uses --system-site-packages (see run.sh); .deb postinst same pattern.
+apt_depends = [
+  "python3 (>= 3.10)",
+  "python3-venv",
+  "python3-gi",
+  "gir1.2-gtk-4.0",
+  "gir1.2-adw-1",
+  "gir1.2-glib-2.0",
+  "gir1.2-camel-1.2",
+  "gir1.2-edataserver-1.2",
+  "gir1.2-webkit-6.0",
+  "librsvg2-bin",
+  "desktop-file-utils",
+]
+
 [tool.setuptools.data-files]
 "share/applications" = ["data/io.github.mbrennwa.Post.desktop"]
 "share/icons/hicolor/48x48/apps" = [
