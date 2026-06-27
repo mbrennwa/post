@@ -992,7 +992,46 @@ class MainWindow(Adw.ApplicationWindow):
         ):
             if self._sync_list_reload_suppressed(account_uid, folder_name):
                 return
+            if self._folder_messages_visible():
+                self._sync_current_folder_messages(account_uid, folder_name)
+                return
             self._load_messages(account_uid, folder_name, sync=True)
+
+    def _folder_messages_visible(self) -> bool:
+        return (
+            self._message_list_view.item_count() > 0
+            or bool(self._current_folder_messages)
+        )
+
+    def _sync_current_folder_messages(
+        self, account_uid: str, folder_name: str
+    ) -> None:
+        """Refresh the open folder from the server without clearing the list."""
+        if (
+            self._search_query is not None
+            or is_post_outbox_folder(folder_name)
+            or not self._network_available
+            or self._message_sync_in_progress
+        ):
+            return
+
+        load_id = self._messages_load_generation
+
+        def fetch_messages(sync_flag: bool) -> tuple[list[dict], int, int, str]:
+            messages, unread, total, source = self._mail.get_folder_messages(
+                account_uid,
+                folder_name,
+                sync=sync_flag,
+            )
+            return messages, unread, total, source
+
+        self._message_sync_in_progress = True
+        self._start_background_message_sync(
+            load_id,
+            account_uid,
+            folder_name,
+            fetch_messages,
+        )
 
     def _on_load_remote_content_changed(self, enabled: bool) -> None:
         self._load_remote_content = enabled
@@ -2445,10 +2484,23 @@ class MainWindow(Adw.ApplicationWindow):
                 )
             )
 
+    def _update_message_flags_in_folder_cache(
+        self, uid: str, flags: dict
+    ) -> None:
+        if self._current_folder_messages is None:
+            return
+        for message in self._current_folder_messages:
+            if message.get("uid") == uid:
+                merged = dict(message.get("flags") or {})
+                merged.update(flags)
+                message["flags"] = merged
+                break
+
     def _mark_message_read(self, uid: str) -> None:
         flags = self._message_flags_for_uid(uid)
         flags["seen"] = True
         self._message_list_view.update_message_flags(uid, flags)
+        self._update_message_flags_in_folder_cache(uid, flags)
 
     def _uids_for_menu(self, uid: str) -> list[str]:
         selected = self._message_list_view.get_selected_uids()
@@ -2959,6 +3011,7 @@ class MainWindow(Adw.ApplicationWindow):
                 continue
             flags = dict(updates_by_uid[uid])
             self._message_list_view.update_message_flags(uid, flags)
+            self._update_message_flags_in_folder_cache(uid, flags)
             if uid == self._current_message_uid and self._current_message is not None:
                 current_flags = dict(self._current_message.get("flags") or {})
                 current_flags.update(flags)
