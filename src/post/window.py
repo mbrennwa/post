@@ -28,7 +28,16 @@ from post.mail import MailService
 from post.mail.eds import MailAccount, MessageNotAvailableError
 from post.mail.sync_watcher import MailSyncWatcher
 from post.message_list_view import VirtualMessageList
-from post.mail.folders import POST_OUTBOX_FOLDER, is_post_outbox_folder
+from post.mail.folders import (
+    POST_OUTBOX_FOLDER,
+    format_account_refresh_done,
+    format_account_refresh_error,
+    format_account_refresh_start,
+    format_folder_refresh_done,
+    format_folder_refresh_error,
+    format_folder_refresh_start,
+    is_post_outbox_folder,
+)
 from post.mail.folder_index_cache import (
     has_cache as folder_index_has_cache,
     load as load_folder_index_cache,
@@ -871,17 +880,43 @@ class MainWindow(Adw.ApplicationWindow):
         self._settings_dialog = None
 
     def _on_sidebar_refresh_account(self, account_uid: str) -> None:
-        self._sidebar.reload_account(account_uid)
+        label = self._sidebar.account_display_label(account_uid)
+        self._set_status(format_account_refresh_start(label))
 
-    def _on_sidebar_refresh_folder(self, account_uid: str, folder_name: str) -> None:
-        self._sidebar.refresh_folder_row(account_uid, folder_name)
-        if (
-            self._current_account
-            and self._current_folder
+        def on_complete(folder_count: int, error: Exception | None) -> None:
+            if error is not None:
+                self._set_status(format_account_refresh_error(label))
+            else:
+                self._set_status(format_account_refresh_done(label, folder_count))
+
+        self._sidebar.reload_account(account_uid, on_complete=on_complete)
+
+    def _is_viewing_folder(self, account_uid: str, folder_name: str) -> bool:
+        return (
+            self._current_account is not None
+            and self._current_folder is not None
             and self._current_account.uid == account_uid
             and self._current_folder == folder_name
-        ):
-            self._load_messages(account_uid, folder_name, sync=True)
+        )
+
+    def _on_sidebar_refresh_folder(self, account_uid: str, folder_name: str) -> None:
+        display = self._sidebar.folder_display_name(account_uid, folder_name)
+        self._set_status(format_folder_refresh_start(display))
+        self._mail.invalidate_folder_index(account_uid, folder_name)
+
+        if self._is_viewing_folder(account_uid, folder_name):
+            self._load_messages(account_uid, folder_name, sync=True, force_sync=True)
+            return
+
+        def on_complete(unread: int, total: int, error: Exception | None) -> None:
+            if error is not None:
+                self._set_status(format_folder_refresh_error(display))
+            else:
+                self._set_status(format_folder_refresh_done(display, unread, total))
+
+        self._sidebar.refresh_folder_row(
+            account_uid, folder_name, on_complete=on_complete
+        )
 
     def _on_sidebar_send_outbox(self) -> None:
         self._flush_send_queue_idle()
@@ -1901,9 +1936,12 @@ class MainWindow(Adw.ApplicationWindow):
         viewing_outbox: bool,
         should_sync: bool,
         use_background_sync: bool,
+        force_sync: bool = False,
     ) -> str:
         if viewing_outbox:
             return "outbox"
+        if force_sync and should_sync:
+            return "server"
         if use_background_sync:
             return "disk_cache" if folder_index_has_cache(account_uid, folder_name) else "local"
         if should_sync:
@@ -1953,6 +1991,7 @@ class MainWindow(Adw.ApplicationWindow):
         *,
         offset: int = 0,
         sync: bool | None = None,
+        force_sync: bool = False,
     ) -> None:
         account = self._current_account
         if account is None or account.uid != account_uid:
@@ -1969,7 +2008,13 @@ class MainWindow(Adw.ApplicationWindow):
         load_id = self._messages_load_generation
 
         display_folder = (
-            "Outbox" if is_post_outbox_folder(folder_name) else folder_name
+            "Outbox"
+            if is_post_outbox_folder(folder_name)
+            else (
+                self._sidebar.folder_display_name(account_uid, folder_name)
+                if force_sync
+                else folder_name
+            )
         )
         search_query = self._search_query
         viewing_outbox = is_post_outbox_folder(folder_name)
@@ -1979,6 +2024,7 @@ class MainWindow(Adw.ApplicationWindow):
             and self._network_available
             and not viewing_outbox
             and search_query is None
+            and not force_sync
         )
         from_label = account.email or account.display_label
 
@@ -2013,13 +2059,23 @@ class MainWindow(Adw.ApplicationWindow):
             viewing_outbox=viewing_outbox,
             should_sync=should_sync,
             use_background_sync=use_background_sync,
+            force_sync=force_sync,
         )
         self._message_list_source = initial_source
-        loading_label = self._loading_progress_text(
-            display_folder,
-            searching=search_query is not None,
-            source=initial_source,
-        )
+        if (
+            force_sync
+            and should_sync
+            and self._network_available
+            and not viewing_outbox
+            and search_query is None
+        ):
+            loading_label = f"Refreshing {display_folder} from server…"
+        else:
+            loading_label = self._loading_progress_text(
+                display_folder,
+                searching=search_query is not None,
+                source=initial_source,
+            )
         self._set_status(loading_label)
         if (
             not self._pending_restore_message_uid
@@ -2036,7 +2092,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._clear_reader()
 
         cache_snapshot: tuple[list[dict], int, int] | None = None
-        if not viewing_outbox and search_query is None:
+        if not viewing_outbox and search_query is None and not force_sync:
             cache_snapshot = load_folder_index_cache(account_uid, folder_name)
 
         send_pending = self._mail.outbound_sends_pending()

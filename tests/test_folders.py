@@ -14,6 +14,12 @@ from post.mail.folders import (
     find_trash_folder,
     folder_can_contain_messages,
     folder_name_from_uri,
+    format_account_refresh_done,
+    format_account_refresh_error,
+    format_account_refresh_start,
+    format_folder_refresh_done,
+    format_folder_refresh_error,
+    format_folder_refresh_start,
     format_folder_label,
     guess_inbox_name,
     is_post_outbox_folder,
@@ -22,6 +28,7 @@ from post.mail.folders import (
     is_drafts_folder_name,
     is_system_folder,
     outbox_folder_dict,
+    resolve_folder_display_name,
     resolve_move_menu_state,
     resolve_sidebar_context_menu,
     validate_folder_display_name,
@@ -519,6 +526,59 @@ class PostOutboxFolderTests(unittest.TestCase):
         self.assertEqual(folder["full_name"], POST_OUTBOX_FOLDER)
         self.assertEqual(folder["display_name"], "Outbox")
         self.assertEqual(folder["total"], 3)
+
+
+class FolderRefreshStatusTests(unittest.TestCase):
+    def test_resolve_folder_display_name_for_unified_inbox(self) -> None:
+        self.assertEqual(
+            resolve_folder_display_name(
+                folder_name="INBOX",
+                inbox_name="INBOX",
+                account_label="alice@example.com",
+            ),
+            "alice@example.com Inbox",
+        )
+
+    def test_resolve_folder_display_name_for_regular_folder(self) -> None:
+        self.assertEqual(
+            resolve_folder_display_name(
+                folder_name="Sent",
+                display_name="Sent Items",
+            ),
+            "Sent Items",
+        )
+
+    def test_format_folder_refresh_messages(self) -> None:
+        self.assertEqual(
+            format_folder_refresh_start("alice@example.com Inbox"),
+            "Refreshing alice@example.com Inbox…",
+        )
+        self.assertEqual(
+            format_folder_refresh_done("Sent", 2, 10),
+            "Refreshed Sent: 10 messages (2 unread)",
+        )
+        self.assertEqual(
+            format_folder_refresh_error("Trash"),
+            "Could not refresh Trash",
+        )
+
+    def test_format_account_refresh_messages(self) -> None:
+        self.assertEqual(
+            format_account_refresh_start("Work"),
+            "Refreshing folders for Work…",
+        )
+        self.assertEqual(
+            format_account_refresh_done("Work", 1),
+            "Refreshed 1 folder for Work",
+        )
+        self.assertEqual(
+            format_account_refresh_done("Work", 4),
+            "Refreshed 4 folders for Work",
+        )
+        self.assertEqual(
+            format_account_refresh_error("Work"),
+            "Could not refresh folders for Work",
+        )
 
 
 if __name__ == "__main__":
