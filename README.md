@@ -5,6 +5,18 @@
 ## Install
 [WIP -- follow Tunes Player README]
 
+## Development
+
+Mail I/O runs on a dedicated background thread; see **[docs/mail-threading.md](docs/mail-threading.md)** for architecture, contributor rules, and the manual regression matrix.
+
+```bash
+# Run unit tests
+PYTHONPATH=src python3 -m pytest
+
+# Run with mail I/O debug tracing
+POST_LOG_LEVEL=DEBUG PYTHONPATH=src python3 -m post.main
+```
+
 ## License
 
 GPL-3.0-or-later — see [LICENSE](LICENSE).
