@@ -34,15 +34,6 @@ class _ImmediateMailIoThread:
         return func(*args, **kwargs)
 
 
-class ImmediateThread:
-    def __init__(self, target=None, args=(), kwargs=None, daemon=None, **__ignored):
-        self._target = target
-
-    def start(self) -> None:
-        if self._target is not None:
-            self._target()
-
-
 class RunOutboundSendTests(unittest.TestCase):
     def setUp(self) -> None:
         self.request = OutboundSendRequest(
@@ -210,15 +201,14 @@ class RunOutboundSendTests(unittest.TestCase):
         on_draft_saved = mock.Mock()
         outbox_changed = mock.Mock()
 
-        with mock.patch("post.compose_window.threading.Thread", ImmediateThread):
-            run_outbound_send(
-                mail=self.mail,
-                parent=None,
-                set_status=self.set_status,
-                on_outbox_changed=outbox_changed,
-                on_draft_saved=on_draft_saved,
-                request=request,
-            )
+        run_outbound_send(
+            mail=self.mail,
+            parent=None,
+            set_status=self.set_status,
+            on_outbox_changed=outbox_changed,
+            on_draft_saved=on_draft_saved,
+            request=request,
+        )
 
         self.mail.delete_draft.assert_called_once_with("acct-1", "Drafts", "42")
         on_draft_saved.assert_called_once()
