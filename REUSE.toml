@@ -52,6 +52,7 @@ path = [
     "run.sh",
     ".github/workflows/test.yml",
     "README.md",
+    "docs/mail-threading.md",
     "pyproject.toml",
     ".gitignore",
     "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post-sketch.svg",
