@@ -11,14 +11,15 @@ Threading contract
 * UI and other threads must dispatch blocking mail work through
   :func:`get_mail_io_thread` — use :meth:`MailIoThread.submit` for fire-and-forget
   work and :meth:`MailIoThread.run_sync` when the caller can block.
-* Never call :meth:`MailIoThread.run_sync` from the GTK main thread or from
-  inside a mail I/O task (deadlock).  Higher layers use
-  :func:`is_mail_io_thread` to run inline when already on the mail thread.
+* Never call :meth:`MailIoThread.run_sync` from the GTK main thread (blocks the UI).
+  Prefer :meth:`MailIoThread.submit` from GTK, or :func:`run_on_mail_thread` which
+  runs inline when already on the mail I/O thread.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 from collections.abc import Callable
@@ -27,9 +28,10 @@ from typing import Any, TypeVar
 
 import gi
 
+gi.require_version("Camel", "1.2")
 gi.require_version("GLib", "2.0")
 
-from gi.repository import GLib
+from gi.repository import Camel, GLib
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +40,7 @@ T = TypeVar("T")
 _io_thread_id: int | None = None
 _instance: MailIoThread | None = None
 _instance_lock = threading.Lock()
+_camel_initialized = False
 
 
 def is_mail_io_thread() -> bool:
@@ -50,6 +53,26 @@ def get_mail_io_thread() -> MailIoThread:
         if _instance is None:
             _instance = MailIoThread()
         return _instance
+
+
+def run_on_mail_thread(func: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+    """Run blocking mail work on the mail I/O thread.
+
+    Executes ``func`` inline when the caller is already on that thread.
+    """
+    if is_mail_io_thread():
+        return func(*args, **kwargs)
+    return get_mail_io_thread().run_sync(func, *args, **kwargs)
+
+
+def _bootstrap_camel_on_mail_thread() -> None:
+    global _camel_initialized
+    if _camel_initialized:
+        return
+    user_data = os.path.expanduser("~/.local/share/evolution")
+    Camel.init(user_data, False)
+    _camel_initialized = True
+    log.debug("Camel.init completed on mail I/O thread")
 
 
 @dataclass
@@ -79,6 +102,8 @@ class MailIoThread:
         self._queue.put(_IoTask(func=func, args=args, kwargs=kwargs))
 
     def run_sync(self, func: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+        if is_mail_io_thread():
+            return func(*args, **kwargs)
         done = threading.Event()
         task = _IoTask(func=func, args=args, kwargs=kwargs, done=done)
         self._queue.put(task)
@@ -92,6 +117,7 @@ class MailIoThread:
         _io_thread_id = threading.get_ident()
         context = GLib.MainContext.new()
         context.push_thread_default()
+        _bootstrap_camel_on_mail_thread()
         self._ready.set()
         log.debug("Mail I/O thread started")
 
