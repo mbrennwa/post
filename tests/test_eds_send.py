@@ -18,8 +18,6 @@ from gi.repository import Camel, Gio, GLib
 from post.mail.eds import (
     MailService,
     _SEND_TIMEOUT_SECONDS,
-    _camel_worker_tls,
-    _ensure_worker_tls_initialized,
 )
 
 
@@ -100,45 +98,7 @@ class FromQueueCamelSendTests(unittest.TestCase):
 
         transport = mock.Mock()
         transport.send_to_sync.return_value = (True, False)
-        service._get_worker_transport_unlocked = mock.Mock(return_value=transport)
-        service._append_sent_copy_and_finish_queue_item = mock.Mock()
-
-        service._send_message_unlocked(
-            "acct-1",
-            to=["to@example.com"],
-            cc=None,
-            bcc=None,
-            subject="Hi",
-            body="Body",
-            in_reply_to=None,
-            references=None,
-            from_queue=True,
-            queue_id="queue-1",
-        )
-
-        transport.send_to_sync.assert_called_once()
-        service._append_sent_copy_and_finish_queue_item.assert_called_once()
-
-    @mock.patch("post.mail.eds.is_mail_io_thread", return_value=True)
-    @mock.patch("post.mail.eds.threading.Timer")
-    @mock.patch("post.mail.eds.build_plain_mime_message")
-    def test_from_queue_on_mail_io_thread_uses_main_transport(
-        self, build_plain_mime_message, timer_cls, _is_mail_io_thread
-    ) -> None:
-        timer_cls.return_value = mock.Mock()
-        build_plain_mime_message.return_value = mock.Mock()
-
-        service = MailService(registry=mock.Mock())
-        account = mock.Mock()
-        account.from_address = "user@example.com"
-        account.from_name = "User"
-        account.transport_uid = "smtp-uid"
-        service.get_account = mock.Mock(return_value=account)
-
-        transport = mock.Mock()
-        transport.send_to_sync.return_value = (True, False)
         service._get_transport_unlocked = mock.Mock(return_value=transport)
-        service._get_worker_transport_unlocked = mock.Mock()
         service._append_sent_copy_and_finish_queue_item = mock.Mock()
 
         service._send_message_unlocked(
@@ -155,36 +115,8 @@ class FromQueueCamelSendTests(unittest.TestCase):
         )
 
         service._get_transport_unlocked.assert_called_once()
-        service._get_worker_transport_unlocked.assert_not_called()
         transport.send_to_sync.assert_called_once()
-
-
-class WorkerTlsInitializationTests(unittest.TestCase):
-    @mock.patch("post.mail.eds.is_mail_io_thread", return_value=True)
-    def test_mail_io_thread_get_worker_transport_without_prepare(
-        self, _is_mail_io_thread
-    ) -> None:
-        service = MailService(registry=mock.Mock())
-        account = mock.Mock()
-        account.transport_uid = "smtp-uid"
-        service.get_account = mock.Mock(return_value=account)
-
-        transport_source = mock.Mock()
-        mail_transport = mock.Mock()
-        mail_transport.get_backend_name.return_value = "smtp"
-        transport_source.get_extension.return_value = mail_transport
-        service.registry.ref_source.return_value = transport_source
-
-        cached = mock.Mock()
-        cached.get_connection_status.return_value = (
-            Camel.ServiceConnectionStatus.CONNECTED
-        )
-        _ensure_worker_tls_initialized()
-        _camel_worker_tls.transports["smtp-uid"] = cached
-
-        transport = service._get_worker_transport_unlocked("acct-1")
-
-        self.assertIs(transport, cached)
+        service._append_sent_copy_and_finish_queue_item.assert_called_once()
 
 
 class OutboundSendTrackingTests(unittest.TestCase):

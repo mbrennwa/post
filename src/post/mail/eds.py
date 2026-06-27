@@ -114,47 +114,6 @@ _SEND_TIMEOUT_SECONDS = 30
 # in evolution-data-server 3.56 when batching UID MOVE/COPY commands.
 _TRANSFER_MESSAGE_BATCH_SIZE = 50
 
-_camel_worker_tls = threading.local()
-
-
-def prepare_camel_worker_thread() -> None:
-    """Give the current thread its own GLib main context for blocking Camel I/O.
-
-    Camel sync calls made from a worker without a thread-default context are
-    marshaled onto the GTK main loop and freeze the UI.
-    """
-    if getattr(_camel_worker_tls, "ready", False):
-        return
-    context = GLib.MainContext.new()
-    context.push_thread_default()
-    _camel_worker_tls.ready = True
-    _camel_worker_tls.session = None
-    _camel_worker_tls.stores = {}
-    _camel_worker_tls.transports = {}
-
-
-def _ensure_worker_tls_initialized() -> None:
-    """Initialize per-thread Camel worker caches.
-
-    On the dedicated mail I/O thread the thread-default GLib context is already
-    set up in ``io_thread``; only the TLS dicts need initializing.  Ad-hoc worker
-    threads still call ``prepare_camel_worker_thread()`` for their own context.
-    """
-    if getattr(_camel_worker_tls, "ready", False):
-        return
-    if is_mail_io_thread():
-        _camel_worker_tls.ready = True
-        _camel_worker_tls.session = None
-        _camel_worker_tls.stores = {}
-        _camel_worker_tls.transports = {}
-        return
-    prepare_camel_worker_thread()
-
-
-def _queue_send_uses_worker_session(from_queue: bool) -> bool:
-    """True when outbox SMTP runs on an ad-hoc thread (legacy worker session)."""
-    return from_queue and not is_mail_io_thread()
-
 
 def _run_on_gtk_thread(callback: Callable[[], None]) -> bool:
     callback()
@@ -397,6 +356,9 @@ class MailService:
         """Wait for in-flight mail work and flush stores before exit."""
         self.wait_for_outbound_sends()
         self.wait_for_pending_mail_ops()
+        run_on_mail_thread(self._flush_stores_on_shutdown)
+
+    def _flush_stores_on_shutdown(self) -> None:
         with self._lock:
             for store in self._stores.values():
                 if (
@@ -433,6 +395,9 @@ class MailService:
 
     def set_network_available(self, available: bool) -> None:
         """Update Camel session/store online state from Gio.NetworkMonitor."""
+        run_on_mail_thread(self._set_network_available_unlocked, available)
+
+    def _set_network_available_unlocked(self, available: bool) -> None:
         with self._lock:
             if self._network_available == available:
                 return
@@ -452,6 +417,9 @@ class MailService:
 
     def go_online_sync(self) -> None:
         """Bring offline stores back online and drop cached folder indexes."""
+        run_on_mail_thread(self._go_online_sync_unlocked)
+
+    def _go_online_sync_unlocked(self) -> None:
         with self._lock:
             self._network_available = True
             if self._session is not None:
@@ -571,7 +539,8 @@ class MailService:
 
         user_data = os.path.expanduser("~/.local/share/evolution")
         user_cache = os.path.expanduser("~/.cache/evolution")
-        Camel.init(user_data, False)
+        if not is_mail_io_thread():
+            Camel.init(user_data, False)
 
         self._session = MailSession(
             self.registry,
@@ -581,124 +550,6 @@ class MailService:
             online=self._network_available,
         )
         return self._session
-
-    def _ensure_worker_session(self) -> Camel.Session:
-        _ensure_worker_tls_initialized()
-        session = _camel_worker_tls.session
-        if session is not None:
-            session.set_online(self._network_available)
-            return session
-
-        user_data = os.path.expanduser("~/.local/share/evolution")
-        user_cache = os.path.expanduser("~/.cache/evolution")
-        Camel.init(user_data, False)
-
-        session = MailSession(
-            self.registry,
-            password_prompt=self._password_prompt,
-            user_data_dir=user_data,
-            user_cache_dir=user_cache,
-            online=self._network_available,
-        )
-        _camel_worker_tls.session = session
-        return session
-
-    def _get_worker_store_unlocked(self, account_uid: str) -> Camel.Store:
-        _ensure_worker_tls_initialized()
-        stores: dict[str, Camel.Store] = _camel_worker_tls.stores
-        if account_uid in stores:
-            store = stores[account_uid]
-            if store.get_connection_status() == Camel.ServiceConnectionStatus.CONNECTED:
-                self._sync_store_online_state_unlocked(store)
-                self._configure_store_settings_unlocked(store)
-                return store
-            del stores[account_uid]
-
-        source = self.registry.ref_source(account_uid)
-        if source is None:
-            raise ValueError(f"Unknown mail account: {account_uid}")
-
-        session = self._ensure_worker_session()
-        mail_ext = source.get_extension("Mail Account")
-        service = session.add_service(
-            account_uid, mail_ext.get_backend_name(), Camel.ProviderType.STORE
-        )
-        if service is None:
-            raise RuntimeError(f"Could not create mail store for {account_uid}")
-
-        source.camel_configure_service(service)
-        store = service
-
-        self._sync_store_online_state_unlocked(store)
-        self._configure_store_settings_unlocked(store)
-        stores[account_uid] = store
-        return store
-
-    def _get_worker_transport_unlocked(
-        self,
-        account_uid: str,
-        cancellable: Gio.Cancellable | None = None,
-    ) -> Camel.Transport:
-        account = self.get_account(account_uid)
-        transport_uid = account.transport_uid
-        if not transport_uid:
-            raise ValueError("No mail transport configured for this account")
-
-        transport_source = self.registry.ref_source(transport_uid)
-        if transport_source is None:
-            raise ValueError(f"Unknown mail transport: {transport_uid}")
-
-        mail_transport = transport_source.get_extension("Mail Transport")
-        expected_backend = mail_transport.get_backend_name()
-
-        _ensure_worker_tls_initialized()
-        transports: dict[str, Camel.Transport] = _camel_worker_tls.transports
-        if transport_uid in transports:
-            transport = transports[transport_uid]
-            if (
-                transport.get_connection_status()
-                == Camel.ServiceConnectionStatus.CONNECTED
-            ):
-                return transport
-            del transports[transport_uid]
-
-        session = self._ensure_worker_session()
-        service = session.ref_service(transport_uid)
-        if service is None:
-            service = session.add_service(
-                transport_uid, expected_backend, Camel.ProviderType.TRANSPORT
-            )
-        if service is None:
-            raise RuntimeError(f"Could not create mail transport for {account_uid}")
-
-        transport_source.camel_configure_service(service)
-        transport = service
-
-        if hasattr(Camel, "OfflineTransport") and isinstance(
-            transport, Camel.OfflineTransport
-        ):
-            transport.set_online_sync(True, cancellable)
-        else:
-            transport.connect_sync(cancellable)
-
-        transports[transport_uid] = transport
-        return transport
-
-    def _open_worker_folder_unlocked(
-        self, account_uid: str, folder_name: str
-    ) -> Camel.Folder | None:
-        store = self._get_worker_store_unlocked(account_uid)
-        try:
-            return store.get_folder_sync(folder_name, 0, None)
-        except GLib.Error as exc:
-            if self._is_missing_folder_error(exc):
-                log.debug(
-                    "Skipping unavailable folder %r for account %s",
-                    folder_name,
-                    account_uid,
-                )
-                return None
-            raise
 
     def get_store(self, account_uid: str) -> Camel.Store:
         with self._lock:
@@ -996,10 +847,7 @@ class MailService:
                         if key[0] == account_uid:
                             self._folder_indexes.pop(key, None)
                     self._correspondent_indexes.pop(account_uid, None)
-                    if from_queue:
-                        self._append_to_sent_folder_worker(account_uid, sent_message)
-                    else:
-                        self._append_to_sent_folder_unlocked(account_uid, sent_message)
+                    self._append_to_sent_folder_unlocked(account_uid, sent_message)
                     if queue_id:
                         remove_queued_outbound_message(queue_id)
                     log.debug(
@@ -1023,18 +871,9 @@ class MailService:
         ok = False
         smtp_start = time.monotonic()
         transport_uid = ""
-        use_worker_session = _queue_send_uses_worker_session(from_queue)
-        get_transport = (
-            self._get_worker_transport_unlocked
-            if use_worker_session
-            else self._get_transport_unlocked
-        )
         try:
-            if use_worker_session:
-                transport = get_transport(account_uid, cancellable)
-            else:
-                with self._lock:
-                    transport = get_transport(account_uid, cancellable)
+            with self._lock:
+                transport = self._get_transport_unlocked(account_uid, cancellable)
             transport_uid = account.transport_uid or ""
             ok, _user_stop = transport.send_to_sync(
                 message, sender, recipients, cancellable
@@ -1084,13 +923,8 @@ class MailService:
                 except Exception:
                     log.debug("Failed to disconnect transport after send", exc_info=True)
             if transport_uid:
-                if use_worker_session:
-                    worker_transports = getattr(_camel_worker_tls, "transports", None)
-                    if isinstance(worker_transports, dict):
-                        worker_transports.pop(transport_uid, None)
-                else:
-                    with self._lock:
-                        self._transports.pop(transport_uid, None)
+                with self._lock:
+                    self._transports.pop(transport_uid, None)
 
         log.debug("SMTP send finished in %.2fs ok=%s", time.monotonic() - smtp_start, ok)
 
@@ -1119,13 +953,7 @@ class MailService:
         send_start: float,
         from_queue: bool = False,
     ) -> None:
-        use_worker_session = _queue_send_uses_worker_session(from_queue)
-        append = (
-            self._append_to_sent_folder_worker
-            if use_worker_session
-            else self._append_to_sent_folder_unlocked
-        )
-        append(account_uid, sent_message)
+        self._append_to_sent_folder_unlocked(account_uid, sent_message)
         if queue_id:
             remove_queued_outbound_message(queue_id)
         log.debug(
@@ -1297,62 +1125,6 @@ class MailService:
         except GLib.Error:
             log.debug("Failed to refresh Sent folder after append", exc_info=True)
         self._invalidate_folder_index(account_uid, folder_name)
-
-    def _append_to_sent_folder_worker(
-        self, account_uid: str, message: Camel.MimeMessage
-    ) -> None:
-        folder_name = self._sent_folder_name_unlocked(account_uid)
-        if not folder_name:
-            return
-
-        folder = self._open_worker_folder_unlocked(account_uid, folder_name)
-        if folder is None:
-            log.warning(
-                "Sent folder %r is not available for account %s",
-                folder_name,
-                account_uid,
-            )
-            return
-
-        cancellable = Gio.Cancellable()
-        timer = threading.Timer(_SEND_TIMEOUT_SECONDS, cancellable.cancel)
-        timer.start()
-        append_start = time.monotonic()
-        try:
-            ok, _uid = folder.append_message_sync(message, None, cancellable)
-        except GLib.Error as exc:
-            if cancellable.is_cancelled():
-                log.warning(
-                    "Sent folder append timed out after %ds folder=%r",
-                    _SEND_TIMEOUT_SECONDS,
-                    folder_name,
-                )
-            else:
-                log.warning(
-                    "Failed to save a copy to Sent folder %r: %s",
-                    folder_name,
-                    exc.message,
-                )
-            return
-        finally:
-            timer.cancel()
-
-        if not ok:
-            log.warning("Could not append message to Sent folder %r", folder_name)
-            return
-
-        log.debug(
-            "Sent folder append finished in %.2fs folder=%r",
-            time.monotonic() - append_start,
-            folder_name,
-        )
-
-        try:
-            folder.refresh_info_sync(None)
-        except GLib.Error:
-            log.debug("Failed to refresh Sent folder after append", exc_info=True)
-        with self._lock:
-            self._invalidate_folder_index(account_uid, folder_name)
 
     def _drafts_folder_name_unlocked(self, account_uid: str) -> str | None:
         folders = self._list_folders_unlocked(account_uid)
