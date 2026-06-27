@@ -3,7 +3,16 @@
 #
 # EDS/Camel glue derived from EvolutionMCP (MIT) — see LICENSES/LicenseRef-MIT-EvolutionMCP.txt
 
-"""EDS SourceRegistry + Camel session."""
+"""EDS SourceRegistry + Camel session.
+
+Mail I/O threading
+------------------
+Blocking Camel calls must run on the dedicated mail I/O thread
+(``post.mail.io_thread``).  :class:`MailService` is the facade: public methods
+either execute on the mail thread already or dispatch via
+``get_mail_io_thread().run_sync`` / ``submit``.  UI code must not call
+``run_sync`` from the GTK thread.
+"""
 
 from __future__ import annotations
 
@@ -227,7 +236,7 @@ class MailSession(Camel.Session):
 
 @dataclass
 class MailService:
-    """Thin wrapper around EDS + Camel for the GTK UI."""
+    """Facade around EDS + Camel; blocking I/O is routed to the mail I/O thread."""
 
     registry: EDataServer.SourceRegistry
     _session: Camel.Session | None = field(default=None, init=False)

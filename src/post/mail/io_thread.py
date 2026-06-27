@@ -1,7 +1,20 @@
 # Copyright (C) 2026 mbrennwa
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Dedicated GLib thread for blocking Camel SMTP / IMAP I/O."""
+"""Dedicated GLib thread for blocking Camel SMTP / IMAP I/O.
+
+Threading contract
+------------------
+* The mail I/O thread owns a private ``GMainContext`` and runs a continuous
+  ``iteration()`` loop so Camel ``*_sync`` calls do not marshal onto the GTK
+  main loop.
+* UI and other threads must dispatch blocking mail work through
+  :func:`get_mail_io_thread` — use :meth:`MailIoThread.submit` for fire-and-forget
+  work and :meth:`MailIoThread.run_sync` when the caller can block.
+* Never call :meth:`MailIoThread.run_sync` from the GTK main thread or from
+  inside a mail I/O task (deadlock).  Higher layers use
+  :func:`is_mail_io_thread` to run inline when already on the mail thread.
+"""
 
 from __future__ import annotations
 
@@ -49,7 +62,7 @@ class _IoTask:
 
 
 class MailIoThread:
-    """Run blocking Camel work off the GTK main loop."""
+    """Serial queue for blocking Camel work off the GTK main loop."""
 
     def __init__(self) -> None:
         self._queue: queue.SimpleQueue[_IoTask] = queue.SimpleQueue()
@@ -88,11 +101,26 @@ class MailIoThread:
             except queue.Empty:
                 pass
             else:
+                func_name = getattr(task.func, "__qualname__", repr(task.func))
+                log.debug(
+                    "Mail I/O task start thread=%s func=%s",
+                    threading.current_thread().name,
+                    func_name,
+                )
+                task_start = GLib.get_monotonic_time()
                 try:
                     task.result["value"] = task.func(*task.args, **task.kwargs)
                 except BaseException as exc:
                     task.result["error"] = exc
-                    log.debug("Mail I/O task failed", exc_info=True)
+                    log.debug("Mail I/O task failed func=%s", func_name, exc_info=True)
+                else:
+                    elapsed_ms = (GLib.get_monotonic_time() - task_start) / 1000
+                    log.debug(
+                        "Mail I/O task finish thread=%s func=%s elapsed=%.1fms",
+                        threading.current_thread().name,
+                        func_name,
+                        elapsed_ms,
+                    )
                 finally:
                     if task.done is not None:
                         task.done.set()
