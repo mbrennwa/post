@@ -489,6 +489,83 @@ class BuildPlainMimeMessageTests(unittest.TestCase):
         self.assertEqual(round_tripped[1].filename, "two.bin")
         self.assertEqual(round_tripped[1].data, b"\x00\x01")
 
+    def test_non_ascii_attachment_filename_uses_utf8_rfc5987(self) -> None:
+        message = build_plain_mime_message(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Unicode file",
+            body="See attached",
+            attachments=[
+                ComposeAttachment(
+                    filename="résumé.pdf",
+                    mime_type="application/pdf",
+                    data=b"%PDF-fake",
+                )
+            ],
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertIn(
+            b"Content-Disposition: attachment; filename*=utf-8''r%C3%A9sum%C3%A9.pdf",
+            raw,
+        )
+        self.assertNotIn(b"ISO-8859-1", raw)
+        filename, data = get_attachment_data(message, 0)
+        self.assertEqual(filename, "résumé.pdf")
+        self.assertEqual(data, b"%PDF-fake")
+
+    def test_ascii_attachment_filename_unchanged(self) -> None:
+        message = build_plain_mime_message(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="ASCII file",
+            body="See attached",
+            attachments=[
+                ComposeAttachment(
+                    filename="doc.pdf",
+                    mime_type="application/pdf",
+                    data=b"%PDF-fake",
+                )
+            ],
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertIn(b'Content-Disposition: attachment; filename="doc.pdf"', raw)
+        self.assertNotIn(b"filename*=", raw)
+
+    def test_build_outbound_mime_package_attachment_filename_matches_wire(self) -> None:
+        attachments = [
+            ComposeAttachment(
+                filename="Grüße.txt",
+                mime_type="text/plain",
+                data=b"hello",
+            )
+        ]
+        package = build_outbound_mime_package(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Unicode attachment",
+            body="See attached",
+            attachments=attachments,
+        )
+        sent_raw = _mime_message_raw_bytes(package.sent_message)
+        assert sent_raw is not None
+
+        expected = (
+            b"Content-Disposition: attachment; filename*=utf-8''Gr%C3%BC%C3%9Fe.txt"
+        )
+        self.assertIn(expected, package.wire_bytes)
+        self.assertIn(expected, sent_raw)
+
 
 class HeaderInjectionTests(unittest.TestCase):
     _BASE = {
