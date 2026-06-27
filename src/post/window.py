@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 import time
 from collections.abc import Callable
 
@@ -26,6 +25,7 @@ from post.credentials import prompt_password_sync
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.eds import MailAccount, MessageNotAvailableError
+from post.mail.io_thread import get_mail_io_thread
 from post.mail.sync_watcher import MailSyncWatcher
 from post.message_list_view import VirtualMessageList
 from post.mail.folders import (
@@ -485,7 +485,7 @@ class MainWindow(Adw.ApplicationWindow):
             )
 
     def _flush_send_queue_idle(self) -> bool:
-        threading.Thread(target=self._flush_send_queue_worker, daemon=True).start()
+        get_mail_io_thread().submit(self._flush_send_queue_worker)
         return False
 
     def _flush_send_queue_worker(self) -> None:
@@ -1122,7 +1122,7 @@ class MainWindow(Adw.ApplicationWindow):
                 self._on_compose_message_loaded, account, msg, error, mode
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     def _on_compose_message_loaded(
         self,
@@ -1720,7 +1720,7 @@ class MainWindow(Adw.ApplicationWindow):
                 on_ready,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     def _on_attachment_fetched(
         self,
@@ -1969,7 +1969,7 @@ class MainWindow(Adw.ApplicationWindow):
                 error,
             )
 
-        threading.Thread(target=worker_sync, daemon=True).start()
+        get_mail_io_thread().submit(worker_sync)
 
     @staticmethod
     def _load_source_label(source: str) -> str:
@@ -2210,7 +2210,7 @@ class MainWindow(Adw.ApplicationWindow):
             )
 
         def start_initial_worker() -> None:
-            threading.Thread(target=worker_initial, daemon=True).start()
+            get_mail_io_thread().submit(worker_initial)
 
         if defer_mail_io:
 
@@ -2707,7 +2707,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         label = "Trash" if destination == "trash" else "Archive"
         self._set_status(f"Moving {len(uids)} message(s) to {label}…")
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     def _dismiss_undo_toast_only(self) -> None:
         if self._undo_toast is not None:
@@ -2777,7 +2777,7 @@ class MainWindow(Adw.ApplicationWindow):
             GLib.idle_add(self._on_move_undo_finished, undo, result, error)
 
         self._set_status("Restoring messages…")
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     def _on_move_undo_finished(
         self,
@@ -3179,7 +3179,7 @@ class MainWindow(Adw.ApplicationWindow):
                 error,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     def _open_draft_for_editing(self, uid: str) -> None:
         if not self._current_account or not self._current_folder:
@@ -3217,7 +3217,7 @@ class MainWindow(Adw.ApplicationWindow):
                 error,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     def _on_draft_compose_loaded(
         self,
