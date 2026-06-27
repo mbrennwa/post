@@ -66,7 +66,7 @@ from post.mail.helpers import (
     reader_toggle_button_state,
 )
 from post.reader import build_reader_document
-from post.wrap_label import WrappingLabel, configure_ellipsize_label
+from post.wrap_label import WrappingLabel, configure_ellipsize_label, set_label_wrap_mode
 from post.preferences import (
     MessageAppearance,
     get_auto_sync,
@@ -379,12 +379,8 @@ class MainWindow(Adw.ApplicationWindow):
         header_row.append(self._message_actions)
         reader.append(header_row)
 
-        self._reader_meta = Gtk.Label(
-            label="",
-            xalign=0,
-            wrap=True,
-            wrap_mode=Gtk.WrapMode.WORD_CHAR,
-        )
+        self._reader_meta = Gtk.Label(label="", xalign=0, wrap=True)
+        set_label_wrap_mode(self._reader_meta, Gtk.WrapMode.WORD_CHAR)
         self._reader_meta.add_css_class("dim-label")
         self._reader_meta.set_width_chars(1)
         self._reader_meta.set_hexpand(True)
