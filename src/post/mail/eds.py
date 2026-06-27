@@ -61,7 +61,6 @@ from .message_flags import (
 )
 from .local_delivery import all_recipients_local, can_deliver_locally, deliver_local_message
 from .io_thread import get_mail_io_thread, is_mail_io_thread, run_on_mail_thread
-from .smtp_send import send_via_smtp
 from .send_errors import (
     MESSAGE_QUEUED,
     SYSTEM_MAIL_EXTERNAL_RECIPIENTS,
@@ -86,7 +85,6 @@ from .compose import (
     ComposeAttachment,
     addresses_to_internet_address,
     build_draft_mime_message,
-    build_outbound_mime_package,
     build_plain_mime_message,
     new_outbound_mime_identifiers,
     normalize_email,
@@ -902,40 +900,6 @@ class MailService:
         }
         outbound_ids = new_outbound_mime_identifiers(from_address)
 
-        if from_queue and account_uid != POST_LOCAL_ACCOUNT_UID:
-            transport_uid = account.transport_uid
-            if not transport_uid:
-                raise ValueError("No mail transport configured for this account")
-            try:
-                package = build_outbound_mime_package(**compose_kwargs)
-                send_via_smtp(
-                    registry=self.registry,
-                    transport_uid=transport_uid,
-                    payload=package.wire_bytes,
-                    envelope_from=from_address,
-                    to=to,
-                    cc=cc,
-                    bcc=bcc,
-                    password_prompt=self._password_prompt,
-                )
-            except SendError:
-                raise
-            except Exception as exc:
-                log.warning("Outbound SMTP failed", exc_info=True)
-                if is_queueable_network_error(exc):
-                    raise SendQueued(MESSAGE_QUEUED) from exc
-                raise SendError(user_send_error_message(exc)) from exc
-            if queue_id:
-                remove_queued_outbound_message(queue_id)
-            log.debug(
-                "Send finished account=%s in %.2fs",
-                account_uid,
-                time.monotonic() - send_start,
-            )
-            prepare_camel_worker_thread()
-            self._append_to_sent_folder_worker(account_uid, package.sent_message)
-            return
-
         message = build_plain_mime_message(
             **compose_kwargs,
             include_bcc_header=False,
@@ -1012,7 +976,6 @@ class MailService:
         )
         try:
             if from_queue:
-                prepare_camel_worker_thread()
                 transport = get_transport(account_uid, cancellable)
             else:
                 with self._lock:
@@ -1067,7 +1030,9 @@ class MailService:
                     log.debug("Failed to disconnect transport after send", exc_info=True)
             if transport_uid:
                 if from_queue:
-                    _camel_worker_tls.transports.pop(transport_uid, None)
+                    worker_transports = getattr(_camel_worker_tls, "transports", None)
+                    if isinstance(worker_transports, dict):
+                        worker_transports.pop(transport_uid, None)
                 else:
                     with self._lock:
                         self._transports.pop(transport_uid, None)
@@ -1141,7 +1106,6 @@ class MailService:
         )
 
     def _flush_send_queue_unlocked(self) -> int:
-        prepare_camel_worker_thread()
         sent = 0
         for queue_id, queued in list_queued_outbound_messages():
             if self._is_outbound_delivery_claimed(queue_id):
@@ -1269,7 +1233,6 @@ class MailService:
     def _append_to_sent_folder_worker(
         self, account_uid: str, message: Camel.MimeMessage
     ) -> None:
-        prepare_camel_worker_thread()
         with self._lock:
             folder_name = self._sent_folder_name_unlocked(account_uid)
         if not folder_name:

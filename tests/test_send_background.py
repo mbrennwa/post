@@ -65,12 +65,11 @@ class RunOutboundSendTests(unittest.TestCase):
         "post.compose_window.get_mail_io_thread",
         return_value=_ImmediateMailIoThread(),
     )
-    @mock.patch("post.compose_window.prepare_camel_worker_thread")
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_success_sets_message_sent(
-        self, _idle_add, _persist, _queue_id, _prepare, _io
+        self, _idle_add, _persist, _queue_id, _io
     ) -> None:
         outbox_changed = mock.Mock()
         run_outbound_send(
@@ -93,12 +92,11 @@ class RunOutboundSendTests(unittest.TestCase):
         "post.compose_window.get_mail_io_thread",
         return_value=_ImmediateMailIoThread(),
     )
-    @mock.patch("post.compose_window.prepare_camel_worker_thread")
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_send_queued_updates_status_and_outbox(
-        self, _idle_add, _persist, _queue_id, _prepare, _io
+        self, _idle_add, _persist, _queue_id, _io
     ) -> None:
         self.mail.deliver_outbound_queue_item.side_effect = SendQueued(MESSAGE_QUEUED)
         outbox_changed = mock.Mock()
@@ -119,13 +117,12 @@ class RunOutboundSendTests(unittest.TestCase):
         "post.compose_window.get_mail_io_thread",
         return_value=_ImmediateMailIoThread(),
     )
-    @mock.patch("post.compose_window.prepare_camel_worker_thread")
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.show_error_toast")
     @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_error_shows_toast_on_parent(
-        self, _idle_add, _persist, show_error_toast, _queue_id, _prepare, _io
+        self, _idle_add, _persist, show_error_toast, _queue_id, _io
     ) -> None:
         self.mail.deliver_outbound_queue_item.side_effect = SendError("SMTP failed")
         parent = mock.Mock()
@@ -151,13 +148,12 @@ class RunOutboundSendTests(unittest.TestCase):
         "post.compose_window.get_mail_io_thread",
         return_value=_ImmediateMailIoThread(),
     )
-    @mock.patch("post.compose_window.prepare_camel_worker_thread")
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.show_error_toast")
     @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_compose_validation_skips_outbox(
-        self, _idle_add, persist, show_error_toast, _queue_id, _prepare, _io
+        self, _idle_add, persist, show_error_toast, _queue_id, _io
     ) -> None:
         parent = mock.Mock()
         request = OutboundSendRequest(
@@ -192,12 +188,11 @@ class RunOutboundSendTests(unittest.TestCase):
         "post.compose_window.get_mail_io_thread",
         return_value=_ImmediateMailIoThread(),
     )
-    @mock.patch("post.compose_window.prepare_camel_worker_thread")
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_success_deletes_draft_before_status(
-        self, _idle_add, _persist, _queue_id, _prepare, _io
+        self, _idle_add, _persist, _queue_id, _io
     ) -> None:
         request = OutboundSendRequest(
             account_uid="acct-1",
@@ -237,7 +232,6 @@ class RunOutboundSendTests(unittest.TestCase):
         "post.compose_window.get_mail_io_thread",
         return_value=_ImmediateMailIoThread(),
     )
-    @mock.patch("post.compose_window.prepare_camel_worker_thread")
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.show_error_toast")
     @mock.patch(
@@ -246,7 +240,7 @@ class RunOutboundSendTests(unittest.TestCase):
     )
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_persist_failure_shows_toast(
-        self, _idle_add, persist, show_error_toast, _queue_id, _prepare, _io
+        self, _idle_add, persist, show_error_toast, _queue_id, _io
     ) -> None:
         parent = mock.Mock()
         run_outbound_send(

@@ -75,6 +75,45 @@ class AppendToSentFolderTests(unittest.TestCase):
         service._invalidate_folder_index.assert_not_called()
 
 
+class FromQueueCamelSendTests(unittest.TestCase):
+    @mock.patch("post.mail.eds.threading.Timer")
+    @mock.patch("post.mail.eds.build_plain_mime_message")
+    def test_from_queue_uses_camel_transport(
+        self, build_plain_mime_message, timer_cls
+    ) -> None:
+        timer_cls.return_value = mock.Mock()
+        mime_message = mock.Mock()
+        build_plain_mime_message.return_value = mime_message
+
+        service = MailService(registry=mock.Mock())
+        account = mock.Mock()
+        account.from_address = "user@example.com"
+        account.from_name = "User"
+        account.transport_uid = "smtp-uid"
+        service.get_account = mock.Mock(return_value=account)
+
+        transport = mock.Mock()
+        transport.send_to_sync.return_value = (True, False)
+        service._get_worker_transport_unlocked = mock.Mock(return_value=transport)
+        service._append_sent_copy_and_finish_queue_item = mock.Mock()
+
+        service._send_message_unlocked(
+            "acct-1",
+            to=["to@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hi",
+            body="Body",
+            in_reply_to=None,
+            references=None,
+            from_queue=True,
+            queue_id="queue-1",
+        )
+
+        transport.send_to_sync.assert_called_once()
+        service._append_sent_copy_and_finish_queue_item.assert_called_once()
+
+
 class OutboundSendTrackingTests(unittest.TestCase):
     def test_wait_for_outbound_sends_blocks_until_complete(self) -> None:
         service = MailService(registry=mock.Mock())
