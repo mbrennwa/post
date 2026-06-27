@@ -547,6 +547,12 @@ def normalize_message_id(message_id: str) -> str:
     return f"<{mid.strip('<>')}>"
 
 
+def normalize_in_reply_to(message_id: str | None) -> str | None:
+    """Return an angle-bracketed In-Reply-To value, or None when blank."""
+    normalized = normalize_message_id(message_id or "")
+    return normalized or None
+
+
 def parse_references_header(references: str | None) -> list[str]:
     """Tokenize Message-IDs from a References header."""
     text = (references or "").strip()
@@ -661,7 +667,9 @@ def validate_compose_mime_fields(
     """Reject user-controlled header fields before outbox queue or MIME build."""
     _sanitize_optional_header_field(from_name, field="From name")
     _sanitize_header_field(subject or "", field="Subject")
-    _sanitize_optional_header_field(in_reply_to, field="In-Reply-To")
+    _sanitize_optional_header_field(
+        normalize_in_reply_to(in_reply_to), field="In-Reply-To"
+    )
     _sanitize_optional_header_field(references, field="References")
     for field, group in (
         ("To", to),
@@ -758,7 +766,7 @@ def _apply_compose_headers(
         message.set_recipients("Bcc", bcc_container)
 
     safe_in_reply_to = _sanitize_optional_header_field(
-        in_reply_to, field="In-Reply-To"
+        normalize_in_reply_to(in_reply_to), field="In-Reply-To"
     )
     if safe_in_reply_to:
         message.set_header("In-Reply-To", safe_in_reply_to)
@@ -833,7 +841,7 @@ def build_outbound_email_message(
     safe_from_name = _sanitize_optional_header_field(from_name, field="From name")
     safe_subject = _sanitize_header_field(subject or "", field="Subject")
     safe_in_reply_to = _sanitize_optional_header_field(
-        in_reply_to, field="In-Reply-To"
+        normalize_in_reply_to(in_reply_to), field="In-Reply-To"
     )
     safe_references = _sanitize_optional_header_field(references, field="References")
     safe_to = [_sanitize_header_field(item.strip(), field="To") for item in to]

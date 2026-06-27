@@ -20,6 +20,7 @@ from post.mail.accounts import (
     compose_from_accounts,
     default_local_mail_config,
     default_spool_path,
+    infer_spool_path_from_hint,
     is_maildir_empty,
     is_spool_empty,
     should_list_local_account,
@@ -174,6 +175,27 @@ class DefaultConfigTests(unittest.TestCase):
         config = default_local_mail_config()
         self.assertFalse(config.enabled)
         self.assertEqual(config.mail_type, "spool")
+
+
+class InferSpoolPathTests(unittest.TestCase):
+    def test_empty_hint_uses_default(self) -> None:
+        self.assertEqual(infer_spool_path_from_hint(""), default_spool_path())
+
+    def test_directory_hint_uses_user_mbox(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            user = os.environ.get("USER") or "user"
+            user_file = os.path.join(tmp, user)
+            with open(user_file, "wb"):
+                pass
+            self.assertEqual(infer_spool_path_from_hint(tmp), user_file)
+
+    def test_file_hint_is_unchanged(self) -> None:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            path = tmp.name
+        try:
+            self.assertEqual(infer_spool_path_from_hint(path), path)
+        finally:
+            os.unlink(path)
 
 
 class BuiltinLocalUidTests(unittest.TestCase):
