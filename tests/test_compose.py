@@ -1182,6 +1182,31 @@ class HtmlForwardReplyTests(unittest.TestCase):
         self.assertIsNotNone(content_type)
         self.assertEqual(content_type.simple(), "multipart/alternative")
 
+    def test_build_plain_mime_message_with_html_and_attachment(self) -> None:
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Files",
+            body="See attached",
+            body_html="<p>See attached</p>",
+            attachments=[
+                ComposeAttachment(
+                    filename="doc.pdf",
+                    mime_type="application/pdf",
+                    data=b"%PDF-fake",
+                )
+            ],
+        )
+        content_type = message.get_content_type()
+        self.assertIsNotNone(content_type)
+        self.assertEqual(content_type.simple(), "multipart/mixed")
+        extracted = extract_attachments(message)
+        self.assertEqual(len(extracted), 1)
+        self.assertEqual(extracted[0]["filename"], "doc.pdf")
+
     def test_build_plain_mime_message_omits_bcc_when_requested(self) -> None:
         message = build_plain_mime_message(
             from_name="Alice",
