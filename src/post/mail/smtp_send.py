@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import base64
 import logging
+import quopri
 import smtplib
 import socket
 import ssl
 import time
 from dataclasses import dataclass
+from email import message_from_bytes, policy
 import gi
 
 gi.require_version("EDataServer", "1.2")
@@ -182,6 +184,48 @@ def _authenticate_smtp(
     smtp.login(username, password)
 
 
+def _payload_has_8bit_parts(payload: bytes) -> bool:
+    """Return True when serialized MIME contains 8bit-encoded body parts."""
+    message = message_from_bytes(payload, policy=policy.SMTP)
+    for part in message.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        cte = (part.get("Content-Transfer-Encoding") or "").lower()
+        if cte == "8bit":
+            return True
+    return False
+
+
+def _reencode_8bit_parts_for_7bit_smtp(payload: bytes) -> bytes:
+    """Re-encode 8bit MIME parts as quoted-printable for strict SMTP servers."""
+    message = message_from_bytes(payload, policy=policy.SMTP)
+    for part in message.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        if (part.get("Content-Transfer-Encoding") or "").lower() != "8bit":
+            continue
+        body = part.get_payload(decode=True)
+        if body is None:
+            continue
+        part.set_payload(quopri.encodestring(body, quotetabs=True).decode("ascii"))
+        part.replace_header("Content-Transfer-Encoding", "quoted-printable")
+    return message.as_bytes()
+
+
+def _prepare_smtp_payload(
+    smtp: smtplib.SMTP, payload: bytes
+) -> tuple[bytes, list[str]]:
+    """Choose SMTP payload and MAIL FROM options for RFC 6152 8BITMIME."""
+    if not _payload_has_8bit_parts(payload):
+        return payload, []
+    if smtp.has_extn("8bitmime"):
+        return payload, ["BODY=8BITMIME"]
+    log.info(
+        "SMTP server lacks 8BITMIME; re-encoding 8bit MIME parts as quoted-printable"
+    )
+    return _reencode_8bit_parts_for_7bit_smtp(payload), []
+
+
 def send_via_smtp(
     *,
     registry: EDataServer.SourceRegistry,
@@ -210,7 +254,10 @@ def send_via_smtp(
             transport_source=transport_source,
             password_prompt=password_prompt,
         )
-        smtp.sendmail(envelope_from, recipients, payload)
+        wire_payload, mail_options = _prepare_smtp_payload(smtp, payload)
+        smtp.sendmail(
+            envelope_from, recipients, wire_payload, mail_options=mail_options
+        )
     except SendError:
         raise
     except (socket.timeout, TimeoutError) as exc:
