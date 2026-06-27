@@ -11,8 +11,6 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-_OUTBOUND_SMTP_POLICY: Any | None = None
-
 import gi
 
 gi.require_version("Gio", "2.0")
@@ -771,15 +769,6 @@ def _apply_compose_headers(
         message.set_header("Date", date)
 
 
-def _outbound_smtp_policy() -> Any:
-    global _OUTBOUND_SMTP_POLICY
-    if _OUTBOUND_SMTP_POLICY is None:
-        from email import policy
-
-        _OUTBOUND_SMTP_POLICY = policy.SMTP
-    return _OUTBOUND_SMTP_POLICY
-
-
 def _outbound_message_id_domain(from_address: str) -> str:
     _, _, domain = normalize_email(from_address).partition("@")
     return domain or "localhost"
@@ -798,149 +787,6 @@ def new_outbound_mime_identifiers(from_address: str) -> OutboundMimeIdentifiers:
     return OutboundMimeIdentifiers(
         message_id=make_msgid(domain=_outbound_message_id_domain(from_address)),
         date=formatdate(localtime=True),
-    )
-
-
-def build_outbound_email_message(
-    *,
-    from_name: str | None,
-    from_address: str,
-    to: list[str],
-    cc: list[str] | None,
-    bcc: list[str] | None,
-    subject: str,
-    body: str,
-    body_html: str | None = None,
-    in_reply_to: str | None = None,
-    references: str | None = None,
-    attachments: Sequence[ComposeAttachment] | None = None,
-    include_bcc_header: bool = False,
-    message_id: str | None = None,
-    date: str | None = None,
-) -> Any:
-    """Build a MIME message for outbound delivery using the stdlib email package."""
-    from email.message import EmailMessage
-    from email.utils import formataddr
-
-    if not to:
-        raise ValueError("At least one To address is required")
-
-    identifiers = new_outbound_mime_identifiers(from_address)
-    resolved_message_id = message_id or identifiers.message_id
-    resolved_date = date or identifiers.date
-
-    safe_from_name = _sanitize_optional_header_field(from_name, field="From name")
-    safe_subject = _sanitize_header_field(subject or "", field="Subject")
-    safe_in_reply_to = _sanitize_optional_header_field(
-        normalize_in_reply_to(in_reply_to), field="In-Reply-To"
-    )
-    safe_references = _sanitize_optional_header_field(references, field="References")
-    safe_to = [_sanitize_header_field(item.strip(), field="To") for item in to]
-    safe_cc = (
-        [_sanitize_header_field(item.strip(), field="Cc") for item in cc] if cc else None
-    )
-    safe_bcc = (
-        [_sanitize_header_field(item.strip(), field="Bcc") for item in bcc]
-        if bcc
-        else None
-    )
-
-    message = EmailMessage(policy=_outbound_smtp_policy())
-    message["From"] = (
-        formataddr((safe_from_name, from_address)) if safe_from_name else from_address
-    )
-    message["To"] = ", ".join(safe_to)
-    if safe_cc:
-        message["Cc"] = ", ".join(safe_cc)
-    if include_bcc_header and safe_bcc:
-        message["Bcc"] = ", ".join(safe_bcc)
-    message["Subject"] = safe_subject
-    message["Message-ID"] = resolved_message_id
-    message["Date"] = resolved_date
-    if safe_in_reply_to:
-        message["In-Reply-To"] = safe_in_reply_to
-    if safe_references:
-        message["References"] = safe_references
-
-    text = body if body else "\n"
-    message.set_content(text, charset="utf-8")
-    if body_html:
-        message.add_alternative(body_html, subtype="html", charset="utf-8")
-    if attachments:
-        for attachment in attachments:
-            maintype, _, subtype = attachment.mime_type.partition("/")
-            if not subtype:
-                maintype, subtype = "application", "octet-stream"
-            message.add_attachment(
-                attachment.data,
-                maintype=maintype,
-                subtype=subtype,
-                filename=_sanitize_header_field(
-                    attachment.filename, field="Attachment filename"
-                ),
-            )
-    return message
-
-
-@dataclass(frozen=True)
-class OutboundMimePackage:
-    message_id: str
-    date: str
-    wire_bytes: bytes
-    sent_message: Any
-
-
-def build_outbound_mime_package(
-    *,
-    from_name: str | None,
-    from_address: str,
-    to: list[str],
-    cc: list[str] | None,
-    bcc: list[str] | None,
-    subject: str,
-    body: str,
-    body_html: str | None = None,
-    in_reply_to: str | None = None,
-    references: str | None = None,
-    attachments: Sequence[ComposeAttachment] | None = None,
-) -> OutboundMimePackage:
-    """Build wire bytes and a Sent-folder Camel message with matching identifiers."""
-    identifiers = new_outbound_mime_identifiers(from_address)
-    wire_bytes = build_outbound_email_bytes(
-        from_name=from_name,
-        from_address=from_address,
-        to=to,
-        cc=cc,
-        bcc=bcc,
-        subject=subject,
-        body=body,
-        body_html=body_html,
-        in_reply_to=in_reply_to,
-        references=references,
-        attachments=attachments,
-        message_id=identifiers.message_id,
-        date=identifiers.date,
-    )
-    sent_message = build_plain_mime_message(
-        from_name=from_name,
-        from_address=from_address,
-        to=to,
-        cc=cc,
-        bcc=bcc,
-        subject=subject,
-        body=body,
-        body_html=body_html,
-        in_reply_to=in_reply_to,
-        references=references,
-        attachments=attachments,
-        message_id=identifiers.message_id,
-        date=identifiers.date,
-    )
-    return OutboundMimePackage(
-        message_id=identifiers.message_id,
-        date=identifiers.date,
-        wire_bytes=wire_bytes,
-        sent_message=sent_message,
     )
 
 
@@ -1035,46 +881,6 @@ def _set_message_body(
 
     message.props.content = multipart
     message.set_mime_type("multipart/mixed")
-
-
-def build_outbound_email_bytes(
-    *,
-    from_name: str | None,
-    from_address: str,
-    to: list[str],
-    cc: list[str] | None,
-    bcc: list[str] | None,
-    subject: str,
-    body: str,
-    body_html: str | None = None,
-    in_reply_to: str | None = None,
-    references: str | None = None,
-    attachments: Sequence[ComposeAttachment] | None = None,
-    message_id: str | None = None,
-    date: str | None = None,
-) -> bytes:
-    """Build a MIME message for SMTP/local delivery without Camel/GObject.
-
-    Bcc addresses are omitted from MIME headers; callers must still pass them
-    for SMTP RCPT TO / local recipient resolution.
-    """
-    message = build_outbound_email_message(
-        from_name=from_name,
-        from_address=from_address,
-        to=to,
-        cc=cc,
-        bcc=bcc,
-        subject=subject,
-        body=body,
-        body_html=body_html,
-        in_reply_to=in_reply_to,
-        references=references,
-        attachments=attachments,
-        include_bcc_header=False,
-        message_id=message_id,
-        date=date,
-    )
-    return message.as_bytes()
 
 
 def build_plain_mime_message(

@@ -10,8 +10,6 @@ from post.mail.compose import (
     body_html_for_quoting,
     body_text_for_quoting,
     build_draft_mime_message,
-    build_outbound_email_bytes,
-    build_outbound_mime_package,
     build_outbound_html_for_compose,
     build_plain_mime_message,
     build_forward_subject,
@@ -539,15 +537,8 @@ class BuildPlainMimeMessageTests(unittest.TestCase):
         self.assertIn(b'Content-Disposition: attachment; filename="doc.pdf"', raw)
         self.assertNotIn(b"filename*=", raw)
 
-    def test_build_outbound_mime_package_attachment_filename_matches_wire(self) -> None:
-        attachments = [
-            ComposeAttachment(
-                filename="Grüße.txt",
-                mime_type="text/plain",
-                data=b"hello",
-            )
-        ]
-        package = build_outbound_mime_package(
+    def test_build_plain_mime_message_unicode_attachment_filename(self) -> None:
+        message = build_plain_mime_message(
             from_name="Alice",
             from_address="alice@example.com",
             to=["bob@example.com"],
@@ -555,16 +546,20 @@ class BuildPlainMimeMessageTests(unittest.TestCase):
             bcc=None,
             subject="Unicode attachment",
             body="See attached",
-            attachments=attachments,
+            attachments=[
+                ComposeAttachment(
+                    filename="Grüße.txt",
+                    mime_type="text/plain",
+                    data=b"hello",
+                )
+            ],
         )
-        sent_raw = _mime_message_raw_bytes(package.sent_message)
-        assert sent_raw is not None
-
-        expected = (
-            b"Content-Disposition: attachment; filename*=utf-8''Gr%C3%BC%C3%9Fe.txt"
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertIn(
+            b"Content-Disposition: attachment; filename*=utf-8''Gr%C3%BC%C3%9Fe.txt",
+            raw,
         )
-        self.assertIn(expected, package.wire_bytes)
-        self.assertIn(expected, sent_raw)
 
 
 class HeaderInjectionTests(unittest.TestCase):
@@ -593,19 +588,11 @@ class HeaderInjectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_draft_mime_message(**kwargs)
 
-    def _assert_rejects_outbound(self, **overrides: object) -> None:
-        kwargs = {**self._BASE, "from_name": "Alice", "subject": "Hi", **overrides}
-        with self.assertRaises(ValueError):
-            build_outbound_email_bytes(**kwargs)
-
     def test_rejects_subject_injection_plain(self) -> None:
         self._assert_rejects_plain(subject=f"Hi{self._INJECT}")
 
     def test_rejects_subject_injection_draft(self) -> None:
         self._assert_rejects_draft(subject=f"Hi{self._INJECT}")
-
-    def test_rejects_subject_injection_outbound(self) -> None:
-        self._assert_rejects_outbound(subject=f"Hi{self._INJECT}")
 
     def test_rejects_from_name_injection_plain(self) -> None:
         self._assert_rejects_plain(from_name=f"Alice{self._INJECT}")
@@ -1195,49 +1182,6 @@ class HtmlForwardReplyTests(unittest.TestCase):
         self.assertIsNotNone(content_type)
         self.assertEqual(content_type.simple(), "multipart/alternative")
 
-    def test_build_outbound_email_bytes_with_html_is_multipart_alternative(self) -> None:
-        payload = build_outbound_email_bytes(
-            from_name="Alice",
-            from_address="alice@example.com",
-            to=["bob@example.com"],
-            cc=None,
-            bcc=None,
-            subject="Fwd: Hi",
-            body="See below\n",
-            body_html='<blockquote class="post_quote"><p>Hi</p></blockquote>',
-        )
-        import email
-        import email.policy
-
-        parsed = email.message_from_bytes(payload, policy=email.policy.default)
-        self.assertTrue(parsed.is_multipart())
-        self.assertEqual(parsed.get_content_type(), "multipart/alternative")
-        plain_part = parsed.get_body(preferencelist=("plain",))
-        html_part = parsed.get_body(preferencelist=("html",))
-        self.assertIsNotNone(plain_part)
-        self.assertIsNotNone(html_part)
-        self.assertIn("See below", str(plain_part.get_content()))
-        self.assertIn("post_quote", str(html_part.get_content()))
-
-    def test_build_outbound_email_bytes_omits_bcc_from_wire(self) -> None:
-        payload = build_outbound_email_bytes(
-            from_name="Alice",
-            from_address="alice@example.com",
-            to=["bob@example.com"],
-            cc=["carol@example.com"],
-            bcc=["secret@example.com"],
-            subject="Hi",
-            body="Hello",
-        )
-        import email
-        import email.policy
-
-        parsed = email.message_from_bytes(payload, policy=email.policy.default)
-        self.assertEqual(parsed["To"], "bob@example.com")
-        self.assertEqual(parsed["Cc"], "carol@example.com")
-        self.assertNotIn("Bcc", parsed)
-        self.assertNotIn(b"Bcc:", payload)
-
     def test_build_plain_mime_message_omits_bcc_when_requested(self) -> None:
         message = build_plain_mime_message(
             from_name="Alice",
@@ -1315,11 +1259,8 @@ class HtmlForwardReplyTests(unittest.TestCase):
 
 
 class OutboundMimeParityTests(unittest.TestCase):
-    def test_build_outbound_email_bytes_includes_message_id_and_date(self) -> None:
-        import email
-        import email.policy
-
-        payload = build_outbound_email_bytes(
+    def test_build_plain_mime_message_includes_message_id_and_date(self) -> None:
+        message = build_plain_mime_message(
             from_name="Alice",
             from_address="alice@example.com",
             to=["bob@example.com"],
@@ -1327,18 +1268,15 @@ class OutboundMimeParityTests(unittest.TestCase):
             bcc=None,
             subject="Hi",
             body="Hello",
+            include_bcc_header=False,
         )
-        parsed = email.message_from_bytes(payload, policy=email.policy.SMTP)
-        self.assertIsNotNone(parsed["Message-ID"])
-        self.assertIsNotNone(parsed["Date"])
-        self.assertTrue(str(parsed["Message-ID"]).startswith("<"))
-        self.assertIn(b"\r\n", payload)
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertIn(b"Message-ID:", raw)
+        self.assertIn(b"Date:", raw)
 
-    def test_build_outbound_mime_package_wire_and_sent_share_identifiers(self) -> None:
-        import email
-        import email.policy
-
-        package = build_outbound_mime_package(
+    def test_build_plain_mime_message_thread_headers_and_omits_bcc_on_wire(self) -> None:
+        message = build_plain_mime_message(
             from_name="Alice",
             from_address="alice@example.com",
             to=["bob@example.com"],
@@ -1348,27 +1286,16 @@ class OutboundMimeParityTests(unittest.TestCase):
             body="Hello",
             in_reply_to="<parent@example.com>",
             references="<parent@example.com>",
+            include_bcc_header=False,
         )
-        wire = email.message_from_bytes(
-            package.wire_bytes, policy=email.policy.SMTP
-        )
-        sent_raw = _mime_message_raw_bytes(package.sent_message)
-        assert sent_raw is not None
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertIn(b"In-Reply-To: <parent@example.com>", raw)
+        self.assertIn(b"References: <parent@example.com>", raw)
+        self.assertNotIn(b"Bcc:", raw)
 
-        self.assertEqual(wire["Message-ID"], package.message_id)
-        self.assertEqual(wire["Date"], package.date)
-        self.assertIn(f"Message-ID: {package.message_id}".encode(), sent_raw)
-        self.assertIn(f"Date: {package.date}".encode(), sent_raw)
-        self.assertEqual(wire["In-Reply-To"], "<parent@example.com>")
-        self.assertEqual(wire["References"], "<parent@example.com>")
-        self.assertNotIn("Bcc", wire)
-        self.assertIn(b"Bcc:", sent_raw)
-
-    def test_build_outbound_mime_package_normalizes_bare_in_reply_to(self) -> None:
-        import email
-        import email.policy
-
-        package = build_outbound_mime_package(
+    def test_build_plain_mime_message_normalizes_bare_in_reply_to(self) -> None:
+        message = build_plain_mime_message(
             from_name="Alice",
             from_address="alice@example.com",
             to=["bob@example.com"],
@@ -1378,23 +1305,16 @@ class OutboundMimeParityTests(unittest.TestCase):
             body="Hello",
             in_reply_to="18137428606209368569",
             references="<18137428606209368569>",
+            include_bcc_header=False,
         )
-        wire = email.message_from_bytes(
-            package.wire_bytes, policy=email.policy.SMTP
-        )
-        sent_raw = _mime_message_raw_bytes(package.sent_message)
-        assert sent_raw is not None
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertIn(b"In-Reply-To: <18137428606209368569>", raw)
 
-        self.assertEqual(wire["In-Reply-To"], "<18137428606209368569>")
-        self.assertIn(b"In-Reply-To: <18137428606209368569>", sent_raw)
-
-    def test_explicit_identifiers_are_shared_between_builders(self) -> None:
-        import email
-        import email.policy
-
+    def test_explicit_identifiers_on_plain_mime_message(self) -> None:
         message_id = "<fixed-id@example.com>"
         date = "Mon, 01 Jan 2024 00:00:00 +0000"
-        wire_bytes = build_outbound_email_bytes(
+        message = build_plain_mime_message(
             from_name="Alice",
             from_address="alice@example.com",
             to=["bob@example.com"],
@@ -1404,26 +1324,12 @@ class OutboundMimeParityTests(unittest.TestCase):
             body="Hello",
             message_id=message_id,
             date=date,
+            include_bcc_header=False,
         )
-        sent = build_plain_mime_message(
-            from_name="Alice",
-            from_address="alice@example.com",
-            to=["bob@example.com"],
-            cc=None,
-            bcc=None,
-            subject="Hi",
-            body="Hello",
-            message_id=message_id,
-            date=date,
-        )
-        wire = email.message_from_bytes(wire_bytes, policy=email.policy.SMTP)
-        sent_raw = _mime_message_raw_bytes(sent)
-        assert sent_raw is not None
-
-        self.assertEqual(wire["Message-ID"], message_id)
-        self.assertEqual(wire["Date"], date)
-        self.assertIn(f"Message-ID: {message_id}".encode(), sent_raw)
-        self.assertIn(f"Date: {date}".encode(), sent_raw)
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertIn(f"Message-ID: {message_id}".encode(), raw)
+        self.assertIn(f"Date: {date}".encode(), raw)
 
 
 if __name__ == "__main__":
