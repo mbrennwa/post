@@ -523,7 +523,14 @@ def quote_plain_reply(original: dict[str, Any], body_plain: str | None) -> str:
 
 
 _MSGID_RE = re.compile(r"<[^>]+>")
+_HEADER_FOLD = re.compile(r"[\r\n]([ \t])")
 _MAX_REFERENCES_IDS = 50
+
+
+def unfold_rfc5322_header(value: str) -> str:
+    """Unfold a header value per RFC 5322 (remove CRLF continuations)."""
+    text = _HEADER_FOLD.sub(r"\1", value)
+    return re.sub(r"[ \t]+", " ", text).strip()
 
 
 def normalize_message_id(message_id: str) -> str:
@@ -532,8 +539,11 @@ def normalize_message_id(message_id: str) -> str:
     if not mid:
         return ""
     if mid.startswith("<") and mid.endswith(">"):
-        return mid
-    return f"<{mid.strip('<>')}>"
+        inner = _HEADER_NEWLINES.sub("", mid[1:-1])
+        return f"<{inner}>"
+    cleaned = _HEADER_NEWLINES.sub("", mid)
+    inner = cleaned.strip("<>")
+    return f"<{inner}>" if inner else ""
 
 
 def normalize_in_reply_to(message_id: str | None) -> str | None:
@@ -542,14 +552,26 @@ def normalize_in_reply_to(message_id: str | None) -> str | None:
     return normalized or None
 
 
+def normalize_references_header(references: str | None) -> str | None:
+    """Return a single-line References value safe for outbound MIME."""
+    if not references:
+        return None
+    parsed = parse_references_header(references)
+    if parsed:
+        return " ".join(parsed)
+    text = unfold_rfc5322_header(references)
+    return text or None
+
+
 def parse_references_header(references: str | None) -> list[str]:
     """Tokenize Message-IDs from a References header."""
-    text = (references or "").strip()
+    text = unfold_rfc5322_header(references or "")
     if not text:
         return []
     tokens = _MSGID_RE.findall(text)
     if not tokens:
-        return [normalize_message_id(token) for token in text.split() if token.strip()]
+        bare = _HEADER_NEWLINES.sub(" ", text)
+        return [normalize_message_id(token) for token in bare.split() if token.strip()]
     return [normalize_message_id(token) for token in tokens]
 
 
@@ -566,7 +588,7 @@ def build_reply_references(message_id: str | None, references: str | None = None
     if not normalized_id:
         parsed = parse_references_header(references)
         if not parsed:
-            return references.strip() if references else None
+            return normalize_references_header(references)
         return " ".join(_prune_references(parsed))
 
     chain = parse_references_header(references)
@@ -656,6 +678,7 @@ def validate_compose_mime_fields(
     """Reject user-controlled header fields before outbox queue or MIME build."""
     _sanitize_optional_header_field(from_name, field="From name")
     _sanitize_header_field(subject or "", field="Subject")
+    _sanitize_optional_header_field(in_reply_to, field="In-Reply-To")
     _sanitize_optional_header_field(
         normalize_in_reply_to(in_reply_to), field="In-Reply-To"
     )
@@ -754,9 +777,8 @@ def _apply_compose_headers(
     if include_bcc_header and bcc_container is not None:
         message.set_recipients("Bcc", bcc_container)
 
-    safe_in_reply_to = _sanitize_optional_header_field(
-        normalize_in_reply_to(in_reply_to), field="In-Reply-To"
-    )
+    _sanitize_optional_header_field(in_reply_to, field="In-Reply-To")
+    safe_in_reply_to = normalize_in_reply_to(in_reply_to)
     if safe_in_reply_to:
         message.set_header("In-Reply-To", safe_in_reply_to)
     safe_references = _sanitize_optional_header_field(references, field="References")
