@@ -88,6 +88,7 @@ from .compose import (
     build_plain_mime_message,
     new_outbound_mime_identifiers,
     normalize_email,
+    normalize_references_header,
 )
 from .correspondents import Correspondent, collect_correspondents
 from .folders import (
@@ -2157,7 +2158,7 @@ class MailService:
         if hasattr(mime, "get_header"):
             references = mime.get_header("References")
             if references:
-                result["references"] = references
+                result["references"] = normalize_references_header(references)
 
         if was_unread and mark_seen:
             unread, total = self._mark_message_seen_unlocked(

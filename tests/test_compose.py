@@ -16,7 +16,9 @@ from post.mail.compose import (
     build_reply_all_recipients,
     build_reply_references,
     normalize_in_reply_to,
+    normalize_references_header,
     parse_references_header,
+    validate_compose_mime_fields,
     build_reply_subject,
     extract_reply_address,
     extract_reply_target_addresses,
@@ -1065,6 +1067,62 @@ class BuildReplyReferencesTests(unittest.TestCase):
         self.assertEqual(len(ids), 50)
         self.assertEqual(ids[0], "<m0@example.com>")
         self.assertEqual(ids[-1], "<m59@example.com>")
+
+
+class ReferencesNormalizationTests(unittest.TestCase):
+    def test_unfolds_folded_references_between_ids(self) -> None:
+        folded = "<a@x.com> <b@x.com>\r\n <c@x.com>"
+        self.assertEqual(
+            normalize_references_header(folded),
+            "<a@x.com> <b@x.com> <c@x.com>",
+        )
+
+    def test_strips_embedded_newline_in_message_id_token(self) -> None:
+        broken = "<foo\r\n@bar.com> <baz@x.com>"
+        self.assertEqual(
+            normalize_references_header(broken),
+            "<foo@bar.com> <baz@x.com>",
+        )
+
+    def test_folded_references_passes_compose_validation(self) -> None:
+        folded = "<a@x.com> <b@x.com>\r\n <c@x.com>"
+        normalized = normalize_references_header(folded)
+        validate_compose_mime_fields(
+            from_name=None,
+            subject="Thread",
+            references=normalized,
+        )
+
+    def test_build_reply_references_cleans_folded_input(self) -> None:
+        folded = "<a@x.com> <b@x.com>\r\n <c@x.com>"
+        result = build_reply_references("<new@x.com>", folded)
+        validate_compose_mime_fields(
+            from_name=None,
+            subject="Thread",
+            in_reply_to="<new@x.com>",
+            references=result,
+        )
+        self.assertNotIn("\n", result or "")
+        self.assertNotIn("\r", result or "")
+
+    def test_normalize_in_reply_to_strips_embedded_newlines(self) -> None:
+        normalized = normalize_in_reply_to("parent\r\n@example.com")
+        self.assertEqual(normalized, "<parent@example.com>")
+        validate_compose_mime_fields(
+            from_name=None,
+            subject="Thread",
+            in_reply_to=normalized,
+        )
+
+    def test_injection_in_subject_still_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "Subject must not contain line breaks.",
+        ):
+            validate_compose_mime_fields(
+                from_name=None,
+                subject="Hello\r\nBcc: evil@example.com",
+            )
 
 
 class SignatureComposeTests(unittest.TestCase):

@@ -32,6 +32,7 @@ from post.mail.compose import (
     build_reply_all_recipients,
     build_reply_references,
     normalize_in_reply_to,
+    normalize_references_header,
     build_reply_subject,
     compose_body_with_signature,
     extract_reply_target_addresses,
@@ -1222,7 +1223,9 @@ class ComposeWindow(Adw.Window):
             )
         elif self._mode == "draft" and self._draft_message is not None:
             in_reply_to = normalize_in_reply_to(self._draft_message.get("message_id"))
-            references = self._draft_message.get("references")
+            references = normalize_references_header(
+                self._draft_message.get("references"),
+            )
 
         return (
             to_addrs,
