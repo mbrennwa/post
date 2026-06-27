@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -20,6 +19,7 @@ from gi.repository import Camel, GLib, GObject
 
 from .eds import MailService
 from .folders import is_post_local_folder
+from .io_thread import get_mail_io_thread
 from .send_queue import is_network_unavailable_error, log_mail_error
 
 log = logging.getLogger(__name__)
@@ -130,7 +130,7 @@ class MailSyncWatcher:
                 setups,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     def _apply_setup(
         self,
