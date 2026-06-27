@@ -16,6 +16,51 @@ def format_folder_label(display: str, unread: int, total: int) -> str:
     return display
 
 
+def resolve_folder_display_name(
+    *,
+    folder_name: str,
+    display_name: str | None = None,
+    inbox_name: str | None = None,
+    account_label: str | None = None,
+    is_outbox: bool = False,
+) -> str:
+    """Return a user-facing folder label for status messages."""
+    if is_outbox:
+        return "Outbox"
+    if inbox_name and folder_name == inbox_name and account_label:
+        return f"{account_label} Inbox"
+    return display_name or folder_name
+
+
+def format_folder_refresh_start(display_name: str) -> str:
+    return f"Refreshing {display_name}…"
+
+
+def format_folder_refresh_done(display_name: str, unread: int, total: int) -> str:
+    if total >= 0 and unread >= 0:
+        return f"Refreshed {display_name}: {total} messages ({unread} unread)"
+    if total >= 0:
+        return f"Refreshed {display_name}: {total} messages"
+    return f"Refreshed {display_name}"
+
+
+def format_folder_refresh_error(display_name: str) -> str:
+    return f"Could not refresh {display_name}"
+
+
+def format_account_refresh_start(display_label: str) -> str:
+    return f"Refreshing folders for {display_label}…"
+
+
+def format_account_refresh_done(display_label: str, folder_count: int) -> str:
+    noun = "folder" if folder_count == 1 else "folders"
+    return f"Refreshed {folder_count} {noun} for {display_label}"
+
+
+def format_account_refresh_error(display_label: str) -> str:
+    return f"Could not refresh folders for {display_label}"
+
+
 def guess_inbox_name(folders: list[dict]) -> str | None:
     for folder in folders:
         name = (folder.get("full_name") or "").upper()

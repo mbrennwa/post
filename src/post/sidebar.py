@@ -31,6 +31,7 @@ from post.mail.folders import (
     is_drafts_folder_name,
     is_post_outbox_folder,
     outbox_folder_dict,
+    resolve_folder_display_name,
     resolve_move_menu_state,
     resolve_sidebar_context_menu,
 )
@@ -59,6 +60,8 @@ OnFolderTreeChanged = Callable[[str, str | None], None]
 OnFolderContentsChanged = Callable[[str, str], None]
 OnMoveStarted = Callable[[str, str], None]
 OnMoveUndoAvailable = Callable[[str, str, dict, str], None]
+FolderRefreshComplete = Callable[[int, int, Exception | None], None]
+AccountRefreshComplete = Callable[[int, Exception | None], None]
 
 
 class MailSidebar:
@@ -113,6 +116,7 @@ class MailSidebar:
         self._context_target: dict | None = None
         self._context_actions: dict[str, Gio.SimpleAction] = {}
         self._context_popover: Gtk.PopoverMenu | None = None
+        self._account_reload_callbacks: dict[str, AccountRefreshComplete] = {}
 
         self._sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
@@ -217,6 +221,24 @@ class MailSidebar:
     def inbox_folder_for_account(self, account_uid: str) -> str | None:
         return self._account_inbox_folders.get(account_uid)
 
+    def account_display_label(self, account_uid: str) -> str:
+        account = self._accounts_by_uid.get(account_uid)
+        return account.display_label if account else account_uid
+
+    def folder_display_name(self, account_uid: str, folder_name: str) -> str:
+        display_name: str | None = None
+        for folder in self._account_folders.get(account_uid, []):
+            if folder.get("full_name") == folder_name:
+                display_name = folder.get("display_name")
+                break
+        return resolve_folder_display_name(
+            folder_name=folder_name,
+            display_name=display_name,
+            inbox_name=self.inbox_folder_for_account(account_uid),
+            account_label=self.account_display_label(account_uid),
+            is_outbox=is_post_outbox_folder(folder_name),
+        )
+
     def folder_is_drafts(self, account_uid: str, folder_name: str) -> bool:
         return is_drafts_folder_name(
             self._account_folders.get(account_uid, []),
@@ -314,11 +336,21 @@ class MailSidebar:
         self.update_folder_row(account_uid, folder_name, unread, total)
         return False
 
-    def reload_account(self, account_uid: str) -> None:
+    def reload_account(
+        self,
+        account_uid: str,
+        *,
+        on_complete: AccountRefreshComplete | None = None,
+    ) -> None:
         account = self._accounts_by_uid.get(account_uid)
         folder_list = self._folder_lists.get(account_uid)
         if account is None or folder_list is None:
+            if on_complete is not None:
+                on_complete(0, ValueError(f"Account not loaded: {account_uid}"))
             return
+
+        if on_complete is not None:
+            self._account_reload_callbacks[account_uid] = on_complete
 
         self._clear_listbox(folder_list)
         loading = Gtk.Label(label="Loading Folders…", xalign=0)
@@ -329,9 +361,24 @@ class MailSidebar:
         folder_list.append(self._wrap_list_row(loading))
         self._start_folder_load(self._load_generation, account)
 
-    def refresh_folder_row(self, account_uid: str, folder_name: str) -> None:
+    def refresh_folder_row(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        on_complete: FolderRefreshComplete | None = None,
+    ) -> None:
         if is_post_outbox_folder(folder_name):
+            count = count_queued_for_account(account_uid)
             self.refresh_outbox_row(account_uid)
+            if on_complete is not None:
+                GLib.idle_add(
+                    self._dispatch_folder_refresh_complete,
+                    on_complete,
+                    0,
+                    count,
+                    None,
+                )
             return
 
         def worker() -> None:
@@ -354,9 +401,20 @@ class MailSidebar:
                 unread,
                 total,
                 error,
+                on_complete,
             )
 
         threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _dispatch_folder_refresh_complete(
+        on_complete: FolderRefreshComplete,
+        unread: int,
+        total: int,
+        error: Exception | None,
+    ) -> bool:
+        on_complete(unread, total, error)
+        return False
 
     def _on_folder_row_refreshed(
         self,
@@ -365,11 +423,20 @@ class MailSidebar:
         unread: int,
         total: int,
         error: Exception | None,
+        on_complete: FolderRefreshComplete | None = None,
     ) -> bool:
-        if error is not None:
-            return False
-        self.update_folder_row(account_uid, folder_name, unread, total)
+        if error is None:
+            self.update_folder_row(account_uid, folder_name, unread, total)
+        if on_complete is not None:
+            on_complete(unread, total, error)
         return False
+
+    def _finish_account_reload(
+        self, account_uid: str, folder_count: int, error: Exception | None
+    ) -> None:
+        callback = self._account_reload_callbacks.pop(account_uid, None)
+        if callback is not None:
+            callback(folder_count, error)
 
     def _setup_context_menu(self) -> None:
         specs = (
@@ -920,6 +987,7 @@ class MailSidebar:
             self._add_outbox_row(account_uid)
             self._folder_loads_pending -= 1
             self._maybe_apply_initial_selection()
+            self._finish_account_reload(account_uid, 0, error)
             return False
 
         assert folders is not None
@@ -934,6 +1002,7 @@ class MailSidebar:
 
         self._folder_loads_pending -= 1
         self._maybe_apply_initial_selection()
+        self._finish_account_reload(account_uid, len(folders), None)
 
         return False
 
