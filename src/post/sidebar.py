@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 from collections.abc import Callable
 
 import gi
@@ -21,6 +20,7 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
 from post.mail import MailService
 from post.mail.eds import MailAccount
+from post.mail.io_thread import get_mail_io_thread
 from post.folder_dialogs import confirm_action, prompt_folder_name, show_error
 from post.mail.folders import (
     POST_OUTBOX_FOLDER,
@@ -269,7 +269,7 @@ class MailSidebar:
                 error,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     def _inbox_folder_name(self, account_uid: str) -> str | None:
         inbox_name = self._account_inbox_folders.get(account_uid)
@@ -320,7 +320,7 @@ class MailSidebar:
                 error,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     def _on_folder_counts_refreshed(
         self,
@@ -404,7 +404,7 @@ class MailSidebar:
                 on_complete,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     @staticmethod
     def _dispatch_folder_refresh_complete(
@@ -778,7 +778,7 @@ class MailSidebar:
                 error_heading,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     def _on_folder_operation_finished(
         self,
@@ -950,7 +950,7 @@ class MailSidebar:
                 error,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     def _on_folders_loaded(
         self,
