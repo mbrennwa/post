@@ -8,8 +8,9 @@ import unittest
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Pango", "1.0")
 
-from gi.repository import Gtk
+from gi.repository import Gtk, Pango
 
 from post.wrap_label import WrappingLabel, configure_ellipsize_label
 
@@ -24,6 +25,14 @@ class WrappingLabelTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         if not Gtk.is_initialized():
             Gtk.init()
+
+    def test_wrap_mode_accepts_gtk_enum(self) -> None:
+        label = WrappingLabel(
+            label="hello",
+            wrap=True,
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+        )
+        self.assertEqual(label.get_wrap_mode(), Pango.WrapMode.WORD_CHAR)
 
     def test_horizontal_measure_without_constraint_is_zero(self) -> None:
         label = WrappingLabel(label=_LONG_LINE, wrap=True)

@@ -22,6 +22,17 @@ if _pango_wrap_none is not None:
     _GTK_TO_PANGO_WRAP[Gtk.WrapMode.NONE] = _pango_wrap_none
 
 
+def _to_pango_wrap_mode(mode: Gtk.WrapMode | Pango.WrapMode) -> Pango.WrapMode:
+    if isinstance(mode, Pango.WrapMode):
+        return mode
+    return _GTK_TO_PANGO_WRAP.get(mode, Pango.WrapMode.WORD_CHAR)
+
+
+def set_label_wrap_mode(label: Gtk.Label, mode: Gtk.WrapMode | Pango.WrapMode) -> None:
+    """Apply wrap mode to a Gtk.Label without passing Gtk enums to Pango."""
+    label.set_wrap_mode(_to_pango_wrap_mode(mode))
+
+
 def configure_ellipsize_label(label: Gtk.Label) -> Gtk.Label:
     """Keep ellipsized labels from forcing invalid GtkBox measure results."""
     if label.get_ellipsize() == Pango.EllipsizeMode.NONE:
@@ -36,8 +47,17 @@ class WrappingLabel(Gtk.Label):
 
     __gtype_name__ = "WrappingLabel"
 
+    def __init__(self, *args, **kwargs) -> None:
+        wrap_mode = kwargs.pop("wrap_mode", None)
+        super().__init__(*args, **kwargs)
+        if wrap_mode is not None:
+            self.set_wrap_mode(wrap_mode)
+
+    def set_wrap_mode(self, mode: Gtk.WrapMode | Pango.WrapMode) -> None:
+        super().set_wrap_mode(_to_pango_wrap_mode(mode))
+
     def _pango_wrap_mode(self) -> Pango.WrapMode:
-        return _GTK_TO_PANGO_WRAP.get(self.get_wrap_mode(), Pango.WrapMode.WORD_CHAR)
+        return self.get_wrap_mode()
 
     def do_get_request_mode(self) -> Gtk.SizeRequestMode:
         if self.get_wrap():
