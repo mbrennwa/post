@@ -17,6 +17,7 @@ from post.mail.compose import (
     build_forward_subject,
     build_reply_all_recipients,
     build_reply_references,
+    parse_references_header,
     build_reply_subject,
     extract_reply_address,
     extract_reply_target_addresses,
@@ -847,6 +848,58 @@ class BuildReplyReferencesTests(unittest.TestCase):
             ),
             "<old@example.com> <new@example.com>",
         )
+
+    def test_substring_false_positive_appends(self) -> None:
+        self.assertEqual(
+            build_reply_references(
+                "<a@b.c>",
+                "<xa@b.c@other.com>",
+            ),
+            "<xa@b.c@other.com> <a@b.c>",
+        )
+
+    def test_skips_duplicate_token(self) -> None:
+        self.assertEqual(
+            build_reply_references(
+                "<abc@example.com>",
+                "<abc@example.com> <def@example.com>",
+            ),
+            "<abc@example.com> <def@example.com>",
+        )
+
+    def test_bracket_mismatch_treated_as_duplicate(self) -> None:
+        self.assertEqual(
+            build_reply_references(
+                "abc@example.com",
+                "<abc@example.com>",
+            ),
+            "<abc@example.com>",
+        )
+
+    def test_normalizes_bare_references_on_append(self) -> None:
+        self.assertEqual(
+            build_reply_references(
+                "<new@example.com>",
+                "abc@example.com",
+            ),
+            "<abc@example.com> <new@example.com>",
+        )
+
+    def test_prunes_long_chain(self) -> None:
+        chain = " ".join(f"<m{i}@example.com>" for i in range(60))
+        result = build_reply_references("<m60@example.com>", chain)
+        ids = parse_references_header(result)
+        self.assertEqual(len(ids), 50)
+        self.assertEqual(ids[0], "<m0@example.com>")
+        self.assertEqual(ids[-1], "<m60@example.com>")
+
+    def test_prunes_references_without_new_message_id(self) -> None:
+        chain = " ".join(f"<m{i}@example.com>" for i in range(60))
+        result = build_reply_references(None, chain)
+        ids = parse_references_header(result)
+        self.assertEqual(len(ids), 50)
+        self.assertEqual(ids[0], "<m0@example.com>")
+        self.assertEqual(ids[-1], "<m59@example.com>")
 
 
 class SignatureComposeTests(unittest.TestCase):
