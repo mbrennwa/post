@@ -3,18 +3,37 @@
 **Post** is a mail app for GNOME — read and send email with a simple, native desktop experience. It is free and open source, built for Linux. Post picks up online accounts from GNOME Online Accounts and optionally also local system email.
 
 ## Install
-[WIP -- follow Tunes Player README]
+
+On Debian 12+, Ubuntu 24.04+, or similar DEB-based distros, install system
+dependencies (GObject introspection typelibs and related tools — not installable
+via pip), then run Post from source:
+
+```bash
+./scripts/install-deps.sh
+./run.sh
+```
+
+The canonical package list lives in **`pyproject.toml`** under
+**`[tool.deb].apt_depends`**. Post uses a venv with
+`--system-site-packages` so PyGObject and GI typelibs from the distro are
+visible to the app.
 
 ## Development
 
 Mail I/O runs on a dedicated background thread; see **[docs/mail-threading.md](docs/mail-threading.md)** for architecture, contributor rules, and the manual regression matrix.
 
+On a fresh machine, install system dependencies first:
+
+```bash
+./scripts/install-deps.sh
+```
+
 ```bash
 # Run unit tests
-PYTHONPATH=src python3 -m pytest
+./scripts/check.sh
 
 # Run with mail I/O debug tracing
-POST_LOG_LEVEL=DEBUG PYTHONPATH=src python3 -m post.main
+POST_LOG_LEVEL=DEBUG ./run.sh
 ```
 
 ## License
