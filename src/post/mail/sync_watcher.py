@@ -112,8 +112,7 @@ class MailSyncWatcher:
                 current_name: str | None = None
                 try:
                     store = self._mail.get_store_for_sync(account_uid)
-                    folders = self._mail.list_folders(account_uid)
-                    inbox_name = self._mail.guess_inbox(folders)
+                    inbox_name = self._mail.get_inbox_folder_name(account_uid)
                     if account_uid == current_account_uid and current_folder_name:
                         current_name = current_folder_name
                 except Exception as exc:
