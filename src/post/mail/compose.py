@@ -547,6 +547,18 @@ def _encode_plain_body(body: str) -> bytes:
     return encoded if encoded else b"\n"
 
 
+def _camel_text_transfer_encoding(payload: bytes) -> Any:
+    """Pick RFC 2045 CTE for UTF-8 text parts (7bit only when US-ASCII)."""
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    if payload and all(byte < 0x80 for byte in payload):
+        return Camel.TransferEncoding.ENCODING_7BIT
+    return Camel.TransferEncoding.ENCODING_8BIT
+
+
 @dataclass(frozen=True)
 class ComposeAttachment:
     filename: str
@@ -865,12 +877,12 @@ def _build_alternative_multipart(
 
     plain_part = Camel.MimePart.new()
     plain_part.set_content(encoded_plain, "text/plain; charset=utf-8")
-    plain_part.set_encoding(Camel.TransferEncoding.ENCODING_7BIT)
+    plain_part.set_encoding(_camel_text_transfer_encoding(encoded_plain))
     alternative.add_part(plain_part)
 
     html_part = Camel.MimePart.new()
     html_part.set_content(encoded_html, "text/html; charset=utf-8")
-    html_part.set_encoding(Camel.TransferEncoding.ENCODING_7BIT)
+    html_part.set_encoding(_camel_text_transfer_encoding(encoded_html))
     alternative.add_part(html_part)
 
     return alternative
@@ -908,7 +920,7 @@ def _set_message_body(
     else:
         body_part = Camel.MimePart.new()
         body_part.set_content(encoded_plain, "text/plain; charset=utf-8")
-        body_part.set_encoding(Camel.TransferEncoding.ENCODING_7BIT)
+        body_part.set_encoding(_camel_text_transfer_encoding(encoded_plain))
         multipart.add_part(body_part)
 
     for attachment in attachments or ():

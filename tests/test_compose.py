@@ -357,6 +357,75 @@ class BuildPlainMimeMessageTests(unittest.TestCase):
         self.assertIn(b"Content-Transfer-Encoding: base64", raw)
         self.assertNotIn(b"\xff\xd8", raw)
 
+    def test_multipart_non_ascii_body_uses_8bit_cte(self) -> None:
+        message = build_plain_mime_message(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Unicode",
+            body="Café",
+            attachments=[
+                ComposeAttachment(
+                    filename="note.txt",
+                    mime_type="text/plain",
+                    data=b"attachment",
+                )
+            ],
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertRegex(
+            raw,
+            rb"Content-Type: text/plain[^\n]*\nContent-Transfer-Encoding: 8bit",
+        )
+        self.assertIn(b"Content-Transfer-Encoding: base64", raw)
+        self.assertNotRegex(
+            raw,
+            rb"Content-Type: text/plain[^\n]*\nContent-Transfer-Encoding: 7bit",
+        )
+
+    def test_multipart_ascii_body_keeps_7bit_cte(self) -> None:
+        message = build_plain_mime_message(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="ASCII",
+            body="Hello",
+            attachments=[
+                ComposeAttachment(
+                    filename="note.txt",
+                    mime_type="text/plain",
+                    data=b"attachment",
+                )
+            ],
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertRegex(
+            raw,
+            rb"Content-Type: text/plain[^\n]*\nContent-Transfer-Encoding: 7bit",
+        )
+
+    def test_alternative_non_ascii_body_uses_8bit_cte(self) -> None:
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Unicode HTML",
+            body="Café",
+            body_html="<p>Café</p>",
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertEqual(raw.count(b"Content-Transfer-Encoding: 8bit"), 2)
+        self.assertNotIn(b"Content-Transfer-Encoding: 7bit", raw)
+
     def test_with_multiple_attachments_round_trips(self) -> None:
         attachments = [
             ComposeAttachment(
