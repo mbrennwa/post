@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 from post.mail.helpers import (
+    _decode_attachment_filename,
     _decode_header_value,
     enrich_message_dict_from_mime,
     flag_menu_items,
@@ -406,6 +407,33 @@ class DecodeHeaderValueTests(unittest.TestCase):
 
     def test_none_returns_none(self) -> None:
         self.assertIsNone(_decode_header_value(None))
+
+
+class DecodeAttachmentFilenameTests(unittest.TestCase):
+    def test_rfc5987_utf8_filename(self) -> None:
+        self.assertEqual(
+            _decode_attachment_filename("utf-8''r%C3%A9sum%C3%A9.pdf"),
+            "résumé.pdf",
+        )
+
+    def test_percent_encoded_without_charset_prefix(self) -> None:
+        self.assertEqual(
+            _decode_attachment_filename("r%C3%A9sum%C3%A9.pdf"),
+            "résumé.pdf",
+        )
+
+    def test_rfc2047_encoded_word(self) -> None:
+        self.assertEqual(
+            _decode_attachment_filename(b"=?ISO-8859-1?Q?r=E9sum=E9.pdf?="),
+            "résumé.pdf",
+        )
+
+    def test_already_decoded_unicode_unchanged(self) -> None:
+        self.assertEqual(_decode_attachment_filename("Grüße.txt"), "Grüße.txt")
+        self.assertEqual(_decode_attachment_filename("doc.pdf"), "doc.pdf")
+
+    def test_none_returns_none(self) -> None:
+        self.assertIsNone(_decode_attachment_filename(None))
 
 
 class MessageInfoToDictTests(unittest.TestCase):

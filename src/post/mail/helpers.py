@@ -117,6 +117,37 @@ def _decode_header_value(value: Any) -> str | None:
     return str(value)
 
 
+_RFC2231_FILENAME_RE = re.compile(r"^[\w-]+''", re.ASCII)
+
+
+def _looks_like_rfc2231_filename(value: str) -> bool:
+    """True when *value* looks like an RFC 2231/5987 filename parameter."""
+    if _RFC2231_FILENAME_RE.match(value):
+        return True
+    if value.startswith("=?"):
+        return False
+    return "%" in value
+
+
+def _decode_attachment_filename(value: Any) -> str | None:
+    """Decode inbound attachment filenames (RFC 2047 and RFC 2231 filename*)."""
+    from email.utils import decode_rfc2231
+    from urllib.parse import unquote
+
+    decoded = _decode_header_value(value)
+    if not decoded:
+        return None
+    if not _looks_like_rfc2231_filename(decoded):
+        return decoded
+    try:
+        charset, _language, encoded = decode_rfc2231(decoded)
+    except (TypeError, ValueError):
+        return decoded
+    if charset:
+        return unquote(encoded, encoding=charset, errors="replace")
+    return unquote(encoded, errors="replace")
+
+
 def format_recipient_header(value: Any) -> str:
     """Return a formatted To/Cc/From header string from Camel metadata."""
     if value is None:
@@ -782,7 +813,7 @@ def _walk_attachment_parts(
     size = part.get_size() if hasattr(part, "get_size") else None
     attachments.append(
         {
-            "filename": _decode_header_value(filename) or "attachment",
+            "filename": _decode_attachment_filename(filename) or "attachment",
             "mime_type": mime_type,
             "size": size if isinstance(size, int) else None,
         }
@@ -857,7 +888,7 @@ def _email_collect_attachments(mime_msg: Any, attachments: list[dict[str, Any]])
             payload = part.get_payload(decode=True) or b""
             attachments.append(
                 {
-                    "filename": filename or "attachment",
+                    "filename": _decode_attachment_filename(filename) or "attachment",
                     "mime_type": part.get_content_type(),
                     "size": len(payload),
                     "source": "email",
