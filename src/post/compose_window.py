@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -305,7 +304,7 @@ def _finish_outbound_send(
                 request,
             )
 
-        threading.Thread(target=delete_worker, daemon=True).start()
+        get_mail_io_thread().submit(delete_worker)
         return False
 
     _complete_outbound_send_success(
@@ -676,7 +675,7 @@ class ComposeWindow(Adw.Window):
                 )
             GLib.idle_add(self._on_draft_attachments_loaded, loaded)
 
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
         return False
 
     def _on_draft_attachments_loaded(
@@ -818,7 +817,7 @@ class ComposeWindow(Adw.Window):
                 self._on_correspondents_loaded, generation, correspondents
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        get_mail_io_thread().submit(worker)
 
     def _on_correspondents_loaded(
         self, generation: int, correspondents: list[Correspondent]
