@@ -86,14 +86,40 @@ def envelope_recipient_addresses(
     return addresses
 
 
-def parse_address_list(text: str) -> list[str]:
-    """Parse a comma-separated To/Cc/Bcc field into address strings."""
+def _parse_address_part(part: str, *, strict: bool) -> list[str]:
+    """Parse one comma-separated address token into formatted addresses."""
     import gi
 
     gi.require_version("Camel", "1.2")
     from gi.repository import Camel
 
-    text = text.strip()
+    container = Camel.InternetAddress.new()
+    container.unformat(part)
+    if container.length() == 0:
+        if strict:
+            raise ValueError(f"Invalid address: {part}")
+        return []
+
+    addresses: list[str] = []
+    for index in range(container.length()):
+        ok, name, address = container.get(index)
+        if not ok or not address:
+            continue
+        if not bare_address_is_valid(address):
+            if strict:
+                raise ValueError(f'The address "{part}" is not valid.')
+            continue
+        addresses.append(format_parsed_address(name, address))
+    return addresses
+
+
+def _parse_address_field(text: str, *, strict: bool) -> list[str]:
+    """Parse a comma-separated address field.
+
+    ``strict=True`` raises on invalid parts (compose send validation).
+    ``strict=False`` skips invalid parts (inbound headers / reply targets).
+    """
+    text = (text or "").strip()
     if not text:
         return []
 
@@ -102,20 +128,15 @@ def parse_address_list(text: str) -> list[str]:
         part = part.strip()
         if not part:
             continue
-        container = Camel.InternetAddress.new()
-        container.unformat(part)
-        if container.length() == 0:
-            raise ValueError(f"Invalid address: {part}")
-        for index in range(container.length()):
-            ok, name, address = container.get(index)
-            if not ok or not address:
-                continue
-            if not bare_address_is_valid(address):
-                raise ValueError(f'The address "{part}" is not valid.')
-            addresses.append(format_parsed_address(name, address))
-    if not addresses:
+        addresses.extend(_parse_address_part(part, strict=strict))
+    if strict and not addresses:
         raise ValueError("No valid addresses found")
     return addresses
+
+
+def parse_address_list(text: str) -> list[str]:
+    """Parse a comma-separated To/Cc/Bcc field into address strings."""
+    return _parse_address_field(text, strict=True)
 
 
 def parse_draft_address_list(text: str) -> list[str]:
@@ -359,33 +380,12 @@ def normalize_email(address: str) -> str:
 
 
 def parse_address_header(text: str) -> list[str]:
-    """Parse a To/Cc header into formatted address strings (empty if blank)."""
-    import gi
+    """Parse a To/Cc header into formatted address strings (empty if blank).
 
-    gi.require_version("Camel", "1.2")
-    from gi.repository import Camel
-
-    text = (text or "").strip()
-    if not text:
-        return []
-
-    addresses: list[str] = []
-    for part in _ADDRESS_SPLIT.split(text):
-        part = part.strip()
-        if not part:
-            continue
-        container = Camel.InternetAddress.new()
-        container.unformat(part)
-        if container.length() == 0:
-            if "@" in part:
-                addresses.append(part)
-            continue
-        for index in range(container.length()):
-            ok, name, bare = container.get(index)
-            if not ok or not bare or "@" not in bare:
-                continue
-            addresses.append(format_parsed_address(name, bare))
-    return addresses
+    Invalid entries are skipped rather than raised, using the same validity
+    rules as :func:`parse_address_list`.
+    """
+    return _parse_address_field(text, strict=False)
 
 
 def format_address_list(addresses: list[str]) -> str:
@@ -472,23 +472,14 @@ def extract_reply_target_addresses(message: dict[str, Any]) -> list[str]:
 
 def extract_reply_address(from_header: str) -> str:
     """Return a single address suitable for the To field when replying."""
-    import gi
-
-    gi.require_version("Camel", "1.2")
-    from gi.repository import Camel
-
     from_header = (from_header or "").strip()
     if not from_header:
         raise ValueError("Original message has no From address")
 
-    container = Camel.InternetAddress.new()
-    container.unformat(from_header)
-    if container.length() == 0:
-        return from_header
-    ok, name, address = container.get(0)
-    if not ok or not address:
-        return from_header
-    return format_parsed_address(name, address)
+    addresses = parse_address_header(from_header)
+    if not addresses:
+        raise ValueError("Original message has no From address")
+    return addresses[0]
 
 
 _QUOTE_LINE_RE = re.compile(r"^(>+)( ?)(.*)$")
