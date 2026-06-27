@@ -1577,24 +1577,27 @@ class MailService:
     def archive_read_messages(
         self, account_uid: str, folder_name: str
     ) -> dict[str, Any]:
-        with self._lock:
-            return self._archive_read_messages_unlocked(account_uid, folder_name)
+        return run_on_mail_thread(
+            self._archive_read_messages_unlocked, account_uid, folder_name
+        )
 
     def count_read_unflagged_messages(
         self, account_uid: str, folder_name: str
     ) -> int:
-        with self._lock:
-            return self._count_read_unflagged_messages_unlocked(
-                account_uid, folder_name
-            )
+        return run_on_mail_thread(
+            self._count_read_unflagged_messages_unlocked,
+            account_uid,
+            folder_name,
+        )
 
     def archive_read_unflagged_messages(
         self, account_uid: str, folder_name: str
     ) -> dict[str, Any]:
-        with self._lock:
-            return self._archive_read_unflagged_messages_unlocked(
-                account_uid, folder_name
-            )
+        return run_on_mail_thread(
+            self._archive_read_unflagged_messages_unlocked,
+            account_uid,
+            folder_name,
+        )
 
     def _create_folder_unlocked(
         self,
@@ -2123,19 +2126,21 @@ class MailService:
     def toggle_message_seen(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
-        return self._with_mail_op(
-            lambda: self._toggle_message_seen_unlocked(
-                account_uid, folder_name, message_uid
-            )
+        return run_on_mail_thread(
+            self._toggle_message_seen_unlocked,
+            account_uid,
+            folder_name,
+            message_uid,
         )
 
     def toggle_message_flagged(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
-        return self._with_mail_op(
-            lambda: self._toggle_message_flagged_unlocked(
-                account_uid, folder_name, message_uid
-            )
+        return run_on_mail_thread(
+            self._toggle_message_flagged_unlocked,
+            account_uid,
+            folder_name,
+            message_uid,
         )
 
     def set_messages_seen(
@@ -2146,10 +2151,12 @@ class MailService:
         *,
         seen: bool,
     ) -> dict[str, Any]:
-        return self._with_mail_op(
-            lambda: self._set_messages_seen_unlocked(
-                account_uid, folder_name, message_uids, seen=seen
-            )
+        return run_on_mail_thread(
+            self._set_messages_seen_unlocked,
+            account_uid,
+            folder_name,
+            message_uids,
+            seen=seen,
         )
 
     def set_messages_flagged(
@@ -2160,45 +2167,53 @@ class MailService:
         *,
         flagged: bool,
     ) -> dict[str, Any]:
-        return self._with_mail_op(
-            lambda: self._set_messages_flagged_unlocked(
-                account_uid, folder_name, message_uids, flagged=flagged
-            )
+        return run_on_mail_thread(
+            self._set_messages_flagged_unlocked,
+            account_uid,
+            folder_name,
+            message_uids,
+            flagged=flagged,
         )
 
     def toggle_messages_seen(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
-        return self._with_mail_op(
-            lambda: self._toggle_messages_seen_unlocked(
-                account_uid, folder_name, message_uids
-            )
+        return run_on_mail_thread(
+            self._toggle_messages_seen_unlocked,
+            account_uid,
+            folder_name,
+            message_uids,
         )
 
     def toggle_messages_flagged(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
-        return self._with_mail_op(
-            lambda: self._toggle_messages_flagged_unlocked(
-                account_uid, folder_name, message_uids
-            )
+        return run_on_mail_thread(
+            self._toggle_messages_flagged_unlocked,
+            account_uid,
+            folder_name,
+            message_uids,
         )
 
     def move_messages_to_trash(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
-        with self._lock:
-            return self._move_messages_to_trash_unlocked(
-                account_uid, folder_name, message_uids
-            )
+        return run_on_mail_thread(
+            self._move_messages_to_trash_unlocked,
+            account_uid,
+            folder_name,
+            message_uids,
+        )
 
     def archive_messages(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
-        with self._lock:
-            return self._archive_messages_unlocked(
-                account_uid, folder_name, message_uids
-            )
+        return run_on_mail_thread(
+            self._archive_messages_unlocked,
+            account_uid,
+            folder_name,
+            message_uids,
+        )
 
     def move_messages(
         self,
@@ -2207,22 +2222,37 @@ class MailService:
         destination_folder: str,
         message_uids: list[str],
     ) -> dict[str, Any]:
-        with self._lock:
-            store = self._get_store_unlocked(account_uid)
-            dest = store.get_folder_sync(destination_folder, 0, None)
-            if dest is None:
-                raise ValueError(f"Folder not found: {destination_folder}")
-            return self._transfer_messages_unlocked(
-                account_uid, source_folder, message_uids, dest
-            )
+        return run_on_mail_thread(
+            self._move_messages_unlocked,
+            account_uid,
+            source_folder,
+            destination_folder,
+            message_uids,
+        )
 
     def mark_message_read(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> tuple[int, int]:
-        return self._with_mail_op(
-            lambda: self._mark_message_read_unlocked(
-                account_uid, folder_name, message_uid
-            )
+        return run_on_mail_thread(
+            self._mark_message_read_unlocked,
+            account_uid,
+            folder_name,
+            message_uid,
+        )
+
+    def _move_messages_unlocked(
+        self,
+        account_uid: str,
+        source_folder: str,
+        destination_folder: str,
+        message_uids: list[str],
+    ) -> dict[str, Any]:
+        store = self._get_store_unlocked(account_uid)
+        dest = store.get_folder_sync(destination_folder, 0, None)
+        if dest is None:
+            raise ValueError(f"Folder not found: {destination_folder}")
+        return self._transfer_messages_unlocked(
+            account_uid, source_folder, message_uids, dest
         )
 
     def _read_message_unlocked(
