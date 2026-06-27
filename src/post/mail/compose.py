@@ -827,6 +827,19 @@ def _build_alternative_multipart(
     return alternative
 
 
+def _wrap_multipart_as_mime_part(multipart: Any, mime_type: str) -> Any:
+    """Wrap a Camel.Multipart so it can be added to multipart/mixed."""
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    wrapper = Camel.MimePart.new()
+    wrapper.props.content = multipart
+    wrapper.set_mime_type(mime_type)
+    return wrapper
+
+
 def _set_message_body(
     message: Any,
     body: str,
@@ -855,7 +868,10 @@ def _set_message_body(
     multipart.set_boundary(f"----post-{uuid.uuid4().hex}")
 
     if encoded_html:
-        multipart.add_part(_build_alternative_multipart(encoded_plain, encoded_html))
+        alternative = _build_alternative_multipart(encoded_plain, encoded_html)
+        multipart.add_part(
+            _wrap_multipart_as_mime_part(alternative, "multipart/alternative")
+        )
     else:
         body_part = Camel.MimePart.new()
         body_part.set_content(encoded_plain, "text/plain; charset=utf-8")
