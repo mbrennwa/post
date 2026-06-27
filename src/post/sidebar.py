@@ -273,6 +273,47 @@ class MailSidebar:
         self.update_folder_row(account_uid, folder_name, unread, total)
         return False
 
+    def refresh_folder_counts(self, account_uid: str, folder_name: str) -> None:
+        """Re-fetch folder stats and update sidebar rows."""
+
+        def worker() -> None:
+            error: Exception | None = None
+            unread = -1
+            total = -1
+            try:
+                unread, total = self._mail.get_folder_stats(account_uid, folder_name)
+            except Exception as exc:
+                log_mail_error(
+                    log,
+                    f"Failed to refresh counts for {folder_name!r} ({account_uid})",
+                    exc,
+                )
+                error = exc
+            GLib.idle_add(
+                self._on_folder_counts_refreshed,
+                account_uid,
+                folder_name,
+                unread,
+                total,
+                error,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_folder_counts_refreshed(
+        self,
+        account_uid: str,
+        folder_name: str,
+        unread: int,
+        total: int,
+        error: Exception | None,
+    ) -> bool:
+        if error is not None:
+            return False
+
+        self.update_folder_row(account_uid, folder_name, unread, total)
+        return False
+
     def reload_account(self, account_uid: str) -> None:
         account = self._accounts_by_uid.get(account_uid)
         folder_list = self._folder_lists.get(account_uid)

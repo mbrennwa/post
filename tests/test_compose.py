@@ -24,6 +24,7 @@ from post.mail.compose import (
     normalize_email,
     parse_address_header,
     parse_address_list,
+    parse_draft_address_list,
     quote_html_forward,
     quote_plain_forward,
     quote_plain_reply,
@@ -76,6 +77,24 @@ class ParseAddressListTests(unittest.TestCase):
             parse_address_list("mbrennwa@gmail.com <mbrennwa@gmail.com>"),
             ["mbrennwa@gmail.com"],
         )
+
+
+class ParseDraftAddressListTests(unittest.TestCase):
+    def test_allows_invalid_address(self) -> None:
+        self.assertEqual(parse_draft_address_list("asdf"), ["asdf"])
+
+    def test_allows_valid_and_invalid(self) -> None:
+        self.assertEqual(
+            parse_draft_address_list("asdf, user@example.com"),
+            ["asdf", "user@example.com"],
+        )
+
+    def test_empty(self) -> None:
+        self.assertEqual(parse_draft_address_list(""), [])
+
+    def test_rejects_newlines(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_draft_address_list("bob@example.com\r\nBcc: evil@example.com")
 
 
 class BuildReplySubjectTests(unittest.TestCase):
@@ -279,6 +298,18 @@ class BuildDraftMimeMessageTests(unittest.TestCase):
         )
         self.assertIsNotNone(message.get_recipients("to"))
         self.assertIsNotNone(message.get_recipients("cc"))
+
+    def test_allows_unparseable_to_address(self) -> None:
+        message = build_draft_mime_message(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["asdf"],
+            cc=None,
+            bcc=None,
+            subject="Hi",
+            body="Hello",
+        )
+        self.assertIsNotNone(message.get_recipients("to"))
 
 
 class BuildPlainMimeMessageTests(unittest.TestCase):

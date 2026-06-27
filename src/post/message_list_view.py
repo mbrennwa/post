@@ -181,6 +181,39 @@ class VirtualMessageList(Gtk.ScrolledWindow):
             self._rebuild_uid_positions()
         return removed
 
+    def upsert_message(
+        self,
+        message: dict[str, Any],
+        *,
+        folder_name: str,
+        replace_uid: str | None = None,
+    ) -> None:
+        uid = str(message.get("uid") or "")
+        if not uid:
+            return
+        self._folder_name = folder_name
+        message = dict(message)
+
+        if replace_uid:
+            replace_position = self._uid_positions.get(replace_uid)
+            if replace_position is not None:
+                item = self._store.get_item(replace_position)
+                if isinstance(item, MessageListItem):
+                    item.set_message(message)
+                    if replace_uid != uid:
+                        del self._uid_positions[replace_uid]
+                        self._uid_positions[uid] = replace_position
+                    return
+
+        position = self._uid_positions.get(uid)
+        if position is not None:
+            item = self._store.get_item(position)
+            if isinstance(item, MessageListItem):
+                item.set_message(message)
+            return
+
+        self.prepend_messages([message], folder_name=folder_name)
+
     def update_message_flags(self, uid: str, flags: dict[str, Any]) -> None:
         position = self._uid_positions.get(uid)
         if position is None:

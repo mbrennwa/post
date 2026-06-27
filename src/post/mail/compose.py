@@ -118,6 +118,21 @@ def parse_address_list(text: str) -> list[str]:
     return addresses
 
 
+def parse_draft_address_list(text: str) -> list[str]:
+    """Parse a To/Cc/Bcc field for draft saving without validating addresses."""
+    text = text.strip()
+    if not text:
+        return []
+
+    addresses: list[str] = []
+    for part in _ADDRESS_SPLIT.split(text):
+        part = part.strip()
+        if not part:
+            continue
+        addresses.append(_sanitize_header_field(part, field="Recipient address"))
+    return addresses
+
+
 def addresses_to_internet_address(addresses: list[str]) -> Any | None:
     import gi
 
@@ -137,6 +152,35 @@ def addresses_to_internet_address(addresses: list[str]) -> Any | None:
                 safe_name = _sanitize_optional_header_field(name, field="Display name")
                 safe_address = _sanitize_header_field(address, field="Recipient address")
                 container.add(safe_name or "", safe_address)
+    return container if container.length() > 0 else None
+
+
+def draft_addresses_to_internet_address(addresses: list[str]) -> Any | None:
+    """Build Camel recipients for drafts, preserving unparseable addresses."""
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    if not addresses:
+        return None
+
+    container = Camel.InternetAddress.new()
+    for item in addresses:
+        single = Camel.InternetAddress.new()
+        single.unformat(item.strip())
+        if single.length() > 0:
+            for index in range(single.length()):
+                ok, name, address = single.get(index)
+                if ok and address:
+                    safe_name = _sanitize_optional_header_field(name, field="Display name")
+                    safe_address = _sanitize_header_field(address, field="Recipient address")
+                    container.add(safe_name or "", safe_address)
+        else:
+            container.add(
+                "",
+                _sanitize_header_field(item.strip(), field="Recipient address"),
+            )
     return container if container.length() > 0 else None
 
 
@@ -638,6 +682,7 @@ def _apply_compose_headers(
     include_bcc_header: bool = True,
     message_id: str | None = None,
     date: str | None = None,
+    allow_unparseable_recipients: bool = False,
 ) -> None:
     import gi
 
@@ -653,22 +698,27 @@ def _apply_compose_headers(
     sender.add(safe_from_name or "", from_address)
     message.set_from(sender)
 
-    to_addrs = addresses_to_internet_address(to or [])
+    if allow_unparseable_recipients:
+        to_container = draft_addresses_to_internet_address(to or [])
+        cc_container = draft_addresses_to_internet_address(cc or [])
+        bcc_container = draft_addresses_to_internet_address(bcc or [])
+    else:
+        to_container = addresses_to_internet_address(to or [])
+        cc_container = addresses_to_internet_address(cc or [])
+        bcc_container = addresses_to_internet_address(bcc or [])
+
     if require_to:
-        if to_addrs is None:
+        if to_container is None:
             raise ValueError("At least one valid To address is required")
-        message.set_recipients("To", to_addrs)
-    elif to_addrs is not None:
-        message.set_recipients("To", to_addrs)
+        message.set_recipients("To", to_container)
+    elif to_container is not None:
+        message.set_recipients("To", to_container)
 
-    cc_addrs = addresses_to_internet_address(cc or [])
-    if cc_addrs is not None:
-        message.set_recipients("Cc", cc_addrs)
+    if cc_container is not None:
+        message.set_recipients("Cc", cc_container)
 
-    if include_bcc_header:
-        bcc_addrs = addresses_to_internet_address(bcc or [])
-        if bcc_addrs is not None:
-            message.set_recipients("Bcc", bcc_addrs)
+    if include_bcc_header and bcc_container is not None:
+        message.set_recipients("Bcc", bcc_container)
 
     safe_in_reply_to = _sanitize_optional_header_field(
         in_reply_to, field="In-Reply-To"
@@ -1054,6 +1104,7 @@ def build_draft_mime_message(
         in_reply_to=in_reply_to,
         references=references,
         require_to=False,
+        allow_unparseable_recipients=True,
     )
     _set_message_body(message, body, attachments, body_html=body_html)
     return message

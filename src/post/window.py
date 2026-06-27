@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 
 import gi
@@ -20,7 +21,7 @@ gi.require_version("Gdk", "4.0")
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, WebKit
 
-from post.compose_window import ComposeWindow
+from post.compose_window import ComposeWindow, SavedDraftNotification
 from post.credentials import prompt_password_sync
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
@@ -165,6 +166,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._restore_message_folder: tuple[str, str] | None = None
         self._pending_restore_message_uid: str | None = None
         self._suppress_sync_list_reload: tuple[str, str] | None = None
+        self._local_draft_sync_suppress_until: dict[tuple[str, str], float] = {}
         self._user_message_click_pending = False
         self._search_query: MessageSearchQuery | None = None
         self._search_entry_updating = False
@@ -957,8 +959,7 @@ class MainWindow(Adw.ApplicationWindow):
             and self._current_account.uid == account_uid
             and self._current_folder == folder_name
         ):
-            if self._suppress_sync_list_reload == (account_uid, folder_name):
-                self._suppress_sync_list_reload = None
+            if self._sync_list_reload_suppressed(account_uid, folder_name):
                 return
             self._load_messages(account_uid, folder_name, sync=True)
 
@@ -1091,6 +1092,7 @@ class MainWindow(Adw.ApplicationWindow):
             set_status=self._set_status,
             on_outbox_changed=self._on_outbox_changed,
             on_draft_saved=self._on_draft_saved,
+            on_draft_save_started=self._on_draft_save_started,
             mode=mode,  # type: ignore[arg-type]
             reply_to=reply_to,
             draft_folder_name=draft_folder_name,
@@ -1099,14 +1101,127 @@ class MainWindow(Adw.ApplicationWindow):
         )
         window.present()
 
-    def _on_draft_saved(self) -> None:
-        if self._current_account is None or self._current_folder is None:
+    def _on_draft_save_started(
+        self, account_uid: str, drafts_folder_name: str | None
+    ) -> None:
+        folder_name = drafts_folder_name
+        if (
+            folder_name is None
+            and self._current_account is not None
+            and self._current_account.uid == account_uid
+            and self._current_folder is not None
+            and self._sidebar.folder_is_drafts(account_uid, self._current_folder)
+        ):
+            folder_name = self._current_folder
+        if folder_name is None:
             return
-        self._load_messages(
-            self._current_account.uid,
-            self._current_folder,
-            sync=self._network_available and get_auto_sync(),
+        self._suppress_local_draft_sync_reload(account_uid, folder_name)
+
+    def _suppress_local_draft_sync_reload(
+        self, account_uid: str, folder_name: str, *, seconds: float = 2.0
+    ) -> None:
+        key = (account_uid, folder_name)
+        until = time.time() + seconds
+        current = self._local_draft_sync_suppress_until.get(key, 0)
+        if until > current:
+            self._local_draft_sync_suppress_until[key] = until
+
+    def _sync_list_reload_suppressed(
+        self, account_uid: str, folder_name: str
+    ) -> bool:
+        key = (account_uid, folder_name)
+        if time.time() < self._local_draft_sync_suppress_until.get(key, 0):
+            return True
+        self._local_draft_sync_suppress_until.pop(key, None)
+        if self._suppress_sync_list_reload == key:
+            self._suppress_sync_list_reload = None
+            return True
+        return False
+
+    def _on_draft_saved(self, notification: SavedDraftNotification) -> None:
+        self._suppress_local_draft_sync_reload(
+            notification.account_uid, notification.folder_name
         )
+        self._sidebar.refresh_folder_counts(
+            notification.account_uid, notification.folder_name
+        )
+        if (
+            self._current_account is None
+            or self._current_account.uid != notification.account_uid
+            or self._current_folder != notification.folder_name
+        ):
+            return
+
+        if notification.removed:
+            removed_uid = notification.previous_uid or notification.uid
+            if removed_uid:
+                self._message_list_view.remove_uids([removed_uid])
+                self._remove_message_from_folder_cache(removed_uid)
+                if self._current_message_uid == removed_uid:
+                    self._clear_reader()
+            return
+
+        if notification.uid is None:
+            return
+
+        existing: dict | None = None
+        for lookup_uid in (notification.uid, notification.previous_uid):
+            if lookup_uid:
+                existing = self._message_list_view.get_message(lookup_uid)
+                if existing is not None:
+                    break
+
+        flags = dict((existing or {}).get("flags") or {})
+        flags["attachments"] = notification.has_attachments
+
+        message = {
+            "uid": notification.uid,
+            "subject": notification.subject or "(no subject)",
+            "from": notification.from_label,
+            "to": notification.to,
+            "sort_date": notification.sort_date,
+            "flags": flags,
+        }
+        self._message_list_view.upsert_message(
+            message,
+            folder_name=notification.folder_name,
+            replace_uid=notification.previous_uid,
+        )
+        self._upsert_message_in_folder_cache(message, notification.previous_uid)
+        if (
+            notification.previous_uid
+            and self._current_message_uid == notification.previous_uid
+            and notification.uid is not None
+        ):
+            self._current_message_uid = notification.uid
+
+    def _upsert_message_in_folder_cache(
+        self,
+        message: dict,
+        previous_uid: str | None,
+    ) -> None:
+        if self._current_folder_messages is None:
+            return
+        messages = list(self._current_folder_messages)
+        uid = str(message.get("uid") or "")
+        if previous_uid and previous_uid != uid:
+            messages = [item for item in messages if item.get("uid") != previous_uid]
+        for index, item in enumerate(messages):
+            if item.get("uid") == uid:
+                messages[index] = dict(message)
+                self._current_folder_messages = messages
+                return
+        messages.insert(0, dict(message))
+        self._current_folder_messages = messages
+
+    def _remove_message_from_folder_cache(self, uid: str) -> None:
+        if self._current_folder_messages is None:
+            return
+        self._current_folder_messages = [
+            message
+            for message in self._current_folder_messages
+            if message.get("uid") != uid
+        ]
 
     def _setup_undo_action(self) -> None:
         self._undo_move_action = Gio.SimpleAction.new("undo-move", None)
@@ -2850,12 +2965,17 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_message_list_item_activated(self, uid: str) -> None:
         if self._message_list_view.is_restoring_selection():
             return
-        mark_seen = self._user_message_click_pending
-        self._user_message_click_pending = False
         if not self._current_account or not self._current_folder:
             return
         if len(self._message_list_view.get_selected_uids()) != 1:
             return
+        if self._sidebar.folder_is_drafts(
+            self._current_account.uid, self._current_folder
+        ):
+            self._open_draft_for_editing(uid)
+            return
+        mark_seen = self._user_message_click_pending
+        self._user_message_click_pending = False
         if uid == self._current_message_uid and self._current_message is not None:
             return
         self._current_message_uid = uid
@@ -2928,27 +3048,55 @@ class MainWindow(Adw.ApplicationWindow):
             except Exception as exc:
                 log.exception("Failed to read message")
                 error = exc
-            if viewing_drafts:
-                GLib.idle_add(
-                    self._on_draft_message_loaded,
-                    account,
-                    folder_name,
-                    uid,
-                    msg,
-                    error,
-                )
-            else:
-                GLib.idle_add(
-                    self._on_message_read,
-                    read_id,
-                    uid,
-                    msg,
-                    error,
-                )
+            GLib.idle_add(
+                self._on_message_read,
+                read_id,
+                uid,
+                msg,
+                error,
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_draft_message_loaded(
+    def _open_draft_for_editing(self, uid: str) -> None:
+        if not self._current_account or not self._current_folder:
+            return
+
+        account = self._current_account
+        folder_name = self._current_folder
+
+        def worker() -> None:
+            error: Exception | None = None
+            msg: dict | None = None
+            try:
+                msg = self._mail.read_message(
+                    account.uid,
+                    folder_name,
+                    uid,
+                    mark_seen=False,
+                )
+            except MessageNotAvailableError as exc:
+                log.warning(
+                    "Draft %s no longer available in %r",
+                    uid,
+                    folder_name,
+                )
+                error = exc
+            except Exception as exc:
+                log.exception("Failed to read draft for editing")
+                error = exc
+            GLib.idle_add(
+                self._on_draft_compose_loaded,
+                account,
+                folder_name,
+                uid,
+                msg,
+                error,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_draft_compose_loaded(
         self,
         account: MailAccount,
         folder_name: str,
