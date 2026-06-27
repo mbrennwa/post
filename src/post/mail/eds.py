@@ -1764,7 +1764,7 @@ class MailService:
         limit: int = DEFAULT_MESSAGE_PAGE_SIZE,
         sync: bool = True,
     ) -> tuple[list[dict], int, int, bool]:
-        with self._lock:
+        if is_mail_io_thread():
             return self._list_messages_page_unlocked(
                 account_uid,
                 folder_name,
@@ -1772,6 +1772,14 @@ class MailService:
                 limit=limit,
                 sync=sync,
             )
+        return get_mail_io_thread().run_sync(
+            self._list_messages_page_unlocked,
+            account_uid,
+            folder_name,
+            offset=offset,
+            limit=limit,
+            sync=sync,
+        )
 
     def _get_folder_messages_unlocked(
         self,
@@ -1928,11 +1936,12 @@ class MailService:
         limit: int,
         sync: bool,
     ) -> tuple[list[dict], int, int, bool]:
-        index, _source = self._get_folder_index_unlocked(
-            account_uid, folder_name, sync=sync
-        )
-        page, has_more = paginate_messages(index.messages, offset, limit)
-        return page, index.unread, index.total, has_more
+        with self._lock:
+            index, _source = self._get_folder_index_unlocked(
+                account_uid, folder_name, sync=sync
+            )
+            page, has_more = paginate_messages(index.messages, offset, limit)
+            return page, index.unread, index.total, has_more
 
     def _get_folder_index_unlocked(
         self,
