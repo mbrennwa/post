@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from post.mail.helpers import extract_inline_images, get_attachment_data
+from post.mail.helpers import extract_inline_images, extract_attachments, get_attachment_data
 
 
 class _FakeMimeMessage:
@@ -55,6 +55,42 @@ iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADULEQVR42mP8z8BQDwAEhQGAhKmMIQAA
 --bound--
 """
 
+_SAMPLE_RFC5987_MIME = b"""From: a@example.com
+To: b@example.com
+Subject: Unicode attachment
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bound"
+
+--bound
+Content-Type: text/plain
+
+Hello
+--bound
+Content-Type: application/pdf
+Content-Disposition: attachment; filename*=utf-8''r%C3%A9sum%C3%A9.pdf
+
+%PDF-fake-content
+--bound--
+"""
+
+_SAMPLE_RFC2047_FILENAME_MIME = b"""From: a@example.com
+To: b@example.com
+Subject: Encoded-word attachment
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bound"
+
+--bound
+Content-Type: text/plain
+
+Hello
+--bound
+Content-Type: application/pdf
+Content-Disposition: attachment; filename="=?ISO-8859-1?Q?r=E9sum=E9.pdf?="
+
+%PDF-fake-content
+--bound--
+"""
+
 
 class GetAttachmentDataTests(unittest.TestCase):
     def test_email_fallback_extracts_attachment_bytes(self) -> None:
@@ -67,6 +103,21 @@ class GetAttachmentDataTests(unittest.TestCase):
         mime = _FakeMimeMessage(_SAMPLE_MIME)
         with self.assertRaises(ValueError):
             get_attachment_data(mime, 99)
+
+    def test_email_fallback_decodes_rfc5987_filename(self) -> None:
+        mime = _FakeMimeMessage(_SAMPLE_RFC5987_MIME)
+        attachments = extract_attachments(mime)
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["filename"], "résumé.pdf")
+        filename, data = get_attachment_data(mime, 0)
+        self.assertEqual(filename, "résumé.pdf")
+        self.assertIn(b"%PDF-fake-content", data)
+
+    def test_email_fallback_decodes_rfc2047_filename(self) -> None:
+        mime = _FakeMimeMessage(_SAMPLE_RFC2047_FILENAME_MIME)
+        attachments = extract_attachments(mime)
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["filename"], "résumé.pdf")
 
 
 class ExtractInlineImagesTests(unittest.TestCase):
