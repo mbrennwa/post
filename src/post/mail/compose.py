@@ -958,6 +958,13 @@ def _encode_html_body(body_html: str) -> bytes:
     return encoded if encoded else b"\n"
 
 
+def _attachment_content_disposition(filename: str) -> str:
+    """Build RFC 5987 Content-Disposition matching stdlib EmailMessage."""
+    from email.utils import encode_rfc2231
+
+    return f"attachment; filename*={encode_rfc2231(filename, charset='utf-8')}"
+
+
 def _build_alternative_multipart(
     encoded_plain: bytes,
     encoded_html: bytes,
@@ -1021,10 +1028,17 @@ def _set_message_body(
     for attachment in attachments or ():
         part = Camel.MimePart.new()
         part.set_content(attachment.data, attachment.mime_type)
-        part.set_disposition("attachment")
-        part.set_filename(
-            _sanitize_header_field(attachment.filename, field="Attachment filename")
+        safe_filename = _sanitize_header_field(
+            attachment.filename, field="Attachment filename"
         )
+        if safe_filename.isascii():
+            part.set_disposition("attachment")
+            part.set_filename(safe_filename)
+        else:
+            part.set_header(
+                "Content-Disposition",
+                _attachment_content_disposition(safe_filename),
+            )
         part.set_encoding(Camel.TransferEncoding.ENCODING_BASE64)
         multipart.add_part(part)
 
