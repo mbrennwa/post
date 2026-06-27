@@ -522,6 +522,9 @@ def _walk_mime_parts(part: Any, bodies: dict[str, str | None]) -> None:
     gi.require_version("Camel", "1.2")
     from gi.repository import Camel
 
+    if not hasattr(part, "get_content_type"):
+        return
+
     content_type = part.get_content_type()
     if content_type is None:
         return
@@ -646,6 +649,56 @@ def _walk_inline_image_parts(
     images[_normalize_content_id(str(content_id))] = (mime_type, data)
 
 
+def _charset_from_camel_part(part: Any) -> str | None:
+    content_type = part.get_content_type() if hasattr(part, "get_content_type") else None
+    if content_type is None:
+        return None
+    try:
+        charset = content_type.param("charset")
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if charset is None or charset == "":
+        return None
+    return str(charset)
+
+
+def _decode_text_bytes(raw: bytes, charset: str | None = None) -> str:
+    encodings: list[str] = []
+    if charset:
+        normalized = charset.strip().strip('"').strip("'")
+        if normalized:
+            encodings.append(normalized)
+    for fallback in ("utf-8", "latin-1"):
+        if fallback not in encodings:
+            encodings.append(fallback)
+    for encoding in encodings:
+        try:
+            return raw.decode(encoding)
+        except LookupError:
+            continue
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _email_part_text(part: Any) -> str | None:
+    try:
+        payload = part.get_content()
+    except Exception:
+        payload = part.get_payload(decode=True)
+        if not isinstance(payload, bytes):
+            return None
+        charset = part.get_content_charset()
+        return _decode_text_bytes(payload, charset)
+
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, bytes):
+        charset = part.get_content_charset()
+        return _decode_text_bytes(payload, charset)
+    return None
+
+
 def _email_module_fallback(mime_msg: Any, bodies: dict[str, str | None]) -> None:
     """Parse raw MIME with Python's email module when Camel walking finds nothing."""
     import email
@@ -657,21 +710,23 @@ def _email_module_fallback(mime_msg: Any, bodies: dict[str, str | None]) -> None
 
     try:
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
-        for part in msg.walk():
-            ct = part.get_content_type()
-            payload = part.get_content()
-            if isinstance(payload, bytes):
-                text = payload.decode("utf-8", errors="replace")
-            elif isinstance(payload, str):
-                text = payload
-            else:
-                continue
-            if ct == "text/plain" and bodies["plain"] is None:
-                bodies["plain"] = text
-            elif ct == "text/html" and bodies["html"] is None:
-                bodies["html"] = text
     except Exception:
-        pass
+        return
+
+    for part in msg.walk():
+        ct = part.get_content_type()
+        if ct.startswith("multipart/"):
+            continue
+        try:
+            text = _email_part_text(part)
+        except Exception:
+            continue
+        if text is None:
+            continue
+        if ct == "text/plain" and bodies["plain"] is None:
+            bodies["plain"] = text
+        elif ct == "text/html" and bodies["html"] is None:
+            bodies["html"] = text
 
 
 def _walk_attachment_parts(
@@ -876,7 +931,7 @@ def _decode_text_part(part: Any) -> str | None:
             if data:
                 raw = bytes(data) if not isinstance(data, bytes) else data
                 if raw:
-                    return raw.decode("utf-8", errors="replace")
+                    return _decode_text_bytes(raw, _charset_from_camel_part(part))
     except Exception:
         pass
     return None
