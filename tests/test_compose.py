@@ -902,6 +902,81 @@ class ParseAddressHeaderTests(unittest.TestCase):
             ["a@example.com", "Bob <b@example.com>"],
         )
 
+    def test_skips_invalid_address(self) -> None:
+        self.assertEqual(parse_address_header("not-an-address"), [])
+
+    def test_skips_missing_local_part(self) -> None:
+        self.assertEqual(parse_address_header("@xyz"), [])
+
+    def test_skips_missing_domain(self) -> None:
+        self.assertEqual(parse_address_header("user@"), [])
+
+    def test_keeps_valid_and_skips_invalid_in_list(self) -> None:
+        self.assertEqual(
+            parse_address_header("a@example.com, not-an-address, @invalid"),
+            ["a@example.com"],
+        )
+
+    def test_email_as_display_name_normalizes_to_bare(self) -> None:
+        self.assertEqual(
+            parse_address_header("mbrennwa@gmail.com <mbrennwa@gmail.com>"),
+            ["mbrennwa@gmail.com"],
+        )
+
+    def test_valid_entries_match_strict_parser(self) -> None:
+        cases = [
+            "user@example.com",
+            "Alice <alice@example.com>",
+            "a@example.com, Bob <b@example.com>",
+            "mbrennwa@gmail.com <mbrennwa@gmail.com>",
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                self.assertEqual(
+                    parse_address_header(case),
+                    parse_address_list(case),
+                )
+
+
+class BuildReplyAllMalformedHeaderTests(unittest.TestCase):
+    def test_skips_invalid_stored_addresses(self) -> None:
+        original = {
+            "from": "@bad-from",
+            "reply_to": "",
+            "to": "Alice <alice@example.com>, @invalid",
+            "cc": "user@, Carol <carol@example.com>",
+        }
+        to_addrs, cc_addrs = build_reply_all_recipients(
+            original,
+            own_addresses=set(),
+        )
+        self.assertEqual(
+            to_addrs,
+            ["Alice <alice@example.com>"],
+        )
+        self.assertEqual(cc_addrs, ["Carol <carol@example.com>"])
+
+    def test_prefilled_addresses_pass_send_validation(self) -> None:
+        original = {
+            "from": "Author <author@example.com>",
+            "reply_to": "",
+            "to": "Alice <alice@example.com>, @invalid",
+            "cc": "user@, Carol <carol@example.com>",
+        }
+        to_addrs, cc_addrs = build_reply_all_recipients(
+            original,
+            own_addresses=set(),
+        )
+        for address in to_addrs + cc_addrs:
+            with self.subTest(address=address):
+                parse_address_list(address)
+
+
+class ExtractReplyAddressInvalidFromTests(unittest.TestCase):
+    def test_raises_for_unparseable_from(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no From address"):
+            extract_reply_address("@bad-from")
+
 
 class FormatAddressListTests(unittest.TestCase):
     def test_joins_addresses(self) -> None:
