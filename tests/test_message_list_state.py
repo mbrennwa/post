@@ -28,7 +28,15 @@ class MessageListFingerprintTests(unittest.TestCase):
         messages = [_msg("3"), _msg("1"), _msg("2")]
         self.assertEqual(
             message_list_fingerprint(messages),
-            ("3", "1", "2"),
+            ("3:Message 3", "1:Message 1", "2:Message 2"),
+        )
+
+    def test_subject_change_is_detected(self) -> None:
+        first = [{"uid": "1", "subject": "Old subject"}]
+        second = [{"uid": "1", "subject": "New subject"}]
+        self.assertNotEqual(
+            message_list_fingerprint(first),
+            message_list_fingerprint(second),
         )
 
     def test_order_change_is_detected(self) -> None:

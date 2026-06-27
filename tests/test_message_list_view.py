@@ -108,5 +108,47 @@ class PrependMessagesTests(unittest.TestCase):
         self.assertTrue(scrolled["called"])
 
 
+class UpsertMessageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not Gtk.is_initialized():
+            Gtk.init()
+
+    def setUp(self) -> None:
+        self.message_list = VirtualMessageList()
+        self.message_list.set_messages([_msg("1", seen=False)], folder_name="Drafts")
+
+    def test_upsert_message_updates_subject_in_place(self) -> None:
+        updated = {
+            "uid": "1",
+            "subject": "Updated subject",
+            "from": "sender@example.com",
+            "flags": {"seen": False, "flagged": False},
+        }
+        self.message_list.upsert_message(updated, folder_name="Drafts")
+
+        message = self.message_list.get_message("1")
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertEqual(message["subject"], "Updated subject")
+
+    def test_upsert_message_replaces_uid_in_place(self) -> None:
+        replacement = {
+            "uid": "2",
+            "subject": "New draft",
+            "from": "sender@example.com",
+            "flags": {"seen": True, "flagged": False},
+        }
+        self.message_list.upsert_message(
+            replacement,
+            folder_name="Drafts",
+            replace_uid="1",
+        )
+
+        self.assertIsNone(self.message_list.get_message("1"))
+        self.assertEqual(self.message_list.get_message("2"), replacement)
+        self.assertEqual(self.message_list.item_count(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

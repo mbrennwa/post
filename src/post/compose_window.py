@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -38,6 +39,7 @@ from post.mail.compose import (
     guess_attachment_mime_type,
     normalize_email,
     parse_address_list,
+    parse_draft_address_list,
     plain_to_simple_html,
     quote_plain_forward,
     quote_plain_reply,
@@ -63,13 +65,30 @@ from post.mail.send_queue import (
     remove_queued_outbound_message,
 )
 from post.preferences import get_account_signature, get_account_signatures
-from post.toast import show_error_toast
+from post.toast import show_error_toast, show_toast
 
 log = logging.getLogger(__name__)
 
 ComposeMode = Literal["new", "reply", "reply-all", "forward", "draft"]
 SetStatus = Callable[[str], None]
-OnDraftSaved = Callable[[], None]
+
+
+@dataclass(frozen=True)
+class SavedDraftNotification:
+    account_uid: str
+    folder_name: str
+    uid: str | None
+    previous_uid: str | None
+    subject: str
+    to: str
+    from_label: str
+    has_attachments: bool
+    sort_date: float
+    removed: bool = False
+
+
+OnDraftSaved = Callable[[SavedDraftNotification], None]
+OnDraftSaveStarted = Callable[[str, str | None], None]
 
 
 @dataclass
@@ -283,13 +302,14 @@ def _finish_outbound_send(
                 on_draft_saved,
                 on_outbox_changed,
                 success_status,
+                request,
             )
 
         threading.Thread(target=delete_worker, daemon=True).start()
         return False
 
     _complete_outbound_send_success(
-        set_status, on_draft_saved, on_outbox_changed, success_status
+        set_status, on_draft_saved, on_outbox_changed, success_status, request
     )
     return False
 
@@ -299,9 +319,23 @@ def _complete_outbound_send_success(
     on_draft_saved: OnDraftSaved | None,
     on_outbox_changed: Callable[[], None] | None,
     success_status: str | None,
+    request: OutboundSendRequest,
 ) -> bool:
-    if on_draft_saved is not None:
-        on_draft_saved()
+    if on_draft_saved is not None and request.draft_folder and request.draft_uid:
+        on_draft_saved(
+            SavedDraftNotification(
+                account_uid=request.account_uid,
+                folder_name=request.draft_folder,
+                uid=request.draft_uid,
+                previous_uid=request.draft_uid,
+                subject="",
+                to="",
+                from_label="",
+                has_attachments=False,
+                sort_date=0.0,
+                removed=True,
+            )
+        )
     if on_outbox_changed is not None:
         on_outbox_changed()
     set_status(success_status or "Message sent")
@@ -325,6 +359,7 @@ class ComposeWindow(Adw.Window):
         set_status: SetStatus,
         on_outbox_changed: Callable[[], None] | None = None,
         on_draft_saved: OnDraftSaved | None = None,
+        on_draft_save_started: OnDraftSaveStarted | None = None,
         mode: ComposeMode = "new",
         reply_to: dict[str, Any] | None = None,
         draft_folder_name: str | None = None,
@@ -337,6 +372,7 @@ class ComposeWindow(Adw.Window):
         self._set_status = set_status
         self._on_outbox_changed = on_outbox_changed
         self._on_draft_saved = on_draft_saved
+        self._on_draft_save_started = on_draft_save_started
         self._mode = mode
         self._reply_to = reply_to
         self._draft_folder_name = draft_folder_name
@@ -376,22 +412,21 @@ class ComposeWindow(Adw.Window):
         self.set_default_size(720, 560)
 
         header = Adw.HeaderBar()
-        header.set_show_end_title_buttons(False)
+        header.set_show_end_title_buttons(True)
         header.set_title_widget(Gtk.Label(label=title))
 
-        cancel_btn = Gtk.Button(label="Cancel")
-        cancel_btn.connect("clicked", self._on_cancel_clicked)
-        header.pack_start(cancel_btn)
-        self._cancel_btn = cancel_btn
+        self._save_draft_btn = Gtk.Button(label="Save Draft")
+        self._save_draft_btn.connect("clicked", self._on_save_draft_clicked)
 
         self._send_btn = Gtk.Button(label="Send")
         self._send_btn.add_css_class("suggested-action")
         self._send_btn.connect("clicked", self._on_send_clicked)
-        header.pack_end(self._send_btn)
 
-        self._save_draft_btn = Gtk.Button(label="Save Draft")
-        self._save_draft_btn.connect("clicked", self._on_save_draft_clicked)
-        header.pack_end(self._save_draft_btn)
+        send_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        send_actions.add_css_class("linked")
+        send_actions.append(self._send_btn)
+        send_actions.append(self._save_draft_btn)
+        header.pack_start(send_actions)
 
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -509,6 +544,7 @@ class ComposeWindow(Adw.Window):
         self._load_correspondents()
         self._update_field_hints()
         self._update_send_enabled()
+        self._update_save_draft_enabled()
         self.connect("close-request", self._on_close_request)
         GLib.idle_add(self._set_initial_focus)
         if self._mode == "draft":
@@ -820,6 +856,7 @@ class ComposeWindow(Adw.Window):
     def _mark_user_edited(self, *_args) -> None:
         if self._tracking_edits:
             self._user_edited = True
+            self._update_save_draft_enabled()
 
     def _on_form_field_changed(self, *_args) -> None:
         self._mark_user_edited()
@@ -928,6 +965,11 @@ class ComposeWindow(Adw.Window):
             return
         self._send_btn.set_sensitive(self._validate_send_fields())
 
+    def _update_save_draft_enabled(self) -> None:
+        if self._saving_draft:
+            return
+        self._save_draft_btn.set_sensitive(self._user_edited)
+
     def _prefill_fields(self) -> None:
         self._tracking_edits = False
         try:
@@ -936,6 +978,7 @@ class ComposeWindow(Adw.Window):
             self._tracking_edits = True
         self._update_field_hints()
         self._update_send_enabled()
+        self._update_save_draft_enabled()
 
     def _prefill_fields_impl(self) -> None:
         account = self._selected_account()
@@ -1062,28 +1105,17 @@ class ComposeWindow(Adw.Window):
         """Close the compose window without re-entering close-request."""
         self.destroy()
 
-    def _request_dismiss(self) -> None:
-        """Cancel button and explicit dismiss: prompt only when the user edited."""
-        if self._saving_draft:
-            return
-        if not self._user_edited:
-            self._dismiss()
-            return
-        self._prompt_save_before_close()
-
     def _set_compose_actions_sensitive(self, sensitive: bool) -> None:
         if not sensitive:
-            self._cancel_btn.set_sensitive(False)
             self._save_draft_btn.set_sensitive(False)
             self._send_btn.set_sensitive(False)
             self._attach_files_btn.set_sensitive(False)
             self._attachments_box.set_sensitive(False)
             return
-        self._cancel_btn.set_sensitive(True)
-        self._save_draft_btn.set_sensitive(True)
         self._attach_files_btn.set_sensitive(True)
         self._attachments_box.set_sensitive(True)
         self._update_send_enabled()
+        self._update_save_draft_enabled()
 
     def _on_close_request(self, *_args) -> bool:
         """Window manager / header close: block while busy or when prompting."""
@@ -1119,9 +1151,6 @@ class ComposeWindow(Adw.Window):
         elif response == "save":
             self._begin_save_draft(close_when_done=True)
 
-    def _on_cancel_clicked(self, *_args) -> None:
-        self._request_dismiss()
-
     def _on_save_draft_clicked(self, *_args) -> None:
         self._begin_save_draft(close_when_done=False)
 
@@ -1144,6 +1173,8 @@ class ComposeWindow(Adw.Window):
 
     def _collect_draft_fields(
         self,
+        *,
+        for_draft: bool = True,
     ) -> tuple[
         list[str],
         list[str],
@@ -1154,9 +1185,12 @@ class ComposeWindow(Adw.Window):
         str | None,
         str | None,
     ]:
-        to_addrs = parse_address_list(self._to_entry.get_text())
-        cc_addrs = parse_address_list(self._cc_entry.get_text())
-        bcc_addrs = parse_address_list(self._bcc_entry.get_text())
+        parse_addresses = (
+            parse_draft_address_list if for_draft else parse_address_list
+        )
+        to_addrs = parse_addresses(self._to_entry.get_text())
+        cc_addrs = parse_addresses(self._cc_entry.get_text())
+        bcc_addrs = parse_addresses(self._bcc_entry.get_text())
         subject = self._subject_entry.get_text().strip()
         buffer = self._body_view.get_buffer()
         start, end = buffer.get_bounds()
@@ -1207,15 +1241,10 @@ class ComposeWindow(Adw.Window):
             return
 
         account = self._selected_account()
-        if not account.can_send:
-            self._show_error("This account has no mail transport configured")
-            self._close_when_saved = False
-            return
 
         self._close_when_saved = close_when_done
         self._saving_draft = True
         self._set_compose_actions_sensitive(False)
-        self._set_status("Saving draft…")
         self._pending_draft_body = body
         self._pending_draft_body_html = body_html
 
@@ -1223,6 +1252,9 @@ class ComposeWindow(Adw.Window):
         existing_uid = self._draft_message_uid
         drafts_folder_name = self._draft_folder_name
         attachments = list(self._attachments)
+
+        if self._on_draft_save_started is not None:
+            self._on_draft_save_started(account_uid, drafts_folder_name)
 
         def worker() -> None:
             error: Exception | None = None
@@ -1263,13 +1295,28 @@ class ComposeWindow(Adw.Window):
             return False
 
         assert result is not None
+        previous_uid = self._draft_message_uid
         self._draft_folder_name, self._draft_message_uid = result
         self._user_edited = False
         self._draft_body_plain_snapshot = self._pending_draft_body
         self._draft_body_html = self._pending_draft_body_html
-        self._set_status("Draft saved")
+        self._update_save_draft_enabled()
+        show_toast(self, "Draft saved")
         if self._on_draft_saved is not None:
-            self._on_draft_saved()
+            account = self._selected_account()
+            self._on_draft_saved(
+                SavedDraftNotification(
+                    account_uid=account.uid,
+                    folder_name=self._draft_folder_name,
+                    uid=self._draft_message_uid,
+                    previous_uid=previous_uid,
+                    subject=self._subject_entry.get_text().strip() or "(no subject)",
+                    to=self._to_entry.get_text().strip(),
+                    from_label=account.from_label,
+                    has_attachments=bool(self._attachments),
+                    sort_date=time.time(),
+                )
+            )
         if close_when_done:
             self._dismiss()
         return False
@@ -1285,7 +1332,7 @@ class ComposeWindow(Adw.Window):
                 body_html,
                 in_reply_to,
                 references,
-            ) = self._collect_draft_fields()
+            ) = self._collect_draft_fields(for_draft=False)
         except ValueError as exc:
             self._show_error(str(exc))
             return

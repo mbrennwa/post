@@ -17,7 +17,10 @@ DEFAULT_FOLDER_LIST_CACHE_SIZE = 2
 
 
 def message_list_fingerprint(messages: list[dict[str, Any]]) -> tuple[str, ...]:
-    return tuple(str(message.get("uid")) for message in messages)
+    return tuple(
+        f"{message.get('uid')}:{message.get('subject') or ''}"
+        for message in messages
+    )
 
 
 def prepended_message_count(

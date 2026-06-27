@@ -14,6 +14,7 @@ from gi.repository import GLib
 
 from post.compose_window import (
     OutboundSendRequest,
+    SavedDraftNotification,
     _finish_outbound_send,
     run_outbound_send,
 )
@@ -226,6 +227,10 @@ class RunOutboundSendTests(unittest.TestCase):
 
         self.mail.delete_draft.assert_called_once_with("acct-1", "Drafts", "42")
         on_draft_saved.assert_called_once()
+        notification = on_draft_saved.call_args.args[0]
+        self.assertIsInstance(notification, SavedDraftNotification)
+        self.assertTrue(notification.removed)
+        self.assertEqual(notification.previous_uid, "42")
         self.assertEqual(self.status_messages, ["Message sent"])
 
     @mock.patch(
