@@ -533,15 +533,52 @@ def quote_plain_reply(original: dict[str, Any], body_plain: str | None) -> str:
     return f"\n\nOn {date}, {sender} wrote:\n{quoted}\n"
 
 
+_MSGID_RE = re.compile(r"<[^>]+>")
+_MAX_REFERENCES_IDS = 50
+
+
+def normalize_message_id(message_id: str) -> str:
+    """Return an angle-bracketed Message-ID, or empty when input is blank."""
+    mid = (message_id or "").strip()
+    if not mid:
+        return ""
+    if mid.startswith("<") and mid.endswith(">"):
+        return mid
+    return f"<{mid.strip('<>')}>"
+
+
+def parse_references_header(references: str | None) -> list[str]:
+    """Tokenize Message-IDs from a References header."""
+    text = (references or "").strip()
+    if not text:
+        return []
+    tokens = _MSGID_RE.findall(text)
+    if not tokens:
+        return [normalize_message_id(token) for token in text.split() if token.strip()]
+    return [normalize_message_id(token) for token in tokens]
+
+
+def _prune_references(ids: list[str], *, max_ids: int = _MAX_REFERENCES_IDS) -> list[str]:
+    """Keep the thread root and the most recent ancestors."""
+    if len(ids) <= max_ids:
+        return ids
+    return [ids[0], *ids[-(max_ids - 1) :]]
+
+
 def build_reply_references(message_id: str | None, references: str | None = None) -> str | None:
-    message_id = (message_id or "").strip()
-    if not message_id:
-        return references.strip() if references else None
-    if references and message_id in references:
-        return references.strip()
-    if references:
-        return f"{references.strip()} {message_id}"
-    return message_id
+    """Build a References header for a reply (RFC 5322 §3.6.4)."""
+    normalized_id = normalize_message_id(message_id or "")
+    if not normalized_id:
+        parsed = parse_references_header(references)
+        if not parsed:
+            return references.strip() if references else None
+        return " ".join(_prune_references(parsed))
+
+    chain = parse_references_header(references)
+    if normalized_id not in chain:
+        chain.append(normalized_id)
+    pruned = _prune_references(chain)
+    return " ".join(pruned) if pruned else normalized_id
 
 
 def format_signature_block(signature: str) -> str:
