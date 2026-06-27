@@ -368,6 +368,13 @@ class VirtualMessageList(Gtk.ScrolledWindow):
                 self._on_item_context_menu(uid, outer, x, y)
                 gesture.set_state(Gtk.EventSequenceState.CLAIMED)
                 return
+            modifiers = (
+                event.get_modifier_state() if event is not None else Gdk.ModifierType(0)
+            )
+            if modifiers & (
+                Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.CONTROL_MASK
+            ):
+                return
             if self._on_item_pressed is not None:
                 self._on_item_pressed(uid)
 

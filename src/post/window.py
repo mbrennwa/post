@@ -2361,6 +2361,9 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_message_list_item_pressed(self, uid: str) -> None:
         self._user_message_click_pending = True
+        selected = self._message_list_view.get_selected_uids()
+        if len(selected) == 1 and selected[0] == uid:
+            return
         self._message_list_view.select_uid(uid)
 
     def _on_message_list_context_menu(
@@ -2831,6 +2834,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         selected = self._message_list_view.get_selected_uids()
         if len(selected) != 1:
+            self._user_message_click_pending = False
             return False
 
         uid = selected[0]
