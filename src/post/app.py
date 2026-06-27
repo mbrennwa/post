@@ -22,7 +22,7 @@ from post.window import MainWindow
 
 
 def main() -> int:
-    # POST_LOG_LEVEL=DEBUG enables send-phase tracing in post.mail.eds (default: quiet).
+    # POST_LOG_LEVEL=DEBUG enables mail I/O task tracing (io_thread, eds send path).
     log_level_name = os.environ.get("POST_LOG_LEVEL")
     if log_level_name:
         logging.basicConfig(
