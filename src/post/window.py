@@ -2069,7 +2069,7 @@ class MainWindow(Adw.ApplicationWindow):
             and not viewing_outbox
             and search_query is None
         ):
-            loading_label = f"Refreshing {display_folder} from server…"
+            loading_label = f"Refreshing {display_folder} From Server…"
         else:
             loading_label = self._loading_progress_text(
                 display_folder,
@@ -2336,7 +2336,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_list_source = "server"
         self._message_sync_in_progress = False
         self._messages_load_generation += 1
-        self._set_status(f"Refreshing {folder_name} from server…")
+        self._set_status(f"Refreshing {folder_name} From Server…")
 
         if not messages:
             folder_label = "Outbox" if is_post_outbox_folder(folder_name) else folder_name
