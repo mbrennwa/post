@@ -197,6 +197,18 @@ class InferSpoolPathTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_other_users_system_spool_uses_default(self) -> None:
+        with mock.patch.dict(os.environ, {"USER": "alice"}, clear=False):
+            with mock.patch("post.mail.accounts.getpass.getuser", return_value="alice"):
+                self.assertEqual(
+                    infer_spool_path_from_hint("/var/spool/mail/root"),
+                    "/var/spool/mail/alice",
+                )
+                self.assertEqual(
+                    infer_spool_path_from_hint("/var/mail/root"),
+                    "/var/spool/mail/alice",
+                )
+
 
 class BuiltinLocalUidTests(unittest.TestCase):
     def test_builtin_uid_constant(self) -> None:

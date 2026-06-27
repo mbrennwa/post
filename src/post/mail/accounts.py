@@ -26,6 +26,7 @@ POST_LOCAL_TRANSPORT_UID = "post-local-sendmail"
 BUILTIN_LOCAL_UID = "local"
 EDS_LOCAL_DISPLAY_NAME = "Evolution Data Server"
 LOCAL_BACKENDS = frozenset({"spool", "maildir"})
+SYSTEM_SPOOL_DIRS = frozenset({"/var/mail", "/var/spool/mail"})
 
 LocalMailType = Literal["spool", "maildir"]
 
@@ -190,15 +191,24 @@ def infer_spool_path_from_hint(hint: str) -> str:
     hint = hint.strip()
     if not hint:
         return default_spool_path()
+    user = os.environ.get("USER") or getpass.getuser()
+    parent = os.path.dirname(hint)
+    parent_real = os.path.realpath(parent) if parent else ""
+    basename = os.path.basename(hint)
+    if parent_real in SYSTEM_SPOOL_DIRS and basename != user:
+        return default_spool_path()
     if os.path.isfile(hint):
+        if os.access(hint, os.R_OK):
+            return hint
+        if parent_real in SYSTEM_SPOOL_DIRS:
+            return default_spool_path()
         return hint
     if os.path.isdir(hint):
-        user = os.environ.get("USER") or getpass.getuser()
         user_file = os.path.join(hint, user)
         if os.path.isfile(user_file):
             return user_file
-        parent = os.path.dirname(user_file)
-        if parent and os.path.isdir(parent):
+        parent_dir = os.path.dirname(user_file)
+        if parent_dir and os.path.isdir(parent_dir):
             return user_file
     parent = os.path.dirname(hint)
     if parent and os.path.isdir(parent):
@@ -206,14 +216,31 @@ def infer_spool_path_from_hint(hint: str) -> str:
     return default_spool_path()
 
 
+def _is_local_backend_accessible(path: str, mail_type: LocalMailType) -> bool:
+    path = path.strip()
+    if not path:
+        return False
+    if mail_type == "maildir":
+        return os.path.isdir(path) and os.access(path, os.R_OK | os.X_OK)
+    if os.path.isfile(path):
+        return os.access(path, os.R_OK)
+    parent = os.path.dirname(path) or "/"
+    if not os.path.isdir(parent):
+        return False
+    return os.access(parent, os.W_OK | os.X_OK)
+
+
 def is_local_account_usable(source: EDataServer.Source) -> bool:
-    """True when a spool/Maildir account has an absolute storage path configured."""
+    """True when a spool/Maildir account has a readable storage path configured."""
     mail_ext = source.get_extension("Mail Account")
-    if mail_ext.get_backend_name() not in LOCAL_BACKENDS:
+    backend = mail_ext.get_backend_name()
+    if backend not in LOCAL_BACKENDS:
         return True
 
     path = get_local_backend_path(source)
-    return bool(path and os.path.isabs(path))
+    if not path or not os.path.isabs(path):
+        return False
+    return _is_local_backend_accessible(path, backend)  # type: ignore[arg-type]
 
 
 def should_list_local_account(source: EDataServer.Source) -> bool:
@@ -496,7 +523,10 @@ def repair_local_mail_config(registry: EDataServer.SourceRegistry) -> bool:
             path = hint
         else:
             path = default_local_mail_config().path
-    elif config.mail_type == "spool" and os.path.isdir(path):
+    elif config.mail_type == "spool" and (
+        os.path.isdir(path)
+        or not _is_local_backend_accessible(path, "spool")
+    ):
         path = infer_spool_path_from_hint(path)
 
     repaired = LocalMailConfig(
@@ -573,7 +603,12 @@ def validate_local_mail_config(config: LocalMailConfig) -> str | None:
     if config.mail_type == "maildir":
         if not os.path.isdir(path):
             return f"Mail folder does not exist: {path}"
-    elif not os.path.isfile(path):
+        if not os.access(path, os.R_OK | os.X_OK):
+            return f"Cannot read mail folder: {path}"
+    elif os.path.isfile(path):
+        if not os.access(path, os.R_OK):
+            return f"Cannot read mail file: {path}"
+    else:
         parent = os.path.dirname(path) or "/"
         if not os.path.isdir(parent):
             return f"Folder for the mail file does not exist: {parent}"
