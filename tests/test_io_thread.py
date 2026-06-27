@@ -6,7 +6,7 @@ from __future__ import annotations
 import threading
 import unittest
 
-from post.mail.io_thread import get_mail_io_thread, is_mail_io_thread
+from post.mail.io_thread import get_mail_io_thread, is_mail_io_thread, run_on_mail_thread
 
 
 class MailIoThreadTests(unittest.TestCase):
@@ -81,3 +81,18 @@ class MailIoThreadTests(unittest.TestCase):
 
         gate.set()
         self.assertTrue(sync_done.wait(timeout=5.0))
+
+    def test_run_sync_on_mail_thread_runs_inline(self) -> None:
+        def inner() -> bool:
+            return self._io.run_sync(is_mail_io_thread)
+
+        self.assertTrue(self._io.run_sync(inner))
+
+    def test_run_on_mail_thread_executes_on_mail_thread(self) -> None:
+        self.assertTrue(run_on_mail_thread(is_mail_io_thread))
+
+    def test_run_on_mail_thread_is_reentrant(self) -> None:
+        def nested() -> int:
+            return run_on_mail_thread(lambda: 7)
+
+        self.assertEqual(run_on_mail_thread(nested), 7)
