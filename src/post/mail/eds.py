@@ -110,7 +110,6 @@ from .folders import (
 from .offline_settings import apply_offline_settings_to_store, apply_offline_sync_to_folder
 from .offline_sync import OfflineBodySyncCoordinator, OfflineSyncProgress
 from .search import MessageSearchQuery, filter_messages_by_query, query_to_sexp
-from post.search_cancel_trace import trace
 
 log = logging.getLogger(__name__)
 
@@ -311,11 +310,6 @@ class MailService:
         with self._folder_search_state_lock:
             cancellable = self._folder_search_cancellable
             self._folder_search_cancellable = None
-        trace(
-            "cancel_folder_search",
-            had_cancellable=cancellable is not None,
-            cancelled=cancellable.is_cancelled() if cancellable is not None else None,
-        )
         if cancellable is not None:
             cancellable.cancel()
 
@@ -1839,13 +1833,6 @@ class MailService:
                 messages = list(index.messages)
                 unread = index.unread
 
-            trace(
-                "search_unlocked_before_filter",
-                account=account_uid,
-                folder=folder_name,
-                messages=len(messages),
-                cancelled=cancellable.is_cancelled(),
-            )
 
             def body_text_for_uid(uid: str) -> str | None:
                 if cancellable.is_cancelled():
@@ -1873,20 +1860,9 @@ class MailService:
                 is_cancelled=cancellable.is_cancelled,
             )
             if cancellable.is_cancelled():
-                trace(
-                    "search_unlocked_cancelled",
-                    account=account_uid,
-                    folder=folder_name,
-                )
                 return [], unread, 0, source
 
             match_count = len(filtered)
-            trace(
-                "search_unlocked_done",
-                account=account_uid,
-                folder=folder_name,
-                matches=match_count,
-            )
             return filtered, unread, match_count, source
         finally:
             self._end_folder_search_unlocked(cancellable)
@@ -2192,13 +2168,6 @@ class MailService:
         *,
         mark_seen: bool = True,
     ) -> dict:
-        trace(
-            "read_message_dispatch",
-            account=account_uid,
-            folder=folder_name,
-            uid=message_uid,
-            mark_seen=mark_seen,
-        )
         return run_on_mail_thread(
             self._read_message_unlocked,
             account_uid,
@@ -2369,13 +2338,6 @@ class MailService:
             extract_message_bodies,
         )
 
-        trace(
-            "read_message_start",
-            account=account_uid,
-            folder=folder_name,
-            uid=message_uid,
-            mark_seen=mark_seen,
-        )
         store = self._get_store_unlocked(account_uid)
         folder = store.get_folder_sync(folder_name, 0, None)
         if folder is None:
@@ -2410,13 +2372,6 @@ class MailService:
             result["folder_unread"] = unread
             result["folder_total"] = total
 
-        trace(
-            "read_message_done",
-            account=account_uid,
-            folder=folder_name,
-            uid=message_uid,
-            subject=result.get("subject"),
-        )
         return result
 
     def _read_attachment_data_unlocked(
