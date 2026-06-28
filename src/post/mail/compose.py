@@ -645,16 +645,14 @@ def _encode_plain_body(body: str) -> bytes:
     return encoded if encoded else b"\n"
 
 
-def _camel_text_transfer_encoding(payload: bytes) -> Any:
-    """Pick RFC 2045 CTE for UTF-8 text parts (7bit only when US-ASCII)."""
+def _camel_text_transfer_encoding(_payload: bytes) -> Any:
+    """Pick RFC 2045 CTE for outbound text parts (quoted-printable wraps long lines)."""
     import gi
 
     gi.require_version("Camel", "1.2")
     from gi.repository import Camel
 
-    if payload and all(byte < 0x80 for byte in payload):
-        return Camel.TransferEncoding.ENCODING_7BIT
-    return Camel.TransferEncoding.ENCODING_8BIT
+    return Camel.TransferEncoding.ENCODING_QUOTEDPRINTABLE
 
 
 @dataclass(frozen=True)
@@ -878,6 +876,7 @@ def _set_message_body(
 
     if not encoded_html and not attachments:
         message.set_content(encoded_plain, "text/plain; charset=utf-8")
+        message.set_encoding(_camel_text_transfer_encoding(encoded_plain))
         return
 
     if encoded_html and not attachments:
