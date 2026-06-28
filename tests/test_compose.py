@@ -42,6 +42,24 @@ from post.mail.helpers import (
     plain_body_looks_truncated,
 )
 
+RFC5322_MAX_LINE_LENGTH = 998
+
+
+def _max_mime_line_length(raw: bytes) -> int:
+    """Return the longest line in serialized MIME (RFC 5322 limit is 998)."""
+    normalized = raw.replace(b"\r\n", b"\n")
+    lines = normalized.split(b"\n")
+    return max(len(line) for line in lines) if lines else 0
+
+
+def _assert_rfc5322_line_lengths(raw: bytes) -> None:
+    max_len = _max_mime_line_length(raw)
+    if max_len > RFC5322_MAX_LINE_LENGTH:
+        raise AssertionError(
+            f"MIME line length {max_len} exceeds RFC 5322 limit "
+            f"({RFC5322_MAX_LINE_LENGTH})"
+        )
+
 
 class ParseAddressListTests(unittest.TestCase):
     def test_single_address(self) -> None:
@@ -390,7 +408,7 @@ class BuildPlainMimeMessageTests(unittest.TestCase):
         self.assertIn(b"Content-Transfer-Encoding: base64", raw)
         self.assertNotIn(b"\xff\xd8", raw)
 
-    def test_multipart_non_ascii_body_uses_8bit_cte(self) -> None:
+    def test_multipart_non_ascii_body_uses_quoted_printable_cte(self) -> None:
         message = build_plain_mime_message(
             from_name=None,
             from_address="alice@example.com",
@@ -411,15 +429,15 @@ class BuildPlainMimeMessageTests(unittest.TestCase):
         assert raw is not None
         self.assertRegex(
             raw,
-            rb"Content-Type: text/plain[^\n]*\nContent-Transfer-Encoding: 8bit",
+            rb"Content-Type: text/plain[^\n]*\nContent-Transfer-Encoding: quoted-printable",
         )
         self.assertIn(b"Content-Transfer-Encoding: base64", raw)
         self.assertNotRegex(
             raw,
-            rb"Content-Type: text/plain[^\n]*\nContent-Transfer-Encoding: 7bit",
+            rb"Content-Type: text/plain[^\n]*\nContent-Transfer-Encoding: 8bit",
         )
 
-    def test_multipart_ascii_body_keeps_7bit_cte(self) -> None:
+    def test_multipart_ascii_body_uses_quoted_printable_cte(self) -> None:
         message = build_plain_mime_message(
             from_name=None,
             from_address="alice@example.com",
@@ -440,10 +458,10 @@ class BuildPlainMimeMessageTests(unittest.TestCase):
         assert raw is not None
         self.assertRegex(
             raw,
-            rb"Content-Type: text/plain[^\n]*\nContent-Transfer-Encoding: 7bit",
+            rb"Content-Type: text/plain[^\n]*\nContent-Transfer-Encoding: quoted-printable",
         )
 
-    def test_alternative_non_ascii_body_uses_8bit_cte(self) -> None:
+    def test_alternative_non_ascii_body_uses_quoted_printable_cte(self) -> None:
         message = build_plain_mime_message(
             from_name="Alice",
             from_address="alice@example.com",
@@ -456,8 +474,8 @@ class BuildPlainMimeMessageTests(unittest.TestCase):
         )
         raw = _mime_message_raw_bytes(message)
         assert raw is not None
-        self.assertEqual(raw.count(b"Content-Transfer-Encoding: 8bit"), 2)
-        self.assertNotIn(b"Content-Transfer-Encoding: 7bit", raw)
+        self.assertEqual(raw.count(b"Content-Transfer-Encoding: quoted-printable"), 2)
+        self.assertNotIn(b"Content-Transfer-Encoding: 8bit", raw)
 
     def test_with_multiple_attachments_round_trips(self) -> None:
         attachments = [
@@ -1413,6 +1431,70 @@ class OutboundMimeParityTests(unittest.TestCase):
         assert raw is not None
         self.assertIn(f"Message-ID: {message_id}".encode(), raw)
         self.assertIn(f"Date: {date}".encode(), raw)
+
+
+class Rfc5322LineLengthTests(unittest.TestCase):
+    def test_reply_with_long_html_quote(self) -> None:
+        long_html = '<p style="color:#000">' + ("x" * 2000) + "</p>"
+        original = {
+            "from": "Sender <s@example.com>",
+            "date_received": "today",
+            "body_html": long_html,
+        }
+        quoted_plain = quote_plain_reply(original, "short plain")
+        body_html = build_outbound_html_for_compose(
+            body_plain=f"My reply{quoted_plain}",
+            mode="reply",
+            reply_to=original,
+            quoted_html_source=long_html,
+            quoted_plain_expected=quoted_plain,
+        )
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["info@klotzholz.com"],
+            cc=None,
+            bcc=None,
+            subject="Re: test",
+            body=f"My reply{quoted_plain}",
+            body_html=body_html,
+            in_reply_to="<parent@example.com>",
+            references="<parent@example.com>",
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        _assert_rfc5322_line_lengths(raw)
+
+    def test_reply_with_long_url_in_plain_quote(self) -> None:
+        long_url = "https://example.com/" + ("a" * 1500)
+        original = {"from": "s@x.com", "date_received": "today"}
+        quoted = quote_plain_reply(original, long_url)
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["info@klotzholz.com"],
+            cc=None,
+            bcc=None,
+            subject="Re: test",
+            body=f"Thanks{quoted}",
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        _assert_rfc5322_line_lengths(raw)
+
+    def test_new_message_with_long_plain_body(self) -> None:
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hi",
+            body="x" * 2000,
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        _assert_rfc5322_line_lengths(raw)
 
 
 if __name__ == "__main__":
