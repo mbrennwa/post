@@ -17,6 +17,8 @@ Epic: [#99](https://github.com/mbrennwa/post/issues/99)
 
 Applies to **all folders** in remote accounts (IMAP, Exchange, POP).
 
+**Everything** can use significant disk space and bandwidth on large mailboxes. The first-run prompt and Settings both explain this trade-off.
+
 On first launch, Post offers a one-time prompt to enable offline download.
 
 ## Architecture
@@ -40,12 +42,12 @@ Offline downsync and Camel search run on **`post-mail-io`** only. UI updates via
 
 | Scenario | Pass |
 |----------|------|
-| Enable **Last month** in Settings → status shows download activity | ☐ |
-| Wait for download → airplane mode → open never-opened message (in range) | ☐ |
-| Search for body-only phrase offline → match found | ☐ |
-| Message not yet downloaded offline → clear “not available offline yet” message | ☐ |
-| Relaunch app → download resumes without re-fetching completed messages | ☐ |
-| Header search offline (`from:`) without server sync | ☐ |
+| Enable **Last month** in Settings → status shows download activity | ☑ |
+| Wait for download → airplane mode → open never-opened message (in range) | ☑ |
+| Search for body-only phrase offline → match found | ☑ |
+| Message not yet downloaded offline → clear “not available offline yet” message | ☑ |
+| Relaunch app → download resumes without re-fetching completed messages | ☑ |
+| Header search offline (`from:`) without server sync | ☑ |
 
 ## Shared cache with Evolution
 
