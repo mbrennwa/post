@@ -262,6 +262,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_refresh_folder=self._on_sidebar_refresh_folder,
             on_send_outbox=self._on_sidebar_send_outbox,
             on_accounts_loaded=self._on_accounts_loaded,
+            on_initial_folder_load_complete=self._on_initial_folder_load_complete,
             on_folder_tree_changed=self._on_sidebar_folder_tree_changed,
             on_folder_contents_changed=self._on_sidebar_folder_contents_changed,
             on_move_started=self._on_sidebar_move_started,
@@ -467,7 +468,6 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _flush_send_queue_on_startup(self) -> bool:
         self._flush_send_queue_idle()
-        self._mail.schedule_offline_body_sync()
         return False
 
     def _on_network_available_changed(self, monitor: Gio.NetworkMonitor, *_args) -> None:
@@ -977,8 +977,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._sync_watcher.set_accounts(account_uids)
         if get_auto_sync() and not self._sync_watcher.running:
             self._sync_watcher.start()
-        self._mail.schedule_offline_body_sync()
         self._maybe_show_offline_body_sync_prompt(account_uids)
+
+    def _on_initial_folder_load_complete(self) -> None:
+        self._mail.schedule_offline_body_sync()
 
     def _remote_sync_account_backends(self) -> frozenset[str]:
         return frozenset({"imap", "imapx", "ews", "microsoft365", "pop3"})
@@ -2249,7 +2251,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._clear_reader()
 
         cache_snapshot: tuple[list[dict], int, int] | None = None
-        if not viewing_outbox and not force_sync:
+        if not viewing_outbox and not force_sync and search_query is None:
             cache_snapshot = load_folder_index_cache(account_uid, folder_name)
 
         send_pending = self._mail.outbound_sends_pending()
@@ -2718,6 +2720,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._user_message_click_pending = True
         selected = self._message_list_view.get_selected_uids()
         if len(selected) == 1 and selected[0] == uid:
+            if uid != self._current_message_uid or self._current_message is None:
+                self._current_message_uid = uid
+                self._load_message_body_for_uid(uid, mark_seen=True)
             return
         self._message_list_view.select_uid(uid)
 
@@ -3258,6 +3263,10 @@ class MainWindow(Adw.ApplicationWindow):
         folder_name = self._current_folder
         self._message_read_generation += 1
         read_id = self._message_read_generation
+        self._reader_subject.set_label("Loading message…")
+        self._reader_subject.set_visible(True)
+        self._reader_meta.set_label("")
+        self._reader_body_stack.set_visible_child_name("empty")
         viewing_outbox = is_post_outbox_folder(folder_name)
         viewing_drafts = self._sidebar.folder_is_drafts(account.uid, folder_name)
         from_label = account.email or account.display_label

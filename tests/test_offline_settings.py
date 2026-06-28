@@ -127,6 +127,37 @@ class RefreshOfflineSettingsTests(unittest.TestCase):
         schedule_sync.assert_called_once_with("acct-1")
 
 
+class OfflineSyncYieldTests(unittest.TestCase):
+    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
+    def test_run_account_sync_yields_when_interactive_work_pending(
+        self, get_io: mock.Mock,
+    ) -> None:
+        from post.mail.offline_sync import OfflineBodySyncCoordinator
+
+        io_thread = mock.Mock()
+        io_thread.has_interactive_work_pending.return_value = True
+        get_io.return_value = io_thread
+
+        mail = mock.Mock()
+        mail.get_account.return_value = mock.Mock(display_label="Test")
+        coordinator = OfflineBodySyncCoordinator(mail)
+
+        folder = mock.Mock()
+        cancellable = mock.Mock()
+        cancellable.is_cancelled.return_value = False
+
+        complete = coordinator._run_account_sync(
+            "acct-1",
+            "last_month",
+            cancellable,
+            folders=[folder],
+            folder_index=0,
+        )
+
+        self.assertFalse(complete)
+        io_thread.submit_background.assert_called_once()
+
+
 class ShutdownSyncTests(unittest.TestCase):
     def test_shutdown_cancels_active_offline_sync_without_blocking(self) -> None:
         from post.mail.eds import MailService
@@ -146,7 +177,7 @@ class ShutdownSyncTests(unittest.TestCase):
 
         coordinator.cancel_all.assert_called_once()
         wait_ops.assert_called_once_with(timeout=2.0)
-        io_thread.submit.assert_called_once_with(service._flush_stores_on_shutdown)
+        io_thread.submit_background.assert_called_once_with(service._flush_stores_on_shutdown)
         run_sync.assert_not_called()
 
     def test_shutdown_flushes_synchronously_when_offline_sync_idle(self) -> None:
@@ -169,6 +200,7 @@ class ShutdownSyncTests(unittest.TestCase):
         wait_ops.assert_called_once_with(timeout=10.0)
         run_sync.assert_called_once_with(service._flush_stores_on_shutdown)
         io_thread.submit.assert_not_called()
+        io_thread.submit_background.assert_not_called()
 
 
 class QueryToSexpTests(unittest.TestCase):

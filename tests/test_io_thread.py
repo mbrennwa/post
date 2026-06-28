@@ -96,3 +96,54 @@ class MailIoThreadTests(unittest.TestCase):
             return run_on_mail_thread(lambda: 7)
 
         self.assertEqual(run_on_mail_thread(nested), 7)
+
+    def test_interactive_runs_before_pending_background(self) -> None:
+        results: list[str] = []
+
+        self._io.submit_background(lambda: results.append("background"))
+        self._io.submit(lambda: results.append("interactive"))
+        self._io.run_sync(lambda: None)
+        self.assertEqual(results, ["interactive", "background"])
+
+    def test_has_interactive_work_pending(self) -> None:
+        gate = threading.Event()
+        started = threading.Event()
+
+        def background() -> None:
+            started.set()
+            gate.wait(timeout=5.0)
+
+        self._io.submit_background(background)
+        self.assertTrue(started.wait(timeout=5.0))
+        self.assertFalse(self._io.has_interactive_work_pending())
+        self._io.submit(lambda: None)
+        self.assertTrue(self._io.has_interactive_work_pending())
+        gate.set()
+        self._io.run_sync(lambda: None)
+        self.assertFalse(self._io.has_interactive_work_pending())
+
+    def test_interactive_preempts_running_background(self) -> None:
+        gate = threading.Event()
+        started = threading.Event()
+        preempted = threading.Event()
+        results: list[str] = []
+
+        def background() -> None:
+            started.set()
+            gate.wait(timeout=5.0)
+            results.append("background")
+
+        def interactive() -> None:
+            results.append("interactive")
+
+        def on_preempt() -> None:
+            preempted.set()
+            gate.set()
+
+        self._io.set_background_preempt_callbacks(on_preempt, None)
+        self._io.submit_background(background)
+        self.assertTrue(started.wait(timeout=5.0))
+        self._io.submit(interactive)
+        self.assertTrue(preempted.wait(timeout=5.0))
+        self._io.run_sync(lambda: None)
+        self.assertEqual(results, ["background", "interactive"])

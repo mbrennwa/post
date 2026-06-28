@@ -16,6 +16,7 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Camel, Gio, GLib
 
 from post.mail.folders import folder_can_contain_messages
+from post.mail.io_thread import get_mail_io_thread
 from post.mail.offline_settings import (
     account_is_user_offline,
     apply_offline_sync_to_folder,
@@ -94,18 +95,9 @@ class OfflineBodySyncCoordinator:
         self._cancellables[account_uid] = cancellable
         self._running.add(account_uid)
 
-        def worker() -> None:
-            try:
-                self._run_account_sync(account_uid, mode, cancellable)
-            finally:
-                self._running.discard(account_uid)
-                self._cancellables.pop(account_uid, None)
-                if not self._running:
-                    self._notify_progress(None)
-
-        from post.mail.io_thread import get_mail_io_thread
-
-        get_mail_io_thread().submit(worker)
+        get_mail_io_thread().submit_background(
+            self._account_sync_worker, account_uid, mode, cancellable
+        )
 
     def cancel_account(self, account_uid: str) -> None:
         cancellable = self._cancellables.get(account_uid)
@@ -121,19 +113,91 @@ class OfflineBodySyncCoordinator:
     def is_active(self) -> bool:
         return bool(self._running)
 
+    def _account_sync_worker(
+        self,
+        account_uid: str,
+        mode: OfflineBodySyncMode,
+        cancellable: Gio.Cancellable,
+        *,
+        folders: list[Camel.Folder] | None = None,
+        folder_index: int = 0,
+    ) -> None:
+        try:
+            complete = self._run_account_sync(
+                account_uid,
+                mode,
+                cancellable,
+                folders=folders,
+                folder_index=folder_index,
+            )
+        finally:
+            if complete:
+                self._running.discard(account_uid)
+                self._cancellables.pop(account_uid, None)
+                if not self._running:
+                    self._notify_progress(None)
+
     def _run_account_sync(
         self,
         account_uid: str,
         mode: OfflineBodySyncMode,
         cancellable: Gio.Cancellable,
-    ) -> None:
+        *,
+        folders: list[Camel.Folder] | None = None,
+        folder_index: int = 0,
+    ) -> bool:
         expression = downsync_expression_for_mode(mode)
         if expression is None:
-            return
+            return True
 
         account = self._mail.get_account(account_uid)
         account_label = account.display_label
 
+        if folders is None:
+            folders = self._collect_downsync_folders(account_uid, cancellable)
+            if folders is None:
+                return True
+            folder_index = 0
+
+        while folder_index < len(folders):
+            if cancellable.is_cancelled():
+                return True
+            if get_mail_io_thread().has_interactive_work_pending():
+                get_mail_io_thread().submit_background(
+                    self._account_sync_worker,
+                    account_uid,
+                    mode,
+                    cancellable,
+                    folders=folders,
+                    folder_index=folder_index,
+                )
+                return False
+
+            folder = folders[folder_index]
+            folder_index += 1
+            if not isinstance(folder, Camel.OfflineFolder):
+                continue
+            apply_offline_sync_to_folder(folder, mode)
+            if not folder.can_downsync():
+                continue
+            folder_name = folder.get_full_name() or ""
+            self._notify_progress(
+                OfflineSyncProgress(
+                    account_uid=account_uid,
+                    account_label=account_label,
+                    folder_name=folder_name,
+                    active=True,
+                )
+            )
+            self._downsync_folder_sync(folder, expression, cancellable)
+
+        return True
+
+    def _collect_downsync_folders(
+        self,
+        account_uid: str,
+        cancellable: Gio.Cancellable,
+    ) -> list[Camel.Folder] | None:
         try:
             store = self._mail._get_store_unlocked(account_uid)  # noqa: SLF001
         except Exception:
@@ -142,10 +206,10 @@ class OfflineBodySyncCoordinator:
                 account_uid,
                 exc_info=True,
             )
-            return
+            return None
 
         if not isinstance(store, Camel.OfflineStore):
-            return
+            return None
 
         if not store.requires_downsync():
             log.debug(
@@ -178,26 +242,9 @@ class OfflineBodySyncCoordinator:
                     account_uid,
                     exc_info=True,
                 )
-                return
+                return None
 
-        for folder in folders:
-            if cancellable.is_cancelled():
-                break
-            if not isinstance(folder, Camel.OfflineFolder):
-                continue
-            apply_offline_sync_to_folder(folder, mode)
-            if not folder.can_downsync():
-                continue
-            folder_name = folder.get_full_name() or ""
-            self._notify_progress(
-                OfflineSyncProgress(
-                    account_uid=account_uid,
-                    account_label=account_label,
-                    folder_name=folder_name,
-                    active=True,
-                )
-            )
-            self._downsync_folder_sync(folder, expression, cancellable)
+        return folders
 
     def _downsync_folder_sync(
         self,
