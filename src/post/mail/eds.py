@@ -1837,7 +1837,7 @@ class MailService:
             def body_text_for_uid(uid: str) -> str | None:
                 if cancellable.is_cancelled():
                     return None
-                from .helpers import extract_message_bodies
+                from .helpers import extract_message_bodies, searchable_body_text
 
                 try:
                     api_uid = camel_uid_to_api(uid)
@@ -1847,11 +1847,10 @@ class MailService:
                 except Exception:
                     return None
                 bodies = extract_message_bodies(mime)
-                plain = bodies.get("plain")
-                if plain:
-                    return plain
-                html = bodies.get("html")
-                return html or ""
+                return searchable_body_text(
+                    plain=bodies.get("plain"),
+                    html=bodies.get("html"),
+                )
 
             filtered = filter_messages_by_query(
                 messages,

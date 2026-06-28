@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import unittest
 
+from post.mail.helpers import searchable_body_text
 from post.mail.search import (
     SearchTerm,
     filter_messages_by_query,
@@ -205,6 +206,48 @@ class FilterMessagesByQueryTests(unittest.TestCase):
             body_text_for_uid=body_text,
         )
         self.assertEqual([message["uid"] for message in matched], ["2"])
+
+    def test_text_term_ignores_base64_data_uri_substrings(self) -> None:
+        query = parse_search_query("ewz")
+        assert query is not None
+        messages = [
+            {"uid": "1", "subject": "Einladung", "flags": {"seen": True}},
+        ]
+        html = (
+            "<p>eBaugesuche project invitation</p>"
+            '<img src="data:image/png;base64,CHhEwzIZ0NcVewZoet">'
+        )
+
+        def body_text(_uid: str) -> str | None:
+            return searchable_body_text(html=html)
+
+        matched = filter_messages_by_query(
+            messages,
+            query,
+            body_text_for_uid=body_text,
+        )
+        self.assertEqual(matched, [])
+
+    def test_text_term_matches_readable_html_body(self) -> None:
+        query = parse_search_query("ewz")
+        assert query is not None
+        messages = [
+            {"uid": "1", "subject": "Newsletter", "flags": {"seen": True}},
+        ]
+        html = (
+            "<p>Contact the EWZ team about your project</p>"
+            '<img src="data:image/png;base64,QUJDRA==">'
+        )
+
+        def body_text(_uid: str) -> str | None:
+            return searchable_body_text(html=html)
+
+        matched = filter_messages_by_query(
+            messages,
+            query,
+            body_text_for_uid=body_text,
+        )
+        self.assertEqual([message["uid"] for message in matched], ["1"])
 
     def test_boolean_read_flag(self) -> None:
         query = parse_search_query("is:!read")
