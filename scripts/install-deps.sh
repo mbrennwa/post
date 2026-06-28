@@ -20,14 +20,25 @@ done
 
 mapfile -t apt_depends < <(python3 - <<'PY'
 from pathlib import Path
+import re
 import tomllib
 
 cfg = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 apt_depends = cfg.get("tool", {}).get("deb", {}).get("apt_depends", [])
 if not apt_depends:
     raise SystemExit("ERROR: [tool.deb].apt_depends is missing or empty in pyproject.toml")
+
+
+def apt_install_name(spec: str) -> str:
+    """Strip Debian version constraints for apt-get (e.g. 'python3 (>= 3.10)')."""
+    name = spec.strip().split()[0]
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9+.-]*", name):
+        raise SystemExit(f"ERROR: invalid apt dependency: {spec!r}")
+    return name
+
+
 for pkg in apt_depends:
-    print(pkg)
+    print(apt_install_name(pkg))
 PY
 )
 
