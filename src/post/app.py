@@ -18,12 +18,10 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk
 
 from post.icon_utils import APP_ICON_NAME, register_bundled_icons
-from post.search_cancel_trace import configure as configure_search_cancel_trace
 from post.window import MainWindow
 
 
 def main() -> int:
-    configure_search_cancel_trace()
     # POST_LOG_LEVEL=DEBUG enables mail I/O task tracing (io_thread, eds send path).
     log_level_name = os.environ.get("POST_LOG_LEVEL")
     if log_level_name:

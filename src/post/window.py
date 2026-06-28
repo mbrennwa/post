@@ -87,7 +87,6 @@ from post.preferences import (
     set_window_state,
 )
 from post.sidebar import MailSidebar
-from post.search_cancel_trace import trace
 from post.toast import show_error_toast, show_toast
 
 log = logging.getLogger(__name__)
@@ -1617,27 +1616,12 @@ class MainWindow(Adw.ApplicationWindow):
     def _restore_messages_after_search(self) -> None:
         if not self._current_account or not self._current_folder:
             return
-        trace(
-            "restore_after_search",
-            account=self._current_account.uid,
-            folder=self._current_folder,
-            read_gen=self._message_read_generation,
-            load_gen=self._messages_load_generation,
-        )
         self._mail.cancel_folder_search()
         account_uid = self._current_account.uid
         folder_name = self._current_folder
         snapshot = self._take_pre_search_snapshot(account_uid, folder_name)
         if snapshot is not None:
             messages, unread, total, source = snapshot
-            trace(
-                "restore_snapshot",
-                account=account_uid,
-                folder=folder_name,
-                messages=len(messages),
-                total=total,
-                source=source,
-            )
             self._messages_load_generation += 1
             load_id = self._messages_load_generation
             self._messages_load_expects_search = False
@@ -1655,7 +1639,6 @@ class MainWindow(Adw.ApplicationWindow):
                 None,
             )
             return
-        trace("restore_fallback_load_messages", account=account_uid, folder=folder_name)
         self._load_messages(
             account_uid,
             folder_name,
@@ -1678,12 +1661,6 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._preserve_pre_search_snapshot()
         self._search_query = query
-        trace(
-            "search_start",
-            account=self._current_account.uid,
-            folder=self._current_folder,
-            query=raw.strip(),
-        )
         self._load_messages(
             self._current_account.uid,
             self._current_folder,
@@ -1697,7 +1674,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._exit_search_mode()
 
     def _exit_search_mode(self) -> None:
-        trace("exit_search_mode", read_gen=self._message_read_generation)
         self._search_query = None
         self._search_entry_updating = True
         self._header_search_entry.set_text("")
@@ -1776,14 +1752,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._update_message_status(self._current_account, folder_name)
 
     def _clear_reader(self) -> None:
-        previous_gen = self._message_read_generation
         self._message_read_generation += 1
-        trace(
-            "clear_reader",
-            previous_read_gen=previous_gen,
-            read_gen=self._message_read_generation,
-            pending_uid=self._pending_message_read_uid,
-        )
         self._pending_message_read_uid = None
         self._inflight_message_read_id = None
         self._reader_subject.set_label("")
@@ -2274,15 +2243,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._messages_load_generation += 1
         load_id = self._messages_load_generation
         self._messages_load_expects_search = self._search_query is not None
-        trace(
-            "load_messages",
-            load_id=load_id,
-            account=account_uid,
-            folder=folder_name,
-            search=self._search_query is not None,
-            expects_search=self._messages_load_expects_search,
-            read_gen=self._message_read_generation,
-        )
 
         display_folder = (
             "Outbox"
@@ -2403,26 +2363,13 @@ class MainWindow(Adw.ApplicationWindow):
 
         def worker_initial() -> None:
             if load_id != self._messages_load_generation:
-                trace(
-                    "folder_worker_skip_stale",
-                    load_id=load_id,
-                    current_load_gen=self._messages_load_generation,
-                    search=search_query is not None,
-                )
                 return
             if (
                 cache_snapshot is not None
                 and search_query is None
                 and not (should_sync and not use_background_sync)
             ):
-                trace("folder_worker_skip_cache", load_id=load_id)
                 return
-            trace(
-                "folder_worker_start",
-                load_id=load_id,
-                search=search_query is not None,
-                initial_sync=should_sync and not use_background_sync,
-            )
             error: Exception | None = None
             messages: list[dict] | None = None
             unread = -1
@@ -2445,15 +2392,6 @@ class MainWindow(Adw.ApplicationWindow):
                 else:
                     log_mail_error(log, "Failed to list messages", exc)
                     error = exc
-            trace(
-                "folder_worker_done",
-                load_id=load_id,
-                search=search_query is not None,
-                error=error,
-                messages=len(messages) if messages is not None else None,
-                total=total,
-                source=source,
-            )
             GLib.idle_add(
                 self._on_messages_loaded,
                 load_id,
@@ -2529,21 +2467,8 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> bool:
         if load_id != self._messages_load_generation:
-            trace(
-                "messages_loaded_stale",
-                load_id=load_id,
-                current_load_gen=self._messages_load_generation,
-                expects_search=self._messages_load_expects_search,
-                search_active=self._search_query is not None,
-            )
             return False
         if self._messages_load_expects_search != (self._search_query is not None):
-            trace(
-                "messages_loaded_search_mismatch",
-                load_id=load_id,
-                expects_search=self._messages_load_expects_search,
-                search_active=self._search_query is not None,
-            )
             return False
 
         self._message_loading_spinner.stop()
@@ -2721,13 +2646,6 @@ class MainWindow(Adw.ApplicationWindow):
             self._pending_restore_message_uid = None
             return
 
-        trace(
-            "restore_selected_message",
-            account=account_uid,
-            folder=folder_name,
-            uid=uid,
-            read_gen=self._message_read_generation,
-        )
         self._message_list_view.set_restoring_selection(True)
         if self._message_list_view.select_uid(uid):
             self._pending_restore_message_uid = None
@@ -3442,7 +3360,6 @@ class MainWindow(Adw.ApplicationWindow):
             and self._inflight_message_read_id == self._message_read_generation
             and self._current_message is None
         ):
-            trace("read_skip_duplicate", uid=uid, read_gen=self._message_read_generation)
             return
 
         self._mail.cancel_folder_search()
@@ -3452,14 +3369,6 @@ class MainWindow(Adw.ApplicationWindow):
         read_id = self._message_read_generation
         self._pending_message_read_uid = uid
         self._inflight_message_read_id = read_id
-        trace(
-            "read_queue",
-            uid=uid,
-            read_id=read_id,
-            account=account.uid,
-            folder=folder_name,
-            mark_seen=mark_seen,
-        )
         self._reader_subject.set_label("Loading message…")
         self._reader_subject.set_visible(True)
         self._reader_meta.set_label("")
@@ -3470,19 +3379,12 @@ class MainWindow(Adw.ApplicationWindow):
 
         def worker() -> None:
             if read_id != self._message_read_generation:
-                trace(
-                    "read_worker_skip_stale",
-                    uid=uid,
-                    read_id=read_id,
-                    current_read_gen=self._message_read_generation,
-                )
                 GLib.idle_add(
                     self._on_message_read_worker_stale,
                     read_id,
                     uid,
                 )
                 return
-            trace("read_worker_start", uid=uid, read_id=read_id)
             error: Exception | None = None
             msg: dict | None = None
             try:
@@ -3509,13 +3411,6 @@ class MainWindow(Adw.ApplicationWindow):
             except Exception as exc:
                 log.exception("Failed to read message")
                 error = exc
-            trace(
-                "read_worker_done",
-                uid=uid,
-                read_id=read_id,
-                error=error,
-                has_message=msg is not None,
-            )
             GLib.idle_add(
                 self._on_message_read,
                 read_id,
@@ -3599,7 +3494,6 @@ class MainWindow(Adw.ApplicationWindow):
             return False
         if self._inflight_message_read_id != read_id:
             return False
-        trace("read_retry_after_stale", uid=uid, read_id=read_id)
         mark_seen = not self._sidebar.folder_is_drafts(
             self._current_account.uid, self._current_folder
         )
@@ -3614,14 +3508,6 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> bool:
         if read_id != self._message_read_generation:
-            trace(
-                "read_result_stale",
-                uid=uid,
-                read_id=read_id,
-                current_read_gen=self._message_read_generation,
-                pending_uid=self._pending_message_read_uid,
-                loading=self._reader_subject.get_label(),
-            )
             return False
 
         self._pending_message_read_uid = None
@@ -3656,10 +3542,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         assert msg is not None
         if not self._current_account or not self._current_folder:
-            trace("read_result_no_folder", uid=uid, read_id=read_id)
             return False
 
-        trace("read_result_apply", uid=uid, read_id=read_id, subject=msg.get("subject"))
         self._current_message_uid = uid
         set_active_message_uid(uid)
         self._restore_message_folder = (
