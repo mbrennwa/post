@@ -107,9 +107,20 @@ class MailIoThreadTests(unittest.TestCase):
 
     def test_interactive_runs_before_pending_background(self) -> None:
         results: list[str] = []
+        gate = threading.Event()
+        holder_started = threading.Event()
+
+        def holder() -> None:
+            holder_started.set()
+            gate.wait(timeout=5.0)
+
+        self._io.submit(holder)
+        self.assertTrue(holder_started.wait(timeout=5.0))
 
         self._io.submit_background(lambda: results.append("background"))
         self._io.submit(lambda: results.append("interactive"))
+        gate.set()
+        self._io.run_sync(lambda: None)
         self._io.run_sync(lambda: None)
         self.assertEqual(results, ["interactive", "background"])
 
