@@ -53,7 +53,14 @@ from .accounts import (
     read_local_mail_config,
     should_list_local_account,
 )
-from .camel_util import camel_uid_list, normalize_camel_uid
+from .camel_util import (
+    camel_uid_to_api,
+    camel_uid_list,
+    folder_get_message_info,
+    folder_get_uids,
+    folder_search_uids,
+    normalize_camel_uid,
+)
 from .message_flags import (
     apply_message_flags as _apply_message_flags,
     mark_message_seen as _mark_message_seen,
@@ -157,6 +164,12 @@ class _FolderMessageIndex:
     messages: list[dict]
     unread: int
     total: int
+
+
+def _folder_index_is_cacheable(index: _FolderMessageIndex) -> bool:
+    if index.total <= 0:
+        return True
+    return len(index.messages) >= index.total
 
 
 def _read_unflagged_uids(index: _FolderMessageIndex) -> list[str]:
@@ -1233,7 +1246,7 @@ class MailService:
     ) -> None:
         folder = self._require_folder_unlocked(account_uid, folder_name)
         deleted = Camel.MessageFlags.DELETED
-        folder.set_message_flags(message_uid, deleted, deleted)
+        folder.set_message_flags(camel_uid_to_api(message_uid), deleted, deleted)
         folder.expunge_sync(None)
         try:
             folder.refresh_info_sync(None)
@@ -1273,7 +1286,7 @@ class MailService:
 
         if appended_uid:
             return str(appended_uid)
-        uids = folder.get_uids()
+        uids = folder_get_uids(folder)
         if uids:
             return str(uids[-1])
         return None
@@ -1596,13 +1609,13 @@ class MailService:
         self, account_uid: str, folder_name: str
     ) -> dict[str, Any]:
         folder = self._require_folder_unlocked(account_uid, folder_name)
-        uids = camel_uid_list(folder.get_uids())
+        uids = folder_get_uids(folder)
         deleted = Camel.MessageFlags.DELETED
         batch_size = 50
         for offset in range(0, len(uids), batch_size):
             batch = uids[offset : offset + batch_size]
             for message_uid in batch:
-                folder.set_message_flags(message_uid, deleted, deleted)
+                folder.set_message_flags(camel_uid_to_api(message_uid), deleted, deleted)
             if batch:
                 folder.expunge_sync(None)
         folder.refresh_info_sync(None)
@@ -1748,20 +1761,6 @@ class MailService:
         *,
         sync: bool = True,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
-        if not sync:
-            cached = folder_index_cache.load(account_uid, folder_name)
-            if cached is not None:
-                messages, unread, total = cached
-                key = (account_uid, folder_name)
-                with self._lock:
-                    if key not in self._folder_indexes:
-                        self._folder_indexes[key] = _FolderMessageIndex(
-                            messages=messages,
-                            unread=unread,
-                            total=total,
-                        )
-                return list(messages), unread, total, "disk_cache"
-
         if is_mail_io_thread():
             return self._get_folder_messages_unlocked(
                 account_uid, folder_name, sync=sync
@@ -1782,20 +1781,27 @@ class MailService:
         sync: bool,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
         with self._lock:
-            index, source = self._get_folder_index_unlocked(
-                account_uid, folder_name, sync=sync
-            )
+            key = (account_uid, folder_name)
+            index = self._folder_indexes.get(key)
+            if index is None:
+                index, source = self._get_folder_index_unlocked(
+                    account_uid, folder_name, sync=False
+                )
+            else:
+                source = "memory"
+
             folder = self._require_folder_unlocked(account_uid, folder_name)
             uid_set = self._folder_search_uids_unlocked(
                 folder,
                 query_to_sexp(query),
-                only_cached=not self._network_available,
+                self._index_message_uids(index),
             )
             filtered = [
                 msg for msg in index.messages if msg.get("uid") in uid_set
             ]
+
             match_count = len(filtered)
-            return filtered, match_count, match_count, source
+            return filtered, index.unread, match_count, source
 
     def search_folder_messages(
         self,
@@ -1803,7 +1809,7 @@ class MailService:
         folder_name: str,
         query: MessageSearchQuery,
         *,
-        sync: bool = True,
+        sync: bool = False,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
         if is_mail_io_thread():
             return self._search_folder_messages_unlocked(
@@ -1836,7 +1842,7 @@ class MailService:
         *,
         offset: int = 0,
         limit: int = DEFAULT_MESSAGE_PAGE_SIZE,
-        sync: bool = True,
+        sync: bool = False,
     ) -> tuple[list[dict], int, int, bool]:
         return run_on_mail_thread(
             self._search_messages_page_unlocked,
@@ -1861,16 +1867,16 @@ class MailService:
         with self._lock:
             key = (account_uid, folder_name)
             index = self._folder_indexes.get(key)
-            if index is None or sync:
+            if index is None:
                 index, _source = self._get_folder_index_unlocked(
-                    account_uid, folder_name, sync=sync
+                    account_uid, folder_name, sync=False
                 )
 
             folder = self._require_folder_unlocked(account_uid, folder_name)
             uid_set = self._folder_search_uids_unlocked(
                 folder,
                 query_to_sexp(query),
-                only_cached=not self._network_available,
+                self._index_message_uids(index),
             )
             filtered = [
                 msg for msg in index.messages if msg.get("uid") in uid_set
@@ -1908,13 +1914,14 @@ class MailService:
                 account_uid, folder_name, sync=True
             )
             self._folder_indexes[key] = index
-            folder_index_cache.save(
-                account_uid,
-                folder_name,
-                index.messages,
-                index.unread,
-                index.total,
-            )
+            if _folder_index_is_cacheable(index):
+                folder_index_cache.save(
+                    account_uid,
+                    folder_name,
+                    index.messages,
+                    index.unread,
+                    index.total,
+                )
             return index, "server"
 
         index = self._folder_indexes.get(key)
@@ -1937,13 +1944,14 @@ class MailService:
         )
         self._folder_indexes[key] = index
         if index.messages or index.total:
-            folder_index_cache.save(
-                account_uid,
-                folder_name,
-                index.messages,
-                index.unread,
-                index.total,
-            )
+            if _folder_index_is_cacheable(index):
+                folder_index_cache.save(
+                    account_uid,
+                    folder_name,
+                    index.messages,
+                    index.unread,
+                    index.total,
+                )
         return index, "local"
 
     def _is_missing_folder_error(self, exc: GLib.Error) -> bool:
@@ -1958,19 +1966,16 @@ class MailService:
         self,
         folder: Camel.Folder,
         expression: str,
-        *,
-        only_cached: bool,
+        uids: list[str],
     ) -> set[str]:
-        folder_search = Camel.FolderSearch.new()
-        folder_search.set_folder(folder)
-        if only_cached:
-            folder_search.set_only_cached_messages(True)
-        matches = folder_search.search(expression, [], None)
-        if not matches:
+        if not uids:
             return set()
-        # PyGObject returns a Python list; do not call free_result() — passing []
-        # or a converted list crashes Camel (camel_folder_search_free_result).
-        return {str(uid) for uid in matches}
+        matches = folder_search_uids(folder, expression, uids)
+        return set(matches)
+
+    @staticmethod
+    def _index_message_uids(index: _FolderMessageIndex) -> list[str]:
+        return [str(msg["uid"]) for msg in index.messages if msg.get("uid")]
 
     def _get_message_mime_sync(
         self,
@@ -1980,12 +1985,13 @@ class MailService:
     ) -> Any:
         offline = not self._network_available
         mime = None
+        api_uid = camel_uid_to_api(message_uid)
         try:
-            mime = folder.get_message_sync(message_uid, None)
+            mime = folder.get_message_sync(api_uid, None)
         except GLib.Error as exc:
             if self._is_missing_message_error(exc):
                 if offline:
-                    mime = folder.get_message_cached(message_uid, None)
+                    mime = folder.get_message_cached(api_uid, None)
                     if mime is not None:
                         return mime
                     raise MessageNotAvailableError(
@@ -1997,7 +2003,7 @@ class MailService:
             raise
         if mime is None:
             if offline:
-                mime = folder.get_message_cached(message_uid, None)
+                mime = folder.get_message_cached(api_uid, None)
                 if mime is not None:
                     return mime
                 raise MessageNotAvailableError(
@@ -2048,17 +2054,17 @@ class MailService:
             unread = folder.get_unread_message_count()
             total = folder.get_message_count()
 
-            uids = folder.get_uids()
-            if uids is None:
+            uids = folder_get_uids(folder)
+            if not uids:
                 return _FolderMessageIndex(messages=[], unread=unread, total=total)
 
             messages: list[dict] = []
             for uid in uids:
-                info = folder.get_message_info(str(uid))
+                info = folder_get_message_info(folder, uid)
                 if info is None:
                     continue
                 try:
-                    messages.append(message_info_to_dict(info))
+                    messages.append(message_info_to_dict(info, uid=uid))
                 except (OSError, OverflowError, ValueError):
                     log.debug(
                         "Skipping message %r in %r due to invalid metadata",
@@ -2265,7 +2271,7 @@ class MailService:
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
 
-        info = folder.get_message_info(message_uid)
+        info = folder_get_message_info(folder,message_uid)
         was_unread = info is not None and not (
             info.get_flags() & Camel.MessageFlags.SEEN
         )
@@ -2322,7 +2328,7 @@ class MailService:
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
 
-        info = folder.get_message_info(message_uid)
+        info = folder_get_message_info(folder,message_uid)
         if info is None:
             raise ValueError(f"Message not found: {message_uid}")
 
@@ -2360,7 +2366,7 @@ class MailService:
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
         folder = self._require_folder_unlocked(account_uid, folder_name)
-        info = folder.get_message_info(message_uid)
+        info = folder_get_message_info(folder,message_uid)
         if info is None:
             raise ValueError(f"Message not found: {message_uid}")
 
@@ -2392,7 +2398,7 @@ class MailService:
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
         folder = self._require_folder_unlocked(account_uid, folder_name)
-        info = folder.get_message_info(message_uid)
+        info = folder_get_message_info(folder,message_uid)
         if info is None:
             raise ValueError(f"Message not found: {message_uid}")
 
@@ -2425,7 +2431,7 @@ class MailService:
         updates: list[dict[str, Any]] = []
         changed_uids: list[str] = []
         for message_uid in message_uids:
-            info = folder.get_message_info(message_uid)
+            info = folder_get_message_info(folder,message_uid)
             if info is None:
                 continue
             currently_seen = bool(info.get_flags() & Camel.MessageFlags.SEEN)
@@ -2468,7 +2474,7 @@ class MailService:
         updates: list[dict[str, Any]] = []
         changed_uids: list[str] = []
         for message_uid in message_uids:
-            info = folder.get_message_info(message_uid)
+            info = folder_get_message_info(folder,message_uid)
             if info is None:
                 continue
             currently_flagged = bool(info.get_flags() & Camel.MessageFlags.FLAGGED)
@@ -2499,7 +2505,7 @@ class MailService:
         updates: list[dict[str, Any]] = []
         changed_uids: list[str] = []
         for message_uid in message_uids:
-            info = folder.get_message_info(message_uid)
+            info = folder_get_message_info(folder,message_uid)
             if info is None:
                 continue
             currently_seen = bool(info.get_flags() & Camel.MessageFlags.SEEN)
@@ -2535,7 +2541,7 @@ class MailService:
         updates: list[dict[str, Any]] = []
         changed_uids: list[str] = []
         for message_uid in message_uids:
-            info = folder.get_message_info(message_uid)
+            info = folder_get_message_info(folder,message_uid)
             if info is None:
                 continue
             currently_flagged = bool(info.get_flags() & Camel.MessageFlags.FLAGGED)
@@ -2598,7 +2604,7 @@ class MailService:
         deleted_mask = Camel.MessageFlags.DELETED
         for message_uid in message_uids:
             source_folder.set_message_flags(
-                message_uid, deleted_mask, deleted_mask
+                camel_uid_to_api(message_uid), deleted_mask, deleted_mask
             )
         source_folder.expunge_sync(None)
         source_folder.refresh_info_sync(None)
@@ -2653,7 +2659,7 @@ class MailService:
             uid = normalize_camel_uid(raw_uid)
             if uid is None or uid in seen:
                 continue
-            if folder.get_message_info(uid) is None:
+            if folder_get_message_info(folder,uid) is None:
                 continue
             seen.add(uid)
             transfer_uids.append(uid)
@@ -2766,7 +2772,7 @@ class MailService:
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         for message_uid in message_uids:
-            info = folder.get_message_info(message_uid)
+            info = folder_get_message_info(folder,message_uid)
             if info is not None:
                 messages.append(message_info_to_dict(info))
         return messages
@@ -2786,15 +2792,15 @@ class MailService:
             for message in source_messages
         }
         found: list[str] = []
-        uids = folder.get_uids()
-        if uids is None:
+        uids = folder_get_uids(folder)
+        if not uids:
             return []
 
         for uid in uids:
-            info = folder.get_message_info(str(uid))
+            info = folder_get_message_info(folder,uid)
             if info is None:
                 continue
-            message = message_info_to_dict(info)
+            message = message_info_to_dict(info, uid=uid)
             fingerprint = (
                 message.get("subject") or "",
                 message.get("from") or "",

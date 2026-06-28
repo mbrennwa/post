@@ -12,6 +12,8 @@ import gi
 gi.require_version("Camel", "1.2")
 from gi.repository import Camel
 
+from post.mail.camel_util import camel_uid_to_api, folder_get_message_info
+
 
 def persist_folder_flags(
     store: Camel.Store,
@@ -26,7 +28,7 @@ def persist_folder_flags(
             raise RuntimeError("Could not save folder summary after flag change")
 
     for message_uid in message_uids:
-        if not folder.synchronize_message_sync(message_uid, None):
+        if not folder.synchronize_message_sync(camel_uid_to_api(message_uid), None):
             raise RuntimeError(
                 f"Could not synchronize message {message_uid} after flag change"
             )
@@ -50,7 +52,7 @@ def apply_message_flags(
     on_seen_changed: Callable[[bool], None] | None = None,
     on_flagged_changed: Callable[[bool], None] | None = None,
 ) -> bool:
-    info = folder.get_message_info(message_uid)
+    info = folder_get_message_info(folder, message_uid)
     if info is None:
         return False
 
@@ -59,10 +61,11 @@ def apply_message_flags(
     if current == target:
         return False
 
-    if not folder.set_message_flags(message_uid, mask, value):
+    api_uid = camel_uid_to_api(message_uid)
+    if not folder.set_message_flags(api_uid, mask, value):
         return False
 
-    info = folder.get_message_info(message_uid)
+    info = folder_get_message_info(folder, message_uid)
     if info is not None:
         info.set_folder_flagged(True)
 

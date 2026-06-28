@@ -4,8 +4,13 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
-from post.mail.camel_util import camel_uid_list, normalize_camel_uid
+from post.mail.camel_util import (
+    camel_uid_list,
+    folder_get_uids,
+    normalize_camel_uid,
+)
 
 _SPOOL_BACKEND = "spool"
 
@@ -22,6 +27,25 @@ class CamelUidListTests(unittest.TestCase):
 
     def test_empty_string(self) -> None:
         self.assertEqual(camel_uid_list(""), [])
+
+
+class FolderGetUidsTests(unittest.TestCase):
+    def test_uses_get_uids_when_utf8_safe(self) -> None:
+        folder = mock.Mock()
+        folder.get_uids.return_value = ["1", "2"]
+        self.assertEqual(folder_get_uids(folder), ["1", "2"])
+
+    def test_falls_back_when_get_uids_is_not_utf8(self) -> None:
+        folder = mock.Mock()
+        folder.get_uids.side_effect = UnicodeDecodeError(
+            "utf-8", b"\xff", 0, 1, "invalid start byte"
+        )
+        with mock.patch(
+            "post.mail.camel_util._folder_uids_via_ctypes",
+            return_value=["uidb64:ov8="],
+        ) as fallback:
+            self.assertEqual(folder_get_uids(folder), ["uidb64:ov8="])
+        fallback.assert_called_once_with(folder)
 
 
 class NormalizeCamelUidTests(unittest.TestCase):

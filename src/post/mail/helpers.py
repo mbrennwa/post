@@ -228,7 +228,7 @@ def format_message_datetime(unix_time: float | int | None) -> str | None:
         return None
 
 
-def message_info_to_dict(info: Any) -> dict[str, Any]:
+def message_info_to_dict(info: Any, *, uid: str | None = None) -> dict[str, Any]:
     import gi
 
     gi.require_version("Camel", "1.2")
@@ -242,8 +242,13 @@ def message_info_to_dict(info: Any) -> dict[str, Any]:
         or _valid_unix_timestamp(date_sent)
         or 0
     )
+    if uid is None:
+        try:
+            uid = _decode_header_value(info.get_uid())
+        except UnicodeDecodeError:
+            uid = None
     return {
-        "uid": _decode_header_value(info.get_uid()),
+        "uid": uid,
         "subject": _decode_header_value(info.get_subject()) or "(no subject)",
         "from": format_recipient_header(info.get_from()),
         "to": format_recipient_header(info.get_to()),
