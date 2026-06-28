@@ -24,7 +24,7 @@ from post.compose_window import ComposeWindow, SavedDraftNotification
 from post.credentials import prompt_password_sync
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
-from post.mail.eds import MailAccount, MessageNotAvailableError
+from post.mail.eds import MailAccount, MessageNotAvailableError, OfflineSyncProgress
 from post.mail.io_thread import get_mail_io_thread
 from post.mail.sync_watcher import MailSyncWatcher
 from post.message_list_view import VirtualMessageList
@@ -47,6 +47,7 @@ from post.mail.search import MessageSearchQuery, parse_search_query
 from post.mail.send_queue import (
     OFFLINE_CACHED_LIST_STATUS,
     OFFLINE_MAIL_MESSAGE,
+    OFFLINE_SEARCHING_LOCAL_CACHE,
     is_network_unavailable_error,
     list_queued_messages,
     list_queued_outbound_messages,
@@ -69,12 +70,20 @@ from post.reader import build_reader_document
 from post.wrap_label import WrappingLabel, configure_ellipsize_label, set_label_wrap_mode
 from post.preferences import (
     MessageAppearance,
+    OFFLINE_BODY_SYNC_ALL,
+    OFFLINE_BODY_SYNC_LAST_MONTH,
+    OFFLINE_BODY_SYNC_LAST_YEAR,
+    OFFLINE_BODY_SYNC_OFF,
+    OfflineBodySyncMode,
     get_auto_sync,
     get_load_remote_content,
     get_message_appearance,
+    get_offline_body_sync_prompt_seen,
     get_sidebar_state,
     get_window_state,
+    set_account_offline_body_sync,
     set_active_message_uid,
+    set_offline_body_sync_prompt_seen,
     set_window_state,
 )
 from post.sidebar import MailSidebar
@@ -180,6 +189,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._user_message_click_pending = False
         self._search_query: MessageSearchQuery | None = None
         self._search_entry_updating = False
+        self._offline_download_status = ""
         self._status_hint = ""
         self._network_available = Gio.NetworkMonitor.get_default().get_network_available()
 
@@ -190,7 +200,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._header_search_entry = Gtk.SearchEntry()
         self._header_search_entry.set_placeholder_text(
-            "Search…  from: to: subject: cc: is:(!)read is:(!)flagged has:(!)attachment"
+            "Search…  from: to: subject: cc: body: is:(!)read is:(!)flagged has:(!)attachment"
         )
         self._header_search_entry.set_size_request(546, -1)
         self._header_search_entry.set_hexpand(True)
@@ -445,6 +455,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._setup_delete_shortcut()
         self._setup_search_shortcuts()
         self._setup_send_queue_flush()
+        self._mail.offline_sync.add_progress_callback(self._on_offline_sync_progress)
         self._clear_reader()
 
     def _setup_send_queue_flush(self) -> None:
@@ -456,6 +467,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _flush_send_queue_on_startup(self) -> bool:
         self._flush_send_queue_idle()
+        self._mail.schedule_offline_body_sync()
         return False
 
     def _on_network_available_changed(self, monitor: Gio.NetworkMonitor, *_args) -> None:
@@ -468,6 +480,7 @@ class MainWindow(Adw.ApplicationWindow):
         if online:
             self._mail.go_online_sync()
             self._flush_send_queue_idle()
+            self._mail.schedule_offline_body_sync()
             if self._current_account and self._current_folder:
                 if get_auto_sync():
                     self._load_messages(
@@ -868,6 +881,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_load_remote_content_changed=self._on_load_remote_content_changed,
             on_auto_sync_changed=self._on_auto_sync_changed,
             on_message_appearance_changed=self._on_message_appearance_changed,
+            on_offline_body_sync_changed=self._on_offline_body_sync_changed,
         )
         self._settings_dialog = dialog
         dialog.connect("closed", self._on_settings_closed)
@@ -963,6 +977,83 @@ class MainWindow(Adw.ApplicationWindow):
         self._sync_watcher.set_accounts(account_uids)
         if get_auto_sync() and not self._sync_watcher.running:
             self._sync_watcher.start()
+        self._mail.schedule_offline_body_sync()
+        self._maybe_show_offline_body_sync_prompt(account_uids)
+
+    def _remote_sync_account_backends(self) -> frozenset[str]:
+        return frozenset({"imap", "imapx", "ews", "microsoft365", "pop3"})
+
+    def _apply_offline_body_sync_to_accounts(
+        self, account_uids: list[str], mode: OfflineBodySyncMode
+    ) -> None:
+        for account_uid in account_uids:
+            account = self._mail.get_account(account_uid)
+            if account.backend not in self._remote_sync_account_backends():
+                continue
+            set_account_offline_body_sync(account_uid, mode)
+            self._mail.refresh_offline_settings(account_uid)
+
+    def _maybe_show_offline_body_sync_prompt(self, account_uids: list[str]) -> None:
+        if get_offline_body_sync_prompt_seen():
+            return
+        remote_accounts = [
+            uid
+            for uid in account_uids
+            if self._mail.get_account(uid).backend in self._remote_sync_account_backends()
+        ]
+        if not remote_accounts:
+            set_offline_body_sync_prompt_seen(True)
+            return
+
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Offline Mail",
+            body=(
+                "Post can download message bodies from all folders so you can "
+                "read and search mail while offline. This uses extra disk space "
+                "and network bandwidth."
+            ),
+        )
+        dialog.add_response("not_now", "Not Now")
+        dialog.add_response("last_month", "Last Month")
+        dialog.add_response("last_year", "Last Year")
+        dialog.add_response("all", "Everything")
+        dialog.set_response_appearance("all", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("last_month")
+        dialog.set_close_response("not_now")
+
+        def on_response(_dialog: Adw.MessageDialog, response: str) -> None:
+            set_offline_body_sync_prompt_seen(True)
+            mode_by_response = {
+                "last_month": OFFLINE_BODY_SYNC_LAST_MONTH,
+                "last_year": OFFLINE_BODY_SYNC_LAST_YEAR,
+                "all": OFFLINE_BODY_SYNC_ALL,
+            }
+            mode = mode_by_response.get(response)
+            if mode is not None:
+                self._apply_offline_body_sync_to_accounts(remote_accounts, mode)
+
+        dialog.connect("response", on_response)
+        dialog.present()
+
+    def _on_offline_sync_progress(self, progress: OfflineSyncProgress | None) -> None:
+        def update() -> bool:
+            if progress is None or not progress.active:
+                self._offline_download_status = ""
+            else:
+                folder = progress.folder_name or "folders"
+                self._offline_download_status = (
+                    f"Downloading mail for offline · {progress.account_label} · {folder}"
+                )
+            self._refresh_status_display()
+            return False
+
+        GLib.idle_add(update)
+
+    def _on_offline_body_sync_changed(
+        self, account_uid: str, mode: OfflineBodySyncMode
+    ) -> None:
+        self._mail.refresh_offline_settings(account_uid)
 
     def _on_auto_sync_changed(self, enabled: bool) -> None:
         if enabled:
@@ -1413,7 +1504,13 @@ class MainWindow(Adw.ApplicationWindow):
     def _refresh_status_display(self) -> None:
         if not self._network_available:
             queued = len(list_queued_outbound_messages())
-            self._status.set_label(offline_status_text(queued_count=queued))
+            parts = [offline_status_text(queued_count=queued)]
+            if self._search_query is not None:
+                parts.append(OFFLINE_SEARCHING_LOCAL_CACHE)
+            self._status.set_label(" · ".join(parts))
+            return
+        if self._offline_download_status:
+            self._status.set_label(self._offline_download_status)
             return
         self._status.set_label(self._status_hint)
 
@@ -2011,6 +2108,8 @@ class MainWindow(Adw.ApplicationWindow):
         source: str,
     ) -> str:
         action = "Searching" if searching else "Loading"
+        if searching and not self._network_available:
+            return f"Searching {display_folder} · {OFFLINE_SEARCHING_LOCAL_CACHE}…"
         detail = self._load_source_label(source)
         if detail:
             return f"{action} {display_folder} {detail}…"
@@ -2145,7 +2244,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._clear_reader()
 
         cache_snapshot: tuple[list[dict], int, int] | None = None
-        if not viewing_outbox and search_query is None and not force_sync:
+        if not viewing_outbox and not force_sync:
             cache_snapshot = load_folder_index_cache(account_uid, folder_name)
 
         send_pending = self._mail.outbound_sends_pending()
@@ -2171,7 +2270,11 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_stack.set_visible_child_name("loading")
 
         def worker_initial() -> None:
-            if cache_snapshot is not None and not (should_sync and not use_background_sync):
+            if (
+                cache_snapshot is not None
+                and search_query is None
+                and not (should_sync and not use_background_sync)
+            ):
                 return
             error: Exception | None = None
             messages: list[dict] | None = None
@@ -2184,7 +2287,6 @@ class MainWindow(Adw.ApplicationWindow):
             except Exception as exc:
                 if (
                     not viewing_outbox
-                    and search_query is None
                     and initial_sync
                     and is_network_unavailable_error(exc)
                 ):
@@ -2275,16 +2377,27 @@ class MainWindow(Adw.ApplicationWindow):
         if error is not None:
             if is_network_unavailable_error(error):
                 if (
-                    self._search_query is None
-                    and not is_post_outbox_folder(folder_name)
+                    not is_post_outbox_folder(folder_name)
                     and folder_index_has_cache(account_uid, folder_name)
                 ):
                     try:
-                        messages, unread, total, source = self._mail.get_folder_messages(
-                            account_uid,
-                            folder_name,
-                            sync=False,
-                        )
+                        if self._search_query is not None:
+                            messages, unread, total, source = (
+                                self._mail.search_folder_messages(
+                                    account_uid,
+                                    folder_name,
+                                    self._search_query,
+                                    sync=False,
+                                )
+                            )
+                        else:
+                            messages, unread, total, source = (
+                                self._mail.get_folder_messages(
+                                    account_uid,
+                                    folder_name,
+                                    sync=False,
+                                )
+                            )
                     except Exception:
                         messages = None
                     else:

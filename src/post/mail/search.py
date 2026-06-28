@@ -8,22 +8,30 @@ from __future__ import annotations
 import re
 import shlex
 from dataclasses import dataclass
-from typing import Any
 
 # Optional whitespace after ":" so "subject: Auburn" works like "subject:Auburn".
 _QUERY_PATTERN = re.compile(
     r"""
     \b(?P<boolean>is|has):\s*(?P<negated>!)?(?P<prop>read|flagged|attachment)\b
     |
-    \b(?P<header>from|to|subject|cc):\s*
+    \b(?P<header>from|to|subject|cc|body):\s*
     (?:
         "(?P<quoted>[^"]*)"
         |
-        (?P<unquoted>[^\s]+(?:\s+(?!(?:from|to|subject|cc|is|has):)[^\s]+)*)
+        (?P<unquoted>[^\s]+(?:\s+(?!(?:from|to|subject|cc|body|is|has):)[^\s]+)*)
     )
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+_HEADER_FIELD_NAMES = {
+    "from": "From",
+    "to": "To",
+    "subject": "Subject",
+    "cc": "Cc",
+}
+
+_TEXT_HEADER_FIELDS = ("Subject", "From", "To", "Cc")
 
 
 @dataclass(frozen=True)
@@ -31,8 +39,6 @@ class SearchTerm:
     field: str
     value: str | None = None
     negated: bool = False
-
-_DEFAULT_TEXT_FIELDS = ("subject", "from", "to", "cc")
 
 
 @dataclass(frozen=True)
@@ -54,7 +60,7 @@ def _strip_quotes(token: str) -> str:
 
 
 def parse_search_query(raw: str) -> MessageSearchQuery | None:
-    """Parse a search string. Bare words match subject/from/to/cc; prefixes narrow fields."""
+    """Parse a search string. Bare words match subject/from/to/cc/body; prefixes narrow fields."""
     text = raw.strip()
     if not text:
         return None
@@ -105,42 +111,62 @@ def parse_search_query(raw: str) -> MessageSearchQuery | None:
     return MessageSearchQuery(terms=tuple(terms))
 
 
-def _header_matches(msg: dict[str, Any], field: str, needle: str) -> bool:
-    haystack = (msg.get(field) or "").lower()
-    return needle.lower() in haystack
+def _sexp_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
-def _text_matches(msg: dict[str, Any], needle: str) -> bool:
-    lower = needle.lower()
-    for field in _DEFAULT_TEXT_FIELDS:
-        if lower in (msg.get(field) or "").lower():
-            return True
-    return False
+def _boolean_term_to_sexp(term: SearchTerm) -> str:
+    flag_name = {
+        "read": "seen",
+        "flagged": "flagged",
+        "attachment": "attachments",
+    }[term.field]
+    flag_expr = f'(system-flag {_sexp_string(flag_name)})'
+    if term.negated:
+        return f"(not {flag_expr})"
+    return flag_expr
 
 
-def _boolean_matches(msg: dict[str, Any], field: str) -> bool:
-    flags = msg.get("flags") or {}
-    if field == "read":
-        return bool(flags.get("seen", True))
-    if field == "flagged":
-        return bool(flags.get("flagged"))
-    if field == "attachment":
-        return bool(flags.get("attachments"))
-    return False
+def _header_term_to_sexp(header: str, value: str) -> str:
+    return f"(header-contains {_sexp_string(header)} {_sexp_string(value)})"
 
 
-def _term_matches(msg: dict[str, Any], term: SearchTerm) -> bool:
+def _text_term_to_sexp(value: str) -> str:
+    clauses = [
+        _header_term_to_sexp(header, value) for header in _TEXT_HEADER_FIELDS
+    ]
+    clauses.append(f"(body-contains {_sexp_string(value)})")
+    if len(clauses) == 1:
+        return clauses[0]
+    return f'(or {" ".join(clauses)})'
+
+
+def _body_term_to_sexp(value: str) -> str:
+    return f"(body-contains {_sexp_string(value)})"
+
+
+def _term_to_sexp(term: SearchTerm) -> str:
     if term.field in ("read", "flagged", "attachment"):
-        result = _boolean_matches(msg, term.field)
-        return not result if term.negated else result
+        return _boolean_term_to_sexp(term)
     if term.field == "text":
         assert term.value is not None
-        return _text_matches(msg, term.value)
-
+        return _text_term_to_sexp(term.value)
+    if term.field == "body":
+        assert term.value is not None
+        return _body_term_to_sexp(term.value)
     assert term.value is not None
-    return _header_matches(msg, term.field, term.value)
+    header = _HEADER_FIELD_NAMES[term.field]
+    return _header_term_to_sexp(header, term.value)
 
 
-def message_matches(msg: dict[str, Any], query: MessageSearchQuery) -> bool:
-    """Return True if the message matches all search terms."""
-    return all(_term_matches(msg, term) for term in query.terms)
+def query_to_sexp(query: MessageSearchQuery) -> str:
+    """Compile a Post search query to a Camel folder search S-expression."""
+    clauses = [_term_to_sexp(term) for term in query.terms]
+    if not clauses:
+        return "(match-all)"
+    if len(clauses) == 1:
+        inner = clauses[0]
+    else:
+        inner = f'(and {" ".join(clauses)})'
+    return f"(match-all {inner})"

@@ -100,7 +100,9 @@ from .folders import (
     is_virtual_folder,
     validate_folder_display_name,
 )
-from .search import MessageSearchQuery, message_matches
+from .offline_settings import apply_offline_settings_to_store, apply_offline_sync_to_folder
+from .offline_sync import OfflineBodySyncCoordinator, OfflineSyncProgress
+from .search import MessageSearchQuery, query_to_sexp
 
 log = logging.getLogger(__name__)
 
@@ -121,15 +123,32 @@ def _run_on_gtk_thread(callback: Callable[[], None]) -> bool:
     return False
 
 
+class MessageUnavailableReason:
+    VANISHED = "vanished"
+    NOT_CACHED_OFFLINE = "not_cached_offline"
+
+
 class MessageNotAvailableError(LookupError):
     """Raised when Camel reports a listed UID is no longer fetchable."""
 
-    def __init__(self, message_uid: str, folder_name: str | None = None) -> None:
+    def __init__(
+        self,
+        message_uid: str,
+        folder_name: str | None = None,
+        *,
+        reason: str = MessageUnavailableReason.VANISHED,
+    ) -> None:
         self.message_uid = message_uid
         self.folder_name = folder_name
+        self.reason = reason
         super().__init__(message_uid)
 
     def user_message(self) -> str:
+        if self.reason == MessageUnavailableReason.NOT_CACHED_OFFLINE:
+            return (
+                "This message isn't available offline yet. "
+                "Connect to download it."
+            )
         return "This message is no longer available."
 
 
@@ -243,6 +262,39 @@ class MailService:
         default_factory=threading.Condition, init=False, repr=False
     )
     _active_outbound_deliveries: set[str] = field(default_factory=set, init=False)
+    _offline_sync: OfflineBodySyncCoordinator | None = field(
+        default=None, init=False, repr=False
+    )
+
+    @property
+    def offline_sync(self) -> OfflineBodySyncCoordinator:
+        if self._offline_sync is None:
+            self._offline_sync = OfflineBodySyncCoordinator(self)
+        return self._offline_sync
+
+    def is_network_available(self) -> bool:
+        return self._network_available
+
+    def schedule_offline_body_sync(self, account_uid: str | None = None) -> None:
+        if account_uid is None:
+            self.offline_sync.schedule_all_accounts()
+        else:
+            self.offline_sync.schedule_account(account_uid)
+
+    def cancel_offline_body_sync(self, account_uid: str) -> None:
+        self.offline_sync.cancel_account(account_uid)
+
+    def refresh_offline_settings(self, account_uid: str) -> None:
+        """Re-apply offline Camel settings after preference changes."""
+        run_on_mail_thread(self._refresh_offline_settings_unlocked, account_uid)
+
+    def _refresh_offline_settings_unlocked(self, account_uid: str) -> None:
+        with self._lock:
+            store = self._stores.get(account_uid)
+        if store is None:
+            return
+        apply_offline_settings_to_store(store, account_uid)
+        self.schedule_offline_body_sync(account_uid)
 
     def _enter_mail_op(self) -> None:
         with self._pending_mail_ops_cond:
@@ -415,6 +467,8 @@ class MailService:
                             not available,
                             exc_info=True,
                         )
+        if available:
+            self.offline_sync.schedule_all_accounts()
 
     def go_online_sync(self) -> None:
         """Bring offline stores back online and drop cached folder indexes."""
@@ -432,6 +486,7 @@ class MailService:
                     except GLib.Error:
                         log.exception("Failed to bring mail store online")
             self._folder_indexes.clear()
+        self.offline_sync.schedule_all_accounts()
 
     def reload_registry(self) -> None:
         """Reconnect to EDS and drop cached Camel services (after account changes)."""
@@ -596,7 +651,7 @@ class MailService:
             store = self._stores[account_uid]
             if store.get_connection_status() == Camel.ServiceConnectionStatus.CONNECTED:
                 self._sync_store_online_state_unlocked(store)
-                self._configure_store_settings_unlocked(store)
+                self._configure_store_settings_unlocked(store, account_uid)
                 return store
             del self._stores[account_uid]
 
@@ -618,7 +673,7 @@ class MailService:
 
         self._sync_store_online_state_unlocked(store)
 
-        self._configure_store_settings_unlocked(store)
+        self._configure_store_settings_unlocked(store, account_uid)
         self._stores[account_uid] = store
         return store
 
@@ -629,13 +684,10 @@ class MailService:
             store.connect_sync(None)
 
     @staticmethod
-    def _configure_store_settings_unlocked(store: Camel.Store) -> None:
-        settings = store.ref_settings()
-        if settings is None:
-            return
-        set_interval = getattr(settings, "set_store_changes_interval", None)
-        if callable(set_interval):
-            set_interval(0)
+    def _configure_store_settings_unlocked(
+        store: Camel.Store, account_uid: str
+    ) -> None:
+        apply_offline_settings_to_store(store, account_uid)
 
     def _get_transport_unlocked(
         self,
@@ -1704,8 +1756,14 @@ class MailService:
             index, source = self._get_folder_index_unlocked(
                 account_uid, folder_name, sync=sync
             )
+            folder = self._require_folder_unlocked(account_uid, folder_name)
+            uid_set = self._folder_search_uids_unlocked(
+                folder,
+                query_to_sexp(query),
+                only_cached=not self._network_available,
+            )
             filtered = [
-                msg for msg in index.messages if message_matches(msg, query)
+                msg for msg in index.messages if msg.get("uid") in uid_set
             ]
             match_count = len(filtered)
             return filtered, match_count, match_count, source
@@ -1718,16 +1776,6 @@ class MailService:
         *,
         sync: bool = True,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
-        if not sync:
-            cached = folder_index_cache.load(account_uid, folder_name)
-            if cached is not None:
-                messages, _unread, _total = cached
-                filtered = [
-                    msg for msg in messages if message_matches(msg, query)
-                ]
-                match_count = len(filtered)
-                return filtered, match_count, match_count, "disk_cache"
-
         if is_mail_io_thread():
             return self._search_folder_messages_unlocked(
                 account_uid, folder_name, query, sync=sync
@@ -1789,7 +1837,15 @@ class MailService:
                     account_uid, folder_name, sync=sync
                 )
 
-            filtered = [msg for msg in index.messages if message_matches(msg, query)]
+            folder = self._require_folder_unlocked(account_uid, folder_name)
+            uid_set = self._folder_search_uids_unlocked(
+                folder,
+                query_to_sexp(query),
+                only_cached=not self._network_available,
+            )
+            filtered = [
+                msg for msg in index.messages if msg.get("uid") in uid_set
+            ]
             page, has_more = paginate_messages(filtered, offset, limit)
             match_count = len(filtered)
             return page, match_count, match_count, has_more
@@ -1869,19 +1925,59 @@ class MailService:
             Camel.folder_error_quark(), Camel.FolderError.INVALID_UID
         )
 
+    def _folder_search_uids_unlocked(
+        self,
+        folder: Camel.Folder,
+        expression: str,
+        *,
+        only_cached: bool,
+    ) -> set[str]:
+        folder_search = Camel.FolderSearch.new()
+        folder_search.set_folder(folder)
+        if only_cached:
+            folder_search.set_only_cached_messages(True)
+        matches = folder_search.search(expression, [], None)
+        try:
+            if not matches:
+                return set()
+            return {str(uid) for uid in matches}
+        finally:
+            if matches is not None:
+                folder_search.free_result(matches)
+
     def _get_message_mime_sync(
         self,
         folder: Camel.Folder,
         folder_name: str,
         message_uid: str,
     ) -> Any:
+        offline = not self._network_available
+        mime = None
         try:
             mime = folder.get_message_sync(message_uid, None)
         except GLib.Error as exc:
             if self._is_missing_message_error(exc):
+                if offline:
+                    mime = folder.get_message_cached(message_uid, None)
+                    if mime is not None:
+                        return mime
+                    raise MessageNotAvailableError(
+                        message_uid,
+                        folder_name,
+                        reason=MessageUnavailableReason.NOT_CACHED_OFFLINE,
+                    ) from exc
                 raise MessageNotAvailableError(message_uid, folder_name) from exc
             raise
         if mime is None:
+            if offline:
+                mime = folder.get_message_cached(message_uid, None)
+                if mime is not None:
+                    return mime
+                raise MessageNotAvailableError(
+                    message_uid,
+                    folder_name,
+                    reason=MessageUnavailableReason.NOT_CACHED_OFFLINE,
+                )
             raise MessageNotAvailableError(message_uid, folder_name)
         return mime
 
@@ -1907,6 +2003,9 @@ class MailService:
         folder = self._open_folder_unlocked(account_uid, folder_name)
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
+        from post.preferences import get_account_offline_body_sync
+
+        apply_offline_sync_to_folder(folder, get_account_offline_body_sync(account_uid))
         return folder
 
     def _build_folder_index_unlocked(

@@ -6,34 +6,9 @@ from __future__ import annotations
 import unittest
 
 from post.mail.search import (
-    MessageSearchQuery,
     SearchTerm,
-    message_matches,
     parse_search_query,
 )
-
-
-def _msg(
-    *,
-    subject: str = "Hello",
-    from_addr: str = "Alice <alice@example.com>",
-    to_addr: str = "bob@example.com",
-    cc: str = "",
-    seen: bool = True,
-    flagged: bool = False,
-    attachments: bool = False,
-) -> dict:
-    return {
-        "subject": subject,
-        "from": from_addr,
-        "to": to_addr,
-        "cc": cc,
-        "flags": {
-            "seen": seen,
-            "flagged": flagged,
-            "attachments": attachments,
-        },
-    }
 
 
 class ParseSearchQueryTests(unittest.TestCase):
@@ -179,90 +154,6 @@ class ParseSearchQueryTests(unittest.TestCase):
                 SearchTerm(field="text", value="Auburn"),
                 SearchTerm(field="from", value="alice"),
             },
-        )
-
-
-class MessageMatchesTests(unittest.TestCase):
-    def test_from_match(self) -> None:
-        query = MessageSearchQuery(terms=(SearchTerm(field="from", value="alice"),))
-        self.assertTrue(message_matches(_msg(from_addr="Alice <a@b.com>"), query))
-        self.assertFalse(message_matches(_msg(from_addr="Bob <b@b.com>"), query))
-
-    def test_subject_case_insensitive(self) -> None:
-        query = MessageSearchQuery(
-            terms=(SearchTerm(field="subject", value="INVOICE"),)
-        )
-        self.assertTrue(message_matches(_msg(subject="Your invoice"), query))
-
-    def test_to_and_cc(self) -> None:
-        query = MessageSearchQuery(terms=(SearchTerm(field="to", value="bob@"),))
-        self.assertTrue(message_matches(_msg(to_addr="bob@example.com"), query))
-
-        cc_query = MessageSearchQuery(terms=(SearchTerm(field="cc", value="team"),))
-        self.assertTrue(message_matches(_msg(cc="team-list@example.com"), cc_query))
-
-    def test_read_flag(self) -> None:
-        unread = MessageSearchQuery(terms=(SearchTerm(field="read", negated=True),))
-        self.assertTrue(message_matches(_msg(seen=False), unread))
-        self.assertFalse(message_matches(_msg(seen=True), unread))
-
-        read = MessageSearchQuery(terms=(SearchTerm(field="read"),))
-        self.assertTrue(message_matches(_msg(seen=True), read))
-        self.assertFalse(message_matches(_msg(seen=False), read))
-
-    def test_flagged_and_attachment(self) -> None:
-        flagged = MessageSearchQuery(terms=(SearchTerm(field="flagged"),))
-        self.assertTrue(message_matches(_msg(flagged=True), flagged))
-        unflagged = MessageSearchQuery(terms=(SearchTerm(field="flagged", negated=True),))
-        self.assertTrue(message_matches(_msg(flagged=False), unflagged))
-        self.assertFalse(message_matches(_msg(flagged=True), unflagged))
-
-        attach = MessageSearchQuery(terms=(SearchTerm(field="attachment"),))
-        self.assertTrue(message_matches(_msg(attachments=True), attach))
-        no_attach = MessageSearchQuery(
-            terms=(SearchTerm(field="attachment", negated=True),)
-        )
-        self.assertTrue(message_matches(_msg(attachments=False), no_attach))
-        self.assertFalse(message_matches(_msg(attachments=True), no_attach))
-
-    def test_and_semantics(self) -> None:
-        query = MessageSearchQuery(
-            terms=(
-                SearchTerm(field="from", value="alice"),
-                SearchTerm(field="subject", value="invoice"),
-            )
-        )
-        self.assertTrue(
-            message_matches(
-                _msg(from_addr="alice@x.com", subject="invoice #42"), query
-            )
-        )
-        self.assertFalse(
-            message_matches(_msg(from_addr="alice@x.com", subject="hello"), query)
-        )
-
-    def test_text_matches_any_default_field(self) -> None:
-        query = MessageSearchQuery(terms=(SearchTerm(field="text", value="Auburn"),))
-        self.assertTrue(message_matches(_msg(subject="Fwd: miniREUDI for Auburn"), query))
-        self.assertTrue(message_matches(_msg(from_addr="Auburn <a@b.com>"), query))
-        self.assertFalse(message_matches(_msg(subject="H2 Deconvolution"), query))
-
-    def test_text_and_prefix_combined(self) -> None:
-        query = MessageSearchQuery(
-            terms=(
-                SearchTerm(field="text", value="Auburn"),
-                SearchTerm(field="from", value="alice"),
-            )
-        )
-        self.assertTrue(
-            message_matches(
-                _msg(from_addr="Alice <alice@x.com>", subject="Auburn news"), query
-            )
-        )
-        self.assertFalse(
-            message_matches(
-                _msg(from_addr="Bob <bob@x.com>", subject="Auburn news"), query
-            )
         )
 
 
