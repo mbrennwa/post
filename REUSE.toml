@@ -49,6 +49,7 @@ path = [
     "licensing/third_party.json",
     "licensing/paths.json",
     "scripts/check.sh",
+    "scripts/install-deps.sh",
     "run.sh",
     ".github/workflows/test.yml",
     "README.md",
