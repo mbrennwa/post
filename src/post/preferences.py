@@ -165,6 +165,29 @@ def get_offline_body_sync_prompt_seen() -> bool:
     return bool(_load_raw().get("offline_body_sync_prompt_seen"))
 
 
+def set_offline_body_sync_prompt_declined(declined: bool = True) -> None:
+    """Remember that the user dismissed the first-run offline sync dialog."""
+    data = _load_raw()
+    data["offline_body_sync_prompt_declined"] = bool(declined)
+    _save_raw(data)
+
+
+def get_offline_body_sync_prompt_declined() -> bool:
+    return bool(_load_raw().get("offline_body_sync_prompt_declined"))
+
+
+def should_show_offline_body_sync_prompt(remote_account_uids: list[str]) -> bool:
+    """Return whether the first-run offline body sync dialog should appear."""
+    if get_offline_body_sync_prompt_declined():
+        return False
+    if not remote_account_uids:
+        return False
+    return any(
+        get_account_offline_body_sync(uid) == OFFLINE_BODY_SYNC_OFF
+        for uid in remote_account_uids
+    )
+
+
 def set_show_evolution_local(value: bool) -> None:
     data = _load_raw()
     data["show_evolution_local"] = value

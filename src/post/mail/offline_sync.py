@@ -115,6 +115,8 @@ class OfflineBodySyncCoordinator:
     def cancel_all(self) -> None:
         for account_uid in list(self._cancellables):
             self.cancel_account(account_uid)
+        if self._running:
+            self._notify_progress(None)
 
     def is_active(self) -> bool:
         return bool(self._running)

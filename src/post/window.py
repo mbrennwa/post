@@ -78,12 +78,12 @@ from post.preferences import (
     get_auto_sync,
     get_load_remote_content,
     get_message_appearance,
-    get_offline_body_sync_prompt_seen,
     get_sidebar_state,
     get_window_state,
     set_account_offline_body_sync,
     set_active_message_uid,
-    set_offline_body_sync_prompt_seen,
+    set_offline_body_sync_prompt_declined,
+    should_show_offline_body_sync_prompt,
     set_window_state,
 )
 from post.sidebar import MailSidebar
@@ -994,15 +994,12 @@ class MainWindow(Adw.ApplicationWindow):
             self._mail.refresh_offline_settings(account_uid)
 
     def _maybe_show_offline_body_sync_prompt(self, account_uids: list[str]) -> None:
-        if get_offline_body_sync_prompt_seen():
-            return
         remote_accounts = [
             uid
             for uid in account_uids
             if self._mail.get_account(uid).backend in self._remote_sync_account_backends()
         ]
-        if not remote_accounts:
-            set_offline_body_sync_prompt_seen(True)
+        if not should_show_offline_body_sync_prompt(remote_accounts):
             return
 
         dialog = Adw.MessageDialog(
@@ -1023,15 +1020,23 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.set_close_response("not_now")
 
         def on_response(_dialog: Adw.MessageDialog, response: str) -> None:
-            set_offline_body_sync_prompt_seen(True)
+            if response == "not_now":
+                set_offline_body_sync_prompt_declined(True)
+                return
             mode_by_response = {
                 "last_month": OFFLINE_BODY_SYNC_LAST_MONTH,
                 "last_year": OFFLINE_BODY_SYNC_LAST_YEAR,
                 "all": OFFLINE_BODY_SYNC_ALL,
             }
             mode = mode_by_response.get(response)
-            if mode is not None:
+            if mode is None:
+                return
+
+            def apply_mode() -> bool:
                 self._apply_offline_body_sync_to_accounts(remote_accounts, mode)
+                return False
+
+            GLib.idle_add(apply_mode)
 
         dialog.connect("response", on_response)
         dialog.present()
