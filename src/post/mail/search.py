@@ -175,7 +175,7 @@ def query_to_sexp(query: MessageSearchQuery) -> str:
 
 def query_requires_body_scan(query: MessageSearchQuery) -> bool:
     """True when matching needs cached message body text."""
-    return any(term.field == "body" for term in query.terms)
+    return any(term.field in ("body", "text") for term in query.terms)
 
 
 def _header_field(message: dict, field: str) -> str:
@@ -216,10 +216,13 @@ def _message_matches_term(
         body = body_text or ""
         return _contains_insensitive(body, term.value)
     if term.field == "text":
-        return any(
+        if any(
             _contains_insensitive(_header_field(message, header), term.value)
             for header in _TEXT_HEADER_FIELDS
-        )
+        ):
+            return True
+        body = body_text or ""
+        return _contains_insensitive(body, term.value)
     if term.field in _HEADER_FIELD_NAMES:
         header = _HEADER_FIELD_NAMES[term.field]
         return _contains_insensitive(_header_field(message, header), term.value)

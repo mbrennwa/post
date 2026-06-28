@@ -178,7 +178,7 @@ class QueryToSexpTests(unittest.TestCase):
 
 
 class FilterMessagesByQueryTests(unittest.TestCase):
-    def test_text_matches_headers_only(self) -> None:
+    def test_text_matches_headers(self) -> None:
         query = parse_search_query("klotz")
         assert query is not None
         messages = [
@@ -186,6 +186,24 @@ class FilterMessagesByQueryTests(unittest.TestCase):
             {"uid": "2", "subject": "Klotz am Band", "from": "a@b.c", "flags": {"seen": True}},
         ]
         matched = filter_messages_by_query(messages, query)
+        self.assertEqual([message["uid"] for message in matched], ["2"])
+
+    def test_text_term_uses_body_loader(self) -> None:
+        query = parse_search_query("invoice")
+        assert query is not None
+        messages = [
+            {"uid": "1", "subject": "hello", "flags": {"seen": True}},
+            {"uid": "2", "subject": "hello", "flags": {"seen": True}},
+        ]
+
+        def body_text(uid: str) -> str | None:
+            return {"1": "nothing here", "2": "monthly invoice attached"}[uid]
+
+        matched = filter_messages_by_query(
+            messages,
+            query,
+            body_text_for_uid=body_text,
+        )
         self.assertEqual([message["uid"] for message in matched], ["2"])
 
     def test_boolean_read_flag(self) -> None:
