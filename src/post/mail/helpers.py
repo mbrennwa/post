@@ -500,6 +500,31 @@ def html_to_quotable_plain(body_html: str) -> str:
     return text.strip()
 
 
+_DATA_URI_BASE64 = re.compile(
+    r"data:[^;]+;base64,[A-Za-z0-9+/=]+",
+    re.IGNORECASE,
+)
+_DATA_URI_CSS_URL = re.compile(
+    r"url\(\s*['\"]?data:[^)'\"]+['\"]?\s*\)",
+    re.IGNORECASE,
+)
+
+
+def searchable_body_text(
+    *,
+    plain: str | None = None,
+    html: str | None = None,
+) -> str:
+    """Return human-readable body text for folder search."""
+    if plain and plain.strip():
+        return plain.strip()
+    if not html:
+        return ""
+    cleaned = _DATA_URI_BASE64.sub("", html)
+    cleaned = _DATA_URI_CSS_URL.sub("", cleaned)
+    return html_to_quotable_plain(cleaned)
+
+
 def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:
     """Return plain-text and HTML bodies from a Camel.MimeMessage."""
     bodies: dict[str, str | None] = {"plain": None, "html": None}
