@@ -23,7 +23,7 @@ Post runs blocking Camel / Evolution Data Server (EDS) work on a **single dedica
 4. **Password / OAuth prompts** — use `GLib.idle_add` to show dialogs on the GTK thread; mail thread waits on the result.
 5. **Outbound send** — compose persists to outbox first, then delivers via Camel `transport.send_to_sync` on the mail I/O thread. No `smtplib` send path.
 6. **Offline body download** — `OfflineBodySyncCoordinator` runs `downsync_sync` on the mail I/O thread only. See [offline-body-cache.md](offline-body-cache.md).
-7. **Search** — all folder search uses `Camel.FolderSearch` on the mail I/O thread via `query_to_sexp()`.
+7. **Search** — all folder search runs on the mail I/O thread via `query_to_sexp()` and `camel_folder_search_by_expression()` (libcamel). See [offline-body-cache.md](offline-body-cache.md).
 
 ## Debugging
 
