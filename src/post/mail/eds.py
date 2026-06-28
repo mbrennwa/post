@@ -265,12 +265,22 @@ class MailService:
     _offline_sync: OfflineBodySyncCoordinator | None = field(
         default=None, init=False, repr=False
     )
+    _mail_io_callbacks_registered: bool = field(default=False, init=False, repr=False)
 
     @property
     def offline_sync(self) -> OfflineBodySyncCoordinator:
         if self._offline_sync is None:
             self._offline_sync = OfflineBodySyncCoordinator(self)
         return self._offline_sync
+
+    def _ensure_mail_io_callbacks(self) -> None:
+        if self._mail_io_callbacks_registered:
+            return
+        get_mail_io_thread().set_background_preempt_callbacks(
+            self.offline_sync.cancel_all,
+            self.schedule_offline_body_sync,
+        )
+        self._mail_io_callbacks_registered = True
 
     def is_network_available(self) -> bool:
         return self._network_available
@@ -424,7 +434,7 @@ class MailService:
         if offline_sync_active:
             # Downsync runs on the mail I/O thread; flushing would queue behind it and
             # block exit. Camel persists cache incrementally — resume on next launch.
-            get_mail_io_thread().submit(self._flush_stores_on_shutdown)
+            get_mail_io_thread().submit_background(self._flush_stores_on_shutdown)
             return
         run_on_mail_thread(self._flush_stores_on_shutdown)
 
@@ -456,7 +466,9 @@ class MailService:
                 "Could not reconnect to evolution-source-registry after "
                 "configuring local mail transport."
             )
-        return cls(registry=registry)
+        service = cls(registry=registry)
+        service._ensure_mail_io_callbacks()
+        return service
 
     def set_password_prompt(self, callback: PasswordPromptCallback | None) -> None:
         self._password_prompt = callback
@@ -1954,13 +1966,11 @@ class MailService:
         if only_cached:
             folder_search.set_only_cached_messages(True)
         matches = folder_search.search(expression, [], None)
-        try:
-            if not matches:
-                return set()
-            return {str(uid) for uid in matches}
-        finally:
-            if matches is not None:
-                folder_search.free_result(matches)
+        if not matches:
+            return set()
+        # PyGObject returns a Python list; do not call free_result() — passing []
+        # or a converted list crashes Camel (camel_folder_search_free_result).
+        return {str(uid) for uid in matches}
 
     def _get_message_mime_sync(
         self,

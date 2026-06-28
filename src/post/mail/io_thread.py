@@ -14,16 +14,19 @@ Threading contract
 * Never call :meth:`MailIoThread.run_sync` from the GTK main thread (blocks the UI).
   Prefer :meth:`MailIoThread.submit` from GTK, or :func:`run_on_mail_thread` which
   runs inline when already on the mail I/O thread.
+* Use :meth:`MailIoThread.submit_background` for long-running offline body download;
+  interactive tasks are always scheduled ahead of background work.
 """
 
 from __future__ import annotations
 
+import collections
 import logging
 import os
-import queue
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import Any, TypeVar
 
 import gi
@@ -75,11 +78,17 @@ def _bootstrap_camel_on_mail_thread() -> None:
     log.debug("Camel.init completed on mail I/O thread")
 
 
+class _TaskPriority(IntEnum):
+    INTERACTIVE = 0
+    BACKGROUND = 1
+
+
 @dataclass
 class _IoTask:
     func: Callable[..., Any]
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
+    priority: _TaskPriority = _TaskPriority.INTERACTIVE
     done: threading.Event | None = None
     result: dict[str, Any] = field(default_factory=dict)
 
@@ -88,7 +97,14 @@ class MailIoThread:
     """Serial queue for blocking Camel work off the GTK main loop."""
 
     def __init__(self) -> None:
-        self._queue: queue.SimpleQueue[_IoTask] = queue.SimpleQueue()
+        self._interactive: collections.deque[_IoTask] = collections.deque()
+        self._background: collections.deque[_IoTask] = collections.deque()
+        self._lock = threading.Lock()
+        self._work_available = threading.Condition(self._lock)
+        self._current_is_background = False
+        self._background_preempted = False
+        self._on_background_preempt: Callable[[], None] | None = None
+        self._on_background_resume: Callable[[], None] | None = None
         self._ready = threading.Event()
         self._thread = threading.Thread(
             target=self._thread_main,
@@ -98,19 +114,84 @@ class MailIoThread:
         self._thread.start()
         self._ready.wait()
 
+    def set_background_preempt_callbacks(
+        self,
+        on_preempt: Callable[[], None] | None,
+        on_resume: Callable[[], None] | None,
+    ) -> None:
+        with self._lock:
+            self._on_background_preempt = on_preempt
+            self._on_background_resume = on_resume
+
+    def _enqueue_interactive(self, task: _IoTask) -> None:
+        preempt: Callable[[], None] | None = None
+        with self._work_available:
+            if (
+                self._current_is_background
+                and self._on_background_preempt is not None
+                and not self._background_preempted
+            ):
+                self._background_preempted = True
+                preempt = self._on_background_preempt
+            self._interactive.append(task)
+            self._work_available.notify()
+        if preempt is not None:
+            preempt()
+
+    def _maybe_resume_background(self, finished_task: _IoTask) -> None:
+        if finished_task.priority is not _TaskPriority.INTERACTIVE:
+            return
+        resume: Callable[[], None] | None = None
+        with self._work_available:
+            if (
+                self._interactive
+                or not self._background_preempted
+                or self._on_background_resume is None
+            ):
+                return
+            self._background_preempted = False
+            resume = self._on_background_resume
+        if resume is not None:
+            resume()
+
     def submit(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> None:
-        self._queue.put(_IoTask(func=func, args=args, kwargs=kwargs))
+        self._enqueue_interactive(_IoTask(func=func, args=args, kwargs=kwargs))
+
+    def submit_background(
+        self, func: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> None:
+        with self._work_available:
+            self._background.append(
+                _IoTask(
+                    func=func,
+                    args=args,
+                    kwargs=kwargs,
+                    priority=_TaskPriority.BACKGROUND,
+                )
+            )
+            self._work_available.notify()
+
+    def has_interactive_work_pending(self) -> bool:
+        with self._lock:
+            return bool(self._interactive)
 
     def run_sync(self, func: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
         if is_mail_io_thread():
             return func(*args, **kwargs)
         done = threading.Event()
         task = _IoTask(func=func, args=args, kwargs=kwargs, done=done)
-        self._queue.put(task)
+        self._enqueue_interactive(task)
         done.wait()
         if "error" in task.result:
             raise task.result["error"]
         return task.result.get("value")
+
+    def _take_next_task(self) -> _IoTask | None:
+        if self._interactive:
+            return self._interactive.popleft()
+        if self._background:
+            return self._background.popleft()
+        return None
 
     def _thread_main(self) -> None:
         global _io_thread_id
@@ -122,34 +203,48 @@ class MailIoThread:
         log.debug("Mail I/O thread started")
 
         while True:
+            task: _IoTask | None = None
+            with self._work_available:
+                while task is None:
+                    task = self._take_next_task()
+                    if task is not None:
+                        break
+                    self._work_available.wait(timeout=0.05)
+
+            if task is None:
+                while context.pending():
+                    context.iteration(False)
+                continue
+
+            func_name = getattr(task.func, "__qualname__", repr(task.func))
+            log.debug(
+                "Mail I/O task start thread=%s func=%s priority=%s",
+                threading.current_thread().name,
+                func_name,
+                task.priority.name,
+            )
+            with self._work_available:
+                self._current_is_background = task.priority is _TaskPriority.BACKGROUND
+            task_start = GLib.get_monotonic_time()
             try:
-                task = self._queue.get(timeout=0.05)
-            except queue.Empty:
-                pass
+                task.result["value"] = task.func(*task.args, **task.kwargs)
+            except BaseException as exc:
+                task.result["error"] = exc
+                log.debug("Mail I/O task failed func=%s", func_name, exc_info=True)
             else:
-                func_name = getattr(task.func, "__qualname__", repr(task.func))
+                elapsed_ms = (GLib.get_monotonic_time() - task_start) / 1000
                 log.debug(
-                    "Mail I/O task start thread=%s func=%s",
+                    "Mail I/O task finish thread=%s func=%s elapsed=%.1fms",
                     threading.current_thread().name,
                     func_name,
+                    elapsed_ms,
                 )
-                task_start = GLib.get_monotonic_time()
-                try:
-                    task.result["value"] = task.func(*task.args, **task.kwargs)
-                except BaseException as exc:
-                    task.result["error"] = exc
-                    log.debug("Mail I/O task failed func=%s", func_name, exc_info=True)
-                else:
-                    elapsed_ms = (GLib.get_monotonic_time() - task_start) / 1000
-                    log.debug(
-                        "Mail I/O task finish thread=%s func=%s elapsed=%.1fms",
-                        threading.current_thread().name,
-                        func_name,
-                        elapsed_ms,
-                    )
-                finally:
-                    if task.done is not None:
-                        task.done.set()
+            finally:
+                with self._work_available:
+                    self._current_is_background = False
+                if task.done is not None:
+                    task.done.set()
+                self._maybe_resume_background(task)
 
             while context.pending():
                 context.iteration(False)

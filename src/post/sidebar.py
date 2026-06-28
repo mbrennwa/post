@@ -55,6 +55,7 @@ SetStatus = Callable[[str], None]
 OnRefreshAccount = Callable[[str], None]
 OnRefreshFolder = Callable[[str, str], None]
 OnAccountsLoaded = Callable[[list[str]], None]
+OnInitialFolderLoadComplete = Callable[[], None]
 OnSendOutbox = Callable[[], None]
 OnFolderTreeChanged = Callable[[str, str | None], None]
 OnFolderContentsChanged = Callable[[str, str], None]
@@ -74,6 +75,7 @@ class MailSidebar:
         on_refresh_account: OnRefreshAccount | None = None,
         on_refresh_folder: OnRefreshFolder | None = None,
         on_accounts_loaded: OnAccountsLoaded | None = None,
+        on_initial_folder_load_complete: OnInitialFolderLoadComplete | None = None,
         on_send_outbox: OnSendOutbox | None = None,
         on_folder_tree_changed: OnFolderTreeChanged | None = None,
         on_folder_contents_changed: OnFolderContentsChanged | None = None,
@@ -86,6 +88,7 @@ class MailSidebar:
         self._on_refresh_account = on_refresh_account
         self._on_refresh_folder = on_refresh_folder
         self._on_accounts_loaded = on_accounts_loaded
+        self._on_initial_folder_load_complete = on_initial_folder_load_complete
         self._on_send_outbox = on_send_outbox
         self._on_folder_tree_changed = on_folder_tree_changed
         self._on_folder_contents_changed = on_folder_contents_changed
@@ -353,12 +356,7 @@ class MailSidebar:
             self._account_reload_callbacks[account_uid] = on_complete
 
         self._clear_listbox(folder_list)
-        loading = Gtk.Label(label="Loading Folders…", xalign=0)
-        loading.add_css_class("dim-label")
-        loading.set_margin_start(12)
-        loading.set_margin_end(12)
-        loading.set_margin_bottom(8)
-        folder_list.append(self._wrap_list_row(loading))
+        folder_list.append(self._make_loading_row("Loading Folders…"))
         self._start_folder_load(self._load_generation, account)
 
     def refresh_folder_row(
@@ -988,6 +986,7 @@ class MailSidebar:
             self._folder_loads_pending -= 1
             self._maybe_apply_initial_selection()
             self._finish_account_reload(account_uid, 0, error)
+            self._maybe_finish_initial_folder_load()
             return False
 
         assert folders is not None
@@ -1003,8 +1002,18 @@ class MailSidebar:
         self._folder_loads_pending -= 1
         self._maybe_apply_initial_selection()
         self._finish_account_reload(account_uid, len(folders), None)
+        self._maybe_finish_initial_folder_load()
 
         return False
+
+    def _maybe_finish_initial_folder_load(self) -> None:
+        if self._folder_loads_pending > 0:
+            return
+        callback = self._on_initial_folder_load_complete
+        if callback is None:
+            return
+        self._on_initial_folder_load_complete = None
+        callback()
 
     def _save_expanded_state(self) -> None:
         if self._inbox_expander is not None:
@@ -1118,12 +1127,7 @@ class MailSidebar:
         self._inbox_list = inbox_list
         self._inbox_expander = expander
 
-        loading = Gtk.Label(label="Loading Inboxes…", xalign=0)
-        loading.add_css_class("dim-label")
-        loading.set_margin_start(12)
-        loading.set_margin_end(12)
-        loading.set_margin_bottom(8)
-        inbox_list.append(self._wrap_list_row(loading))
+        inbox_list.append(self._make_loading_row("Loading Inboxes…"))
 
         expander.set_child(inbox_list)
         return expander
@@ -1285,12 +1289,7 @@ class MailSidebar:
         folder_list.connect("row-selected", self._on_folder_row_selected)
         self._folder_lists[account.uid] = folder_list
 
-        loading = Gtk.Label(label="Loading Folders…", xalign=0)
-        loading.add_css_class("dim-label")
-        loading.set_margin_start(12)
-        loading.set_margin_end(12)
-        loading.set_margin_bottom(8)
-        folder_list.append(self._wrap_list_row(loading))
+        folder_list.append(self._make_loading_row("Loading Folders…"))
 
         expander.set_child(folder_list)
         return expander
@@ -1306,6 +1305,17 @@ class MailSidebar:
         label.set_margin_bottom(4)
         self._attach_refresh_menu(label, account_uid=account.uid, folder_name=None)
         return label
+
+    @staticmethod
+    def _make_loading_row(text: str) -> Gtk.ListBoxRow:
+        label = Gtk.Label(label=text, xalign=0, margin_start=12, margin_end=12)
+        label.add_css_class("dim-label")
+        label.set_valign(Gtk.Align.CENTER)
+        row = Gtk.ListBoxRow()
+        row.set_child(label)
+        row.set_activatable(False)
+        row.set_selectable(False)
+        return row
 
     @staticmethod
     def _wrap_list_row(widget: Gtk.Widget) -> Gtk.ListBoxRow:
