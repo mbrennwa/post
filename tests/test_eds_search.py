@@ -12,42 +12,41 @@ from post.mail.eds import MailService
 
 
 class FolderSearchUidTests(unittest.TestCase):
-    def test_empty_matches_skip_free_result(self) -> None:
+    def test_empty_scope_skips_search(self) -> None:
         folder = mock.Mock()
-        folder_search = mock.Mock()
-        folder_search.search.return_value = []
 
-        with mock.patch(
-            "post.mail.eds.Camel.FolderSearch.new", return_value=folder_search
-        ):
+        with mock.patch("post.mail.eds.folder_search_uids") as folder_search_uids:
             service = MailService(registry=mock.Mock())
             result = service._folder_search_uids_unlocked(
                 folder,
                 '(match-all (header-contains "Subject" "missing"))',
-                only_cached=False,
+                [],
             )
 
         self.assertEqual(result, set())
-        folder_search.free_result.assert_not_called()
+        folder_search_uids.assert_not_called()
 
     def test_non_empty_matches_return_uid_set(self) -> None:
         folder = mock.Mock()
-        folder_search = mock.Mock()
-        folder_search.search.return_value = ["uid-1", "uid-2"]
+        index_uids = ["uid-1", "uid-2", "uid-3"]
 
         with mock.patch(
-            "post.mail.eds.Camel.FolderSearch.new", return_value=folder_search
-        ):
+            "post.mail.eds.folder_search_uids",
+            return_value=["uid-1", "uid-2"],
+        ) as folder_search_uids:
             service = MailService(registry=mock.Mock())
             result = service._folder_search_uids_unlocked(
                 folder,
                 '(match-all (header-contains "Subject" "invoice"))',
-                only_cached=True,
+                index_uids,
             )
 
         self.assertEqual(result, {"uid-1", "uid-2"})
-        folder_search.set_only_cached_messages.assert_called_once_with(True)
-        folder_search.free_result.assert_not_called()
+        folder_search_uids.assert_called_once_with(
+            folder,
+            '(match-all (header-contains "Subject" "invoice"))',
+            index_uids,
+        )
 
 
 if __name__ == "__main__":

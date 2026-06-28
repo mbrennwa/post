@@ -189,6 +189,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._user_message_click_pending = False
         self._search_query: MessageSearchQuery | None = None
         self._search_entry_updating = False
+        self._messages_load_expects_search = False
         self._offline_download_status = ""
         self._status_hint = ""
         self._network_available = Gio.NetworkMonitor.get_default().get_network_available()
@@ -1576,6 +1577,17 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self._apply_search_from_entry()
 
+    def _restore_messages_after_search(self) -> None:
+        if not self._current_account or not self._current_folder:
+            return
+        self._load_messages(
+            self._current_account.uid,
+            self._current_folder,
+            offset=0,
+            sync=False,
+            skip_disk_cache=True,
+        )
+
     def _apply_search_from_entry(self) -> None:
         if self._search_entry_updating:
             return
@@ -1585,16 +1597,16 @@ class MainWindow(Adw.ApplicationWindow):
         raw = self._header_search_entry.get_text()
         query = parse_search_query(raw)
         if query is None:
-            if self._search_query is not None:
-                self._search_query = None
-                self._load_messages(
-                    self._current_account.uid, self._current_folder, offset=0
-                )
+            self._search_query = None
+            self._restore_messages_after_search()
             return
 
         self._search_query = query
         self._load_messages(
-            self._current_account.uid, self._current_folder, offset=0
+            self._current_account.uid,
+            self._current_folder,
+            offset=0,
+            sync=False,
         )
 
     def _on_search_stopped(self, _entry: Gtk.SearchEntry) -> None:
@@ -1604,10 +1616,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _exit_search_mode(self) -> None:
         self._search_query = None
-        if self._current_account and self._current_folder:
-            self._load_messages(
-                self._current_account.uid, self._current_folder, offset=0
-            )
+        self._restore_messages_after_search()
 
     def _on_folder_selected(self, account: MailAccount, folder_name: str) -> None:
         self._current_account = account
@@ -2151,6 +2160,7 @@ class MainWindow(Adw.ApplicationWindow):
         offset: int = 0,
         sync: bool | None = None,
         force_sync: bool = False,
+        skip_disk_cache: bool = False,
     ) -> None:
         account = self._current_account
         if account is None or account.uid != account_uid:
@@ -2165,6 +2175,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._messages_load_generation += 1
         load_id = self._messages_load_generation
+        self._messages_load_expects_search = self._search_query is not None
 
         display_folder = (
             "Outbox"
@@ -2251,7 +2262,12 @@ class MainWindow(Adw.ApplicationWindow):
         self._clear_reader()
 
         cache_snapshot: tuple[list[dict], int, int] | None = None
-        if not viewing_outbox and not force_sync and search_query is None:
+        if (
+            not skip_disk_cache
+            and not viewing_outbox
+            and not force_sync
+            and search_query is None
+        ):
             cache_snapshot = load_folder_index_cache(account_uid, folder_name)
 
         send_pending = self._mail.outbound_sends_pending()
@@ -2378,6 +2394,8 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> bool:
         if load_id != self._messages_load_generation:
             return False
+        if self._messages_load_expects_search != (self._search_query is not None):
+            return False
 
         self._message_loading_spinner.stop()
 
@@ -2476,6 +2494,11 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> bool:
         if load_id != self._messages_load_generation:
             return False
+        if self._search_query is not None:
+            return False
+        if self._messages_load_expects_search:
+            return False
+
         if error is not None:
             self._message_sync_in_progress = False
             if account := self._current_account:

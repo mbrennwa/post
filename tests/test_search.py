@@ -8,6 +8,7 @@ import unittest
 from post.mail.search import (
     SearchTerm,
     parse_search_query,
+    query_to_sexp,
 )
 
 
@@ -154,6 +155,24 @@ class ParseSearchQueryTests(unittest.TestCase):
                 SearchTerm(field="text", value="Auburn"),
                 SearchTerm(field="from", value="alice"),
             },
+        )
+
+
+class QueryToSexpTests(unittest.TestCase):
+    def test_bare_word_searches_headers_and_body(self) -> None:
+        query = parse_search_query("Core")
+        assert query is not None
+        sexp = query_to_sexp(query)
+        self.assertIn('(header-contains "Subject" "Core")', sexp)
+        self.assertIn('(body-contains "Core")', sexp)
+        self.assertIn("(or ", sexp)
+
+    def test_subject_prefix_is_header_only(self) -> None:
+        query = parse_search_query("subject:Invoice")
+        assert query is not None
+        self.assertEqual(
+            query_to_sexp(query),
+            '(match-all (header-contains "Subject" "Invoice"))',
         )
 
 
