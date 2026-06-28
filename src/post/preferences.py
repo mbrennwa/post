@@ -13,6 +13,21 @@ from typing import Any, Literal
 _PREF_PATH = os.path.join(os.path.expanduser("~"), ".config", "post", "preferences.json")
 
 MessageAppearance = Literal["adapt_text", "adapt_background", "accept_sender"]
+OfflineBodySyncMode = Literal["off", "last_month", "last_year", "all"]
+
+OFFLINE_BODY_SYNC_OFF: OfflineBodySyncMode = "off"
+OFFLINE_BODY_SYNC_LAST_MONTH: OfflineBodySyncMode = "last_month"
+OFFLINE_BODY_SYNC_LAST_YEAR: OfflineBodySyncMode = "last_year"
+OFFLINE_BODY_SYNC_ALL: OfflineBodySyncMode = "all"
+
+_OFFLINE_BODY_SYNC_VALUES: frozenset[str] = frozenset(
+    {
+        OFFLINE_BODY_SYNC_OFF,
+        OFFLINE_BODY_SYNC_LAST_MONTH,
+        OFFLINE_BODY_SYNC_LAST_YEAR,
+        OFFLINE_BODY_SYNC_ALL,
+    }
+)
 
 MESSAGE_APPEARANCE_ADAPT_TEXT: MessageAppearance = "adapt_text"
 MESSAGE_APPEARANCE_ADAPT_BACKGROUND: MessageAppearance = "adapt_background"
@@ -101,6 +116,53 @@ def set_auto_sync(value: bool) -> None:
     data = _load_raw()
     data["auto_sync"] = value
     _save_raw(data)
+
+
+def _offline_body_sync_raw() -> dict[str, Any]:
+    raw = _load_raw().get("offline_body_sync")
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def get_account_offline_body_sync(account_uid: str) -> OfflineBodySyncMode:
+    value = _offline_body_sync_raw().get(account_uid, OFFLINE_BODY_SYNC_OFF)
+    if isinstance(value, str) and value in _OFFLINE_BODY_SYNC_VALUES:
+        return value  # type: ignore[return-value]
+    return OFFLINE_BODY_SYNC_OFF
+
+
+def set_account_offline_body_sync(
+    account_uid: str, mode: OfflineBodySyncMode
+) -> None:
+    if mode not in _OFFLINE_BODY_SYNC_VALUES:
+        raise ValueError(f"Invalid offline body sync mode: {mode!r}")
+    data = _load_raw()
+    modes = _offline_body_sync_raw()
+    if mode == OFFLINE_BODY_SYNC_OFF:
+        modes.pop(account_uid, None)
+    else:
+        modes[account_uid] = mode
+    data["offline_body_sync"] = modes
+    _save_raw(data)
+
+
+def get_all_offline_body_sync_modes() -> dict[str, OfflineBodySyncMode]:
+    modes: dict[str, OfflineBodySyncMode] = {}
+    for uid, value in _offline_body_sync_raw().items():
+        if isinstance(uid, str) and isinstance(value, str) and value in _OFFLINE_BODY_SYNC_VALUES:
+            modes[uid] = value  # type: ignore[assignment]
+    return modes
+
+
+def set_offline_body_sync_prompt_seen(seen: bool = True) -> None:
+    data = _load_raw()
+    data["offline_body_sync_prompt_seen"] = bool(seen)
+    _save_raw(data)
+
+
+def get_offline_body_sync_prompt_seen() -> bool:
+    return bool(_load_raw().get("offline_body_sync_prompt_seen"))
 
 
 def set_show_evolution_local(value: bool) -> None:

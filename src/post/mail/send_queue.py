@@ -31,6 +31,7 @@ OFFLINE_MAIL_MESSAGE = (
 )
 OFFLINE_FOLDER_MESSAGE = "Offline — folders unavailable until you reconnect."
 OFFLINE_CACHED_LIST_STATUS = "Offline · showing cached list"
+OFFLINE_SEARCHING_LOCAL_CACHE = "Offline · searching local cache"
 
 
 @dataclass

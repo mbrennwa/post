@@ -34,11 +34,18 @@ from post.preferences import (
     MESSAGE_APPEARANCE_ADAPT_BACKGROUND,
     MESSAGE_APPEARANCE_ADAPT_TEXT,
     MessageAppearance,
+    OFFLINE_BODY_SYNC_ALL,
+    OFFLINE_BODY_SYNC_LAST_MONTH,
+    OFFLINE_BODY_SYNC_LAST_YEAR,
+    OFFLINE_BODY_SYNC_OFF,
+    OfflineBodySyncMode,
+    get_account_offline_body_sync,
     get_account_signature,
     get_auto_sync,
     get_load_remote_content,
     get_message_appearance,
     get_show_evolution_local,
+    set_account_offline_body_sync,
     set_account_signature,
     set_auto_sync,
     set_load_remote_content,
@@ -56,6 +63,7 @@ OnSaved = Callable[[], None]
 OnLoadRemoteContentChanged = Callable[[bool], None]
 OnAutoSyncChanged = Callable[[bool], None]
 OnMessageAppearanceChanged = Callable[[MessageAppearance], None]
+OnOfflineBodySyncChanged = Callable[[str, OfflineBodySyncMode], None]
 
 _MESSAGE_APPEARANCE_LABELS = (
     "Adapt text",
@@ -66,6 +74,17 @@ _MESSAGE_APPEARANCE_VALUES: tuple[MessageAppearance, ...] = (
     MESSAGE_APPEARANCE_ADAPT_TEXT,
     MESSAGE_APPEARANCE_ADAPT_BACKGROUND,
     MESSAGE_APPEARANCE_ACCEPT_SENDER,
+)
+
+_OFFLINE_SYNC_LABELS = ("Off", "Last month", "Last year", "Everything")
+_OFFLINE_SYNC_VALUES: tuple[OfflineBodySyncMode, ...] = (
+    OFFLINE_BODY_SYNC_OFF,
+    OFFLINE_BODY_SYNC_LAST_MONTH,
+    OFFLINE_BODY_SYNC_LAST_YEAR,
+    OFFLINE_BODY_SYNC_ALL,
+)
+_REMOTE_OFFLINE_BACKENDS = frozenset(
+    {"imap", "imapx", "ews", "microsoft365", "pop3"}
 )
 
 
@@ -80,6 +99,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         on_load_remote_content_changed: OnLoadRemoteContentChanged | None = None,
         on_auto_sync_changed: OnAutoSyncChanged | None = None,
         on_message_appearance_changed: OnMessageAppearanceChanged | None = None,
+        on_offline_body_sync_changed: OnOfflineBodySyncChanged | None = None,
     ) -> None:
         super().__init__()
         self._parent = parent
@@ -89,6 +109,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         self._remote_content_changed_callback = on_load_remote_content_changed
         self._auto_sync_changed_callback = on_auto_sync_changed
         self._message_appearance_changed_callback = on_message_appearance_changed
+        self._offline_body_sync_changed_callback = on_offline_body_sync_changed
         self._saving = False
         self._loading_settings = True
         self._local_mail_save_id: int | None = None
@@ -97,6 +118,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         self._config = existing or default_local_mail_config()
 
         self.add(self._build_reading_page())
+        self.add(self._build_offline_mail_page())
         self.add(self._build_composing_page())
         self.add(self._build_local_mail_page())
         self._loading_settings = False
@@ -146,6 +168,118 @@ class SettingsDialog(Adw.PreferencesDialog):
         group.add(self._auto_sync_row)
         page.add(group)
         return page
+
+    def _build_offline_mail_page(self) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage()
+        page.set_title("Offline Mail")
+        page.set_icon_name("network-offline-symbolic")
+
+        group = Adw.PreferencesGroup()
+        group.set_title("Download Message Bodies")
+        group.set_description(
+            "Keep full message content on this computer for all folders in an "
+            "account. Uses extra disk space and network bandwidth. Shares the "
+            "same local cache as Evolution."
+        )
+
+        self._offline_accounts = [
+            account
+            for account in self._mail.list_accounts()
+            if account.backend in _REMOTE_OFFLINE_BACKENDS
+        ]
+        self._offline_account_uid: str | None = None
+        self._offline_mode_updating = False
+
+        if not self._offline_accounts:
+            empty_row = Adw.ActionRow(title="No Remote Mail Accounts")
+            empty_row.set_subtitle(
+                "Offline body download applies to IMAP and Exchange accounts"
+            )
+            group.add(empty_row)
+            page.add(group)
+            self._offline_account_dropdown = None
+            self._offline_mode_row = None
+            return page
+
+        picker_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        picker_box.set_margin_start(12)
+        picker_box.set_margin_end(12)
+        picker_box.set_margin_top(6)
+        picker_box.set_margin_bottom(6)
+
+        account_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        account_label = Gtk.Label(label="Account", xalign=0)
+        account_label.add_css_class("heading")
+        account_label.set_valign(Gtk.Align.CENTER)
+        account_row.append(account_label)
+
+        labels = [account.display_label for account in self._offline_accounts]
+        self._offline_account_dropdown = Gtk.DropDown.new_from_strings(labels)
+        self._offline_account_dropdown.set_selected(0)
+        self._offline_account_dropdown.set_hexpand(True)
+        self._offline_account_dropdown.connect(
+            "notify::selected", self._on_offline_account_changed
+        )
+        account_row.append(self._offline_account_dropdown)
+        picker_box.append(account_row)
+
+        self._offline_mode_row = Adw.ComboRow(title="Keep Offline")
+        self._offline_mode_row.set_subtitle(
+            "How much mail to download for offline reading and search"
+        )
+        self._offline_mode_row.set_model(Gtk.StringList.new(list(_OFFLINE_SYNC_LABELS)))
+        self._offline_mode_row.connect(
+            "notify::selected", self._on_offline_mode_changed
+        )
+        picker_box.append(self._offline_mode_row)
+        group.add(picker_box)
+        page.add(group)
+
+        self._load_offline_mode_for_selected_account()
+        return page
+
+    def _selected_offline_account_uid(self) -> str | None:
+        if self._offline_account_dropdown is None:
+            return None
+        index = self._offline_account_dropdown.get_selected()
+        if index == Gtk.INVALID_LIST_POSITION:
+            return None
+        return self._offline_accounts[index].uid
+
+    def _load_offline_mode_for_selected_account(self) -> None:
+        if self._offline_mode_row is None:
+            return
+        self._offline_mode_updating = True
+        uid = self._selected_offline_account_uid()
+        self._offline_account_uid = uid
+        mode = get_account_offline_body_sync(uid) if uid else OFFLINE_BODY_SYNC_OFF
+        try:
+            index = _OFFLINE_SYNC_VALUES.index(mode)
+        except ValueError:
+            index = 0
+        self._offline_mode_row.set_selected(index)
+        self._offline_mode_updating = False
+
+    def _on_offline_account_changed(self, *_args) -> None:
+        if self._offline_mode_updating:
+            return
+        self._load_offline_mode_for_selected_account()
+
+    def _on_offline_mode_changed(self, *_args) -> None:
+        if self._loading_settings or self._offline_mode_updating:
+            return
+        if self._offline_mode_row is None:
+            return
+        account_uid = self._selected_offline_account_uid()
+        if account_uid is None:
+            return
+        index = self._offline_mode_row.get_selected()
+        if index < 0 or index >= len(_OFFLINE_SYNC_VALUES):
+            return
+        mode = _OFFLINE_SYNC_VALUES[index]
+        set_account_offline_body_sync(account_uid, mode)
+        if self._offline_body_sync_changed_callback is not None:
+            self._offline_body_sync_changed_callback(account_uid, mode)
 
     def _build_composing_page(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage()

@@ -21,6 +21,16 @@ class MessageNotAvailableErrorTests(unittest.TestCase):
         self.assertEqual(exc.folder_name, "INBOX")
         self.assertEqual(exc.user_message(), "This message is no longer available.")
 
+    def test_not_cached_offline_message(self) -> None:
+        from post.mail.eds import MessageUnavailableReason
+
+        exc = MessageNotAvailableError(
+            "1",
+            "INBOX",
+            reason=MessageUnavailableReason.NOT_CACHED_OFFLINE,
+        )
+        self.assertIn("offline", exc.user_message().lower())
+
 
 class MissingMessageErrorDetectionTests(unittest.TestCase):
     def test_is_missing_message_error_matches_invalid_uid(self) -> None:
@@ -49,6 +59,7 @@ class ReadMessageUnavailableTests(unittest.TestCase):
         get_store_mock: MagicMock,
     ) -> None:
         service = MailService(registry=MagicMock())
+        service._network_available = True
         folder = MagicMock()
         folder.get_message_info.return_value = MagicMock()
         folder.get_message_sync.side_effect = GLib.Error.new_literal(
@@ -65,6 +76,35 @@ class ReadMessageUnavailableTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.message_uid, "53054")
         self.assertEqual(ctx.exception.folder_name, "INBOX")
+
+    @patch("post.mail.eds.MailService._get_store_unlocked")
+    def test_read_message_offline_not_cached(
+        self,
+        get_store_mock: MagicMock,
+    ) -> None:
+        from post.mail.eds import MessageUnavailableReason
+
+        service = MailService(registry=MagicMock())
+        service._network_available = False
+        folder = MagicMock()
+        folder.get_message_info.return_value = MagicMock()
+        folder.get_message_sync.side_effect = GLib.Error.new_literal(
+            Camel.folder_error_quark(),
+            "Cannot get message with message ID 1: No such message available.",
+            int(Camel.FolderError.INVALID_UID),
+        )
+        folder.get_message_cached.return_value = None
+        store = MagicMock()
+        store.get_folder_sync.return_value = folder
+        get_store_mock.return_value = store
+
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._read_message_unlocked("account", "INBOX", "1")
+
+        self.assertEqual(
+            ctx.exception.reason,
+            MessageUnavailableReason.NOT_CACHED_OFFLINE,
+        )
 
     @patch("post.mail.eds.MailService._get_store_unlocked")
     def test_read_attachment_raises_when_message_missing(
