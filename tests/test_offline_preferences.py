@@ -48,10 +48,35 @@ class OfflineBodySyncPreferenceTests(unittest.TestCase):
             {},
         )
 
-    def test_prompt_seen_flag(self) -> None:
-        self.assertFalse(preferences.get_offline_body_sync_prompt_seen())
+    def test_prompt_declined_flag(self) -> None:
+        self.assertFalse(preferences.get_offline_body_sync_prompt_declined())
+        preferences.set_offline_body_sync_prompt_declined(True)
+        self.assertTrue(preferences.get_offline_body_sync_prompt_declined())
+
+    def test_should_show_prompt_when_accounts_still_off(self) -> None:
+        self.assertTrue(
+            preferences.should_show_offline_body_sync_prompt(["acct-1", "acct-2"])
+        )
+
+    def test_should_not_show_prompt_after_decline(self) -> None:
+        preferences.set_offline_body_sync_prompt_declined(True)
+        self.assertFalse(
+            preferences.should_show_offline_body_sync_prompt(["acct-1"])
+        )
+
+    def test_should_not_show_prompt_when_configured(self) -> None:
+        preferences.set_account_offline_body_sync(
+            "acct-1", preferences.OFFLINE_BODY_SYNC_LAST_MONTH
+        )
+        self.assertFalse(
+            preferences.should_show_offline_body_sync_prompt(["acct-1"])
+        )
+
+    def test_legacy_prompt_seen_does_not_block_reprompt_when_still_off(self) -> None:
         preferences.set_offline_body_sync_prompt_seen(True)
-        self.assertTrue(preferences.get_offline_body_sync_prompt_seen())
+        self.assertTrue(
+            preferences.should_show_offline_body_sync_prompt(["acct-1"])
+        )
 
 
 if __name__ == "__main__":

@@ -90,6 +90,87 @@ class ApplyOfflineSettingsTests(unittest.TestCase):
         settings.set_limit_by_age.assert_called_once_with(False)
 
 
+class RefreshOfflineSettingsTests(unittest.TestCase):
+    def test_refresh_submits_to_mail_io_thread(self) -> None:
+        from post.mail.eds import MailService
+
+        service = MailService(registry=mock.Mock())
+        service._stores = {"acct-1": mock.Mock()}
+
+        with mock.patch("post.mail.eds.get_mail_io_thread") as get_io:
+            io_thread = mock.Mock()
+            get_io.return_value = io_thread
+            service.refresh_offline_settings("acct-1")
+            io_thread.submit.assert_called_once_with(
+                service._refresh_offline_settings_unlocked, "acct-1"
+            )
+
+    @mock.patch("post.mail.eds.apply_offline_settings_to_store")
+    @mock.patch("post.mail.eds.MailService._get_store_unlocked")
+    @mock.patch("post.mail.eds.MailService.schedule_offline_body_sync")
+    def test_refresh_opens_store_when_not_cached(
+        self,
+        schedule_sync: mock.Mock,
+        get_store: mock.Mock,
+        apply_settings: mock.Mock,
+    ) -> None:
+        from post.mail.eds import MailService
+
+        service = MailService(registry=mock.Mock())
+        store = mock.Mock()
+        get_store.return_value = store
+
+        service._refresh_offline_settings_unlocked("acct-1")
+
+        get_store.assert_called_once_with("acct-1")
+        apply_settings.assert_called_once_with(store, "acct-1")
+        schedule_sync.assert_called_once_with("acct-1")
+
+
+class ShutdownSyncTests(unittest.TestCase):
+    def test_shutdown_cancels_active_offline_sync_without_blocking(self) -> None:
+        from post.mail.eds import MailService
+
+        service = MailService(registry=mock.Mock())
+        coordinator = mock.Mock()
+        coordinator.is_active.return_value = True
+        service._offline_sync = coordinator
+
+        with mock.patch.object(service, "wait_for_outbound_sends"):
+            with mock.patch.object(service, "wait_for_pending_mail_ops") as wait_ops:
+                with mock.patch("post.mail.eds.get_mail_io_thread") as get_io:
+                    io_thread = mock.Mock()
+                    get_io.return_value = io_thread
+                    with mock.patch("post.mail.eds.run_on_mail_thread") as run_sync:
+                        service.shutdown_sync()
+
+        coordinator.cancel_all.assert_called_once()
+        wait_ops.assert_called_once_with(timeout=2.0)
+        io_thread.submit.assert_called_once_with(service._flush_stores_on_shutdown)
+        run_sync.assert_not_called()
+
+    def test_shutdown_flushes_synchronously_when_offline_sync_idle(self) -> None:
+        from post.mail.eds import MailService
+
+        service = MailService(registry=mock.Mock())
+        coordinator = mock.Mock()
+        coordinator.is_active.return_value = False
+        service._offline_sync = coordinator
+
+        with mock.patch.object(service, "wait_for_outbound_sends"):
+            with mock.patch.object(service, "wait_for_pending_mail_ops") as wait_ops:
+                with mock.patch("post.mail.eds.get_mail_io_thread") as get_io:
+                    io_thread = mock.Mock()
+                    get_io.return_value = io_thread
+                    with mock.patch("post.mail.eds.run_on_mail_thread") as run_sync:
+                        service.shutdown_sync()
+
+        coordinator.cancel_all.assert_called_once()
+        wait_ops.assert_called_once_with(timeout=10.0)
+        run_sync.assert_called_once_with(service._flush_stores_on_shutdown)
+        io_thread.submit.assert_not_called()
+
+
 class QueryToSexpTests(unittest.TestCase):
     def test_from_prefix(self) -> None:
         query = parse_search_query("from:alice")

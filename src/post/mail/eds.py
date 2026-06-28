@@ -286,12 +286,22 @@ class MailService:
 
     def refresh_offline_settings(self, account_uid: str) -> None:
         """Re-apply offline Camel settings after preference changes."""
-        run_on_mail_thread(self._refresh_offline_settings_unlocked, account_uid)
+        if is_mail_io_thread():
+            self._refresh_offline_settings_unlocked(account_uid)
+        else:
+            get_mail_io_thread().submit(
+                self._refresh_offline_settings_unlocked, account_uid
+            )
 
     def _refresh_offline_settings_unlocked(self, account_uid: str) -> None:
-        with self._lock:
-            store = self._stores.get(account_uid)
-        if store is None:
+        try:
+            store = self._get_store_unlocked(account_uid)
+        except Exception:
+            log.debug(
+                "Cannot refresh offline settings for %s",
+                account_uid,
+                exc_info=True,
+            )
             return
         apply_offline_settings_to_store(store, account_uid)
         self.schedule_offline_body_sync(account_uid)
@@ -406,9 +416,16 @@ class MailService:
                 self._pending_mail_ops_cond.wait(timeout=remaining)
 
     def shutdown_sync(self) -> None:
-        """Wait for in-flight mail work and flush stores before exit."""
+        """Best-effort store flush before exit; never wait for offline body download."""
         self.wait_for_outbound_sends()
-        self.wait_for_pending_mail_ops()
+        offline_sync_active = self.offline_sync.is_active()
+        self.offline_sync.cancel_all()
+        self.wait_for_pending_mail_ops(timeout=2.0 if offline_sync_active else 10.0)
+        if offline_sync_active:
+            # Downsync runs on the mail I/O thread; flushing would queue behind it and
+            # block exit. Camel persists cache incrementally — resume on next launch.
+            get_mail_io_thread().submit(self._flush_stores_on_shutdown)
+            return
         run_on_mail_thread(self._flush_stores_on_shutdown)
 
     def _flush_stores_on_shutdown(self) -> None:
