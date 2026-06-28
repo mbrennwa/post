@@ -123,7 +123,7 @@ class MailIoThread:
             self._on_background_preempt = on_preempt
             self._on_background_resume = on_resume
 
-    def _enqueue_interactive(self, task: _IoTask) -> None:
+    def _enqueue_interactive(self, task: _IoTask, *, front: bool = False) -> None:
         preempt: Callable[[], None] | None = None
         with self._work_available:
             if (
@@ -133,7 +133,10 @@ class MailIoThread:
             ):
                 self._background_preempted = True
                 preempt = self._on_background_preempt
-            self._interactive.append(task)
+            if front:
+                self._interactive.appendleft(task)
+            else:
+                self._interactive.append(task)
             self._work_available.notify()
         if preempt is not None:
             preempt()
@@ -156,6 +159,10 @@ class MailIoThread:
 
     def submit(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> None:
         self._enqueue_interactive(_IoTask(func=func, args=args, kwargs=kwargs))
+
+    def submit_front(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> None:
+        """Queue interactive work ahead of other pending interactive tasks."""
+        self._enqueue_interactive(_IoTask(func=func, args=args, kwargs=kwargs), front=True)
 
     def submit_background(
         self, func: Callable[..., Any], /, *args: Any, **kwargs: Any

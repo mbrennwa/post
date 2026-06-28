@@ -7,6 +7,7 @@ import unittest
 
 from post.mail.search import (
     SearchTerm,
+    filter_messages_by_query,
     parse_search_query,
     query_to_sexp,
 )
@@ -174,6 +175,73 @@ class QueryToSexpTests(unittest.TestCase):
             query_to_sexp(query),
             '(match-all (header-contains "Subject" "Invoice"))',
         )
+
+
+class FilterMessagesByQueryTests(unittest.TestCase):
+    def test_text_matches_headers_only(self) -> None:
+        query = parse_search_query("klotz")
+        assert query is not None
+        messages = [
+            {"uid": "1", "subject": "hello", "from": "a@b.c", "flags": {"seen": True}},
+            {"uid": "2", "subject": "Klotz am Band", "from": "a@b.c", "flags": {"seen": True}},
+        ]
+        matched = filter_messages_by_query(messages, query)
+        self.assertEqual([message["uid"] for message in matched], ["2"])
+
+    def test_boolean_read_flag(self) -> None:
+        query = parse_search_query("is:!read")
+        assert query is not None
+        messages = [
+            {"uid": "1", "subject": "a", "flags": {"seen": True}},
+            {"uid": "2", "subject": "b", "flags": {"seen": False}},
+        ]
+        matched = filter_messages_by_query(messages, query)
+        self.assertEqual([message["uid"] for message in matched], ["2"])
+
+    def test_body_term_uses_loader(self) -> None:
+        query = parse_search_query("body:invoice")
+        assert query is not None
+        messages = [
+            {"uid": "1", "subject": "hello", "flags": {"seen": True}},
+            {"uid": "2", "subject": "hello", "flags": {"seen": True}},
+        ]
+
+        def body_text(uid: str) -> str | None:
+            return {"1": "nothing here", "2": "monthly invoice attached"}[uid]
+
+        matched = filter_messages_by_query(
+            messages,
+            query,
+            body_text_for_uid=body_text,
+        )
+        self.assertEqual([message["uid"] for message in matched], ["2"])
+
+    def test_cancelled_scan_stops_early(self) -> None:
+        query = parse_search_query("body:needle")
+        assert query is not None
+        messages = [{"uid": str(index), "subject": "x", "flags": {}} for index in range(100)]
+        calls = {"count": 0}
+
+        def body_text(_uid: str) -> str | None:
+            calls["count"] += 1
+            return "haystack"
+
+        cancelled = {"value": False}
+
+        def is_cancelled() -> bool:
+            if calls["count"] >= 5:
+                cancelled["value"] = True
+            return cancelled["value"]
+
+        matched = filter_messages_by_query(
+            messages,
+            query,
+            body_text_for_uid=body_text,
+            is_cancelled=is_cancelled,
+        )
+        self.assertEqual(matched, [])
+        self.assertGreaterEqual(calls["count"], 5)
+        self.assertLess(calls["count"], 100)
 
 
 if __name__ == "__main__":
