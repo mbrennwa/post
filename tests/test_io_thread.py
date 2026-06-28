@@ -51,6 +51,14 @@ class MailIoThreadTests(unittest.TestCase):
         self._io.run_sync(lambda: None)
         self.assertEqual(results, [0, 1, 2, 3, 4])
 
+    def test_submit_front_runs_before_pending_interactive(self) -> None:
+        results: list[str] = []
+
+        self._io.submit(lambda: results.append("first"))
+        self._io.submit_front(lambda: results.append("front"))
+        self._io.run_sync(lambda: None)
+        self.assertEqual(results, ["front", "first"])
+
     def test_run_sync_tasks_run_in_order(self) -> None:
         results: list[int] = []
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass
 
 # Optional whitespace after ":" so "subject: Auburn" works like "subject:Auburn".
@@ -170,3 +171,86 @@ def query_to_sexp(query: MessageSearchQuery) -> str:
     else:
         inner = f'(and {" ".join(clauses)})'
     return f"(match-all {inner})"
+
+
+def query_requires_body_scan(query: MessageSearchQuery) -> bool:
+    """True when matching needs cached message body text."""
+    return any(term.field == "body" for term in query.terms)
+
+
+def _header_field(message: dict, field: str) -> str:
+    if field == "Subject":
+        return str(message.get("subject") or "")
+    if field == "From":
+        return str(message.get("from") or "")
+    if field == "To":
+        return str(message.get("to") or "")
+    if field == "Cc":
+        return str(message.get("cc") or "")
+    return ""
+
+
+def _contains_insensitive(haystack: str, needle: str) -> bool:
+    return needle.casefold() in haystack.casefold()
+
+
+def _message_matches_term(
+    message: dict,
+    term: SearchTerm,
+    *,
+    body_text: str | None = None,
+) -> bool:
+    flags = message.get("flags") or {}
+    if term.field == "read":
+        seen = bool(flags.get("seen", False))
+        return seen if not term.negated else not seen
+    if term.field == "flagged":
+        flagged = bool(flags.get("flagged", False))
+        return flagged if not term.negated else not flagged
+    if term.field == "attachment":
+        has_attachment = bool(flags.get("attachments", False))
+        return has_attachment if not term.negated else not has_attachment
+
+    assert term.value is not None
+    if term.field == "body":
+        body = body_text or ""
+        return _contains_insensitive(body, term.value)
+    if term.field == "text":
+        return any(
+            _contains_insensitive(_header_field(message, header), term.value)
+            for header in _TEXT_HEADER_FIELDS
+        )
+    if term.field in _HEADER_FIELD_NAMES:
+        header = _HEADER_FIELD_NAMES[term.field]
+        return _contains_insensitive(_header_field(message, header), term.value)
+    return False
+
+
+def filter_messages_by_query(
+    messages: list[dict],
+    query: MessageSearchQuery,
+    *,
+    body_text_for_uid: Callable[[str], str | None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> list[dict]:
+    """Filter folder index messages locally, checking cancellation between body loads."""
+    if not query.terms:
+        return list(messages)
+
+    needs_body = query_requires_body_scan(query)
+    matched: list[dict] = []
+    for message in messages:
+        if is_cancelled is not None and is_cancelled():
+            break
+        uid = message.get("uid")
+        body_text: str | None = None
+        if needs_body and body_text_for_uid is not None and uid:
+            body_text = body_text_for_uid(str(uid))
+            if is_cancelled is not None and is_cancelled():
+                break
+        if all(
+            _message_matches_term(message, term, body_text=body_text)
+            for term in query.terms
+        ):
+            matched.append(message)
+    return matched

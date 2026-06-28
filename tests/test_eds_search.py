@@ -8,6 +8,12 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import gi
+
+gi.require_version("Gio", "2.0")
+
+from gi.repository import Gio
+
 from post.mail.eds import MailService
 
 
@@ -21,6 +27,23 @@ class FolderSearchUidTests(unittest.TestCase):
                 folder,
                 '(match-all (header-contains "Subject" "missing"))',
                 [],
+            )
+
+        self.assertEqual(result, set())
+        folder_search_uids.assert_not_called()
+
+    def test_cancelled_cancellable_skips_search(self) -> None:
+        folder = mock.Mock()
+        cancellable = Gio.Cancellable()
+        cancellable.cancel()
+
+        with mock.patch("post.mail.eds.folder_search_uids") as folder_search_uids:
+            service = MailService(registry=mock.Mock())
+            result = service._folder_search_uids_unlocked(
+                folder,
+                '(match-all (header-contains "Subject" "invoice"))',
+                ["uid-1"],
+                cancellable,
             )
 
         self.assertEqual(result, set())
@@ -46,7 +69,18 @@ class FolderSearchUidTests(unittest.TestCase):
             folder,
             '(match-all (header-contains "Subject" "invoice"))',
             index_uids,
+            cancellable=None,
         )
+
+    def test_cancel_folder_search_clears_active_cancellable(self) -> None:
+        service = MailService(registry=mock.Mock())
+        cancellable = Gio.Cancellable()
+        service._folder_search_cancellable = cancellable
+
+        service.cancel_folder_search()
+
+        self.assertTrue(cancellable.is_cancelled())
+        self.assertIsNone(service._folder_search_cancellable)
 
 
 if __name__ == "__main__":

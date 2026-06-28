@@ -109,7 +109,8 @@ from .folders import (
 )
 from .offline_settings import apply_offline_settings_to_store, apply_offline_sync_to_folder
 from .offline_sync import OfflineBodySyncCoordinator, OfflineSyncProgress
-from .search import MessageSearchQuery, query_to_sexp
+from .search import MessageSearchQuery, filter_messages_by_query, query_to_sexp
+from post.search_cancel_trace import trace
 
 log = logging.getLogger(__name__)
 
@@ -279,6 +280,12 @@ class MailService:
         default=None, init=False, repr=False
     )
     _mail_io_callbacks_registered: bool = field(default=False, init=False, repr=False)
+    _folder_search_cancellable: Gio.Cancellable | None = field(
+        default=None, init=False, repr=False
+    )
+    _folder_search_state_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
 
     @property
     def offline_sync(self) -> OfflineBodySyncCoordinator:
@@ -290,10 +297,46 @@ class MailService:
         if self._mail_io_callbacks_registered:
             return
         get_mail_io_thread().set_background_preempt_callbacks(
-            self.offline_sync.cancel_all,
+            self._preempt_background_work,
             self.schedule_offline_body_sync,
         )
         self._mail_io_callbacks_registered = True
+
+    def _preempt_background_work(self) -> None:
+        self.cancel_folder_search()
+        self.offline_sync.cancel_all()
+
+    def cancel_folder_search(self) -> None:
+        """Abort an in-flight Camel folder search so interactive reads can proceed."""
+        with self._folder_search_state_lock:
+            cancellable = self._folder_search_cancellable
+            self._folder_search_cancellable = None
+        trace(
+            "cancel_folder_search",
+            had_cancellable=cancellable is not None,
+            cancelled=cancellable.is_cancelled() if cancellable is not None else None,
+        )
+        if cancellable is not None:
+            cancellable.cancel()
+
+    def _cancel_folder_search_unlocked(self) -> None:
+        with self._folder_search_state_lock:
+            cancellable = self._folder_search_cancellable
+            self._folder_search_cancellable = None
+        if cancellable is not None:
+            cancellable.cancel()
+
+    def _begin_folder_search_unlocked(self) -> Gio.Cancellable:
+        self._cancel_folder_search_unlocked()
+        cancellable = Gio.Cancellable()
+        with self._folder_search_state_lock:
+            self._folder_search_cancellable = cancellable
+        return cancellable
+
+    def _end_folder_search_unlocked(self, cancellable: Gio.Cancellable) -> None:
+        with self._folder_search_state_lock:
+            if self._folder_search_cancellable is cancellable:
+                self._folder_search_cancellable = None
 
     def is_network_available(self) -> bool:
         return self._network_available
@@ -1780,28 +1823,73 @@ class MailService:
         *,
         sync: bool,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
-        with self._lock:
-            key = (account_uid, folder_name)
-            index = self._folder_indexes.get(key)
-            if index is None:
-                index, source = self._get_folder_index_unlocked(
-                    account_uid, folder_name, sync=False
-                )
-            else:
-                source = "memory"
+        cancellable = self._begin_folder_search_unlocked()
+        try:
+            with self._lock:
+                key = (account_uid, folder_name)
+                index = self._folder_indexes.get(key)
+                if index is None:
+                    index, source = self._get_folder_index_unlocked(
+                        account_uid, folder_name, sync=False
+                    )
+                else:
+                    source = "memory"
 
-            folder = self._require_folder_unlocked(account_uid, folder_name)
-            uid_set = self._folder_search_uids_unlocked(
-                folder,
-                query_to_sexp(query),
-                self._index_message_uids(index),
+                folder = self._require_folder_unlocked(account_uid, folder_name)
+                messages = list(index.messages)
+                unread = index.unread
+
+            trace(
+                "search_unlocked_before_filter",
+                account=account_uid,
+                folder=folder_name,
+                messages=len(messages),
+                cancelled=cancellable.is_cancelled(),
             )
-            filtered = [
-                msg for msg in index.messages if msg.get("uid") in uid_set
-            ]
+
+            def body_text_for_uid(uid: str) -> str | None:
+                if cancellable.is_cancelled():
+                    return None
+                from .helpers import extract_message_bodies
+
+                try:
+                    api_uid = camel_uid_to_api(uid)
+                    mime = folder.get_message_cached(api_uid, None)
+                    if mime is None:
+                        return None
+                except Exception:
+                    return None
+                bodies = extract_message_bodies(mime)
+                plain = bodies.get("plain")
+                if plain:
+                    return plain
+                html = bodies.get("html")
+                return html or ""
+
+            filtered = filter_messages_by_query(
+                messages,
+                query,
+                body_text_for_uid=body_text_for_uid,
+                is_cancelled=cancellable.is_cancelled,
+            )
+            if cancellable.is_cancelled():
+                trace(
+                    "search_unlocked_cancelled",
+                    account=account_uid,
+                    folder=folder_name,
+                )
+                return [], unread, 0, source
 
             match_count = len(filtered)
-            return filtered, index.unread, match_count, source
+            trace(
+                "search_unlocked_done",
+                account=account_uid,
+                folder=folder_name,
+                matches=match_count,
+            )
+            return filtered, unread, match_count, source
+        finally:
+            self._end_folder_search_unlocked(cancellable)
 
     def search_folder_messages(
         self,
@@ -1967,10 +2055,18 @@ class MailService:
         folder: Camel.Folder,
         expression: str,
         uids: list[str],
+        cancellable: Gio.Cancellable | None = None,
     ) -> set[str]:
         if not uids:
             return set()
-        matches = folder_search_uids(folder, expression, uids)
+        if cancellable is not None and cancellable.is_cancelled():
+            return set()
+        matches = folder_search_uids(
+            folder,
+            expression,
+            uids,
+            cancellable=cancellable,
+        )
         return set(matches)
 
     @staticmethod
@@ -2096,6 +2192,13 @@ class MailService:
         *,
         mark_seen: bool = True,
     ) -> dict:
+        trace(
+            "read_message_dispatch",
+            account=account_uid,
+            folder=folder_name,
+            uid=message_uid,
+            mark_seen=mark_seen,
+        )
         return run_on_mail_thread(
             self._read_message_unlocked,
             account_uid,
@@ -2266,6 +2369,13 @@ class MailService:
             extract_message_bodies,
         )
 
+        trace(
+            "read_message_start",
+            account=account_uid,
+            folder=folder_name,
+            uid=message_uid,
+            mark_seen=mark_seen,
+        )
         store = self._get_store_unlocked(account_uid)
         folder = store.get_folder_sync(folder_name, 0, None)
         if folder is None:
@@ -2300,6 +2410,13 @@ class MailService:
             result["folder_unread"] = unread
             result["folder_total"] = total
 
+        trace(
+            "read_message_done",
+            account=account_uid,
+            folder=folder_name,
+            uid=message_uid,
+            subject=result.get("subject"),
+        )
         return result
 
     def _read_attachment_data_unlocked(

@@ -12,6 +12,8 @@ import logging
 import re
 from typing import Any
 
+from post.search_cancel_trace import trace
+
 log = logging.getLogger(__name__)
 
 _UID_B64_PREFIX = "uidb64:"
@@ -215,6 +217,8 @@ def folder_search_uids(
     folder: Any,
     expression: str,
     scope_uids: list[str],
+    *,
+    cancellable: Any | None = None,
 ) -> list[str]:
     """Run Camel folder search and return matching UID strings.
 
@@ -224,20 +228,45 @@ def folder_search_uids(
     """
     if not scope_uids:
         return []
+    if cancellable is not None and cancellable.is_cancelled():
+        return []
+    trace(
+        "camel_search_start",
+        scope_uids=len(scope_uids),
+        expression=expression[:120],
+        cancelled=cancellable.is_cancelled() if cancellable is not None else False,
+    )
     lib = _get_libcamel()
     folder_ptr = _gobject_pointer(folder)
+    cancel_ptr = (
+        _gobject_pointer(cancellable)
+        if cancellable is not None
+        else ctypes.c_void_p()
+    )
     array = lib.camel_folder_search_by_expression(
         folder_ptr,
         expression.encode("utf-8"),
         None,
-        None,
+        cancel_ptr,
     )
+    if cancellable is not None and cancellable.is_cancelled():
+        if array:
+            lib.camel_folder_search_free(folder_ptr, array)
+        trace("camel_search_cancelled", scope_uids=len(scope_uids))
+        return []
     try:
         matches = _read_ptr_array_uids(array)
     finally:
         if array:
             lib.camel_folder_search_free(folder_ptr, array)
-    return _align_uids_to_scope(matches, scope_uids)
+    aligned = _align_uids_to_scope(matches, scope_uids)
+    trace(
+        "camel_search_done",
+        scope_uids=len(scope_uids),
+        matches=len(aligned),
+        cancelled=cancellable.is_cancelled() if cancellable is not None else False,
+    )
+    return aligned
 
 
 def normalize_camel_uid(value: Any) -> str | None:
