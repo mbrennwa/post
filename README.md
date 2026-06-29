@@ -1,6 +1,8 @@
 # Post
 
-**Post** is a mail app for GNOME — read and send email with a simple, native desktop experience. It is free and open source, built for Linux. Post picks up online accounts from GNOME Online Accounts and optionally also local system email.
+**Post** is a mail app for GNOME — read and send email with a simple, native desktop experience. It is free and open source, built for Linux. Post picks up online accounts from GNOME Online Accounts and optionally also local system email.
+
+Project site: [mbrennwa.github.io/post](https://mbrennwa.github.io/post)
 
 ## Install
 
