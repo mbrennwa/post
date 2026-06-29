@@ -76,6 +76,14 @@ from .send_errors import (
     is_compose_validation_error,
     user_send_error_message,
 )
+from .operation_queue import (
+    OperationType,
+    QueuedOperation,
+    count_queued_operations,
+    enqueue_operation,
+    list_queued_operations,
+    remove_queued_operation,
+)
 from .send_queue import (
     QueuedOutboundMessage,
     enqueue_outbound_message,
@@ -275,6 +283,7 @@ class MailService:
         default_factory=threading.Condition, init=False, repr=False
     )
     _active_outbound_deliveries: set[str] = field(default_factory=set, init=False)
+    _flushing_operation_queue: bool = field(default=False, init=False)
     _offline_sync: OfflineBodySyncCoordinator | None = field(
         default=None, init=False, repr=False
     )
@@ -825,6 +834,15 @@ class MailService:
             return self._flush_send_queue_unlocked()
         return get_mail_io_thread().run_sync(self._flush_send_queue_unlocked)
 
+    def flush_operation_queue(self) -> int:
+        """Apply queued mail mutations after reconnect. Returns count flushed."""
+        if is_mail_io_thread():
+            return self._flush_operation_queue_unlocked()
+        return get_mail_io_thread().run_sync(self._flush_operation_queue_unlocked)
+
+    def count_queued_operations(self) -> int:
+        return count_queued_operations()
+
     def send_message(
         self,
         account_uid: str,
@@ -1162,6 +1180,74 @@ class MailService:
             finally:
                 self._end_outbound_send()
         return sent
+
+    def _flush_operation_queue_unlocked(self) -> int:
+        flushed = 0
+        self._flushing_operation_queue = True
+        try:
+            for queue_id, operation in list_queued_operations():
+                try:
+                    self._execute_queued_operation_unlocked(operation)
+                except Exception:
+                    log.exception(
+                        "Failed to flush queued operation %s (%s)",
+                        queue_id,
+                        operation.op_type,
+                    )
+                    break
+                else:
+                    remove_queued_operation(queue_id)
+                    flushed += 1
+        finally:
+            self._flushing_operation_queue = False
+        return flushed
+
+    def _execute_queued_operation_unlocked(self, operation: QueuedOperation) -> None:
+        if operation.op_type == "move_to_trash":
+            self._move_messages_to_trash_unlocked(
+                operation.account_uid,
+                operation.folder_name,
+                list(operation.message_uids),
+            )
+            return
+        if operation.op_type == "archive":
+            self._archive_messages_unlocked(
+                operation.account_uid,
+                operation.folder_name,
+                list(operation.message_uids),
+            )
+            return
+        if operation.op_type == "move_to_folder":
+            if not operation.destination_folder:
+                raise ValueError("Queued move is missing destination folder")
+            self._move_messages_unlocked(
+                operation.account_uid,
+                operation.folder_name,
+                operation.destination_folder,
+                list(operation.message_uids),
+            )
+            return
+        if operation.op_type == "set_seen":
+            if operation.seen is None:
+                raise ValueError("Queued seen update is missing seen flag")
+            self._set_messages_seen_unlocked(
+                operation.account_uid,
+                operation.folder_name,
+                list(operation.message_uids),
+                seen=operation.seen,
+            )
+            return
+        if operation.op_type == "set_flagged":
+            if operation.flagged is None:
+                raise ValueError("Queued flagged update is missing flagged flag")
+            self._set_messages_flagged_unlocked(
+                operation.account_uid,
+                operation.folder_name,
+                list(operation.message_uids),
+                flagged=operation.flagged,
+            )
+            return
+        raise ValueError(f"Unknown queued operation: {operation.op_type}")
 
     def _sent_folder_name_unlocked(self, account_uid: str) -> str | None:
         account = self.get_account(account_uid)
@@ -1506,9 +1592,99 @@ class MailService:
             return self._list_folders_unlocked(account_uid)
         return run_on_mail_thread(self._list_folders_unlocked, account_uid)
 
+    def _list_folders_from_local_store_unlocked(
+        self, account_uid: str
+    ) -> list[dict]:
+        """Build a folder tree from Camel's on-disk cache when the server is unreachable."""
+        with self._lock:
+            store = self._get_store_unlocked(account_uid)
+        self._sync_store_online_state_unlocked(store)
+
+        folders: list[dict] = []
+        try:
+            root = store.get_folder_info_sync(
+                None, Camel.StoreGetFolderInfoFlags.RECURSIVE, None
+            )
+            if root is not None:
+                walk_folder_info(root, folders)
+                result = [folder for folder in folders if folder.get("full_name")]
+                if result:
+                    return result
+        except GLib.Error as exc:
+            if not is_network_unavailable_error(exc):
+                log.debug(
+                    "Local folder info unavailable for account %s",
+                    account_uid,
+                    exc_info=True,
+                )
+
+        if isinstance(store, Camel.OfflineStore):
+            try:
+                listed = store.dup_downsync_folders()
+            except Exception:
+                log.debug(
+                    "dup_downsync_folders failed for account %s",
+                    account_uid,
+                    exc_info=True,
+                )
+                listed = []
+            if listed:
+                seen: set[str] = set()
+                local_folders: list[dict] = []
+                for folder in listed:
+                    full_name = folder.get_full_name()
+                    if not isinstance(full_name, str) or not full_name:
+                        continue
+                    if full_name in seen:
+                        continue
+                    seen.add(full_name)
+                    display_name = folder.get_display_name()
+                    local_folders.append(
+                        {
+                            "full_name": full_name,
+                            "display_name": display_name or full_name,
+                            "unread": -1,
+                            "total": -1,
+                            "flags": 0,
+                        }
+                    )
+                if local_folders:
+                    return local_folders
+
+        for inbox_candidate in ("INBOX", "Inbox", "inbox"):
+            try:
+                folder = store.get_folder_sync(inbox_candidate, 0, None)
+            except GLib.Error:
+                continue
+            if folder is None:
+                continue
+            full_name = folder.get_full_name() or inbox_candidate
+            display_name = folder.get_display_name() or full_name
+            return [
+                {
+                    "full_name": full_name,
+                    "display_name": display_name,
+                    "unread": -1,
+                    "total": -1,
+                    "flags": int(Camel.FolderInfoFlags.TYPE_INBOX),
+                }
+            ]
+
+        return []
+
     def _list_folders_unlocked(self, account_uid: str) -> list[dict]:
         with self._lock:
             cached = self._folder_tree_cache.get(account_uid)
+
+        if not self._network_available:
+            if cached is not None:
+                return cached
+            result = self._list_folders_from_local_store_unlocked(account_uid)
+            if result:
+                with self._lock:
+                    self._folder_tree_cache[account_uid] = result
+            return result
+
         try:
             with self._lock:
                 store = self._get_store_unlocked(account_uid)
@@ -1529,6 +1705,12 @@ class MailService:
                     account_uid,
                 )
                 return cached
+            if is_network_unavailable_error(exc):
+                result = self._list_folders_from_local_store_unlocked(account_uid)
+                if result:
+                    with self._lock:
+                        self._folder_tree_cache[account_uid] = result
+                    return result
             raise
 
     def get_folder_stats(
@@ -1721,6 +1903,19 @@ class MailService:
         self._correspondent_indexes.pop(account_uid, None)
         folder_index_cache.invalidate_account(account_uid)
 
+    def _cached_folder_stats_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> tuple[int, int] | None:
+        key = (account_uid, folder_name)
+        index = self._folder_indexes.get(key)
+        if index is not None:
+            return index.unread, index.total
+        cached = folder_index_cache.load(account_uid, folder_name)
+        if cached is not None:
+            _messages, unread, total = cached
+            return unread, total
+        return None
+
     def _get_folder_stats_unlocked(
         self, account_uid: str, folder_name: str
     ) -> tuple[int, int]:
@@ -1729,7 +1924,20 @@ class MailService:
             folder = store.get_folder_sync(folder_name, 0, None)
             if folder is None:
                 raise ValueError(f"Folder not found: {folder_name}")
-            folder.refresh_info_sync(None)
+            if not self._network_available:
+                cached = self._cached_folder_stats_unlocked(account_uid, folder_name)
+                if cached is not None:
+                    return cached
+            try:
+                folder.refresh_info_sync(None)
+            except GLib.Error as exc:
+                if is_network_unavailable_error(exc):
+                    cached = self._cached_folder_stats_unlocked(
+                        account_uid, folder_name
+                    )
+                    if cached is not None:
+                        return cached
+                raise
             return folder.get_unread_message_count(), folder.get_message_count()
 
     @staticmethod
@@ -2319,7 +2527,7 @@ class MailService:
         if dest is None:
             raise ValueError(f"Folder not found: {destination_folder}")
         return self._transfer_messages_unlocked(
-            account_uid, source_folder, message_uids, dest
+            account_uid, source_folder, message_uids, dest, op_type="move_to_folder"
         )
 
     def _read_message_unlocked(
@@ -2429,7 +2637,7 @@ class MailService:
                 )
             ),
             persist_uids=lambda uids: self._persist_message_flag_changes_unlocked(
-                account_uid, folder, uids
+                account_uid, folder, uids, op_type="set_seen", seen=True
             ),
         )
 
@@ -2455,14 +2663,20 @@ class MailService:
         unread = folder.get_unread_message_count()
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
+        queued = False
         if changed:
-            self._persist_message_flag_changes_unlocked(
-                account_uid, folder, [message_uid]
+            queued = self._persist_message_flag_changes_unlocked(
+                account_uid,
+                folder,
+                [message_uid],
+                op_type="set_seen",
+                seen=new_seen,
             )
         return {
             "flags": {"seen": new_seen},
             "folder_unread": unread,
             "folder_total": total,
+            "queued": queued,
         }
 
     def _toggle_message_flagged_unlocked(
@@ -2484,11 +2698,16 @@ class MailService:
             Camel.MessageFlags.FLAGGED,
             flag_value,
         )
+        queued = False
         if changed:
-            self._persist_message_flag_changes_unlocked(
-                account_uid, folder, [message_uid]
+            queued = self._persist_message_flag_changes_unlocked(
+                account_uid,
+                folder,
+                [message_uid],
+                op_type="set_flagged",
+                flagged=new_flagged,
             )
-        return {"flags": {"flagged": new_flagged}}
+        return {"flags": {"flagged": new_flagged}, "queued": queued}
 
     def _set_messages_seen_unlocked(
         self,
@@ -2520,9 +2739,14 @@ class MailService:
             ):
                 changed_uids.append(message_uid)
             updates.append({"uid": message_uid, "flags": {"seen": seen}})
+        queued = False
         if changed_uids:
-            self._persist_message_flag_changes_unlocked(
-                account_uid, folder, changed_uids
+            queued = self._persist_message_flag_changes_unlocked(
+                account_uid,
+                folder,
+                changed_uids,
+                op_type="set_seen",
+                seen=seen,
             )
         unread = folder.get_unread_message_count()
         total = folder.get_message_count()
@@ -2531,6 +2755,7 @@ class MailService:
             "updates": updates,
             "folder_unread": unread,
             "folder_total": total,
+            "queued": queued,
         }
 
     def _set_messages_flagged_unlocked(
@@ -2563,11 +2788,16 @@ class MailService:
             ):
                 changed_uids.append(message_uid)
             updates.append({"uid": message_uid, "flags": {"flagged": flagged}})
+        queued = False
         if changed_uids:
-            self._persist_message_flag_changes_unlocked(
-                account_uid, folder, changed_uids
+            queued = self._persist_message_flag_changes_unlocked(
+                account_uid,
+                folder,
+                changed_uids,
+                op_type="set_flagged",
+                flagged=flagged,
             )
-        return {"updates": updates}
+        return {"updates": updates, "queued": queued}
 
     def _toggle_messages_seen_unlocked(
         self, account_uid: str, folder_name: str, message_uids: list[str]
@@ -2592,10 +2822,34 @@ class MailService:
             ):
                 changed_uids.append(message_uid)
             updates.append({"uid": message_uid, "flags": {"seen": new_seen}})
+        queued = False
         if changed_uids:
-            self._persist_message_flag_changes_unlocked(
-                account_uid, folder, changed_uids
-            )
+            if not self._network_available and not self._flushing_operation_queue:
+                for item in updates:
+                    uid = item.get("uid")
+                    if uid not in changed_uids:
+                        continue
+                    flags = item.get("flags") or {}
+                    if "seen" not in flags:
+                        continue
+                    self._queue_flag_operation_unlocked(
+                        account_uid,
+                        folder_name,
+                        [str(uid)],
+                        op_type="set_seen",
+                        seen=bool(flags["seen"]),
+                    )
+                queued = True
+            else:
+                queued = self._persist_message_flag_changes_unlocked(
+                    account_uid,
+                    folder,
+                    changed_uids,
+                    op_type="set_seen",
+                    seen=bool(updates[0].get("flags", {}).get("seen"))
+                    if updates
+                    else True,
+                )
         unread = folder.get_unread_message_count()
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
@@ -2603,6 +2857,7 @@ class MailService:
             "updates": updates,
             "folder_unread": unread,
             "folder_total": total,
+            "queued": queued,
         }
 
     def _toggle_messages_flagged_unlocked(
@@ -2628,11 +2883,35 @@ class MailService:
             ):
                 changed_uids.append(message_uid)
             updates.append({"uid": message_uid, "flags": {"flagged": new_flagged}})
+        queued = False
         if changed_uids:
-            self._persist_message_flag_changes_unlocked(
-                account_uid, folder, changed_uids
-            )
-        return {"updates": updates}
+            if not self._network_available and not self._flushing_operation_queue:
+                for item in updates:
+                    uid = item.get("uid")
+                    if uid not in changed_uids:
+                        continue
+                    flags = item.get("flags") or {}
+                    if "flagged" not in flags:
+                        continue
+                    self._queue_flag_operation_unlocked(
+                        account_uid,
+                        folder_name,
+                        [str(uid)],
+                        op_type="set_flagged",
+                        flagged=bool(flags["flagged"]),
+                    )
+                queued = True
+            else:
+                queued = self._persist_message_flag_changes_unlocked(
+                    account_uid,
+                    folder,
+                    changed_uids,
+                    op_type="set_flagged",
+                    flagged=bool(updates[0].get("flags", {}).get("flagged"))
+                    if updates
+                    else True,
+                )
+        return {"updates": updates, "queued": queued}
 
     def _move_messages_to_trash_unlocked(
         self, account_uid: str, folder_name: str, message_uids: list[str]
@@ -2657,7 +2936,7 @@ class MailService:
             raise ValueError("Trash folder not found for this account")
 
         return self._transfer_messages_unlocked(
-            account_uid, folder_name, message_uids, trash_folder
+            account_uid, folder_name, message_uids, trash_folder, op_type="move_to_trash"
         )
 
     def _spool_trash_messages_unlocked(
@@ -2717,7 +2996,7 @@ class MailService:
             raise ValueError("Archive folder not found for this account")
 
         return self._transfer_messages_unlocked(
-            account_uid, folder_name, message_uids, archive_folder
+            account_uid, folder_name, message_uids, archive_folder, op_type="archive"
         )
 
     @staticmethod
@@ -2736,12 +3015,104 @@ class MailService:
             transfer_uids.append(uid)
         return transfer_uids
 
+    def _optimistic_remove_messages_from_cache_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+    ) -> tuple[int, int]:
+        index = self._folder_indexes.get((account_uid, folder_name))
+        if index is None:
+            return -1, -1
+        uid_set = set(message_uids)
+        removed_unread = sum(
+            1
+            for message in index.messages
+            if message.get("uid") in uid_set
+            and not (message.get("flags") or {}).get("seen", False)
+        )
+        index.messages = [
+            message
+            for message in index.messages
+            if message.get("uid") not in uid_set
+        ]
+        if index.unread >= 0:
+            index.unread = max(0, index.unread - removed_unread)
+        if index.total >= 0:
+            index.total = max(0, index.total - len(message_uids))
+        else:
+            index.total = len(index.messages)
+        folder_index_cache.save(
+            account_uid,
+            folder_name,
+            index.messages,
+            index.unread,
+            index.total,
+        )
+        return index.unread, index.total
+
+    def _queue_transfer_operation_unlocked(
+        self,
+        account_uid: str,
+        source_folder_name: str,
+        message_uids: list[str],
+        *,
+        op_type: OperationType,
+        destination_folder: str | None,
+    ) -> dict[str, Any]:
+        source_unread, source_total = self._optimistic_remove_messages_from_cache_unlocked(
+            account_uid, source_folder_name, message_uids
+        )
+        enqueue_operation(
+            QueuedOperation(
+                op_type=op_type,
+                account_uid=account_uid,
+                folder_name=source_folder_name,
+                message_uids=list(message_uids),
+                destination_folder=destination_folder,
+            )
+        )
+        return {
+            "moved_uids": list(message_uids),
+            "destination_uids": [],
+            "source_folder": source_folder_name,
+            "source_folder_unread": source_unread,
+            "source_folder_total": source_total,
+            "destination_folder": destination_folder,
+            "destination_folder_unread": -1,
+            "destination_folder_total": -1,
+            "queued": True,
+        }
+
+    def _queue_flag_operation_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        op_type: OperationType,
+        seen: bool | None = None,
+        flagged: bool | None = None,
+    ) -> None:
+        enqueue_operation(
+            QueuedOperation(
+                op_type=op_type,
+                account_uid=account_uid,
+                folder_name=folder_name,
+                message_uids=list(message_uids),
+                seen=seen,
+                flagged=flagged,
+            )
+        )
+
     def _transfer_messages_unlocked(
         self,
         account_uid: str,
         source_folder_name: str,
         message_uids: list[str],
         destination_folder: Camel.Folder,
+        *,
+        op_type: OperationType = "move_to_folder",
     ) -> dict[str, Any]:
         if not message_uids:
             return {"moved_uids": []}
@@ -2755,26 +3126,51 @@ class MailService:
         if not transfer_uids:
             return {"moved_uids": []}
 
+        if not self._network_available and not self._flushing_operation_queue:
+            return self._queue_transfer_operation_unlocked(
+                account_uid,
+                source_folder_name,
+                transfer_uids,
+                op_type=op_type,
+                destination_folder=dest_name,
+            )
+
         source_messages = self._message_dicts_for_uids_unlocked(
             source_folder, transfer_uids
         )
 
         destination_uids: list[str] = []
-        for offset in range(0, len(transfer_uids), _TRANSFER_MESSAGE_BATCH_SIZE):
-            batch = transfer_uids[offset : offset + _TRANSFER_MESSAGE_BATCH_SIZE]
-            ok, transferred = source_folder.transfer_messages_to_sync(
-                batch, destination_folder, True, None
-            )
-            if not ok:
-                raise RuntimeError("Could not move messages")
-            destination_uids.extend(camel_uid_list(transferred))
+        try:
+            for offset in range(0, len(transfer_uids), _TRANSFER_MESSAGE_BATCH_SIZE):
+                batch = transfer_uids[offset : offset + _TRANSFER_MESSAGE_BATCH_SIZE]
+                ok, transferred = source_folder.transfer_messages_to_sync(
+                    batch, destination_folder, True, None
+                )
+                if not ok:
+                    raise RuntimeError("Could not move messages")
+                destination_uids.extend(camel_uid_list(transferred))
 
-        self._commit_folder_transfer_unlocked(source_folder, destination_folder)
+            self._commit_folder_transfer_unlocked(source_folder, destination_folder)
+        except Exception as exc:
+            if is_queueable_network_error(exc) and not self._flushing_operation_queue:
+                return self._queue_transfer_operation_unlocked(
+                    account_uid,
+                    source_folder_name,
+                    transfer_uids,
+                    op_type=op_type,
+                    destination_folder=dest_name,
+                )
+            raise
 
         # Camel returns destination UIDs; the UI and cache use source UIDs.
         moved_uids = list(transfer_uids)
-        source_folder.refresh_info_sync(None)
-        destination_folder.refresh_info_sync(None)
+        try:
+            source_folder.refresh_info_sync(None)
+            destination_folder.refresh_info_sync(None)
+        except GLib.Error as exc:
+            if not is_network_unavailable_error(exc):
+                raise
+
         if not destination_uids:
             destination_uids = self._find_moved_uids_in_folder_unlocked(
                 destination_folder, source_messages
@@ -2810,11 +3206,50 @@ class MailService:
         account_uid: str,
         folder: Camel.Folder,
         message_uids: list[str],
-    ) -> None:
+        *,
+        op_type: OperationType | None = None,
+        seen: bool | None = None,
+        flagged: bool | None = None,
+    ) -> bool:
         if not message_uids:
-            return
+            return False
+        if not self._network_available and not self._flushing_operation_queue:
+            if op_type is None:
+                raise RuntimeError("Offline flag sync requires operation type")
+            folder_name = folder.get_full_name()
+            if not folder_name:
+                raise RuntimeError("Could not determine folder for queued flag change")
+            self._queue_flag_operation_unlocked(
+                account_uid,
+                folder_name,
+                message_uids,
+                op_type=op_type,
+                seen=seen,
+                flagged=flagged,
+            )
+            return True
         store = self._get_store_unlocked(account_uid)
-        self._persist_folder_flags_unlocked(store, folder, message_uids)
+        try:
+            self._persist_folder_flags_unlocked(store, folder, message_uids)
+        except Exception as exc:
+            if (
+                is_queueable_network_error(exc)
+                and not self._flushing_operation_queue
+                and op_type is not None
+            ):
+                folder_name = folder.get_full_name()
+                if folder_name:
+                    self._queue_flag_operation_unlocked(
+                        account_uid,
+                        folder_name,
+                        message_uids,
+                        op_type=op_type,
+                        seen=seen,
+                        flagged=flagged,
+                    )
+                    return True
+            raise
+        return False
 
     @staticmethod
     def _persist_folder_flags_unlocked(

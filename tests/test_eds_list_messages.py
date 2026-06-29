@@ -144,3 +144,53 @@ class ReadPathDispatchTests(unittest.TestCase):
             limit=20,
             sync=False,
         )
+
+
+class FolderStatsOfflineFallbackTests(unittest.TestCase):
+    def test_returns_memory_index_when_offline(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = MailService(registry=mock.Mock())
+        service._network_available = False
+        service._folder_indexes[("acct-1", "INBOX")] = _FolderMessageIndex(
+            messages=[{"uid": "1"}],
+            unread=2,
+            total=5,
+        )
+        folder = mock.Mock()
+        store = mock.Mock()
+        store.get_folder_sync.return_value = folder
+
+        with mock.patch.object(service, "_get_store_unlocked", return_value=store):
+            unread, total = service._get_folder_stats_unlocked("acct-1", "INBOX")
+
+        self.assertEqual((unread, total), (2, 5))
+        folder.refresh_info_sync.assert_not_called()
+
+    def test_falls_back_to_disk_cache_on_network_error(self) -> None:
+        import gi
+
+        gi.require_version("GLib", "2.0")
+        from gi.repository import GLib
+
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        folder = mock.Mock()
+        folder.refresh_info_sync.side_effect = GLib.Error.new_literal(
+            GLib.quark_from_string("g-io-error-quark"),
+            "Network is unreachable",
+            39,
+        )
+        store = mock.Mock()
+        store.get_folder_sync.return_value = folder
+
+        with (
+            mock.patch.object(service, "_get_store_unlocked", return_value=store),
+            mock.patch(
+                "post.mail.eds.folder_index_cache.load",
+                return_value=([], 1, 3),
+            ),
+        ):
+            unread, total = service._get_folder_stats_unlocked("acct-1", "INBOX")
+
+        self.assertEqual((unread, total), (1, 3))

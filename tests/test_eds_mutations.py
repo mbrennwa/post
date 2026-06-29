@@ -28,6 +28,37 @@ class DraftDispatchTests(unittest.TestCase):
         )
         self.assertEqual(result, ("Drafts", "7"))
 
+    def test_save_draft_unlocked_appends_locally(self) -> None:
+        service = MailService(registry=mock.Mock())
+        account = mock.Mock()
+        account.from_address = "user@example.com"
+        account.from_name = "User"
+        account.email = "user@example.com"
+        service.get_account = mock.Mock(return_value=account)
+        service._drafts_folder_name_unlocked = mock.Mock(return_value="Drafts")
+        service._append_draft_unlocked = mock.Mock(return_value="draft-1")
+
+        with mock.patch(
+            "post.mail.eds.build_draft_mime_message",
+            return_value=mock.Mock(),
+        ):
+            folder_name, uid = service._save_draft_unlocked(
+                "acct-1",
+                to=["bob@example.com"],
+                cc=None,
+                bcc=None,
+                subject="Hi",
+                body="Body",
+                body_html=None,
+                in_reply_to=None,
+                references=None,
+                existing_uid=None,
+                drafts_folder_name=None,
+            )
+
+        service._append_draft_unlocked.assert_called_once()
+        self.assertEqual((folder_name, uid), ("Drafts", "draft-1"))
+
     @mock.patch("post.mail.eds.run_on_mail_thread")
     def test_read_attachment_data_uses_mail_thread(self, run_on_mail_thread) -> None:
         run_on_mail_thread.return_value = ("file.txt", b"data")
@@ -108,3 +139,100 @@ class InboxFolderNameTests(unittest.TestCase):
 
         list_folders.assert_not_called()
         self.assertEqual(inbox, "[Gmail]/Inbox")
+
+
+class ListFoldersOfflineBootstrapTests(unittest.TestCase):
+    def test_offline_uses_local_bootstrap_when_no_memory_cache(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = False
+        local_folders = [
+            {
+                "full_name": "INBOX",
+                "display_name": "Inbox",
+                "unread": -1,
+                "total": -1,
+                "flags": 1024,
+            }
+        ]
+
+        with mock.patch.object(
+            service,
+            "_list_folders_from_local_store_unlocked",
+            return_value=local_folders,
+        ) as local_bootstrap:
+            result = service._list_folders_unlocked("acct-1")
+
+        local_bootstrap.assert_called_once_with("acct-1")
+        self.assertEqual(result, local_folders)
+        self.assertEqual(service._folder_tree_cache["acct-1"], local_folders)
+
+    def test_offline_prefers_memory_cache_over_local_bootstrap(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = False
+        cached = [{"full_name": "Sent", "display_name": "Sent"}]
+        service._folder_tree_cache["acct-1"] = cached
+
+        with mock.patch.object(
+            service,
+            "_list_folders_from_local_store_unlocked",
+        ) as local_bootstrap:
+            result = service._list_folders_unlocked("acct-1")
+
+        local_bootstrap.assert_not_called()
+        self.assertEqual(result, cached)
+
+    def test_server_failure_falls_back_to_local_bootstrap(self) -> None:
+        import gi
+
+        gi.require_version("GLib", "2.0")
+        from gi.repository import GLib
+
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        store = mock.Mock()
+        store.get_folder_info_sync.side_effect = GLib.Error.new_literal(
+            GLib.quark_from_string("g-io-error-quark"),
+            "Network is unreachable",
+            39,
+        )
+        local_folders = [{"full_name": "INBOX", "display_name": "Inbox"}]
+
+        with (
+            mock.patch.object(service, "_get_store_unlocked", return_value=store),
+            mock.patch.object(
+                service,
+                "_list_folders_from_local_store_unlocked",
+                return_value=local_folders,
+            ) as local_bootstrap,
+        ):
+            result = service._list_folders_unlocked("acct-1")
+
+        local_bootstrap.assert_called_once_with("acct-1")
+        self.assertEqual(result, local_folders)
+
+
+class OfflineTransferQueueTests(unittest.TestCase):
+    def test_transfer_queues_when_offline(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = False
+        folder = mock.Mock()
+        folder.get_full_name.return_value = "Trash"
+        source_folder = mock.Mock()
+        service._open_folder_unlocked = mock.Mock(return_value=source_folder)
+        service._transfer_uids_in_folder = mock.Mock(return_value=["1"])
+
+        with mock.patch.object(
+            service,
+            "_queue_transfer_operation_unlocked",
+            return_value={"moved_uids": ["1"], "queued": True},
+        ) as queue_transfer:
+            result = service._transfer_messages_unlocked(
+                "acct-1",
+                "INBOX",
+                ["1"],
+                folder,
+                op_type="move_to_trash",
+            )
+
+        queue_transfer.assert_called_once()
+        self.assertTrue(result.get("queued"))

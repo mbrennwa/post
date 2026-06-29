@@ -370,6 +370,7 @@ def resolve_sidebar_context_menu(
     total: int,
     outbox_count: int,
     folder_crud_enabled: bool,
+    network_available: bool = True,
 ) -> dict[str, bool]:
     """Return show/enabled flags for sidebar folder context menu actions."""
     is_account = folder_name is None
@@ -425,7 +426,7 @@ def resolve_sidebar_context_menu(
         "show_empty_trash": show_empty_trash,
         "enable_empty_trash": show_empty_trash and total > 0,
         "show_refresh": show_refresh,
-        "enable_refresh": True,
+        "enable_refresh": network_available,
         "read_count": read_count,
         "archive_folder": archive_name,
     }
