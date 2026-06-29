@@ -476,6 +476,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _flush_send_queue_on_startup(self) -> bool:
         self._flush_send_queue_idle()
         self._flush_operation_queue_idle()
+        self._flush_draft_queue_idle()
         return False
 
     def _on_network_available_changed(self, monitor: Gio.NetworkMonitor, *_args) -> None:
@@ -490,6 +491,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._mail.go_online_sync()
             self._flush_send_queue_idle()
             self._flush_operation_queue_idle()
+            self._flush_draft_queue_idle()
             self._mail.schedule_offline_body_sync()
             if self._current_account and self._current_folder:
                 if get_auto_sync():
@@ -533,6 +535,30 @@ class MainWindow(Adw.ApplicationWindow):
             self._set_status("Synced 1 queued action")
         else:
             self._set_status(f"Synced {flushed} queued actions")
+        return False
+
+    def _flush_draft_queue_idle(self) -> bool:
+        get_mail_io_thread().submit(self._flush_draft_queue_worker)
+        return False
+
+    def _flush_draft_queue_worker(self) -> None:
+        try:
+            flushed = self._mail.flush_draft_queue()
+        except Exception:
+            log.exception("Failed to flush queued drafts")
+            return
+        if flushed <= 0:
+            return
+        GLib.idle_add(self._on_draft_queue_flushed, flushed)
+
+    def _on_draft_queue_flushed(self, flushed: int) -> bool:
+        self._refresh_status_display()
+        if flushed <= 0:
+            return False
+        if flushed == 1:
+            self._set_status("Synced 1 queued draft to Drafts")
+        else:
+            self._set_status(f"Synced {flushed} queued drafts to Drafts")
         return False
 
     def _flush_send_queue_worker(self) -> None:
@@ -1550,10 +1576,12 @@ class MainWindow(Adw.ApplicationWindow):
         if not self._network_available:
             send_queued = len(list_queued_outbound_messages())
             operation_queued = self._mail.count_queued_operations()
+            draft_queued = self._mail.count_queued_drafts()
             parts = [
                 offline_queue_status_text(
                     send_queued_count=send_queued,
                     operation_queued_count=operation_queued,
+                    draft_queued_count=draft_queued,
                 )
             ]
             if self._search_query is not None:

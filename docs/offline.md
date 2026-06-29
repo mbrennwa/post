@@ -11,7 +11,7 @@ Related: [#6](https://github.com/mbrennwa/post/issues/6), [offline body cache](o
 - **Read & search** — cached bodies and headers via Camel; see [offline-body-cache.md](offline-body-cache.md).
 - **Compose & send** — outbound mail is queued in `~/.config/post/outbox/` and sent on reconnect.
 - **Move, archive, flag** — changes apply locally in the UI; server sync is queued in `~/.config/post/operations/` and flushed on reconnect.
-- **Drafts** — saved via Camel `append_message_sync` to the local Drafts folder when the store allows.
+- **Drafts** — queued in `~/.config/post/draft-queue/` when offline (IMAP cannot append to Drafts until reconnect); flushed to the server Drafts folder when back online.
 
 ## What is disabled offline
 
@@ -24,14 +24,16 @@ When the network returns:
 1. Camel stores go back online (`go_online_sync`)
 2. Outbound send queue is flushed
 3. Queued move/archive/flag operations are flushed
-4. Optional body downsync resumes
-5. Open folder reloads from server when **Auto Sync** is enabled
+4. Queued drafts are appended to Drafts on the server
+5. Optional body downsync resumes
+6. Open folder reloads from server when **Auto Sync** is enabled
 
 Status bar examples:
 
 - `Offline`
 - `Offline · 2 messages queued`
 - `Offline · 1 action queued`
+- `Offline · 1 draft queued`
 - `Offline · 1 message queued · 2 actions queued`
 
 ## Manual checks (before closing #6)
@@ -41,4 +43,4 @@ Status bar examples:
 | Cold start offline with synced mail — folders visible | |
 | Move + flag offline → reconnect → verified on server | |
 | Refresh greyed out in sidebar while offline | |
-| Save draft offline → visible in Drafts when back online | |
+| Save draft offline → toast says will sync; appears in Drafts after reconnect | |

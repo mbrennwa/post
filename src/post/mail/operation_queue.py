@@ -123,12 +123,17 @@ def offline_queue_status_text(
     *,
     send_queued_count: int,
     operation_queued_count: int,
+    draft_queued_count: int = 0,
 ) -> str:
     parts: list[str] = []
     if send_queued_count == 1:
         parts.append("1 message queued")
     elif send_queued_count > 1:
         parts.append(f"{send_queued_count} messages queued")
+    if draft_queued_count == 1:
+        parts.append("1 draft queued")
+    elif draft_queued_count > 1:
+        parts.append(f"{draft_queued_count} drafts queued")
     if operation_queued_count == 1:
         parts.append("1 action queued")
     elif operation_queued_count > 1:

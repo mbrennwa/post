@@ -76,6 +76,15 @@ from .send_errors import (
     is_compose_validation_error,
     user_send_error_message,
 )
+from .draft_queue import (
+    QueuedDraft,
+    count_queued_drafts,
+    enqueue_draft,
+    is_queued_draft_id,
+    list_queued_drafts,
+    load_queued_draft_attachments,
+    remove_queued_draft,
+)
 from .operation_queue import (
     OperationType,
     QueuedOperation,
@@ -284,6 +293,7 @@ class MailService:
     )
     _active_outbound_deliveries: set[str] = field(default_factory=set, init=False)
     _flushing_operation_queue: bool = field(default=False, init=False)
+    _flushing_draft_queue: bool = field(default=False, init=False)
     _offline_sync: OfflineBodySyncCoordinator | None = field(
         default=None, init=False, repr=False
     )
@@ -843,6 +853,15 @@ class MailService:
     def count_queued_operations(self) -> int:
         return count_queued_operations()
 
+    def count_queued_drafts(self) -> int:
+        return count_queued_drafts()
+
+    def flush_draft_queue(self) -> int:
+        """Append queued drafts to Drafts folders after reconnect."""
+        if is_mail_io_thread():
+            return self._flush_draft_queue_unlocked()
+        return get_mail_io_thread().run_sync(self._flush_draft_queue_unlocked)
+
     def send_message(
         self,
         account_uid: str,
@@ -1202,6 +1221,41 @@ class MailService:
             self._flushing_operation_queue = False
         return flushed
 
+    def _flush_draft_queue_unlocked(self) -> int:
+        flushed = 0
+        self._flushing_draft_queue = True
+        try:
+            for queue_id, queued in list_queued_drafts():
+                try:
+                    attachments = load_queued_draft_attachments(queue_id, queued)
+                    self._save_draft_unlocked(
+                        queued.account_uid,
+                        to=queued.to,
+                        cc=queued.cc,
+                        bcc=queued.bcc,
+                        subject=queued.subject,
+                        body=queued.body,
+                        body_html=queued.body_html,
+                        in_reply_to=queued.in_reply_to,
+                        references=queued.references,
+                        existing_uid=queued.existing_uid,
+                        drafts_folder_name=queued.drafts_folder_name,
+                        attachments=attachments,
+                    )
+                except Exception:
+                    log.exception(
+                        "Failed to flush queued draft %s for account %s",
+                        queue_id,
+                        queued.account_uid,
+                    )
+                    break
+                else:
+                    remove_queued_draft(queue_id)
+                    flushed += 1
+        finally:
+            self._flushing_draft_queue = False
+        return flushed
+
     def _execute_queued_operation_unlocked(self, operation: QueuedOperation) -> None:
         if operation.op_type == "move_to_trash":
             self._move_messages_to_trash_unlocked(
@@ -1414,6 +1468,49 @@ class MailService:
             return str(uids[-1])
         return None
 
+    def _queue_draft_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        to: list[str] | None,
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str,
+        body: str,
+        body_html: str | None,
+        in_reply_to: str | None,
+        references: str | None,
+        existing_uid: str | None,
+        attachments: Sequence[ComposeAttachment] | None,
+        queue_id: str | None = None,
+    ) -> tuple[str, str]:
+        replace_uid: str | None = None
+        if existing_uid and is_queued_draft_id(existing_uid):
+            remove_queued_draft(existing_uid)
+            queue_id = existing_uid
+        elif existing_uid:
+            replace_uid = existing_uid
+
+        queue_id = enqueue_draft(
+            QueuedDraft(
+                account_uid=account_uid,
+                drafts_folder_name=folder_name,
+                to=to,
+                cc=cc,
+                bcc=bcc,
+                subject=subject,
+                body=body,
+                body_html=body_html,
+                in_reply_to=in_reply_to,
+                references=references,
+                existing_uid=replace_uid,
+            ),
+            attachment_payloads=attachments,
+            queue_id=queue_id,
+        )
+        return folder_name, queue_id
+
     def save_draft(
         self,
         account_uid: str,
@@ -1488,10 +1585,57 @@ class MailService:
         if not folder_name:
             raise RuntimeError("No Drafts folder is configured for this account")
 
-        if existing_uid:
-            self._delete_message_unlocked(account_uid, folder_name, existing_uid)
+        if not self._network_available and not self._flushing_draft_queue:
+            return self._queue_draft_unlocked(
+                account_uid,
+                folder_name,
+                to=to,
+                cc=cc,
+                bcc=bcc,
+                subject=subject,
+                body=body,
+                body_html=body_html,
+                in_reply_to=in_reply_to,
+                references=references,
+                existing_uid=existing_uid,
+                attachments=attachments,
+            )
 
-        appended_uid = self._append_draft_unlocked(account_uid, folder_name, message)
+        if existing_uid:
+            if is_queued_draft_id(existing_uid):
+                remove_queued_draft(existing_uid)
+            else:
+                self._delete_message_unlocked(account_uid, folder_name, existing_uid)
+
+        try:
+            appended_uid = self._append_draft_unlocked(
+                account_uid, folder_name, message
+            )
+        except RuntimeError as exc:
+            if self._flushing_draft_queue:
+                raise
+            cause = exc.__cause__
+            offline = is_network_unavailable_error(exc) or (
+                isinstance(cause, BaseException)
+                and is_network_unavailable_error(cause)
+            )
+            if offline or "working online" in str(exc).lower():
+                return self._queue_draft_unlocked(
+                    account_uid,
+                    folder_name,
+                    to=to,
+                    cc=cc,
+                    bcc=bcc,
+                    subject=subject,
+                    body=body,
+                    body_html=body_html,
+                    in_reply_to=in_reply_to,
+                    references=references,
+                    existing_uid=None,
+                    attachments=attachments,
+                )
+            raise
+
         if not appended_uid:
             raise RuntimeError("Draft was saved but its UID could not be determined")
         return folder_name, appended_uid
@@ -1509,6 +1653,9 @@ class MailService:
     def _delete_draft_unlocked(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> None:
+        if is_queued_draft_id(message_uid):
+            remove_queued_draft(message_uid)
+            return
         with self._lock:
             self._delete_message_unlocked(account_uid, folder_name, message_uid)
 
