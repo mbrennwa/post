@@ -1037,7 +1037,10 @@ def _effective_message_appearance(
     if quoted is not None:
         if not prefix.strip():
             return appearance
-        if html_sender_defines_complete_colors(prefix):
+        if (
+            html_sender_defines_complete_colors(prefix)
+            and not html_message_needs_adaptation(prefix)
+        ):
             return MESSAGE_APPEARANCE_ACCEPT_SENDER
         return appearance
     if not html_message_needs_adaptation(body_html):
