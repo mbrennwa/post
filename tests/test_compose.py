@@ -936,6 +936,7 @@ class ParseAddressHeaderTests(unittest.TestCase):
             "Alice <alice@example.com>",
             "a@example.com, Bob <b@example.com>",
             "mbrennwa@gmail.com <mbrennwa@gmail.com>",
+            '"Last, First" <person@example.com>',
         ]
         for case in cases:
             with self.subTest(case=case):
@@ -943,6 +944,15 @@ class ParseAddressHeaderTests(unittest.TestCase):
                     parse_address_header(case),
                     parse_address_list(case),
                 )
+
+    def test_round_trip_through_compose_field_text(self) -> None:
+        for header in (
+            '"Last, First" <person@example.com>',
+            "Alice <alice@example.com>, Bob <bob@example.com>",
+        ):
+            with self.subTest(header=header):
+                field_text = format_address_list(parse_address_header(header))
+                self.assertEqual(parse_address_list(field_text), parse_address_header(header))
 
 
 class BuildReplyAllMalformedHeaderTests(unittest.TestCase):
@@ -974,9 +984,14 @@ class BuildReplyAllMalformedHeaderTests(unittest.TestCase):
             original,
             own_addresses=set(),
         )
-        for address in to_addrs + cc_addrs:
-            with self.subTest(address=address):
-                parse_address_list(address)
+        parse_address_list(format_address_list(to_addrs))
+        parse_address_list(format_address_list(cc_addrs))
+
+    def test_reply_prefill_with_comma_display_name_passes_send_validation(self) -> None:
+        to_addrs = extract_reply_target_addresses(
+            {"from": '"Last, First" <person@example.com>'}
+        )
+        parse_address_list(format_address_list(to_addrs))
 
 
 class ExtractReplyAddressInvalidFromTests(unittest.TestCase):

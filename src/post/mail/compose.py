@@ -45,6 +45,11 @@ def bare_address_is_valid(address: str) -> bool:
 
 def format_parsed_address(name: str | None, address: str) -> str:
     """Return a display string safe for headers and SMTP envelope parsing."""
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
     address = _sanitize_header_field(address.strip(), field="Recipient address")
     name = _sanitize_header_field((name or "").strip(), field="Display name")
     if not name:
@@ -52,7 +57,10 @@ def format_parsed_address(name: str | None, address: str) -> str:
     # Unquoted @ in display names break email.utils.getaddresses.
     if "@" in name or name.casefold() == address.casefold():
         return address
-    return f"{name} <{address}>"
+    single = Camel.InternetAddress.new()
+    single.add(name, address)
+    formatted = single.format()
+    return formatted.strip() if formatted else address
 
 
 def envelope_recipient_addresses(
