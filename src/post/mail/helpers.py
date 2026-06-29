@@ -441,6 +441,15 @@ def plain_body_looks_truncated(plain: str, html: str | None) -> bool:
     return _BLOCKQUOTE_RE.search(html) is not None
 
 
+_NON_VISIBLE_HTML_CONTAINER_TAGS = frozenset(
+    {"head", "noscript", "script", "style", "title"}
+)
+_STRIP_NON_VISIBLE_HTML_BLOCKS = re.compile(
+    r"<(style|script)\b[^>]*>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 class _QuotableHtmlParser(HTMLParser):
     """Convert HTML message bodies into plain text with blockquote depth markers."""
 
@@ -448,9 +457,13 @@ class _QuotableHtmlParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self._parts: list[str] = []
         self._blockquote_depth = 0
+        self._skip_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
+        if tag in _NON_VISIBLE_HTML_CONTAINER_TAGS:
+            self._skip_depth += 1
+            return
         if tag == "blockquote":
             if self._parts and not self._parts[-1].endswith("\n"):
                 self._parts.append("\n")
@@ -463,6 +476,9 @@ class _QuotableHtmlParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+        if tag in _NON_VISIBLE_HTML_CONTAINER_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
         if tag == "blockquote":
             self._blockquote_depth = max(0, self._blockquote_depth - 1)
             self._parts.append("\n")
@@ -470,7 +486,7 @@ class _QuotableHtmlParser(HTMLParser):
             self._parts.append("\n")
 
     def handle_data(self, data: str) -> None:
-        if not data:
+        if not data or self._skip_depth > 0:
             return
         if self._blockquote_depth <= 0:
             self._parts.append(data)
@@ -491,7 +507,8 @@ def html_to_quotable_plain(body_html: str) -> str:
         parser.feed(body_html)
         parser.close()
     except Exception:
-        text = re.sub(r"<br\s*/?>", "\n", body_html, flags=re.IGNORECASE)
+        cleaned = _STRIP_NON_VISIBLE_HTML_BLOCKS.sub("", body_html)
+        text = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.IGNORECASE)
         text = re.sub(r"<[^>]+>", "", text)
         return html.unescape(text).strip()
     text = "".join(parser._parts)
