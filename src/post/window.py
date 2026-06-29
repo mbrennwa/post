@@ -44,6 +44,7 @@ from post.mail.folder_index_cache import (
 )
 from post.mail.message_list_state import message_list_fingerprint, prepended_message_count
 from post.mail.search import MessageSearchQuery, parse_search_query
+from post.mail.operation_queue import offline_queue_status_text
 from post.mail.send_queue import (
     OFFLINE_CACHED_LIST_STATUS,
     OFFLINE_MAIL_MESSAGE,
@@ -466,6 +467,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _setup_send_queue_flush(self) -> None:
         self._mail.set_network_available(self._network_available)
+        self._sidebar.set_network_available(self._network_available)
         monitor = Gio.NetworkMonitor.get_default()
         monitor.connect("notify::network-available", self._on_network_available_changed)
         self._refresh_status_display()
@@ -473,6 +475,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _flush_send_queue_on_startup(self) -> bool:
         self._flush_send_queue_idle()
+        self._flush_operation_queue_idle()
         return False
 
     def _on_network_available_changed(self, monitor: Gio.NetworkMonitor, *_args) -> None:
@@ -481,10 +484,12 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self._network_available = online
         self._mail.set_network_available(online)
+        self._sidebar.set_network_available(online)
         self._refresh_status_display()
         if online:
             self._mail.go_online_sync()
             self._flush_send_queue_idle()
+            self._flush_operation_queue_idle()
             self._mail.schedule_offline_body_sync()
             if self._current_account and self._current_folder:
                 if get_auto_sync():
@@ -504,6 +509,30 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _flush_send_queue_idle(self) -> bool:
         get_mail_io_thread().submit(self._flush_send_queue_worker)
+        return False
+
+    def _flush_operation_queue_idle(self) -> bool:
+        get_mail_io_thread().submit(self._flush_operation_queue_worker)
+        return False
+
+    def _flush_operation_queue_worker(self) -> None:
+        try:
+            flushed = self._mail.flush_operation_queue()
+        except Exception:
+            log.exception("Failed to flush queued mail operations")
+            return
+        if flushed <= 0:
+            return
+        GLib.idle_add(self._on_operation_queue_flushed, flushed)
+
+    def _on_operation_queue_flushed(self, flushed: int) -> bool:
+        self._refresh_status_display()
+        if flushed <= 0:
+            return False
+        if flushed == 1:
+            self._set_status("Synced 1 queued action")
+        else:
+            self._set_status(f"Synced {flushed} queued actions")
         return False
 
     def _flush_send_queue_worker(self) -> None:
@@ -896,6 +925,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._settings_dialog = None
 
     def _on_sidebar_refresh_account(self, account_uid: str) -> None:
+        if not self._network_available:
+            return
         label = self._sidebar.account_display_label(account_uid)
         self._set_status(format_account_refresh_start(label))
 
@@ -916,6 +947,8 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
     def _on_sidebar_refresh_folder(self, account_uid: str, folder_name: str) -> None:
+        if not self._network_available:
+            return
         display = self._sidebar.folder_display_name(account_uid, folder_name)
         self._set_status(format_folder_refresh_start(display))
         self._mail.invalidate_folder_index(account_uid, folder_name)
@@ -1515,8 +1548,14 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _refresh_status_display(self) -> None:
         if not self._network_available:
-            queued = len(list_queued_outbound_messages())
-            parts = [offline_status_text(queued_count=queued)]
+            send_queued = len(list_queued_outbound_messages())
+            operation_queued = self._mail.count_queued_operations()
+            parts = [
+                offline_queue_status_text(
+                    send_queued_count=send_queued,
+                    operation_queued_count=operation_queued,
+                )
+            ]
             if self._search_query is not None:
                 parts.append(OFFLINE_SEARCHING_LOCAL_CACHE)
             self._status.set_label(" · ".join(parts))
@@ -3105,6 +3144,17 @@ class MainWindow(Adw.ApplicationWindow):
         if status_label is None:
             status_label = self._move_status_label(destination, moved_count)
 
+        if result.get("queued"):
+            self._clear_move_undo()
+            if moved_count == 1:
+                self._set_status("Queued 1 message — will sync when online")
+            else:
+                self._set_status(
+                    f"Queued {moved_count} messages — will sync when online"
+                )
+            self._refresh_status_display()
+            return
+
         dest_folder = result.get("destination_folder")
         dest_uids = result.get("destination_uids") or []
         if dest_folder and dest_uids:
@@ -3276,6 +3326,13 @@ class MainWindow(Adw.ApplicationWindow):
                 )
 
         count = len(updates_by_uid)
+        if result.get("queued"):
+            if count == 1:
+                self._set_status("Queued 1 action — will sync when online")
+            elif count > 1:
+                self._set_status(f"Queued {count} actions — will sync when online")
+            self._refresh_status_display()
+            return False
         if count > 1:
             self._set_status(f"Updated {count} messages")
         return False

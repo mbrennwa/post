@@ -359,6 +359,37 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
         )
         self.assertFalse(state["show_new_folder"])
 
+    def test_refresh_disabled_when_offline(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=self._folders(),
+            folder_name="INBOX",
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=2,
+            total=5,
+            outbox_count=0,
+            folder_crud_enabled=True,
+            network_available=False,
+        )
+        self.assertTrue(state["show_refresh"])
+        self.assertFalse(state["enable_refresh"])
+
+    def test_refresh_enabled_when_online(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=self._folders(),
+            folder_name="INBOX",
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=2,
+            total=5,
+            outbox_count=0,
+            folder_crud_enabled=True,
+            network_available=True,
+        )
+        self.assertTrue(state["enable_refresh"])
+
 
 class IsSystemFolderTests(unittest.TestCase):
     TYPE_ARCHIVE = 11264

@@ -94,6 +94,7 @@ class MailSidebar:
         self._on_folder_contents_changed = on_folder_contents_changed
         self._on_move_started = on_move_started
         self._on_move_undo_available = on_move_undo_available
+        self._network_available = True
 
         self._accounts: list[MailAccount] = []
         self._accounts_by_uid: dict[str, MailAccount] = {}
@@ -212,6 +213,9 @@ class MailSidebar:
             trash_type=Camel.FolderInfoFlags.TYPE_TRASH,
             type_mask=Camel.FOLDER_TYPE_MASK,
         )
+
+    def set_network_available(self, available: bool) -> None:
+        self._network_available = available
 
     def refresh_outbox_row(self, account_uid: str) -> None:
         count = count_queued_for_account(account_uid)
@@ -490,6 +494,7 @@ class MailSidebar:
             folder_crud_enabled=account_supports_folder_crud(
                 backend=account.backend if account else None
             ),
+            network_available=self._network_available,
         )
 
     def _build_context_menu_model(self, state: dict[str, bool]) -> Gio.Menu:
