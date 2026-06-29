@@ -371,6 +371,8 @@ def resolve_sidebar_context_menu(
     outbox_count: int,
     folder_crud_enabled: bool,
     network_available: bool = True,
+    account_user_online: bool = True,
+    account_offline_toggle_enabled: bool = False,
 ) -> dict[str, bool]:
     """Return show/enabled flags for sidebar folder context menu actions."""
     is_account = folder_name is None
@@ -407,6 +409,12 @@ def resolve_sidebar_context_menu(
     show_send_now = is_outbox
     show_empty_trash = is_trash
     show_refresh = True
+    show_take_offline = (
+        is_account and account_offline_toggle_enabled and account_user_online
+    )
+    show_take_online = (
+        is_account and account_offline_toggle_enabled and not account_user_online
+    )
 
     return {
         "show_new_folder": show_new_folder,
@@ -426,7 +434,11 @@ def resolve_sidebar_context_menu(
         "show_empty_trash": show_empty_trash,
         "enable_empty_trash": show_empty_trash and total > 0,
         "show_refresh": show_refresh,
-        "enable_refresh": network_available,
+        "enable_refresh": network_available or (is_account and not account_user_online),
+        "show_take_offline": show_take_offline,
+        "enable_take_offline": show_take_offline,
+        "show_take_online": show_take_online,
+        "enable_take_online": show_take_online,
         "read_count": read_count,
         "archive_folder": archive_name,
     }

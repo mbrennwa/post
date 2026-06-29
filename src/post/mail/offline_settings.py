@@ -17,6 +17,7 @@ from post.preferences import (
     OFFLINE_BODY_SYNC_OFF,
     OfflineBodySyncMode,
     get_account_offline_body_sync,
+    get_account_user_online,
 )
 
 _DOWNSYNC_EXPRESSION = "(match-all)"
@@ -82,6 +83,6 @@ def apply_offline_sync_to_folder(
         folder.set_offline_sync(Camel.ThreeState.ON)
 
 
-def account_is_user_offline(_account_uid: str) -> bool:
-    """Stub for #55 per-account user-offline control."""
-    return False
+def account_is_user_offline(account_uid: str) -> bool:
+    """Return True when the user has taken this account offline."""
+    return not get_account_user_online(account_uid)

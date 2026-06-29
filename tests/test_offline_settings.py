@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from post.mail.offline_settings import (
+    account_is_user_offline,
     apply_offline_settings_to_store,
     downsync_expression_for_mode,
 )
@@ -23,6 +24,7 @@ from post.preferences import (
     OFFLINE_BODY_SYNC_LAST_MONTH,
     OFFLINE_BODY_SYNC_LAST_YEAR,
     OFFLINE_BODY_SYNC_OFF,
+    set_account_user_online,
 )
 
 
@@ -234,6 +236,19 @@ class QueryToSexpTests(unittest.TestCase):
         self.assertIn("(and ", sexp)
         self.assertIn('header-contains "From" "alice"', sexp)
         self.assertIn('header-contains "Subject" "invoice"', sexp)
+
+
+class AccountUserOfflineTests(unittest.TestCase):
+    def test_account_is_user_offline_reads_preferences(self) -> None:
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "preferences.json")
+            with mock.patch("post.preferences._PREF_PATH", path):
+                self.assertFalse(account_is_user_offline("acct-1"))
+                set_account_user_online("acct-1", False)
+                self.assertTrue(account_is_user_offline("acct-1"))
 
 
 if __name__ == "__main__":

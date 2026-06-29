@@ -41,13 +41,11 @@ from post.preferences import (
     OfflineBodySyncMode,
     get_account_offline_body_sync,
     get_account_signature,
-    get_auto_sync,
     get_load_remote_content,
     get_message_appearance,
     get_show_evolution_local,
     set_account_offline_body_sync,
     set_account_signature,
-    set_auto_sync,
     set_load_remote_content,
     set_message_appearance,
     set_show_evolution_local,
@@ -61,7 +59,6 @@ _SIGNATURE_EDITOR_MIN_HEIGHT = 120
 SetStatus = Callable[[str], None]
 OnSaved = Callable[[], None]
 OnLoadRemoteContentChanged = Callable[[bool], None]
-OnAutoSyncChanged = Callable[[bool], None]
 OnMessageAppearanceChanged = Callable[[MessageAppearance], None]
 OnOfflineBodySyncChanged = Callable[[str, OfflineBodySyncMode], None]
 
@@ -97,7 +94,6 @@ class SettingsDialog(Adw.PreferencesDialog):
         set_status: SetStatus,
         on_saved: OnSaved,
         on_load_remote_content_changed: OnLoadRemoteContentChanged | None = None,
-        on_auto_sync_changed: OnAutoSyncChanged | None = None,
         on_message_appearance_changed: OnMessageAppearanceChanged | None = None,
         on_offline_body_sync_changed: OnOfflineBodySyncChanged | None = None,
     ) -> None:
@@ -107,7 +103,6 @@ class SettingsDialog(Adw.PreferencesDialog):
         self._set_status = set_status
         self._on_saved = on_saved
         self._remote_content_changed_callback = on_load_remote_content_changed
-        self._auto_sync_changed_callback = on_auto_sync_changed
         self._message_appearance_changed_callback = on_message_appearance_changed
         self._offline_body_sync_changed_callback = on_offline_body_sync_changed
         self._saving = False
@@ -158,14 +153,6 @@ class SettingsDialog(Adw.PreferencesDialog):
             "notify::selected", self._on_message_appearance_row_changed
         )
         group.add(self._message_appearance_row)
-
-        self._auto_sync_row = Adw.SwitchRow(title="Auto Sync")
-        self._auto_sync_row.set_subtitle(
-            "Check for new mail while Post is open. When off, use Refresh to update."
-        )
-        self._auto_sync_row.set_active(get_auto_sync())
-        self._auto_sync_row.connect("notify::active", self._on_auto_sync_row_changed)
-        group.add(self._auto_sync_row)
         page.add(group)
         return page
 
@@ -469,14 +456,6 @@ class SettingsDialog(Adw.PreferencesDialog):
         set_message_appearance(appearance)
         if self._message_appearance_changed_callback is not None:
             self._message_appearance_changed_callback(appearance)
-
-    def _on_auto_sync_row_changed(self, *_args) -> None:
-        if self._loading_settings:
-            return
-        enabled = self._auto_sync_row.get_active()
-        set_auto_sync(enabled)
-        if self._auto_sync_changed_callback is not None:
-            self._auto_sync_changed_callback(enabled)
 
     def _current_config(self) -> LocalMailConfig:
         return LocalMailConfig(

@@ -105,16 +105,42 @@ def set_message_appearance(value: MessageAppearance) -> None:
     _save_raw(data)
 
 
-def get_auto_sync() -> bool:
-    value = _load_raw().get("auto_sync")
+REMOTE_SYNC_ACCOUNT_BACKENDS: frozenset[str] = frozenset(
+    {"imap", "imapx", "ews", "microsoft365", "pop3"}
+)
+
+
+def account_supports_user_offline(backend: str | None) -> bool:
+    """Return whether the user may toggle online/offline for this account."""
+    return backend in REMOTE_SYNC_ACCOUNT_BACKENDS if backend else False
+
+
+def _account_user_online_raw() -> dict[str, Any]:
+    raw = _load_raw().get("account_user_online")
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def get_account_user_online(account_uid: str) -> bool:
+    """Return per-account user online state (default True)."""
+    value = _account_user_online_raw().get(account_uid)
     if value is None:
         return True
     return bool(value)
 
 
-def set_auto_sync(value: bool) -> None:
+def set_account_user_online(account_uid: str, online: bool) -> None:
     data = _load_raw()
-    data["auto_sync"] = value
+    modes = dict(_account_user_online_raw())
+    if online:
+        modes.pop(account_uid, None)
+    else:
+        modes[account_uid] = False
+    if modes:
+        data["account_user_online"] = modes
+    else:
+        data.pop("account_user_online", None)
     _save_raw(data)
 
 

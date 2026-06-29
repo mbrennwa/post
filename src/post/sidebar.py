@@ -42,6 +42,8 @@ from post.mail.send_queue import (
     log_mail_error,
 )
 from post.preferences import (
+    account_supports_user_offline,
+    get_account_user_online,
     get_sidebar_state,
     register_inbox_accounts,
     resolve_inbox_display_order,
@@ -61,6 +63,7 @@ OnFolderTreeChanged = Callable[[str, str | None], None]
 OnFolderContentsChanged = Callable[[str, str], None]
 OnMoveStarted = Callable[[str, str], None]
 OnMoveUndoAvailable = Callable[[str, str, dict, str], None]
+OnAccountOnlineChanged = Callable[[str, bool], None]
 FolderRefreshComplete = Callable[[int, int, Exception | None], None]
 AccountRefreshComplete = Callable[[int, Exception | None], None]
 
@@ -81,6 +84,7 @@ class MailSidebar:
         on_folder_contents_changed: OnFolderContentsChanged | None = None,
         on_move_started: OnMoveStarted | None = None,
         on_move_undo_available: OnMoveUndoAvailable | None = None,
+        on_account_online_changed: OnAccountOnlineChanged | None = None,
     ) -> None:
         self._mail = mail
         self._on_folder_selected = on_folder_selected
@@ -94,7 +98,9 @@ class MailSidebar:
         self._on_folder_contents_changed = on_folder_contents_changed
         self._on_move_started = on_move_started
         self._on_move_undo_available = on_move_undo_available
+        self._on_account_online_changed = on_account_online_changed
         self._network_available = True
+        self._account_offline_icons: dict[str, Gtk.Image] = {}
 
         self._accounts: list[MailAccount] = []
         self._accounts_by_uid: dict[str, MailAccount] = {}
@@ -134,6 +140,9 @@ class MailSidebar:
     @property
     def widget(self) -> Gtk.ScrolledWindow:
         return self._widget
+
+    def account_uids(self) -> list[str]:
+        return [account.uid for account in self._accounts]
 
     def load(self) -> None:
         self._persist_view_state()
@@ -451,6 +460,8 @@ class MailSidebar:
             ("send-now", self._on_send_now_activate),
             ("empty-trash", self._on_empty_trash_activate),
             ("refresh", self._on_refresh_menu_activate),
+            ("take-offline", self._on_take_offline_activate),
+            ("take-online", self._on_take_online_activate),
         )
         group = Gio.SimpleActionGroup.new()
         for name, handler in specs:
@@ -482,6 +493,7 @@ class MailSidebar:
             type_mask=Camel.FOLDER_TYPE_MASK,
         )
         account = self._accounts_by_uid.get(account_uid)
+        backend = account.backend if account else None
         return resolve_sidebar_context_menu(
             folders=folders,
             folder_name=folder_name,
@@ -492,9 +504,11 @@ class MailSidebar:
             total=total,
             outbox_count=count_queued_for_account(account_uid),
             folder_crud_enabled=account_supports_folder_crud(
-                backend=account.backend if account else None
+                backend=backend
             ),
             network_available=self._network_available,
+            account_user_online=get_account_user_online(account_uid),
+            account_offline_toggle_enabled=account_supports_user_offline(backend),
         )
 
     def _build_context_menu_model(self, state: dict[str, bool]) -> Gio.Menu:
@@ -509,6 +523,8 @@ class MailSidebar:
             menu.append(label, action)
 
         append_item("Refresh", "sidebar.refresh", "refresh")
+        append_item("Take Offline", "sidebar.take-offline", "take_offline")
+        append_item("Take Online", "sidebar.take-online", "take_online")
         append_item("Archive all Read", "sidebar.archive-read", "archive_read")
         append_item(
             "Archive all Read and Unflagged",
@@ -550,6 +566,36 @@ class MailSidebar:
             return
         if self._on_refresh_folder is not None:
             self._on_refresh_folder(account_uid, folder_name)
+
+    def _on_take_offline_activate(self, *_args) -> None:
+        self._set_account_user_online(False)
+
+    def _on_take_online_activate(self, *_args) -> None:
+        self._set_account_user_online(True)
+
+    def _set_account_user_online(self, online: bool) -> None:
+        if self._context_target is None:
+            return
+        account_uid = self._context_target["account_uid"]
+        if self._context_target.get("folder_name") is not None:
+            return
+        account = self._accounts_by_uid.get(account_uid)
+        if account is None or not account_supports_user_offline(account.backend):
+            return
+        if get_account_user_online(account_uid) == online:
+            return
+        self._mail.set_account_user_online(account_uid, online)
+        self._update_account_offline_marker(account_uid)
+        if self._on_account_online_changed is not None:
+            self._on_account_online_changed(account_uid, online)
+
+    def _update_account_offline_marker(self, account_uid: str) -> None:
+        icon = self._account_offline_icons.get(account_uid)
+        if icon is not None:
+            icon.set_visible(not get_account_user_online(account_uid))
+
+    def refresh_account_online_marker(self, account_uid: str) -> None:
+        self._update_account_offline_marker(account_uid)
 
     def _on_new_folder_activate(self, *_args) -> None:
         self._prompt_and_create_folder(parent_folder_name=None)
@@ -1304,12 +1350,20 @@ class MailSidebar:
         self._persist_view_state()
 
     def _make_account_header(self, account: MailAccount) -> Gtk.Widget:
-        label = Gtk.Label(label=account.display_label, xalign=0)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        label = Gtk.Label(label=account.display_label, xalign=0, hexpand=True)
         label.add_css_class("heading")
         label.set_ellipsize(3)
         label.set_margin_bottom(4)
-        self._attach_refresh_menu(label, account_uid=account.uid, folder_name=None)
-        return label
+        offline_icon = Gtk.Image.new_from_icon_name("network-offline-symbolic")
+        offline_icon.set_tooltip_text("Account Offline")
+        offline_icon.add_css_class("dim-label")
+        offline_icon.set_visible(not get_account_user_online(account.uid))
+        self._account_offline_icons[account.uid] = offline_icon
+        box.append(label)
+        box.append(offline_icon)
+        self._attach_refresh_menu(box, account_uid=account.uid, folder_name=None)
+        return box
 
     @staticmethod
     def _make_loading_row(text: str) -> Gtk.ListBoxRow:

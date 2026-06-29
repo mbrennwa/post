@@ -20,6 +20,7 @@ from gi.repository import Camel, GLib, GObject
 from .eds import MailService
 from .folders import is_post_local_folder
 from .io_thread import get_mail_io_thread
+from .offline_settings import account_is_user_offline
 from .send_queue import is_network_unavailable_error, log_mail_error
 
 log = logging.getLogger(__name__)
@@ -108,6 +109,8 @@ class MailSyncWatcher:
         def worker() -> None:
             setups: list[tuple[str, Camel.Store, str | None, str | None]] = []
             for account_uid in account_uids:
+                if account_is_user_offline(account_uid):
+                    continue
                 inbox_name: str | None = None
                 current_name: str | None = None
                 try:
