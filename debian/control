@@ -1,0 +1,33 @@
+Source: post
+Section: mail
+Priority: optional
+Maintainer: Matthias Brennwald <mbrennwa@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               python3,
+               python3-venv,
+               python3-pip
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/mbrennwa/post
+Vcs-Browser: https://github.com/mbrennwa/post
+Vcs-Git: https://github.com/mbrennwa/post.git
+
+Package: post
+Architecture: all
+Depends: ${misc:Depends},
+          python3 (>= 3.10),
+          python3-venv,
+          python3-gi,
+          gir1.2-gtk-4.0,
+          gir1.2-adw-1,
+          gir1.2-glib-2.0,
+          gir1.2-camel-1.2,
+          gir1.2-edataserver-1.2,
+          gir1.2-webkit-6.0,
+          evolution-data-server,
+          librsvg2-bin,
+          desktop-file-utils
+Recommends: gnome-online-accounts
+Description: Post — simple GNOME mail client
+ Post is a mail app for GNOME — read and send email with a native desktop
+ experience. It uses Evolution Data Server and GNOME Online Accounts.

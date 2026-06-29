@@ -1,0 +1,28 @@
+Build a post .deb package
+
+From the repository root:
+
+  make deb
+
+or:
+
+  ./tools/build-deb.sh
+
+Version and runtime dependencies are read from pyproject.toml ([project].version and
+[tool.deb].apt_depends). Each build overwrites dist/post_<version>_all.deb (no
+Debian revision suffix).
+
+Build machine prerequisites (Debian 12+ / Ubuntu 24.04+):
+
+  sudo apt install debhelper devscripts python3 python3-venv python3-pip
+
+Install on a target system (apt pulls in [tool.deb].apt_depends automatically):
+
+  sudo apt install ./dist/post_0.1.0_all.deb
+  post
+
+Published packages: push a tag v<version> (matching pyproject.toml); GitHub Actions
+uploads the .deb to https://github.com/mbrennwa/post/releases
+
+The package installs data/io.github.mbrennwa.Post.desktop and hicolor launcher icons
+from data/icons/hicolor/.

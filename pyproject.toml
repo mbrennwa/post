@@ -38,6 +38,7 @@ apt_depends = [
   "gir1.2-camel-1.2",
   "gir1.2-edataserver-1.2",
   "gir1.2-webkit-6.0",
+  "evolution-data-server",
   "librsvg2-bin",
   "desktop-file-utils",
 ]
@@ -58,10 +59,4 @@ apt_depends = [
 ]
 "share/icons/hicolor/256x256/apps" = [
   "data/icons/hicolor/256x256/apps/io.github.mbrennwa.Post.png",
-]
-"share/icons/hicolor/scalable/actions" = [
-  "data/icons/hicolor/scalable/actions/mail-archive-symbolic.svg",
-  "data/icons/hicolor/scalable/actions/mail-flag-symbolic.svg",
-  "data/icons/hicolor/scalable/actions/mail-mark-read-symbolic.svg",
-  "data/icons/hicolor/scalable/actions/mail-unflag-symbolic.svg",
 ]

@@ -4,16 +4,33 @@
 
 ## Install
 
-On Debian 12+, Ubuntu 24.04+, or similar DEB-based distros, install system
-dependencies (GObject introspection typelibs and related tools — not installable
-via pip), then run Post from source:
+On Debian 12+, Ubuntu 24.04+, or similar DEB-based distros:
+
+**From a release `.deb`** (see [GitHub Releases](https://github.com/mbrennwa/post/releases)):
+
+```bash
+sudo apt install ./dist/post_0.1.0_all.deb
+post
+```
+
+**From source** — install system dependencies (GObject introspection typelibs and
+related tools — not installable via pip), then run Post:
 
 ```bash
 ./scripts/install-deps.sh
 ./run.sh
 ```
 
-The canonical package list lives in **`pyproject.toml`** under
+**Build a `.deb` locally:**
+
+```bash
+make deb
+# artifacts in dist/
+```
+
+See `tools/howto-build-deb.txt` for build-machine prerequisites.
+
+The canonical runtime package list lives in **`pyproject.toml`** under
 **`[tool.deb].apt_depends`**. Post uses a venv with
 `--system-site-packages` so PyGObject and GI typelibs from the distro are
 visible to the app.
