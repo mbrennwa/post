@@ -42,7 +42,11 @@ from post.mail.folder_index_cache import (
     has_cache as folder_index_has_cache,
     load as load_folder_index_cache,
 )
-from post.mail.message_list_state import message_list_fingerprint, prepended_message_count
+from post.mail.message_list_state import (
+    MESSAGE_LIST_UI_BATCH_SIZE,
+    message_list_fingerprint,
+    prepended_message_count,
+)
 from post.mail.search import MessageSearchQuery, parse_search_query
 from post.mail.operation_queue import offline_queue_status_text
 from post.mail.send_queue import (
@@ -175,6 +179,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._current_folder_messages: list[dict] | None = None
         self._message_list_source = ""
         self._message_sync_in_progress = False
+        self._message_list_populating = False
         self._context_attachment_index: int | None = None
         self._context_attachment_mime: str | None = None
         self._context_attachment_name: str | None = None
@@ -1566,7 +1571,62 @@ class MainWindow(Adw.ApplicationWindow):
 
     def begin_load(self) -> None:
         """Load accounts and folders after the window is on screen."""
-        GLib.idle_add(self._reload_sidebar)
+        GLib.idle_add(self._begin_startup_load)
+
+    def _begin_startup_load(self) -> bool:
+        self._sync_watcher.set_current_folder(None, None)
+        if not self._try_eager_restore_active_folder():
+            self._clear_reader()
+            self._message_popover.popdown()
+            self._message_list_view.clear()
+            self._current_account = None
+            self._current_folder = None
+            self._search_query = None
+            self._update_search_entry_state()
+        self._sidebar.load()
+        return False
+
+    def _try_eager_restore_active_folder(self) -> bool:
+        sidebar_state = get_sidebar_state()
+        active_folder = sidebar_state.get("active_folder")
+        if active_folder is None:
+            return False
+        account_uid, folder_name = active_folder
+        try:
+            account = self._mail.get_account(account_uid)
+        except ValueError:
+            return False
+        self._prepare_folder_selection(account, folder_name, sidebar_state)
+        self._sidebar.mark_folder_active(account_uid, folder_name)
+        self._load_messages(account_uid, folder_name)
+        return True
+
+    def _prepare_folder_selection(
+        self,
+        account: MailAccount,
+        folder_name: str,
+        sidebar_state: dict | None = None,
+    ) -> None:
+        if sidebar_state is None:
+            sidebar_state = get_sidebar_state()
+        self._pre_search_snapshot = None
+        self._pre_search_folder = None
+        self._current_account = account
+        self._current_folder = folder_name
+        if self._sync_watcher.running:
+            self._sync_watcher.set_current_folder(account.uid, folder_name)
+        self._update_search_entry_state()
+        selection = (account.uid, folder_name)
+        saved_folder = sidebar_state.get("active_folder")
+        saved_message = sidebar_state.get("active_message_uid")
+        if saved_folder == selection and saved_message:
+            self._restore_message_folder = saved_folder
+            self._pending_restore_message_uid = saved_message
+        else:
+            self._restore_message_folder = selection
+            self._pending_restore_message_uid = None
+            if saved_folder != selection:
+                set_active_message_uid(None)
 
     def _set_status(self, text: str) -> None:
         self._status_hint = text
@@ -1748,25 +1808,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._restore_messages_after_search()
 
     def _on_folder_selected(self, account: MailAccount, folder_name: str) -> None:
-        self._pre_search_snapshot = None
-        self._pre_search_folder = None
-        self._current_account = account
-        self._current_folder = folder_name
-        if self._sync_watcher.running:
-            self._sync_watcher.set_current_folder(account.uid, folder_name)
-        self._update_search_entry_state()
-        selection = (account.uid, folder_name)
-        sidebar_state = get_sidebar_state()
-        saved_folder = sidebar_state.get("active_folder")
-        saved_message = sidebar_state.get("active_message_uid")
-        if saved_folder == selection and saved_message:
-            self._restore_message_folder = saved_folder
-            self._pending_restore_message_uid = saved_message
-        else:
-            self._restore_message_folder = selection
-            self._pending_restore_message_uid = None
-            if saved_folder != selection:
-                set_active_message_uid(None)
+        self._prepare_folder_selection(account, folder_name)
         self._search_query = self._parse_search_from_entry()
         self._load_messages(account.uid, folder_name)
 
@@ -2156,6 +2198,45 @@ class MainWindow(Adw.ApplicationWindow):
         if account is not None:
             self._update_message_status(account, folder_name)
 
+    def _apply_messages_to_list(
+        self,
+        messages: list[dict],
+        folder_name: str,
+        *,
+        account: MailAccount,
+        load_id: int,
+        on_complete: Callable[[], None] | None = None,
+    ) -> None:
+        batch_size = MESSAGE_LIST_UI_BATCH_SIZE
+        if len(messages) <= batch_size:
+            self._apply_folder_messages(messages, folder_name, account=account)
+            if on_complete is not None:
+                on_complete()
+            return
+
+        self._message_list_populating = True
+        first_batch = messages[:batch_size]
+        self._apply_folder_messages(first_batch, folder_name, account=account)
+
+        def append_batches(offset: int) -> bool:
+            if load_id != self._messages_load_generation:
+                self._message_list_populating = False
+                return False
+            next_offset = offset + batch_size
+            batch = messages[offset:next_offset]
+            if batch:
+                self._message_list_view.append_messages(batch, folder_name=folder_name)
+            if next_offset < len(messages):
+                GLib.idle_add(append_batches, next_offset)
+                return False
+            self._message_list_populating = False
+            self._update_message_status(account, folder_name)
+            if on_complete is not None:
+                on_complete()
+            return False
+
+        GLib.idle_add(append_batches, batch_size)
+
     def _message_flags_for_uid(self, uid: str) -> dict:
         message = self._message_list_view.get_message(uid)
         if message is not None:
@@ -2397,45 +2478,49 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_list_view.clear()
         self._clear_reader()
 
-        cache_snapshot: tuple[list[dict], int, int] | None = None
-        if (
+        disk_cache_eligible = (
             not skip_disk_cache
             and not viewing_outbox
             and not force_sync
             and search_query is None
-        ):
-            cache_snapshot = load_folder_index_cache(account_uid, folder_name)
+        )
+        has_disk_cache = (
+            disk_cache_eligible
+            and folder_index_has_cache(account_uid, folder_name)
+        )
+
+        self._message_loading_label.set_label(loading_label)
+        self._message_loading_spinner.start()
+        self._message_stack.set_visible_child_name("loading")
 
         send_pending = self._mail.outbound_sends_pending()
-        defer_mail_io = send_pending and cache_snapshot is None
+        defer_mail_io = send_pending and not has_disk_cache
         sync_after_send = use_background_sync and send_pending
 
-        if cache_snapshot is not None:
-            cached_messages, cached_unread, cached_total = cache_snapshot
-            self._on_messages_loaded(
-                load_id,
-                account_uid,
-                folder_name,
-                list(cached_messages),
-                cached_unread,
-                cached_total,
-                "disk_cache",
-                sync_after_send,
-                None,
-            )
-        else:
-            self._message_loading_label.set_label(loading_label)
-            self._message_loading_spinner.start()
-            self._message_stack.set_visible_child_name("loading")
+        def schedule_background_sync() -> None:
+            if use_background_sync and not send_pending:
+                self._start_background_message_sync(
+                    load_id,
+                    account_uid,
+                    folder_name,
+                    fetch_messages,
+                )
+            elif sync_after_send:
+
+                def sync_after_send_cb() -> None:
+                    if load_id != self._messages_load_generation:
+                        return
+                    self._start_background_message_sync(
+                        load_id,
+                        account_uid,
+                        folder_name,
+                        fetch_messages,
+                    )
+
+                self._mail.when_outbound_sends_complete(sync_after_send_cb)
 
         def worker_initial() -> None:
             if load_id != self._messages_load_generation:
-                return
-            if (
-                cache_snapshot is not None
-                and search_query is None
-                and not (should_sync and not use_background_sync)
-            ):
                 return
             error: Exception | None = None
             messages: list[dict] | None = None
@@ -2478,37 +2563,62 @@ class MainWindow(Adw.ApplicationWindow):
             else:
                 get_mail_io_thread().submit(worker_initial)
 
-        if defer_mail_io:
+        def worker_cache() -> None:
+            if load_id != self._messages_load_generation:
+                return
+            snapshot = load_folder_index_cache(account_uid, folder_name)
 
-            def start_after_send() -> None:
+            def on_main() -> bool:
                 if load_id != self._messages_load_generation:
-                    return
-                start_initial_worker()
+                    return False
+                if snapshot is not None:
+                    cached_messages, cached_unread, cached_total = snapshot
 
-            self._mail.when_outbound_sends_complete(start_after_send)
+                    def after_list() -> None:
+                        if self._search_query is None:
+                            self._try_restore_selected_message(account_uid, folder_name)
+                        schedule_background_sync()
+
+                    self._on_messages_loaded(
+                        load_id,
+                        account_uid,
+                        folder_name,
+                        list(cached_messages),
+                        cached_unread,
+                        cached_total,
+                        "disk_cache",
+                        sync_after_send,
+                        None,
+                        after_list,
+                    )
+                elif defer_mail_io:
+
+                    def start_after_send() -> None:
+                        if load_id != self._messages_load_generation:
+                            return
+                        start_initial_worker()
+
+                    self._mail.when_outbound_sends_complete(start_after_send)
+                else:
+                    start_initial_worker()
+                return False
+
+            GLib.idle_add(on_main)
+
+        if has_disk_cache:
+            get_mail_io_thread().submit(worker_cache)
         else:
-            start_initial_worker()
+            if defer_mail_io:
 
-        if use_background_sync and not send_pending:
-            self._start_background_message_sync(
-                load_id,
-                account_uid,
-                folder_name,
-                fetch_messages,
-            )
-        elif sync_after_send:
+                def start_after_send() -> None:
+                    if load_id != self._messages_load_generation:
+                        return
+                    start_initial_worker()
 
-            def sync_after_send() -> None:
-                if load_id != self._messages_load_generation:
-                    return
-                self._start_background_message_sync(
-                    load_id,
-                    account_uid,
-                    folder_name,
-                    fetch_messages,
-                )
-
-            self._mail.when_outbound_sends_complete(sync_after_send)
+                self._mail.when_outbound_sends_complete(start_after_send)
+            else:
+                start_initial_worker()
+            schedule_background_sync()
 
     def _on_messages_sync_finished(self, load_id: int, changed: bool) -> bool:
         if load_id != self._messages_load_generation:
@@ -2532,6 +2642,7 @@ class MainWindow(Adw.ApplicationWindow):
         source: str,
         sync_pending: bool,
         error: Exception | None,
+        after_list_complete: Callable[[], None] | None = None,
     ) -> bool:
         if load_id != self._messages_load_generation:
             return False
@@ -2618,9 +2729,19 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         self._message_stack.set_visible_child_name("list")
-        self._apply_folder_messages(messages, folder_name, account=account)
-        if self._search_query is None:
-            self._try_restore_selected_message(account.uid, folder_name)
+
+        def default_after_list() -> None:
+            if self._search_query is None:
+                self._try_restore_selected_message(account.uid, folder_name)
+
+        on_complete = after_list_complete or default_after_list
+        self._apply_messages_to_list(
+            messages,
+            folder_name,
+            account=account,
+            load_id=load_id,
+            on_complete=on_complete,
+        )
         return False
 
     def _on_messages_refreshed(
@@ -2638,6 +2759,8 @@ class MainWindow(Adw.ApplicationWindow):
         if self._search_query is not None:
             return False
         if self._messages_load_expects_search:
+            return False
+        if self._message_list_populating:
             return False
 
         if error is not None:

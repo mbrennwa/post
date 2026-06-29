@@ -1398,14 +1398,16 @@ class MailSidebar:
             row = row.get_next_sibling()
         return None
 
-    def _activate_folder_row(self, listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+    def mark_folder_active(self, account_uid: str, folder_name: str) -> None:
+        """Record active folder without firing on_folder_selected (eager launch restore)."""
+        self._activated_folder = (account_uid, folder_name)
+
+    def _sync_folder_row_selection(
+        self, listbox: Gtk.ListBox, row: Gtk.ListBoxRow
+    ) -> None:
         account_uid = getattr(row, "account_uid", None)
         folder_name = getattr(row, "folder_name", None)
         if not account_uid or not folder_name:
-            return
-
-        selection = (account_uid, folder_name)
-        if selection == self._activated_folder:
             return
 
         for other in self._all_folder_listboxes():
@@ -1421,6 +1423,19 @@ class MailSidebar:
             if mirror is not None:
                 other.select_row(mirror)
         self._sidebar_selecting = False
+
+    def _activate_folder_row(self, listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        account_uid = getattr(row, "account_uid", None)
+        folder_name = getattr(row, "folder_name", None)
+        if not account_uid or not folder_name:
+            return
+
+        selection = (account_uid, folder_name)
+        if selection == self._activated_folder:
+            self._sync_folder_row_selection(listbox, row)
+            return
+
+        self._sync_folder_row_selection(listbox, row)
 
         account = self._accounts_by_uid.get(account_uid)
         if account is None:
