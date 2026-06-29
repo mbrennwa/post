@@ -56,6 +56,7 @@ path = [
     "docs/mail-threading.md",
     "docs/offline-body-cache.md",
     "docs/offline.md",
+    "docs/release-checklist.md",
     "pyproject.toml",
     ".gitignore",
     "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post-sketch.svg",
