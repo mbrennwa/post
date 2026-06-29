@@ -8,8 +8,10 @@ from collections import OrderedDict
 
 from post.mail.message_list_state import (
     FolderListSnapshot,
+    MESSAGE_LIST_UI_BATCH_SIZE,
     folder_cache_matches,
     folder_list_ready_to_cache,
+    message_batch_ranges,
     message_list_fingerprint,
     prepended_message_count,
     touch_lru_cache,
@@ -141,6 +143,23 @@ class LruCacheTests(unittest.TestCase):
         )
         self.assertEqual(snapshot.selected_uid, "1")
         self.assertEqual(snapshot.source, "memory")
+
+
+class MessageBatchRangesTests(unittest.TestCase):
+    def test_batch_size_constant(self) -> None:
+        self.assertEqual(MESSAGE_LIST_UI_BATCH_SIZE, 500)
+
+    def test_empty(self) -> None:
+        self.assertEqual(message_batch_ranges(0), [])
+
+    def test_single_batch(self) -> None:
+        self.assertEqual(message_batch_ranges(100, batch_size=500), [(0, 100)])
+
+    def test_multiple_batches(self) -> None:
+        self.assertEqual(
+            message_batch_ranges(1200, batch_size=500),
+            [(0, 500), (500, 1000), (1000, 1200)],
+        )
 
 
 if __name__ == "__main__":

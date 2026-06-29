@@ -108,6 +108,31 @@ class PrependMessagesTests(unittest.TestCase):
         self.assertTrue(scrolled["called"])
 
 
+class AppendMessagesTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not Gtk.is_initialized():
+            Gtk.init()
+
+    def setUp(self) -> None:
+        self.message_list = VirtualMessageList()
+        self.message_list.set_messages([_msg("2"), _msg("1")], folder_name="INBOX")
+
+    def test_append_messages_adds_at_end(self) -> None:
+        self.message_list.append_messages([_msg("0")], folder_name="INBOX")
+
+        self.assertEqual(self.message_list.item_count(), 3)
+        self.assertIsNotNone(self.message_list.get_message("0"))
+        self.assertIsNotNone(self.message_list.get_message("1"))
+
+    def test_append_messages_preserves_order(self) -> None:
+        self.message_list.append_messages([_msg("3"), _msg("4")], folder_name="INBOX")
+
+        self.assertEqual(self.message_list.item_count(), 4)
+        self.assertIsNotNone(self.message_list.get_message("3"))
+        self.assertIsNotNone(self.message_list.get_message("4"))
+
+
 class UpsertMessageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

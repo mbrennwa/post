@@ -165,6 +165,20 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         if at_top:
             self._scroll_to_top_after_layout()
 
+    def append_messages(
+        self,
+        messages: Iterable[dict[str, Any]],
+        *,
+        folder_name: str,
+    ) -> None:
+        items = [MessageListItem(message) for message in messages]
+        if not items:
+            return
+        self._folder_name = folder_name
+        position = self._store.get_n_items()
+        self._store.splice(position, 0, items)
+        self._rebuild_uid_positions()
+
     def remove_uids(self, uids: Iterable[str]) -> int:
         uid_set = set(uids)
         if not uid_set:

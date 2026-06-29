@@ -14,6 +14,20 @@ _K = TypeVar("_K", bound=Hashable)
 _V = TypeVar("_V")
 
 DEFAULT_FOLDER_LIST_CACHE_SIZE = 2
+MESSAGE_LIST_UI_BATCH_SIZE = 500
+
+
+def message_batch_ranges(
+    count: int,
+    batch_size: int = MESSAGE_LIST_UI_BATCH_SIZE,
+) -> list[tuple[int, int]]:
+    """Return (start, end) slices covering range(count) in batch_size chunks."""
+    if count <= 0 or batch_size <= 0:
+        return []
+    return [
+        (start, min(start + batch_size, count))
+        for start in range(0, count, batch_size)
+    ]
 
 
 def message_list_fingerprint(messages: list[dict[str, Any]]) -> tuple[str, ...]:
