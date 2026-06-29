@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from post.mail.compose import (
     ComposeAttachment,
@@ -34,6 +35,7 @@ from post.mail.compose import (
     split_compose_body_at_quote,
 )
 from post.mail.helpers import (
+    _QuotableHtmlParser,
     _mime_message_raw_bytes,
     extract_attachments,
     extract_message_bodies,
@@ -261,6 +263,47 @@ class HtmlToQuotablePlainTests(unittest.TestCase):
         )
         self.assertIn("> Level one", text)
         self.assertIn(">> Level two", text)
+
+    def test_strips_style_and_script_before_visible_text(self) -> None:
+        text = html_to_quotable_plain(
+            "<html><head><style>/* RESET */ html { color: red; }</style>"
+            "<script>alert(1)</script></head>"
+            "<body><p>Guten Tag</p></body></html>"
+        )
+        self.assertIn("Guten Tag", text)
+        self.assertNotIn("RESET", text)
+        self.assertNotIn("color: red", text)
+        self.assertNotIn("alert", text)
+
+    def test_head_meta_and_link_do_not_suppress_body_text(self) -> None:
+        text = html_to_quotable_plain(
+            "<html><head>"
+            '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">'
+            '<link rel="stylesheet" href="https://example.com/email.css">'
+            "<style>.x { color: red; }</style>"
+            "</head><body><p>Guten Tag, Ihr Abo wird verlängert.</p></body></html>"
+        )
+        self.assertIn("Guten Tag, Ihr Abo wird verlängert.", text)
+        self.assertNotIn("color: red", text)
+
+    def test_fallback_strips_style_and_script_blocks(self) -> None:
+        with mock.patch.object(
+            _QuotableHtmlParser,
+            "feed",
+            side_effect=ValueError("force fallback"),
+        ):
+            text = html_to_quotable_plain(
+                "<style>.x { color: red; }</style><p>Hello</p>"
+                "<script>console.log('x')</script>"
+            )
+        self.assertEqual(text, "Hello")
+
+    def test_body_text_for_quoting_ignores_style_blocks(self) -> None:
+        message = {
+            "body_plain": None,
+            "body_html": "<style>.x{color:red}</style><p>Hello</p>",
+        }
+        self.assertEqual(body_text_for_quoting(message), "Hello")
 
 
 class PlainBodyLooksTruncatedTests(unittest.TestCase):
