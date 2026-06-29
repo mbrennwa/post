@@ -60,6 +60,7 @@ from post.mail.send_errors import (
     is_compose_validation_error,
     user_send_error_message,
 )
+from post.mail.draft_queue import is_queued_draft_id
 from post.mail.send_queue import (
     new_outbound_queue_id,
     persist_outbound_send,
@@ -1358,8 +1359,13 @@ class ComposeWindow(Adw.Window):
         self._draft_body_plain_snapshot = self._pending_draft_body
         self._draft_body_html = self._pending_draft_body_html
         self._update_save_draft_enabled()
-        self._set_status("Draft saved")
-        show_toast(self, "Draft saved")
+        if is_queued_draft_id(self._draft_message_uid):
+            queued_status = "Draft saved — will sync to Drafts when online"
+            self._set_status(queued_status)
+            show_toast(self, queued_status)
+        else:
+            self._set_status("Draft saved")
+            show_toast(self, "Draft saved")
         if self._on_draft_saved is not None:
             account = self._selected_account()
             self._on_draft_saved(
