@@ -541,7 +541,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
             body_html=(
                 "<div>Hoi Matthias</div>"
                 '<blockquote type="cite">'
-                "<div>Am 22.06.2026 schrieb Adrian Wicki:</div>"
+                "<div>Am 22.06.2026 schrieb Example Sender:</div>"
                 "<div>Die Boxen sind in Arbeit</div>"
                 "</blockquote>"
             ),
@@ -592,7 +592,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         doc = build_reader_document(
             body_html=(
                 '<p style="color:#000000">Contact '
-                '<a href="mailto:info@klotzholz.com">info@klotzholz.com</a></p>'
+                '<a href="mailto:contact@example.com">contact@example.com</a></p>'
             ),
             body_plain=None,
             allow_remote=False,
@@ -601,7 +601,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         )
         self.assertIn("a { color: #62a0ea; }", doc)
         self.assertNotRegex(doc, r"<a\b[^>]*post-adapt-text")
-        self.assertIn("mailto:info@klotzholz.com", doc)
+        self.assertIn("mailto:contact@example.com", doc)
 
     def test_adapt_text_adapts_low_contrast_link_color(self) -> None:
         doc = build_reader_document(
@@ -636,8 +636,8 @@ class BuildReaderDocumentTests(unittest.TestCase):
     def test_adapt_text_preserves_email_address_brackets(self) -> None:
         doc = build_reader_document(
             body_html=(
-                '<p style="color:#000000">Am 22.06.2026 schrieb Adrian Wicki '
-                "&lt;info@klotzholz.com&gt;:</p>"
+                '<p style="color:#000000">Am 22.06.2026 schrieb Example Sender '
+                "&lt;contact@example.com&gt;:</p>"
             ),
             body_plain=None,
             allow_remote=False,
@@ -645,17 +645,17 @@ class BuildReaderDocumentTests(unittest.TestCase):
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
         self.assertIn(
-            '<span class="post-bracketed">&#x3C;info@klotzholz.com&#x3E;</span>',
+            '<span class="post-bracketed">&#x3C;contact@example.com&#x3E;</span>',
             doc,
         )
-        self.assertNotIn("&lt;info@klotzholz.com&gt;", doc)
-        self.assertNotIn("<info@klotzholz.com>", doc)
+        self.assertNotIn("&lt;contact@example.com&gt;", doc)
+        self.assertNotIn("<contact@example.com>", doc)
 
     def test_adapt_text_preserves_brackets_around_mailto_link(self) -> None:
         doc = build_reader_document(
             body_html=(
-                '<div style="color:#aaaaaa">Am 22.06.2026 um 14:58 schrieb Adrian Wicki '
-                '&lt;<a href="mailto:info@klotzholz.com">info@klotzholz.com</a>&gt;:</div>'
+                '<div style="color:#aaaaaa">Am 22.06.2026 um 14:58 schrieb Example Sender '
+                '&lt;<a href="mailto:contact@example.com">contact@example.com</a>&gt;:</div>'
             ),
             body_plain=None,
             allow_remote=False,
@@ -663,11 +663,11 @@ class BuildReaderDocumentTests(unittest.TestCase):
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
         self.assertIn(
-            '<span class="post-bracketed">&#x3C;<a href="mailto:info@klotzholz.com">'
-            "info@klotzholz.com</a>&#x3E;</span>",
+            '<span class="post-bracketed">&#x3C;<a href="mailto:contact@example.com">'
+            "contact@example.com</a>&#x3E;</span>",
             doc,
         )
-        self.assertNotRegex(doc, r"schrieb Adrian Wicki <a\b")
+        self.assertNotRegex(doc, r"schrieb Example Sender <a\b")
 
     def test_accept_sender_renders_attachment_placeholder_with_brackets(self) -> None:
         doc = build_reader_document(

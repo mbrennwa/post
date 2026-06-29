@@ -21,9 +21,10 @@ Ensure no Debian build artifacts are in the working tree before `reuse lint` (ru
 
 ## Private snippets (#115)
 
-1. Grep for real emails, tokens, credentials in source, docs, and tests (use `example.com` placeholders).
-2. Review GitHub issues for pasted logs or screenshots with private mail.
-3. Landing-page screenshots only after this pass.
+1. Run `./scripts/audit-issue-privacy.sh` — scans all issues/comments for `user-attachments` screenshots and non-placeholder emails.
+2. Grep repo for real addresses (`brennwald`, `klotzholz`, etc.); tests must use `example.com` / `example.org`.
+3. Redact affected issues: remove `<img … user-attachments …>` tags; replace real addresses/subjects in pasted logs with placeholders; note `*(Screenshot redacted — #115 privacy audit.)*`.
+4. Landing-page screenshots only after this pass (no real mail visible).
 
 ## Packaging (#4)
 

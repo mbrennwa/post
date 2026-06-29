@@ -1467,7 +1467,7 @@ class Rfc5322LineLengthTests(unittest.TestCase):
         message = build_plain_mime_message(
             from_name="Alice",
             from_address="alice@example.com",
-            to=["info@klotzholz.com"],
+            to=["contact@example.com"],
             cc=None,
             bcc=None,
             subject="Re: test",
@@ -1487,7 +1487,7 @@ class Rfc5322LineLengthTests(unittest.TestCase):
         message = build_plain_mime_message(
             from_name="Alice",
             from_address="alice@example.com",
-            to=["info@klotzholz.com"],
+            to=["contact@example.com"],
             cc=None,
             bcc=None,
             subject="Re: test",
