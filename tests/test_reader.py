@@ -325,6 +325,44 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("post-keep-color", doc)
         self.assertIn("color: inherit !important", doc)
 
+    def test_adapt_text_applies_for_outlook_reply_with_signature_before_appendonsend(
+        self,
+    ) -> None:
+        """Outlook reply: new text is color-only; signature has white bg before appendonsend."""
+        body_html = (
+            '<div class="elementToProof" style="font-size: 12pt; color: rgb(0, 0, 0);">'
+            "Sehr geehrter Herr Brennwald</div>"
+            '<div class="elementToProof" style="font-size: 12pt; color: rgb(0, 0, 0);">'
+            "Besten Dank für die Vollmacht.</div>"
+            '<p style="background-color: rgb(255, 255, 255);">'
+            '<span style="color: rgb(0, 0, 0);">Marco Martone</span></p>'
+            '<div id="appendonsend"></div>'
+            "<hr>"
+            '<blockquote><p style="color: rgb(0, 0, 0);">Quoted history</p></blockquote>'
+        )
+        doc = build_reader_document(
+            body_html=body_html,
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("post-adapt-text", doc)
+        self.assertIn("post-painted", doc)
+        self.assertIn("post-keep-color", doc)
+        self.assertIn("color: inherit !important", doc)
+
+        doc_bg = build_reader_document(
+            body_html=body_html,
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_BACKGROUND,
+        )
+        self.assertIn('name="color-scheme" content="light"', doc_bg)
+        self.assertIn("background: #ffffff", doc_bg)
+
     def test_adapt_text_adapts_unstyled_sections_in_mixed_message(self) -> None:
         doc = build_reader_document(
             body_html=(
