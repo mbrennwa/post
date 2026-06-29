@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Post — a simple GNOME mail client</title>
+  <meta name="description" content="Post is a native Linux mail app for GNOME. Read and send email with Evolution Data Server and GTK4.">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <header class="hero">
+    <div class="wrap">
+      <img class="logo" src="https://raw.githubusercontent.com/mbrennwa/post/main/data/icons/hicolor/128x128/apps/io.github.mbrennwa.Post.png" width="96" height="96" alt="Post icon">
+      <h1>Post</h1>
+      <p class="tagline">A simple, native mail app for GNOME on Linux.</p>
+      <p class="lede">
+        Post is free and open source. It uses your online accounts from GNOME Online Accounts
+        and can also read local system mail. It is a focused desktop client — not a webmail
+        wrapper and not a groupware suite.
+      </p>
+      <p class="cta">
+        <a class="button primary" href="https://github.com/mbrennwa/post/releases">Download</a>
+        <a class="button" href="https://github.com/mbrennwa/post">Source on GitHub</a>
+      </p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section>
+      <h2>What Post is</h2>
+      <ul>
+        <li>GTK4 / Adwaita mail client built on Evolution Data Server</li>
+        <li>Unified inbox, compose, search, and offline-friendly caching</li>
+        <li>Per-account sync control and optional send delay (undo-send grace period)</li>
+        <li>Packaged for Debian and Ubuntu as a <code>.deb</code></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>What Post is not</h2>
+      <ul>
+        <li>Not a calendar, contacts, or tasks app</li>
+        <li>Not a replacement for your mail provider's web UI on other platforms</li>
+        <li>Not a proprietary sync service — your mail stays with your accounts and Camel cache</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Install</h2>
+      <p>On Debian 12+, Ubuntu 24.04+, or similar:</p>
+      <pre><code>sudo apt install ./post_0.1.0_all.deb
+post</code></pre>
+      <p>
+        Download the latest <code>.deb</code> from
+        <a href="https://github.com/mbrennwa/post/releases">GitHub Releases</a>,
+        or build from source — see the
+        <a href="https://github.com/mbrennwa/post/blob/main/README.md">README</a>.
+      </p>
+    </section>
+
+    <section class="screenshot">
+      <h2>Screenshot</h2>
+      <div class="screenshot-placeholder" role="img" aria-label="Post main window screenshot placeholder">
+        <p>Replace with a sanitized screenshot after install (no private mail).</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="wrap">
+    <p>GPL-3.0-or-later · <a href="https://github.com/mbrennwa/post">mbrennwa/post</a></p>
+  </footer>
+</body>
+</html>
