@@ -32,6 +32,7 @@ OFFLINE_MAIL_MESSAGE = (
 OFFLINE_FOLDER_MESSAGE = "Offline — folders unavailable until you reconnect."
 OFFLINE_CACHED_LIST_STATUS = "Offline · showing cached list"
 OFFLINE_SEARCHING_LOCAL_CACHE = "Offline · searching local cache"
+OFFLINE_CACHE_STATUS_PREFIX = "Caching mail for offline use"
 
 
 @dataclass
@@ -216,6 +217,11 @@ def offline_status_text(*, queued_count: int) -> str:
     if queued_count > 1:
         return f"Offline · {queued_count} messages queued"
     return "Offline"
+
+
+def offline_cache_status_text(*, account_label: str, folder_name: str) -> str:
+    folder = folder_name or "folders"
+    return f"{OFFLINE_CACHE_STATUS_PREFIX} · {account_label} · {folder}"
 
 
 def load_queued_outbound_message(queue_id: str) -> QueuedOutboundMessage:

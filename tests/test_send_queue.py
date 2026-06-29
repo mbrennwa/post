@@ -73,6 +73,18 @@ class QueueableNetworkErrorTests(unittest.TestCase):
             "Offline · 2 messages queued",
         )
 
+    def test_offline_cache_status_text(self) -> None:
+        from post.mail.send_queue import offline_cache_status_text
+
+        self.assertEqual(
+            offline_cache_status_text(account_label="Work", folder_name="Inbox"),
+            "Caching mail for offline use · Work · Inbox",
+        )
+        self.assertEqual(
+            offline_cache_status_text(account_label="Work", folder_name=""),
+            "Caching mail for offline use · Work · folders",
+        )
+
 
 class OutboundQueueStorageTests(unittest.TestCase):
     def test_enqueue_list_and_remove(self) -> None:
