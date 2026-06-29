@@ -94,8 +94,8 @@ class ParseAddressListTests(unittest.TestCase):
 
     def test_email_as_display_name_normalizes_to_bare(self) -> None:
         self.assertEqual(
-            parse_address_list("mbrennwa@gmail.com <mbrennwa@gmail.com>"),
-            ["mbrennwa@gmail.com"],
+            parse_address_list("owner@example.com <owner@example.com>"),
+            ["owner@example.com"],
         )
 
 
@@ -779,55 +779,55 @@ class BuildReplyAllRecipientsTests(unittest.TestCase):
 
     def test_reply_all_includes_cc_not_in_from_or_to(self) -> None:
         original = {
-            "from": "Matthias Brennwald <info@gasometrix.com>",
-            "to": "matthias@brennwald, mbrennwa@gmail.com",
+            "from": "Test Sender <sender@example.com>",
+            "to": "owner@local, owner@example.com",
             "cc": "Carol <carol@example.com>",
         }
         to_addrs, cc_addrs = build_reply_all_recipients(
             original,
             own_addresses={
-                normalize_email("info@gasometrix.com"),
-                normalize_email("matthias@brennwald"),
+                normalize_email("sender@example.com"),
+                normalize_email("owner@local"),
             },
         )
         self.assertEqual(
             to_addrs,
-            ["mbrennwa@gmail.com"],
+            ["owner@example.com"],
         )
         self.assertEqual(cc_addrs, ["Carol <carol@example.com>"])
 
     def test_reply_all_omits_cc_matching_compose_from(self) -> None:
         original = {
-            "from": "Matthias Brennwald <info@gasometrix.com>",
-            "to": "matthias@brennwald, mbrennwa@gmail.com, Matthias Brennwald <brennmat@gmail.com>",
-            "cc": "info@gasometrix.com",
+            "from": "Test Sender <sender@example.com>",
+            "to": "owner@local, owner@example.com, Coworker <coworker@example.com>",
+            "cc": "sender@example.com",
         }
         to_addrs, cc_addrs = build_reply_all_recipients(
             original,
             own_addresses={
-                normalize_email("info@gasometrix.com"),
-                normalize_email("matthias@brennwald"),
+                normalize_email("sender@example.com"),
+                normalize_email("owner@local"),
             },
         )
         self.assertEqual(
             to_addrs,
-            ["mbrennwa@gmail.com", "Matthias Brennwald <brennmat@gmail.com>"],
+            ["owner@example.com", "Coworker <coworker@example.com>"],
         )
         self.assertEqual(cc_addrs, [])
 
     def test_reply_all_omits_cc_addresses_already_in_to(self) -> None:
         original = {
-            "from": "Matthias Brennwald <info@gasometrix.com>",
-            "to": "mbrennwa@gmail.com",
-            "cc": "info@gasometrix.com",
+            "from": "Test Sender <sender@example.com>",
+            "to": "owner@example.com",
+            "cc": "sender@example.com",
         }
         to_addrs, cc_addrs = build_reply_all_recipients(
             original,
-            own_addresses={normalize_email("mbrennwa@gmail.com")},
+            own_addresses={normalize_email("owner@example.com")},
         )
         self.assertEqual(
             to_addrs,
-            ["Matthias Brennwald <info@gasometrix.com>"],
+            ["Test Sender <sender@example.com>"],
         )
         self.assertEqual(cc_addrs, [])
 
@@ -926,8 +926,8 @@ class ParseAddressHeaderTests(unittest.TestCase):
 
     def test_email_as_display_name_normalizes_to_bare(self) -> None:
         self.assertEqual(
-            parse_address_header("mbrennwa@gmail.com <mbrennwa@gmail.com>"),
-            ["mbrennwa@gmail.com"],
+            parse_address_header("owner@example.com <owner@example.com>"),
+            ["owner@example.com"],
         )
 
     def test_valid_entries_match_strict_parser(self) -> None:
@@ -935,7 +935,7 @@ class ParseAddressHeaderTests(unittest.TestCase):
             "user@example.com",
             "Alice <alice@example.com>",
             "a@example.com, Bob <b@example.com>",
-            "mbrennwa@gmail.com <mbrennwa@gmail.com>",
+            "owner@example.com <owner@example.com>",
             '"Last, First" <person@example.com>',
         ]
         for case in cases:

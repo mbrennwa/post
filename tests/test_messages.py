@@ -111,17 +111,17 @@ class FormatReaderHeaderTests(unittest.TestCase):
     def test_includes_reply_to_when_different_from_from(self) -> None:
         header = format_reader_header(
             {
-                "from": "Newsletters <mbrennwa@gmail.com>",
-                "reply_to": "Test Author <matthias@brennwald.org>",
-                "to": "mbrennwa@gmail.com",
+                "from": "Newsletters <newsletters@example.com>",
+                "reply_to": "Test Author <author@example.org>",
+                "to": "owner@example.com",
                 "date_received": "2026-06-22 19:31:58",
             }
         )
-        self.assertIn("From: Newsletters <mbrennwa@gmail.com>", header)
-        self.assertIn("Reply-To: Test Author <matthias@brennwald.org>", header)
+        self.assertIn("From: Newsletters <newsletters@example.com>", header)
+        self.assertIn("Reply-To: Test Author <author@example.org>", header)
         lines = header.splitlines()
-        self.assertEqual(lines[0], "From: Newsletters <mbrennwa@gmail.com>")
-        self.assertEqual(lines[1], "Reply-To: Test Author <matthias@brennwald.org>")
+        self.assertEqual(lines[0], "From: Newsletters <newsletters@example.com>")
+        self.assertEqual(lines[1], "Reply-To: Test Author <author@example.org>")
 
     def test_omits_reply_to_when_same_address_as_from(self) -> None:
         header = format_reader_header(
