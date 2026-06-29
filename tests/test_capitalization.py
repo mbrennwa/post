@@ -83,6 +83,8 @@ _SENTENCE_CONSTANTS = frozenset(
         "OFFLINE_FOLDER_MESSAGE",
         "OFFLINE_CACHED_LIST_STATUS",
         "OFFLINE_SEARCHING_LOCAL_CACHE",
+        "OFFLINE_CACHE_STATUS_PREFIX",
+        "MESSAGE_LIST_SYNC_STATUS",
     }
 )
 
@@ -139,6 +141,36 @@ _SENTENCE_SET_LABEL_RECEIVERS = frozenset(
 
 # Local variables assigned UI strings later passed to header-style labels.
 _HEADER_LABEL_VARIABLES = frozenset({"loading_label"})
+
+# Local variables assigned UI strings later passed to the status bar.
+_SENTENCE_STATUS_VARIABLES = frozenset({"preparing", "queued_status"})
+
+# Status-bar helper functions whose return templates are checked at runtime.
+_STATUS_MESSAGE_FUNCTIONS: dict[str, frozenset[str]] = {
+    "mail/folders.py": frozenset(
+        {
+            "format_folder_refresh_start",
+            "format_folder_refresh_done",
+            "format_folder_refresh_error",
+            "format_account_refresh_start",
+            "format_account_refresh_done",
+            "format_account_refresh_error",
+        }
+    ),
+    "mail/send_queue.py": frozenset(
+        {
+            "offline_status_text",
+            "offline_cache_status_text",
+        }
+    ),
+    "mail/operation_queue.py": frozenset({"offline_queue_status_text"}),
+    "window.py": frozenset(
+        {
+            "_loading_progress_text",
+            "_move_status_label",
+        }
+    ),
+}
 
 # Substitute for {…} placeholders when checking f-string UI templates.
 _FSTRING_PLACEHOLDER = "Inbox"
@@ -250,6 +282,9 @@ class _UIStringCollector(ast.NodeVisitor):
         elif isinstance(target, ast.Name) and target.id in _HEADER_LABEL_VARIABLES:
             for text in _collect_literal_ui_strings(node.value):
                 self._record("header", text, node.lineno)
+        elif isinstance(target, ast.Name) and target.id in _SENTENCE_STATUS_VARIABLES:
+            for text in _collect_literal_ui_strings(node.value):
+                self._record("sentence", text, node.lineno)
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -266,9 +301,16 @@ class _UIStringCollector(ast.NodeVisitor):
         if call_name in _SENTENCE_CALLS:
             index = _SENTENCE_CALLS[call_name]
             if index < len(node.args):
-                value = _is_string_literal(node.args[index])
-                if value is not None:
-                    self._record("sentence", value, node.lineno)
+                arg = node.args[index]
+                if (
+                    call_name == "_set_status"
+                    and isinstance(arg, ast.Call)
+                    and _call_name(arg) == "_with_load_status_detail"
+                    and arg.args
+                ):
+                    arg = arg.args[0]
+                for text in _collect_literal_ui_strings(arg):
+                    self._record("sentence", text, node.lineno)
 
         if call_name == "append" and isinstance(node.func, ast.Attribute):
             receiver = node.func.value
@@ -379,6 +421,37 @@ def _looks_like_menu_label(text: str) -> bool:
     return True
 
 
+def _collect_status_function_strings(
+    tree: ast.AST, relative_path: str
+) -> list[tuple[str, int]]:
+    function_names = _STATUS_MESSAGE_FUNCTIONS.get(relative_path)
+    if function_names is None:
+        return []
+    collected: list[tuple[str, int]] = []
+
+    class _StatusFunctionVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self._active = False
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if node.name not in function_names:
+                self.generic_visit(node)
+                return
+            previous = self._active
+            self._active = True
+            self.generic_visit(node)
+            self._active = previous
+
+        def visit_Return(self, node: ast.Return) -> None:
+            if self._active and node.value is not None:
+                for text in _collect_literal_ui_strings(node.value):
+                    collected.append((text, node.lineno))
+            self.generic_visit(node)
+
+    _StatusFunctionVisitor().visit(tree)
+    return collected
+
+
 def _collect_ui_strings() -> list[tuple[str, str, str, int]]:
     collected: list[tuple[str, str, str, int]] = []
     for relative_path in _UI_MODULES:
@@ -389,7 +462,68 @@ def _collect_ui_strings() -> list[tuple[str, str, str, int]]:
         visitor.visit(tree)
         for style, text, lineno in visitor.strings:
             collected.append((relative_path, style, text, lineno))
+        for text, lineno in _collect_status_function_strings(tree, relative_path):
+            collected.append((relative_path, "sentence", text, lineno))
+    for relative_path in _STATUS_MESSAGE_FUNCTIONS:
+        if relative_path in _UI_MODULES:
+            continue
+        path = _SRC_ROOT / relative_path
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        for text, lineno in _collect_status_function_strings(tree, relative_path):
+            collected.append((relative_path, "sentence", text, lineno))
     return collected
+
+
+def _runtime_status_message_samples() -> list[str]:
+    from post.mail.folders import (
+        format_account_refresh_done,
+        format_account_refresh_error,
+        format_account_refresh_start,
+        format_folder_refresh_done,
+        format_folder_refresh_error,
+        format_folder_refresh_start,
+    )
+    from post.mail.operation_queue import offline_queue_status_text
+    from post.mail.send_queue import offline_cache_status_text, offline_status_text
+    from post.window import MainWindow
+
+    samples = [
+        format_folder_refresh_start("Inbox"),
+        format_folder_refresh_done("Sent", 2, 10),
+        format_folder_refresh_error("Trash"),
+        format_account_refresh_start("Work"),
+        format_account_refresh_done("Work", 1),
+        format_account_refresh_done("Work", 4),
+        format_account_refresh_error("Work"),
+        offline_status_text(queued_count=0),
+        offline_status_text(queued_count=1),
+        offline_status_text(queued_count=3),
+        offline_cache_status_text(account_label="Work", folder_name="Inbox"),
+        offline_cache_status_text(account_label="Work", folder_name=""),
+        offline_queue_status_text(
+            send_queued_count=0,
+            operation_queued_count=0,
+        ),
+        offline_queue_status_text(
+            send_queued_count=1,
+            operation_queued_count=2,
+        ),
+        offline_queue_status_text(
+            send_queued_count=2,
+            operation_queued_count=0,
+            draft_queued_count=1,
+        ),
+        MainWindow._loading_progress_text(
+            MainWindow,
+            "Inbox",
+            searching=False,
+            source="server",
+        ),
+        MainWindow._move_status_label(MainWindow, "trash", 1),
+        MainWindow._move_status_label(MainWindow, "archive", 3),
+    ]
+    return samples
 
 
 class HeaderCapitalizationHelperTests(unittest.TestCase):
@@ -474,6 +608,17 @@ class UISourceCapitalizationTests(unittest.TestCase):
                     f"{module}:{lineno}: sentence string {text!r} "
                     "should start with a capital letter and capitalize "
                     "each new sentence"
+                )
+        if failures:
+            self.fail("\n".join(failures))
+
+    def test_runtime_status_messages_follow_sentence_capitalization(self) -> None:
+        failures: list[str] = []
+        for sample in _runtime_status_message_samples():
+            if not is_sentence_capitalized(sample):
+                failures.append(
+                    f"runtime status message {sample!r} should start with a "
+                    "capital letter and capitalize each new sentence"
                 )
         if failures:
             self.fail("\n".join(failures))

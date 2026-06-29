@@ -57,6 +57,7 @@ from post.mail.send_queue import (
     list_queued_messages,
     list_queued_outbound_messages,
     log_mail_error,
+    offline_cache_status_text,
     offline_status_text,
     read_queued_message,
     remove_queued_outbound_message,
@@ -95,6 +96,8 @@ from post.sidebar import MailSidebar
 from post.toast import show_error_toast, show_toast
 
 log = logging.getLogger(__name__)
+
+MESSAGE_LIST_SYNC_STATUS = "Syncing with Server"
 
 _SIDEBAR_TOP_INSET = 12
 
@@ -1117,9 +1120,9 @@ class MainWindow(Adw.ApplicationWindow):
             if progress is None or not progress.active:
                 self._offline_download_status = ""
             else:
-                folder = progress.folder_name or "folders"
-                self._offline_download_status = (
-                    f"Downloading mail for offline · {progress.account_label} · {folder}"
+                self._offline_download_status = offline_cache_status_text(
+                    account_label=progress.account_label,
+                    folder_name=progress.folder_name or "",
                 )
             self._refresh_status_display()
             return False
@@ -2358,7 +2361,7 @@ class MainWindow(Adw.ApplicationWindow):
             source_label = self._load_source_label(self._message_list_source)
             if source_label:
                 parts.append(source_label)
-            parts.append("Syncing with Server")
+            parts.append(MESSAGE_LIST_SYNC_STATUS)
         return " · ".join(parts)
 
     def _with_load_status_detail(self, text: str) -> str:
