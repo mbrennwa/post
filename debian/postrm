@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        rm -rf /usr/lib/post/venv
+        ;;
+esac
+
+exit 0

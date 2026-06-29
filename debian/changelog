@@ -1,0 +1,5 @@
+post (0.1.0) unstable; urgency=medium
+
+  * .deb installer for Debian/Ubuntu.
+
+ -- Matthias Brennwald <mbrennwa@gmail.com>  Mon, 29 Jun 2026 12:00:00 +0200

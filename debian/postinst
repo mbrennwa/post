@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+VENV=/usr/lib/post/venv
+WHEELS=/usr/lib/post/wheels
+
+rm -rf "$VENV"
+python3 -m venv --system-site-packages "$VENV"
+
+"$VENV/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+"$VENV/bin/python" -m pip install --upgrade pip >/dev/null 2>&1 || true
+
+"$VENV/bin/python" -m pip install \
+  --no-index \
+  --find-links "$WHEELS" \
+  --no-deps \
+  post
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || true
+fi
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database /usr/share/applications || true
+fi
+
+exit 0

@@ -1,0 +1,2 @@
+debian/wrapper/post usr/bin/
+debian/wrapper/post-probe usr/bin/

@@ -1,0 +1,41 @@
+#!/usr/bin/make -f
+
+SHELL := /bin/sh
+.ONESHELL:
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	@:
+
+override_dh_auto_install:
+	set -eu
+	# Ship an offline wheelhouse; the venv is created on the target machine
+	# (postinst) so the Python minor version matches the target system.
+	WHEEL_DIR="debian/post/usr/lib/post/wheels"
+	BUILD_VENV="debian/.build-venv"
+	export PYTHONNOUSERSITE=1
+
+	rm -rf "$$WHEEL_DIR" "$$BUILD_VENV"
+	mkdir -p "$$WHEEL_DIR"
+
+	python3 -m venv "$$BUILD_VENV"
+	"$$BUILD_VENV/bin/python" -m pip install --upgrade pip wheel setuptools
+	"$$BUILD_VENV/bin/python" -m pip wheel --no-deps --wheel-dir "$$WHEEL_DIR" .
+
+	rm -rf "$$BUILD_VENV"
+
+	install -Dm644 data/io.github.mbrennwa.Post.desktop \
+		debian/post/usr/share/applications/io.github.mbrennwa.Post.desktop
+	for size in 48 96 128 192 256; do \
+		install -Dm644 \
+			"data/icons/hicolor/$${size}x$${size}/apps/io.github.mbrennwa.Post.png" \
+			"debian/post/usr/share/icons/hicolor/$${size}x$${size}/apps/io.github.mbrennwa.Post.png"; \
+	done
+	install -Dm644 data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg \
+		debian/post/usr/share/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg
+
+override_dh_auto_clean:
+	dh_auto_clean
+	rm -rf debian/.build-venv
