@@ -33,6 +33,7 @@ from post.preferences import (
     MESSAGE_APPEARANCE_ACCEPT_SENDER,
     MESSAGE_APPEARANCE_ADAPT_BACKGROUND,
     MESSAGE_APPEARANCE_ADAPT_TEXT,
+    SEND_DELAY_PRESETS,
     MessageAppearance,
     OFFLINE_BODY_SYNC_ALL,
     OFFLINE_BODY_SYNC_LAST_MONTH,
@@ -43,11 +44,14 @@ from post.preferences import (
     get_account_signature,
     get_load_remote_content,
     get_message_appearance,
+    get_send_delay_seconds,
     get_show_evolution_local,
+    send_delay_label,
     set_account_offline_body_sync,
     set_account_signature,
     set_load_remote_content,
     set_message_appearance,
+    set_send_delay_seconds,
     set_show_evolution_local,
 )
 from post.toast import show_error_toast
@@ -236,56 +240,81 @@ class SettingsDialog(Adw.PreferencesDialog):
             self._signature_buffer = None
             self._signature_view = None
             self._signature_account_dropdown = None
-            return page
+        else:
+            editor_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            editor_box.set_margin_start(12)
+            editor_box.set_margin_end(12)
+            editor_box.set_margin_top(6)
+            editor_box.set_margin_bottom(12)
 
-        editor_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        editor_box.set_margin_start(12)
-        editor_box.set_margin_end(12)
-        editor_box.set_margin_top(6)
-        editor_box.set_margin_bottom(12)
+            account_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            account_label = Gtk.Label(
+                label="Account",
+                xalign=0,
+            )
+            account_label.add_css_class("heading")
+            account_label.set_valign(Gtk.Align.CENTER)
+            account_row.append(account_label)
 
-        account_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        account_label = Gtk.Label(
-            label="Account",
-            xalign=0,
+            labels = [account.from_label for account in self._signature_accounts]
+            self._signature_account_dropdown = Gtk.DropDown.new_from_strings(labels)
+            self._signature_account_dropdown.set_selected(0)
+            self._signature_account_dropdown.set_hexpand(True)
+            self._signature_account_dropdown.connect(
+                "notify::selected", self._on_signature_account_changed
+            )
+            account_row.append(self._signature_account_dropdown)
+            editor_box.append(account_row)
+
+            editor_frame = Gtk.Frame()
+            editor_frame.add_css_class("view")
+            editor_scroll = Gtk.ScrolledWindow()
+            editor_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            editor_scroll.set_propagate_natural_height(False)
+            editor_scroll.set_size_request(-1, _SIGNATURE_EDITOR_MIN_HEIGHT)
+            self._signature_view = Gtk.TextView()
+            self._signature_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            self._signature_view.set_left_margin(8)
+            self._signature_view.set_right_margin(8)
+            self._signature_view.set_top_margin(8)
+            self._signature_view.set_bottom_margin(8)
+            editor_scroll.set_child(self._signature_view)
+            editor_frame.set_child(editor_scroll)
+            editor_box.append(editor_frame)
+
+            group.add(editor_box)
+            page.add(group)
+
+            self._signature_buffer = self._signature_view.get_buffer()
+            self._signature_buffer.connect("changed", self._on_signature_buffer_changed)
+            self._load_signature_for_selected_account()
+
+        delay_group = Adw.PreferencesGroup()
+        delay_group.set_title("Sending")
+        self._send_delay_row = Adw.ComboRow(title="Send Delay")
+        self._send_delay_row.set_subtitle(
+            "Hold messages in Outbox before delivery so you can undo a send"
         )
-        account_label.add_css_class("heading")
-        account_label.set_valign(Gtk.Align.CENTER)
-        account_row.append(account_label)
-
-        labels = [account.from_label for account in self._signature_accounts]
-        self._signature_account_dropdown = Gtk.DropDown.new_from_strings(labels)
-        self._signature_account_dropdown.set_selected(0)
-        self._signature_account_dropdown.set_hexpand(True)
-        self._signature_account_dropdown.connect(
-            "notify::selected", self._on_signature_account_changed
-        )
-        account_row.append(self._signature_account_dropdown)
-        editor_box.append(account_row)
-
-        editor_frame = Gtk.Frame()
-        editor_frame.add_css_class("view")
-        editor_scroll = Gtk.ScrolledWindow()
-        editor_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        editor_scroll.set_propagate_natural_height(False)
-        editor_scroll.set_size_request(-1, _SIGNATURE_EDITOR_MIN_HEIGHT)
-        self._signature_view = Gtk.TextView()
-        self._signature_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self._signature_view.set_left_margin(8)
-        self._signature_view.set_right_margin(8)
-        self._signature_view.set_top_margin(8)
-        self._signature_view.set_bottom_margin(8)
-        editor_scroll.set_child(self._signature_view)
-        editor_frame.set_child(editor_scroll)
-        editor_box.append(editor_frame)
-
-        group.add(editor_box)
-        page.add(group)
-
-        self._signature_buffer = self._signature_view.get_buffer()
-        self._signature_buffer.connect("changed", self._on_signature_buffer_changed)
-        self._load_signature_for_selected_account()
+        delay_labels = [send_delay_label(seconds) for seconds in SEND_DELAY_PRESETS]
+        self._send_delay_row.set_model(Gtk.StringList.new(delay_labels))
+        current_delay = get_send_delay_seconds()
+        try:
+            delay_index = SEND_DELAY_PRESETS.index(current_delay)
+        except ValueError:
+            delay_index = 0
+        self._send_delay_row.set_selected(delay_index)
+        self._send_delay_row.connect("notify::selected", self._on_send_delay_changed)
+        delay_group.add(self._send_delay_row)
+        page.add(delay_group)
         return page
+
+    def _on_send_delay_changed(self, *_args) -> None:
+        if self._loading_settings:
+            return
+        index = self._send_delay_row.get_selected()
+        if index < 0 or index >= len(SEND_DELAY_PRESETS):
+            return
+        set_send_delay_seconds(SEND_DELAY_PRESETS[index])
 
     def _selected_signature_account_uid(self) -> str | None:
         if self._signature_account_dropdown is None:

@@ -62,16 +62,23 @@ from post.mail.send_errors import (
 )
 from post.mail.draft_queue import is_queued_draft_id
 from post.mail.send_queue import (
+    load_queued_attachments,
+    load_queued_outbound_message,
     new_outbound_queue_id,
     persist_outbound_send,
     remove_queued_outbound_message,
 )
-from post.preferences import get_account_signature, get_account_signatures
+from post.preferences import (
+    format_send_delay_status,
+    get_account_signature,
+    get_account_signatures,
+    get_send_delay_seconds,
+)
 from post.toast import show_error_toast, show_toast
 
 log = logging.getLogger(__name__)
 
-ComposeMode = Literal["new", "reply", "reply-all", "forward", "draft"]
+ComposeMode = Literal["new", "reply", "reply-all", "forward", "draft", "outbox"]
 SetStatus = Callable[[str], None]
 
 
@@ -108,6 +115,7 @@ class OutboundSendRequest:
     draft_folder: str | None = None
     draft_uid: str | None = None
     queue_id: str | None = None
+    send_immediately: bool = False
 
 
 _OUTBOX_FAILURE_SUFFIX = " Message saved in Outbox."
@@ -120,6 +128,7 @@ def run_outbound_send(
     set_status: SetStatus,
     on_outbox_changed: Callable[[], None] | None,
     on_draft_saved: OnDraftSaved | None,
+    on_delayed_send: Callable[[str, float], None] | None = None,
     request: OutboundSendRequest,
 ) -> None:
     """Persist to outbox and send on the mail I/O thread; never block the UI thread."""
@@ -131,6 +140,7 @@ def run_outbound_send(
         set_status=set_status,
         on_outbox_changed=on_outbox_changed,
         on_draft_saved=on_draft_saved,
+        on_delayed_send=on_delayed_send,
         request=request,
     )
 
@@ -142,6 +152,7 @@ def _run_outbound_send_worker(
     set_status: SetStatus,
     on_outbox_changed: Callable[[], None] | None,
     on_draft_saved: OnDraftSaved | None,
+    on_delayed_send: Callable[[str, float], None] | None,
     request: OutboundSendRequest,
 ) -> None:
     queue_id = request.queue_id or new_outbound_queue_id()
@@ -160,6 +171,12 @@ def _run_outbound_send_worker(
                 references=request.references,
                 attachments=request.attachments,
             )
+            delay_seconds = (
+                0 if request.send_immediately else get_send_delay_seconds()
+            )
+            send_after = (
+                time.time() + delay_seconds if delay_seconds > 0 else None
+            )
             persist_outbound_send(
                 account_uid=request.account_uid,
                 to=request.to,
@@ -172,6 +189,7 @@ def _run_outbound_send_worker(
                 references=request.references,
                 attachments=request.attachments,
                 queue_id=queue_id,
+                send_after=send_after,
             )
         except ValueError as exc:
             log.warning("Outbound compose validation failed: %s", exc)
@@ -195,6 +213,22 @@ def _run_outbound_send_worker(
         request_with_id = replace(request, queue_id=queue_id)
         if on_outbox_changed is not None:
             GLib.idle_add(_notify_outbox_changed, on_outbox_changed)
+
+        if delay_seconds > 0 and send_after is not None:
+            if on_delayed_send is not None:
+                GLib.idle_add(_schedule_delayed_send, on_delayed_send, queue_id, send_after)
+            GLib.idle_add(
+                _finish_outbound_send,
+                parent,
+                set_status,
+                on_draft_saved,
+                on_outbox_changed,
+                mail,
+                request_with_id,
+                None,
+                format_send_delay_status(delay_seconds),
+            )
+            return
 
         log.debug("Starting SMTP delivery for outbox item %s", queue_id)
 
@@ -253,6 +287,15 @@ def _show_send_error_toast(parent: Gtk.Window, message: str) -> bool:
 
 def _notify_outbox_changed(on_outbox_changed: Callable[[], None]) -> bool:
     on_outbox_changed()
+    return False
+
+
+def _schedule_delayed_send(
+    on_delayed_send: Callable[[str, float], None],
+    queue_id: str,
+    send_after: float,
+) -> bool:
+    on_delayed_send(queue_id, send_after)
     return False
 
 
@@ -361,11 +404,13 @@ class ComposeWindow(Adw.Window):
         on_outbox_changed: Callable[[], None] | None = None,
         on_draft_saved: OnDraftSaved | None = None,
         on_draft_save_started: OnDraftSaveStarted | None = None,
+        on_delayed_send: Callable[[str, float], None] | None = None,
         mode: ComposeMode = "new",
         reply_to: dict[str, Any] | None = None,
         draft_folder_name: str | None = None,
         draft_message_uid: str | None = None,
         draft_message: dict[str, Any] | None = None,
+        outbox_queue_id: str | None = None,
     ) -> None:
         super().__init__(transient_for=parent, modal=False)
         apply_window_icon(self)
@@ -378,11 +423,13 @@ class ComposeWindow(Adw.Window):
         self._on_outbox_changed = on_outbox_changed
         self._on_draft_saved = on_draft_saved
         self._on_draft_save_started = on_draft_save_started
+        self._on_delayed_send = on_delayed_send
         self._mode = mode
         self._reply_to = reply_to
         self._draft_folder_name = draft_folder_name
         self._draft_message_uid = draft_message_uid
         self._draft_message = draft_message
+        self._outbox_queue_id = outbox_queue_id
         self._saving_draft = False
         self._attachments: list[ComposeAttachment] = []
         self._close_when_saved = False
@@ -411,6 +458,8 @@ class ComposeWindow(Adw.Window):
             title = "Forward"
         elif mode == "draft":
             title = "Draft"
+        elif mode == "outbox":
+            title = "Edit Queued Message"
         else:
             title = "New Message"
         self.set_title(title)
@@ -1067,6 +1116,23 @@ class ComposeWindow(Adw.Window):
             self._draft_body_plain_snapshot = plain_body
             self._quoted_html_source = None
             self._quoted_plain_expected = ""
+        elif self._mode == "outbox" and self._outbox_queue_id is not None:
+            queued = load_queued_outbound_message(self._outbox_queue_id)
+            if queued.to:
+                self._to_entry.set_text(format_address_list(queued.to))
+            if queued.cc:
+                self._show_cc_field(format_address_list(queued.cc))
+            if queued.bcc:
+                self._bcc_entry.set_text(format_address_list(queued.bcc))
+                self._bcc_row.set_visible(True)
+                self._bcc_entry.set_can_focus(True)
+                self._bcc_toggle_btn.set_label("Hide Bcc")
+            self._subject_entry.set_text(queued.subject)
+            self._body_view.get_buffer().set_text(queued.body)
+            self._attachments = load_queued_attachments(
+                self._outbox_queue_id, queued
+            )
+            self._rebuild_attachment_rows()
         else:
             body = compose_body_with_signature(
                 mode="new",
@@ -1443,6 +1509,7 @@ class ComposeWindow(Adw.Window):
             attachments=list(self._attachments) or None,
             draft_folder=self._draft_folder_name,
             draft_uid=self._draft_message_uid,
+            queue_id=self._outbox_queue_id,
         )
 
         self._set_status("Sending message…")
@@ -1453,6 +1520,7 @@ class ComposeWindow(Adw.Window):
             set_status=self._set_status,
             on_outbox_changed=self._on_outbox_changed,
             on_draft_saved=self._on_draft_saved,
+            on_delayed_send=self._on_delayed_send,
             request=request,
         )
 

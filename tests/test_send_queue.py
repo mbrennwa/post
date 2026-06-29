@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -20,6 +21,7 @@ from post.mail.send_queue import (
     QueuedOutboundMessage,
     count_queued_for_account,
     enqueue_outbound_message,
+    is_outbound_ready_to_send,
     is_queueable_network_error,
     list_queued_for_account,
     list_queued_messages_page,
@@ -275,3 +277,30 @@ class OutboxAccountFilterTests(unittest.TestCase):
                 loaded = load_queued_outbound_message(queue_id)
                 self.assertEqual(loaded.subject, "Hello")
                 self.assertEqual(loaded.in_reply_to, "<msg@example.com>")
+
+    def test_send_after_persisted_and_ready_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                send_after = time.time() + 120
+                queue_id = persist_outbound_send(
+                    account_uid="account-1",
+                    to=["user@example.com"],
+                    cc=None,
+                    bcc=None,
+                    subject="Delayed",
+                    body="Body",
+                    send_after=send_after,
+                )
+                loaded = load_queued_outbound_message(queue_id)
+                self.assertEqual(loaded.send_after, send_after)
+                self.assertFalse(is_outbound_ready_to_send(loaded))
+                ready = QueuedOutboundMessage(
+                    account_uid="account-1",
+                    to=["user@example.com"],
+                    cc=None,
+                    bcc=None,
+                    subject="Delayed",
+                    body="Body",
+                    send_after=time.time() - 1,
+                )
+                self.assertTrue(is_outbound_ready_to_send(ready))

@@ -47,6 +47,7 @@ class QueuedOutboundMessage:
     in_reply_to: str | None = None
     references: str | None = None
     queued_at: float = 0.0
+    send_after: float | None = None
     attachments: list[dict[str, str]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -83,8 +84,26 @@ class QueuedOutboundMessage:
             in_reply_to=data.get("in_reply_to"),
             references=data.get("references"),
             queued_at=float(data.get("queued_at") or 0.0),
+            send_after=(
+                float(data["send_after"])
+                if data.get("send_after") is not None
+                else None
+            ),
             attachments=attachments,
         )
+
+
+def is_outbound_ready_to_send(
+    message: QueuedOutboundMessage,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Return True when a queued message may be delivered now."""
+    if now is None:
+        now = time.time()
+    if message.send_after is None:
+        return True
+    return message.send_after <= now
 
 
 def outbox_dir() -> str:
@@ -250,6 +269,7 @@ def persist_outbound_send(
     references: str | None = None,
     attachments: Sequence[ComposeAttachment] | None = None,
     queue_id: str | None = None,
+    send_after: float | None = None,
 ) -> str:
     """Write an outbound message to the outbox before attempting delivery."""
     return enqueue_outbound_message(
@@ -263,6 +283,7 @@ def persist_outbound_send(
             body_html=body_html,
             in_reply_to=in_reply_to,
             references=references,
+            send_after=send_after,
         ),
         attachment_payloads=attachments,
         queue_id=queue_id,
@@ -282,6 +303,8 @@ def enqueue_outbound_message(
         message.attachments = _write_attachment_sidecars(queue_id, attachment_payloads)
     payload = message.to_dict()
     payload["queued_at"] = message.queued_at or time.time()
+    if message.send_after is not None:
+        payload["send_after"] = message.send_after
     path = os.path.join(directory, f"{queue_id}.json")
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".post-", suffix=".tmp")
     try:

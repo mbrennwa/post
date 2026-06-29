@@ -19,6 +19,7 @@ from post.preferences import (
     get_load_remote_content,
     get_message_appearance,
     get_show_evolution_local,
+    get_send_delay_seconds,
     get_sidebar_state,
     get_window_state,
     register_inbox_accounts,
@@ -29,6 +30,7 @@ from post.preferences import (
     set_load_remote_content,
     set_message_appearance,
     set_show_evolution_local,
+    set_send_delay_seconds,
     set_sidebar_state,
     set_window_state,
 )
@@ -125,6 +127,16 @@ class PreferencesTests(unittest.TestCase):
                 with open(path, encoding="utf-8") as handle:
                     data = json.load(handle)
                 self.assertNotIn("account-1", data.get("account_user_online", {}))
+
+    def test_send_delay_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "preferences.json")
+            with mock.patch("post.preferences._PREF_PATH", path):
+                self.assertEqual(get_send_delay_seconds(), 0)
+                set_send_delay_seconds(30)
+                self.assertEqual(get_send_delay_seconds(), 30)
+                set_send_delay_seconds(0)
+                self.assertEqual(get_send_delay_seconds(), 0)
 
     def test_window_state_defaults(self) -> None:
         with mock.patch(

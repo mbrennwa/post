@@ -144,6 +144,60 @@ def set_account_user_online(account_uid: str, online: bool) -> None:
     _save_raw(data)
 
 
+SEND_DELAY_OFF = 0
+SEND_DELAY_PRESETS: tuple[int, ...] = (0, 5, 10, 30, 60, 120, 300)
+_SEND_DELAY_LABELS: tuple[str, ...] = (
+    "Off (send immediately)",
+    "5 seconds",
+    "10 seconds",
+    "30 seconds",
+    "1 minute",
+    "2 minutes",
+    "5 minutes",
+)
+
+
+def get_send_delay_seconds() -> int:
+    value = _load_raw().get("send_delay_seconds", SEND_DELAY_OFF)
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return SEND_DELAY_OFF
+    if seconds not in SEND_DELAY_PRESETS:
+        return SEND_DELAY_OFF
+    return seconds
+
+
+def set_send_delay_seconds(seconds: int) -> None:
+    if seconds not in SEND_DELAY_PRESETS:
+        raise ValueError(f"Invalid send delay: {seconds!r}")
+    data = _load_raw()
+    if seconds == SEND_DELAY_OFF:
+        data.pop("send_delay_seconds", None)
+    else:
+        data["send_delay_seconds"] = seconds
+    _save_raw(data)
+
+
+def send_delay_label(seconds: int) -> str:
+    try:
+        index = SEND_DELAY_PRESETS.index(seconds)
+    except ValueError:
+        return _SEND_DELAY_LABELS[0]
+    return _SEND_DELAY_LABELS[index]
+
+
+def format_send_delay_status(seconds: int) -> str:
+    if seconds <= 0:
+        return "Message sent"
+    if seconds < 60:
+        unit = "second" if seconds == 1 else "seconds"
+        return f"Message will send in {seconds} {unit}"
+    minutes = seconds // 60
+    unit = "minute" if minutes == 1 else "minutes"
+    return f"Message will send in {minutes} {unit}"
+
+
 def _offline_body_sync_raw() -> dict[str, Any]:
     raw = _load_raw().get("offline_body_sync")
     if isinstance(raw, dict):

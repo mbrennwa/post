@@ -49,6 +49,7 @@ from post.mail.message_list_state import (
 )
 from post.mail.search import MessageSearchQuery, parse_search_query
 from post.mail.operation_queue import offline_queue_status_text
+from post.mail.send_delay import OutboundSendDelayScheduler
 from post.mail.send_queue import (
     OFFLINE_CACHED_LIST_STATUS,
     OFFLINE_MAIL_MESSAGE,
@@ -56,6 +57,8 @@ from post.mail.send_queue import (
     is_network_unavailable_error,
     list_queued_messages,
     list_queued_outbound_messages,
+    load_queued_attachments,
+    load_queued_outbound_message,
     log_mail_error,
     offline_cache_status_text,
     offline_status_text,
@@ -163,6 +166,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._close_after_outbound_send = False
 
         self._mail = MailService.connect()
+        self._send_delay_scheduler = OutboundSendDelayScheduler(
+            self._mail,
+            on_outbox_changed=self._on_outbox_changed,
+        )
         self._mail.set_password_prompt(self._prompt_account_password)
         self._sync_watcher = MailSyncWatcher(
             self._mail,
@@ -486,6 +493,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._flush_send_queue_idle()
         self._flush_operation_queue_idle()
         self._flush_draft_queue_idle()
+        self._send_delay_scheduler.reschedule_all()
         return False
 
     def _on_network_available_changed(self, monitor: Gio.NetworkMonitor, *_args) -> None:
@@ -518,9 +526,19 @@ class MainWindow(Adw.ApplicationWindow):
                 sync=False,
             )
 
-    def _flush_send_queue_idle(self) -> bool:
-        get_mail_io_thread().submit(self._flush_send_queue_worker)
+    def _flush_send_queue_idle(self, *, force: bool = False) -> bool:
+        get_mail_io_thread().submit(self._flush_send_queue_worker, force=force)
         return False
+
+    def _flush_send_queue_worker(self, *, force: bool = False) -> None:
+        try:
+            sent = self._mail.flush_send_queue(force=force)
+        except Exception:
+            log.exception("Failed to flush outbound send queue")
+            return
+        if sent <= 0:
+            return
+        GLib.idle_add(self._on_send_queue_flushed, sent)
 
     def _flush_operation_queue_idle(self) -> bool:
         get_mail_io_thread().submit(self._flush_operation_queue_worker)
@@ -569,16 +587,6 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             self._set_status(f"Synced {flushed} queued drafts to Drafts")
         return False
-
-    def _flush_send_queue_worker(self) -> None:
-        try:
-            sent = self._mail.flush_send_queue()
-        except Exception:
-            log.exception("Failed to flush outbound send queue")
-            return
-        if sent <= 0:
-            return
-        GLib.idle_add(self._on_send_queue_flushed, sent)
 
     def _on_send_queue_flushed(self, sent: int) -> bool:
         self._on_outbox_changed()
@@ -1024,7 +1032,7 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
     def _on_sidebar_send_outbox(self) -> None:
-        self._flush_send_queue_idle()
+        self._flush_send_queue_idle(force=True)
 
     def _on_sidebar_folder_tree_changed(
         self, account_uid: str, removed_folder: str | None
@@ -1370,6 +1378,7 @@ class MainWindow(Adw.ApplicationWindow):
         draft_folder_name: str | None = None,
         draft_message_uid: str | None = None,
         draft_message: dict | None = None,
+        outbox_queue_id: str | None = None,
     ) -> None:
         window = ComposeWindow(
             parent=self,
@@ -1379,11 +1388,13 @@ class MainWindow(Adw.ApplicationWindow):
             on_outbox_changed=self._on_outbox_changed,
             on_draft_saved=self._on_draft_saved,
             on_draft_save_started=self._on_draft_save_started,
+            on_delayed_send=self._send_delay_scheduler.schedule_item,
             mode=mode,  # type: ignore[arg-type]
             reply_to=reply_to,
             draft_folder_name=draft_folder_name,
             draft_message_uid=draft_message_uid,
             draft_message=draft_message,
+            outbox_queue_id=outbox_queue_id,
         )
         self._compose_windows.append(window)
         window.connect(
@@ -1579,6 +1590,16 @@ class MainWindow(Adw.ApplicationWindow):
         forward_action = Gio.SimpleAction.new("message-forward", None)
         forward_action.connect("activate", self._on_message_menu_forward)
         self.add_action(forward_action)
+
+        self._outbox_edit_action = Gio.SimpleAction.new("message-outbox-edit", None)
+        self._outbox_edit_action.connect("activate", self._on_message_menu_outbox_edit)
+        self.add_action(self._outbox_edit_action)
+
+        self._outbox_drafts_action = Gio.SimpleAction.new("message-outbox-drafts", None)
+        self._outbox_drafts_action.connect(
+            "activate", self._on_message_menu_outbox_move_drafts
+        )
+        self.add_action(self._outbox_drafts_action)
 
         self._message_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
         self._message_popover.set_parent(self._message_scroll)
@@ -3004,6 +3025,9 @@ class MainWindow(Adw.ApplicationWindow):
         count = len(uids)
         viewing_outbox = is_post_outbox_folder(self._current_folder or "")
         flags_for_uid = self._message_flags_for_uid
+        if viewing_outbox and count == 1:
+            menu.append("Edit", "win.message-outbox-edit")
+            menu.append("Move to Drafts", "win.message-outbox-drafts")
         if not viewing_outbox:
             for action in read_menu_items(
                 self._message_seen_states_for_uids(uids, flags_for_uid)
@@ -3093,6 +3117,65 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_message_menu_forward(self, *_args) -> None:
         self._open_compose_on_message("forward")
 
+    def _on_message_menu_outbox_edit(self, *_args) -> None:
+        if len(self._context_message_uids) != 1 or not self._current_account:
+            return
+        self._open_compose_from_outbox(self._context_message_uids[0])
+
+    def _on_message_menu_outbox_move_drafts(self, *_args) -> None:
+        if len(self._context_message_uids) != 1 or not self._current_account:
+            return
+        self._move_outbox_to_drafts(self._context_message_uids[0])
+
+    def _open_compose_from_outbox(self, queue_id: str) -> None:
+        if not self._current_account:
+            return
+        self._send_delay_scheduler.cancel(queue_id)
+        self._present_compose_window(
+            self._current_account,
+            mode="outbox",
+            outbox_queue_id=queue_id,
+        )
+
+    def _move_outbox_to_drafts(self, queue_id: str) -> None:
+        if not self._current_account:
+            return
+        account = self._current_account
+        self._send_delay_scheduler.cancel(queue_id)
+
+        def worker() -> None:
+            error: Exception | None = None
+            try:
+                queued = load_queued_outbound_message(queue_id)
+                attachments = load_queued_attachments(queue_id, queued)
+                self._mail.save_draft(
+                    account.uid,
+                    to=queued.to,
+                    cc=queued.cc,
+                    bcc=queued.bcc,
+                    subject=queued.subject,
+                    body=queued.body,
+                    body_html=queued.body_html,
+                    in_reply_to=queued.in_reply_to,
+                    references=queued.references,
+                    attachments=attachments or None,
+                )
+                remove_queued_outbound_message(queue_id)
+            except Exception as exc:
+                log.exception("Failed to move outbox message to drafts")
+                error = exc
+            GLib.idle_add(self._on_outbox_moved_to_drafts, error)
+
+        get_mail_io_thread().submit(worker)
+
+    def _on_outbox_moved_to_drafts(self, error: Exception | None) -> bool:
+        if error is not None:
+            show_error_toast(self, f"Could not move to Drafts: {error}")
+            return False
+        self._on_outbox_changed()
+        self._set_status("Moved queued message to Drafts")
+        return False
+
     def _move_selected_messages(self, destination: str) -> None:
         uids = self._message_list_view.get_selected_uids()
         if not uids:
@@ -3106,6 +3189,7 @@ class MainWindow(Adw.ApplicationWindow):
         if not self._current_account:
             return
         for queue_id in queue_ids:
+            self._send_delay_scheduler.cancel(queue_id)
             remove_queued_outbound_message(queue_id)
         count = len(queue_ids)
         if count == 1:

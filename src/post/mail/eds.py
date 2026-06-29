@@ -97,6 +97,7 @@ from .send_queue import (
     QueuedOutboundMessage,
     enqueue_outbound_message,
     is_network_unavailable_error,
+    is_outbound_ready_to_send,
     is_queueable_network_error,
     list_queued_outbound_messages,
     load_queued_attachments,
@@ -869,11 +870,13 @@ class MailService:
         self._transports[transport_uid] = transport
         return transport
 
-    def flush_send_queue(self) -> int:
-        """Try to send messages queued while offline. Returns count sent."""
+    def flush_send_queue(self, *, force: bool = False) -> int:
+        """Try to send queued outbox messages. Returns count sent."""
         if is_mail_io_thread():
-            return self._flush_send_queue_unlocked()
-        return get_mail_io_thread().run_sync(self._flush_send_queue_unlocked)
+            return self._flush_send_queue_unlocked(force=force)
+        return get_mail_io_thread().run_sync(
+            self._flush_send_queue_unlocked, force=force
+        )
 
     def flush_operation_queue(self) -> int:
         """Apply queued mail mutations after reconnect. Returns count flushed."""
@@ -1189,9 +1192,11 @@ class MailService:
             attachment_payloads=attachments,
         )
 
-    def _flush_send_queue_unlocked(self) -> int:
+    def _flush_send_queue_unlocked(self, *, force: bool = False) -> int:
         sent = 0
         for queue_id, queued in list_queued_outbound_messages():
+            if not force and not is_outbound_ready_to_send(queued):
+                continue
             if self._is_outbound_delivery_claimed(queue_id):
                 continue
             self._begin_outbound_send()
