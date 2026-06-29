@@ -26,7 +26,7 @@ When the network returns:
 3. Queued move/archive/flag operations are flushed
 4. Queued drafts are appended to Drafts on the server
 5. Optional body downsync resumes
-6. Open folder reloads from server when **Auto Sync** is enabled
+6. Open folder reloads from server when the account is **online** (user has not taken it offline)
 
 Status bar examples:
 
@@ -35,6 +35,10 @@ Status bar examples:
 - `Offline · 1 action queued`
 - `Offline · 1 draft queued`
 - `Offline · 1 message queued · 2 actions queued`
+
+## Per-account offline
+
+Right-click an account header in the sidebar to **Take Offline** or **Take Online**. Offline accounts do not background-sync; use **Refresh** to reload folders and messages from the local Camel cache. A network-offline icon marks offline accounts in the sidebar.
 
 ## Manual checks (before closing #6)
 

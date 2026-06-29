@@ -81,7 +81,6 @@ from post.preferences import (
     OFFLINE_BODY_SYNC_LAST_YEAR,
     OFFLINE_BODY_SYNC_OFF,
     OfflineBodySyncMode,
-    get_auto_sync,
     get_load_remote_content,
     get_message_appearance,
     get_sidebar_state,
@@ -92,6 +91,7 @@ from post.preferences import (
     should_show_offline_body_sync_prompt,
     set_window_state,
 )
+from post.mail.offline_settings import account_is_user_offline
 from post.sidebar import MailSidebar
 from post.toast import show_error_toast, show_toast
 
@@ -281,6 +281,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_folder_contents_changed=self._on_sidebar_folder_contents_changed,
             on_move_started=self._on_sidebar_move_started,
             on_move_undo_available=self._on_sidebar_move_undo_available,
+            on_account_online_changed=self._on_account_online_changed,
         )
         sidebar_widget = self._sidebar.widget
         sidebar_widget.set_margin_top(_SIDEBAR_TOP_INSET)
@@ -502,7 +503,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._flush_draft_queue_idle()
             self._mail.schedule_offline_body_sync()
             if self._current_account and self._current_folder:
-                if get_auto_sync():
+                if self._account_server_sync_enabled(self._current_account.uid):
                     self._load_messages(
                         self._current_account.uid,
                         self._current_folder,
@@ -947,7 +948,6 @@ class MainWindow(Adw.ApplicationWindow):
             set_status=self._set_status,
             on_saved=self._reload_sidebar,
             on_load_remote_content_changed=self._on_load_remote_content_changed,
-            on_auto_sync_changed=self._on_auto_sync_changed,
             on_message_appearance_changed=self._on_message_appearance_changed,
             on_offline_body_sync_changed=self._on_offline_body_sync_changed,
         )
@@ -958,15 +958,24 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_settings_closed(self, *_args) -> None:
         self._settings_dialog = None
 
+    def _account_server_sync_enabled(self, account_uid: str) -> bool:
+        return self._network_available and not account_is_user_offline(account_uid)
+
     def _on_sidebar_refresh_account(self, account_uid: str) -> None:
         if not self._network_available:
             return
         label = self._sidebar.account_display_label(account_uid)
-        self._set_status(format_account_refresh_start(label))
+        user_offline = account_is_user_offline(account_uid)
+        if user_offline:
+            self._set_status(f"{label} · showing cached folders")
+        else:
+            self._set_status(format_account_refresh_start(label))
 
         def on_complete(folder_count: int, error: Exception | None) -> None:
             if error is not None:
                 self._set_status(format_account_refresh_error(label))
+            elif user_offline:
+                self._set_status(f"{label} · {folder_count} folders from cache")
             else:
                 self._set_status(format_account_refresh_done(label, folder_count))
 
@@ -984,16 +993,29 @@ class MainWindow(Adw.ApplicationWindow):
         if not self._network_available:
             return
         display = self._sidebar.folder_display_name(account_uid, folder_name)
-        self._set_status(format_folder_refresh_start(display))
-        self._mail.invalidate_folder_index(account_uid, folder_name)
+        user_offline = account_is_user_offline(account_uid)
+        sync = not user_offline
+        if user_offline:
+            self._set_status(f"{display} · showing cached list")
+        else:
+            self._set_status(format_folder_refresh_start(display))
+        if sync:
+            self._mail.invalidate_folder_index(account_uid, folder_name)
 
         if self._is_viewing_folder(account_uid, folder_name):
-            self._load_messages(account_uid, folder_name, sync=True, force_sync=True)
+            self._load_messages(
+                account_uid,
+                folder_name,
+                sync=sync,
+                force_sync=sync,
+            )
             return
 
         def on_complete(unread: int, total: int, error: Exception | None) -> None:
             if error is not None:
                 self._set_status(format_folder_refresh_error(display))
+            elif user_offline:
+                self._set_status(f"{display} · {total} messages from cache")
             else:
                 self._set_status(format_folder_refresh_done(display, unread, total))
 
@@ -1047,8 +1069,11 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_accounts_loaded(self, account_uids: list[str]) -> None:
         self._sync_watcher.set_accounts(account_uids)
-        if get_auto_sync() and not self._sync_watcher.running:
-            self._sync_watcher.start()
+        if any(not account_is_user_offline(uid) for uid in account_uids):
+            if not self._sync_watcher.running:
+                self._sync_watcher.start()
+        elif self._sync_watcher.running:
+            self._sync_watcher.stop()
         self._maybe_show_offline_body_sync_prompt(account_uids)
 
     def _on_initial_folder_load_complete(self) -> None:
@@ -1134,16 +1159,36 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> None:
         self._mail.refresh_offline_settings(account_uid)
 
-    def _on_auto_sync_changed(self, enabled: bool) -> None:
-        if enabled:
-            if self._current_account and self._current_folder:
-                self._sync_watcher.set_current_folder(
-                    self._current_account.uid, self._current_folder
-                )
+    def _on_account_online_changed(self, account_uid: str, online: bool) -> None:
+        self._sidebar.refresh_account_online_marker(account_uid)
+        self._sync_watcher.set_accounts(self._sidebar.account_uids())
+        if online:
             if not self._sync_watcher.running:
                 self._sync_watcher.start()
+            if (
+                self._current_account
+                and self._current_account.uid == account_uid
+                and self._current_folder
+                and self._network_available
+            ):
+                self._load_messages(account_uid, self._current_folder, sync=True)
         else:
-            self._sync_watcher.stop()
+            if not any(
+                not account_is_user_offline(uid)
+                for uid in self._sidebar.account_uids()
+            ):
+                self._sync_watcher.stop()
+            if (
+                self._current_account
+                and self._current_account.uid == account_uid
+                and self._current_folder
+            ):
+                self._load_messages(account_uid, self._current_folder, sync=False)
+        label = self._sidebar.account_display_label(account_uid)
+        if online:
+            self._set_status(f"{label} is online")
+        else:
+            self._set_status(f"{label} is offline")
 
     def _on_sync_folder_changed(self, account_uid: str, folder_name: str) -> None:
         self._mail.invalidate_folder_index(account_uid, folder_name)
@@ -1181,7 +1226,7 @@ class MainWindow(Adw.ApplicationWindow):
         if (
             self._search_query is not None
             or is_post_outbox_folder(folder_name)
-            or not self._network_available
+            or not self._account_server_sync_enabled(account_uid)
             or self._message_sync_in_progress
         ):
             return
@@ -2387,7 +2432,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         if sync is None:
-            sync = get_auto_sync()
+            sync = self._account_server_sync_enabled(account_uid)
         if not self._network_available:
             sync = False
 

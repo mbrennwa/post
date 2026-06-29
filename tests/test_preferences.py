@@ -15,7 +15,7 @@ from post.preferences import (
     MESSAGE_APPEARANCE_ADAPT_TEXT,
     get_account_signature,
     get_account_signatures,
-    get_auto_sync,
+    get_account_user_online,
     get_load_remote_content,
     get_message_appearance,
     get_show_evolution_local,
@@ -25,7 +25,7 @@ from post.preferences import (
     resolve_inbox_display_order,
     set_account_signature,
     set_active_message_uid,
-    set_auto_sync,
+    set_account_user_online,
     set_load_remote_content,
     set_message_appearance,
     set_show_evolution_local,
@@ -107,24 +107,24 @@ class PreferencesTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             set_message_appearance("invalid")  # type: ignore[arg-type]
 
-    def test_auto_sync_defaults_true(self) -> None:
+    def test_account_user_online_defaults_true(self) -> None:
         with mock.patch(
             "post.preferences._PREF_PATH",
-            os.path.join(tempfile.gettempdir(), "post-prefs-auto-sync-missing.json"),
+            os.path.join(tempfile.gettempdir(), "post-prefs-account-online-missing.json"),
         ):
-            self.assertTrue(get_auto_sync())
+            self.assertTrue(get_account_user_online("account-1"))
 
-    def test_auto_sync_round_trip(self) -> None:
+    def test_account_user_online_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "preferences.json")
             with mock.patch("post.preferences._PREF_PATH", path):
-                set_auto_sync(False)
-                self.assertFalse(get_auto_sync())
-                set_auto_sync(True)
-                self.assertTrue(get_auto_sync())
+                set_account_user_online("account-1", False)
+                self.assertFalse(get_account_user_online("account-1"))
+                set_account_user_online("account-1", True)
+                self.assertTrue(get_account_user_online("account-1"))
                 with open(path, encoding="utf-8") as handle:
                     data = json.load(handle)
-                self.assertTrue(data["auto_sync"])
+                self.assertNotIn("account-1", data.get("account_user_online", {}))
 
     def test_window_state_defaults(self) -> None:
         with mock.patch(

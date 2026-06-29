@@ -124,6 +124,7 @@ from .folders import (
     is_virtual_folder,
     validate_folder_display_name,
 )
+from post.preferences import get_account_user_online
 from .offline_settings import apply_offline_settings_to_store, apply_offline_sync_to_folder
 from .offline_sync import OfflineBodySyncCoordinator, OfflineSyncProgress
 from .search import MessageSearchQuery, filter_messages_by_query, query_to_sexp
@@ -555,14 +556,15 @@ class MailService:
             self._network_available = available
             if self._session is not None:
                 self._session.set_online(available)
-            for store in self._stores.values():
+            for account_uid, store in self._stores.items():
                 if isinstance(store, Camel.OfflineStore):
+                    effective = available and get_account_user_online(account_uid)
                     try:
-                        store.set_online_sync(available, None)
+                        store.set_online_sync(effective, None)
                     except GLib.Error:
                         log.debug(
                             "Could not set store offline=%s",
-                            not available,
+                            not effective,
                             exc_info=True,
                         )
         if available:
@@ -572,12 +574,41 @@ class MailService:
         """Bring offline stores back online and drop cached folder indexes."""
         run_on_mail_thread(self._go_online_sync_unlocked)
 
+    def set_account_user_online(self, account_uid: str, online: bool) -> None:
+        """Persist and apply per-account user online/offline state."""
+        from post.preferences import set_account_user_online as save_pref
+
+        save_pref(account_uid, online)
+        run_on_mail_thread(self._apply_account_user_online_unlocked, account_uid)
+
+    def _apply_account_user_online_unlocked(self, account_uid: str) -> None:
+        online = get_account_user_online(account_uid)
+        with self._lock:
+            store = self._stores.get(account_uid)
+            if isinstance(store, Camel.OfflineStore):
+                effective = self._network_available and online
+                try:
+                    store.set_online_sync(effective, None)
+                except GLib.Error:
+                    log.debug(
+                        "Could not set account %s online=%s",
+                        account_uid,
+                        effective,
+                        exc_info=True,
+                    )
+        if online:
+            self.schedule_offline_body_sync(account_uid)
+        else:
+            self.cancel_offline_body_sync(account_uid)
+
     def _go_online_sync_unlocked(self) -> None:
         with self._lock:
             self._network_available = True
             if self._session is not None:
                 self._session.set_online(True)
-            for store in self._stores.values():
+            for account_uid, store in self._stores.items():
+                if not get_account_user_online(account_uid):
+                    continue
                 if isinstance(store, Camel.OfflineStore):
                     try:
                         store.set_online_sync(True, None)
