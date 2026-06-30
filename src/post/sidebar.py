@@ -984,13 +984,26 @@ class MailSidebar:
 
     def _start_folder_load(self, load_id: int, account: MailAccount) -> None:
         def worker() -> None:
+            cancellable = Gio.Cancellable()
+            self._mail._register_folder_list_cancellable(cancellable)
             error: Exception | None = None
             folders: list[dict] | None = None
             try:
-                folders = self._mail.list_folders(account.uid)
+                if cancellable.is_cancelled():
+                    return
+                folders = self._mail.list_folders(
+                    account.uid, cancellable=cancellable
+                )
+            except GLib.Error as exc:
+                if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                    return
+                log_mail_error(log, f"Failed to list folders for {account.uid}", exc)
+                error = exc
             except Exception as exc:
                 log_mail_error(log, f"Failed to list folders for {account.uid}", exc)
                 error = exc
+            finally:
+                self._mail._unregister_folder_list_cancellable(cancellable)
             GLib.idle_add(
                 self._on_folders_loaded,
                 load_id,
@@ -999,7 +1012,7 @@ class MailSidebar:
                 error,
             )
 
-        get_mail_io_thread().submit(worker)
+        get_mail_io_thread().submit_background(worker)
 
     def _on_folders_loaded(
         self,

@@ -23,11 +23,15 @@ from post.window import MainWindow
 
 def main() -> int:
     # POST_LOG_LEVEL=DEBUG enables mail I/O task tracing (io_thread, eds send path).
+    # POST_DEBUG_SEARCH=1 enables folder search tracing (post.search logger).
     log_level_name = os.environ.get("POST_LOG_LEVEL")
     if log_level_name:
         logging.basicConfig(
             level=getattr(logging, log_level_name.upper(), logging.DEBUG)
         )
+    from post.mail.search_debug import configure_search_debug_logging
+
+    configure_search_debug_logging()
     # PyGObject adds an extra ref when Python vfuncs return GObjects; harmless at exit.
     warnings.filterwarnings(
         "ignore",

@@ -10,6 +10,8 @@ import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from post.mail.search_debug import search_debug_enabled, search_trace
+
 # Optional whitespace after ":" so "subject: Auburn" works like "subject:Auburn".
 _QUERY_PATTERN = re.compile(
     r"""
@@ -242,9 +244,27 @@ def filter_messages_by_query(
 
     needs_body = query_requires_body_scan(query)
     matched: list[dict] = []
-    for message in messages:
+    search_trace(
+        "filter_messages_begin",
+        message_count=len(messages),
+        term_count=len(query.terms),
+        needs_body=needs_body,
+    )
+    for index, message in enumerate(messages):
         if is_cancelled is not None and is_cancelled():
+            search_trace(
+                "filter_messages_cancelled",
+                scanned=index,
+                message_count=len(messages),
+            )
             break
+        if search_debug_enabled() and index > 0 and index % 100 == 0:
+            search_trace(
+                "filter_messages_progress",
+                scanned=index,
+                message_count=len(messages),
+                matches=len(matched),
+            )
         uid = message.get("uid")
         body_text: str | None = None
         if needs_body and body_text_for_uid is not None and uid:
@@ -256,4 +276,9 @@ def filter_messages_by_query(
             for term in query.terms
         ):
             matched.append(message)
+    search_trace(
+        "filter_messages_done",
+        scanned=len(messages),
+        matches=len(matched),
+    )
     return matched
