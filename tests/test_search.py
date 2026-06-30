@@ -228,6 +228,75 @@ class FilterMessagesByQueryTests(unittest.TestCase):
         )
         self.assertEqual(matched, [])
 
+    def test_text_term_ignores_tracking_url_in_plain_when_html_is_clean(self) -> None:
+        query = parse_search_query("ewz")
+        assert query is not None
+        messages = [
+            {
+                "uid": "1",
+                "subject": "diyAudio notification",
+                "from": "diyAudio <contact@mail.diyaudio.com>",
+                "flags": {"seen": True},
+            },
+        ]
+
+        def body_text(_uid: str) -> str | None:
+            return searchable_body_text(
+                plain=(
+                    "View this direct message:\n"
+                    "https://www.diyaudio.com/direct-messages/abc?token=xEwzNoise"
+                ),
+                html=(
+                    "<p>pras1170 has sent you a direct message at diyAudio.</p>"
+                    "<p><a href=\"https://www.diyaudio.com/direct-messages/abc?"
+                    "token=xEwzNoise\">View this direct message</a></p>"
+                ),
+            )
+
+        matched = filter_messages_by_query(
+            messages,
+            query,
+            body_text_for_uid=body_text,
+        )
+        self.assertEqual(matched, [])
+
+    def test_text_term_prefers_visible_html_over_plain_urls(self) -> None:
+        query = parse_search_query("ewz")
+        assert query is not None
+        messages = [
+            {"uid": "1", "subject": "Newsletter", "flags": {"seen": True}},
+        ]
+
+        def body_text(_uid: str) -> str | None:
+            return searchable_body_text(
+                plain="https://news.example.com/track?payload=EwzToken",
+                html="<p>Contact the EWZ team about your project</p>",
+            )
+
+        matched = filter_messages_by_query(
+            messages,
+            query,
+            body_text_for_uid=body_text,
+        )
+        self.assertEqual([message["uid"] for message in matched], ["1"])
+
+    def test_text_term_ignores_opaque_substrings_in_plain_urls(self) -> None:
+        query = parse_search_query("ewz")
+        assert query is not None
+        messages = [{"uid": "1", "subject": "Hello", "flags": {"seen": True}}]
+
+        def body_text(_uid: str) -> str | None:
+            return searchable_body_text(
+                plain="Open this link: https://example.com/track?payload=xEwzNoise",
+            )
+
+        matched = filter_messages_by_query(
+            messages,
+            query,
+            body_text_for_uid=body_text,
+        )
+        self.assertEqual(matched, [])
+
     def test_text_term_matches_readable_html_body(self) -> None:
         query = parse_search_query("ewz")
         assert query is not None

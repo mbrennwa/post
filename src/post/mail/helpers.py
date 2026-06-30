@@ -525,6 +525,21 @@ _DATA_URI_CSS_URL = re.compile(
     r"url\(\s*['\"]?data:[^)'\"]+['\"]?\s*\)",
     re.IGNORECASE,
 )
+_SEARCH_URL_PATTERN = re.compile(
+    r"https?://[^\s<>'\"\)]+|mailto:[^\s<>'\"\)]+|www\.[^\s<>'\"\)]+",
+    re.IGNORECASE,
+)
+
+
+def _strip_search_body_noise(text: str) -> str:
+    text = _DATA_URI_BASE64.sub(" ", text)
+    text = _DATA_URI_CSS_URL.sub(" ", text)
+    text = _SEARCH_URL_PATTERN.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _plain_body_looks_like_html(text: str) -> bool:
+    return "<" in text and ">" in text and re.search(r"<\s*[a-zA-Z]", text) is not None
 
 
 def searchable_body_text(
@@ -533,13 +548,18 @@ def searchable_body_text(
     html: str | None = None,
 ) -> str:
     """Return human-readable body text for folder search."""
+    if html and html.strip():
+        cleaned = _DATA_URI_BASE64.sub("", html)
+        cleaned = _DATA_URI_CSS_URL.sub("", cleaned)
+        return _strip_search_body_noise(html_to_quotable_plain(cleaned))
     if plain and plain.strip():
-        return plain.strip()
-    if not html:
-        return ""
-    cleaned = _DATA_URI_BASE64.sub("", html)
-    cleaned = _DATA_URI_CSS_URL.sub("", cleaned)
-    return html_to_quotable_plain(cleaned)
+        body = plain.strip()
+        if _plain_body_looks_like_html(body):
+            cleaned = _DATA_URI_BASE64.sub("", body)
+            cleaned = _DATA_URI_CSS_URL.sub("", cleaned)
+            return _strip_search_body_noise(html_to_quotable_plain(cleaned))
+        return _strip_search_body_noise(body)
+    return ""
 
 
 def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:
