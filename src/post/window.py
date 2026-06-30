@@ -47,8 +47,14 @@ from post.mail.message_list_state import (
     message_list_fingerprint,
     prepended_message_count,
 )
-from post.mail.search import MessageSearchQuery, parse_search_query, query_requires_body_scan
-from post.mail.search import filter_messages_by_query
+from post.mail.search import (
+    MessageSearchQuery,
+    SearchFilterProgress,
+    filter_messages_by_query,
+    format_search_filter_progress,
+    parse_search_query,
+    query_requires_body_scan,
+)
 from post.mail.search_debug import search_trace, search_trace_timer
 from post.mail.operation_queue import offline_queue_status_text
 from post.mail.send_delay import OutboundSendDelayScheduler
@@ -105,6 +111,7 @@ log = logging.getLogger(__name__)
 MESSAGE_LIST_SYNC_STATUS = "Syncing with Server"
 
 _SIDEBAR_TOP_INSET = 12
+_SEARCH_PROGRESS_UI_INTERVAL_US = 100_000
 
 _MESSAGE_LIST_CSS = f"""
 listview.message-list row {{
@@ -213,6 +220,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._messages_load_expects_search = False
         self._pre_search_snapshot: tuple[list[dict], int, int, str] | None = None
         self._pre_search_folder: tuple[str, str] | None = None
+        self._search_progress_last_ui_time = 0
         self._offline_download_status = ""
         self._status_hint = ""
         self._network_available = Gio.NetworkMonitor.get_default().get_network_available()
@@ -318,6 +326,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_loading_spinner = Gtk.Spinner()
         self._message_loading_spinner.set_size_request(32, 32)
         loading_box.append(self._message_loading_spinner)
+        self._message_loading_progress = Gtk.ProgressBar()
+        self._message_loading_progress.set_show_text(False)
+        self._message_loading_progress.set_visible(False)
+        loading_box.append(self._message_loading_progress)
         self._message_loading_label = Gtk.Label(label="Loading Messages…")
         self._message_loading_label.set_wrap(True)
         self._message_loading_label.add_css_class("dim-label")
@@ -2425,6 +2437,48 @@ class MainWindow(Adw.ApplicationWindow):
             return f"{action} {display_folder} {detail}…"
         return f"{action} {display_folder}…"
 
+    def _reset_search_progress_ui(self) -> None:
+        self._message_loading_progress.set_visible(False)
+        self._message_loading_progress.set_fraction(0.0)
+        self._message_loading_spinner.set_visible(True)
+        self._search_progress_last_ui_time = 0
+
+    def _show_search_progress_ui(self, *, fraction: float, label: str) -> None:
+        self._message_loading_spinner.set_visible(False)
+        self._message_loading_progress.set_visible(True)
+        self._message_loading_progress.set_fraction(fraction)
+        self._message_loading_label.set_label(label)
+
+    def _report_search_progress(
+        self, load_id: int, progress: SearchFilterProgress
+    ) -> None:
+        GLib.idle_add(self._apply_search_progress, load_id, progress)
+
+    def _apply_search_progress(
+        self, load_id: int, progress: SearchFilterProgress
+    ) -> bool:
+        if load_id != self._messages_load_generation:
+            return False
+        if self._search_query is None:
+            return False
+        now = GLib.get_monotonic_time()
+        if (
+            progress.scanned < progress.message_count
+            and now - self._search_progress_last_ui_time
+            < _SEARCH_PROGRESS_UI_INTERVAL_US
+        ):
+            return False
+        self._search_progress_last_ui_time = now
+        progress_text = format_search_filter_progress(progress)
+        fraction = (
+            progress.scanned / progress.message_count
+            if progress.message_count > 0
+            else 0.0
+        )
+        self._show_search_progress_ui(fraction=fraction, label=progress_text)
+        self._set_status(progress_text)
+        return False
+
     def _message_load_status_detail(self) -> str:
         parts: list[str] = []
         if (
@@ -2494,6 +2548,9 @@ class MainWindow(Adw.ApplicationWindow):
         )
         from_label = account.email or account.display_label
 
+        def on_search_progress(progress: SearchFilterProgress) -> None:
+            self._report_search_progress(load_id, progress)
+
         def fetch_messages(sync_flag: bool) -> tuple[list[dict], int, int, str]:
             if viewing_outbox:
                 messages, unread, total = list_queued_messages(
@@ -2507,6 +2564,7 @@ class MainWindow(Adw.ApplicationWindow):
                     folder_name,
                     search_query,
                     sync=sync_flag,
+                    on_progress=on_search_progress,
                 )
                 return messages, unread, total, source
             messages, unread, total, source = self._mail.get_folder_messages(
@@ -2568,8 +2626,12 @@ class MainWindow(Adw.ApplicationWindow):
             and folder_index_has_cache(account_uid, folder_name)
         )
 
+        self._reset_search_progress_ui()
         self._message_loading_label.set_label(loading_label)
-        self._message_loading_spinner.start()
+        if search_query is not None:
+            self._show_search_progress_ui(fraction=0.0, label=loading_label)
+        else:
+            self._message_loading_spinner.start()
         self._message_stack.set_visible_child_name("loading")
 
         send_pending = self._mail.outbound_sends_pending()
@@ -2680,12 +2742,16 @@ class MainWindow(Adw.ApplicationWindow):
                     )
                     snapshot = load_folder_index_cache(account_uid, folder_name)
                     if snapshot is None:
+                        self._mail.cancel_folder_list()
                         get_mail_io_thread().submit_front(worker_initial)
                         return False
                     cached_messages, cached_unread, cached_total = snapshot
                     filtered = filter_messages_by_query(
                         list(cached_messages),
                         search_query,
+                        on_progress=lambda progress: self._report_search_progress(
+                            load_id, progress
+                        ),
                     )
                     self._on_messages_loaded(
                         load_id,
@@ -2702,6 +2768,8 @@ class MainWindow(Adw.ApplicationWindow):
 
                 GLib.idle_add(run_cached_header_search)
                 return
+            if search_query is not None:
+                self._mail.cancel_folder_list()
             search_trace("search_worker_submit_front", load_id=load_id)
             get_mail_io_thread().submit_front(worker_initial)
 
@@ -2859,6 +2927,7 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         self._message_loading_spinner.stop()
+        self._reset_search_progress_ui()
 
         if error is not None:
             if is_network_unavailable_error(error):

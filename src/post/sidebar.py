@@ -988,22 +988,32 @@ class MailSidebar:
             self._mail._register_folder_list_cancellable(cancellable)
             error: Exception | None = None
             folders: list[dict] | None = None
+            cancelled = False
             try:
                 if cancellable.is_cancelled():
-                    return
-                folders = self._mail.list_folders(
-                    account.uid, cancellable=cancellable
-                )
+                    cancelled = True
+                else:
+                    folders = self._mail.list_folders(
+                        account.uid, cancellable=cancellable
+                    )
             except GLib.Error as exc:
                 if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
-                    return
-                log_mail_error(log, f"Failed to list folders for {account.uid}", exc)
-                error = exc
+                    cancelled = True
+                else:
+                    log_mail_error(
+                        log, f"Failed to list folders for {account.uid}", exc
+                    )
+                    error = exc
             except Exception as exc:
                 log_mail_error(log, f"Failed to list folders for {account.uid}", exc)
                 error = exc
             finally:
                 self._mail._unregister_folder_list_cancellable(cancellable)
+            if cancelled:
+                GLib.idle_add(
+                    self._on_folder_load_cancelled, load_id, account.uid
+                )
+                return
             GLib.idle_add(
                 self._on_folders_loaded,
                 load_id,
@@ -1014,6 +1024,32 @@ class MailSidebar:
 
         get_mail_io_thread().submit_background(worker)
 
+    def _on_folder_load_cancelled(self, load_id: int, account_uid: str) -> bool:
+        if load_id != self._load_generation:
+            self._release_folder_load_slot()
+            return False
+        account = self._accounts_by_uid.get(account_uid)
+        if account is None:
+            self._release_folder_load_slot()
+            return False
+        GLib.timeout_add(250, self._retry_folder_load, load_id, account_uid)
+        return False
+
+    def _retry_folder_load(self, load_id: int, account_uid: str) -> bool:
+        if load_id != self._load_generation:
+            self._release_folder_load_slot()
+            return False
+        account = self._accounts_by_uid.get(account_uid)
+        if account is None:
+            self._release_folder_load_slot()
+            return False
+        self._start_folder_load(load_id, account)
+        return False
+
+    def _release_folder_load_slot(self) -> None:
+        self._folder_loads_pending = max(0, self._folder_loads_pending - 1)
+        self._maybe_finish_initial_folder_load()
+
     def _on_folders_loaded(
         self,
         load_id: int,
@@ -1022,10 +1058,12 @@ class MailSidebar:
         error: Exception | None,
     ) -> bool:
         if load_id != self._load_generation:
+            self._release_folder_load_slot()
             return False
 
         folder_list = self._folder_lists.get(account_uid)
         if folder_list is None:
+            self._release_folder_load_slot()
             return False
 
         self._clear_listbox(folder_list)

@@ -304,6 +304,34 @@ class FilterMessagesByQueryTests(unittest.TestCase):
         self.assertGreaterEqual(calls["count"], 5)
         self.assertLess(calls["count"], 100)
 
+    def test_reports_filter_progress(self) -> None:
+        from post.mail.search import SearchFilterProgress, format_search_filter_progress
+
+        query = parse_search_query("invoice")
+        assert query is not None
+        messages = [
+            {"uid": str(index), "subject": "monthly invoice", "flags": {}}
+            for index in range(250)
+        ]
+        seen: list[SearchFilterProgress] = []
+
+        matched = filter_messages_by_query(
+            messages,
+            query,
+            on_progress=seen.append,
+            progress_interval=100,
+        )
+
+        self.assertEqual(len(matched), 250)
+        self.assertEqual(seen[0], SearchFilterProgress(0, 250, 0))
+        self.assertEqual(seen[1], SearchFilterProgress(100, 250, 100))
+        self.assertEqual(seen[2], SearchFilterProgress(200, 250, 200))
+        self.assertEqual(seen[-1], SearchFilterProgress(250, 250, 250))
+        self.assertEqual(
+            format_search_filter_progress(seen[-1]),
+            "Searching… 250 / 250 · 250 matches",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
