@@ -130,6 +130,7 @@ from .offline_settings import apply_offline_settings_to_store, apply_offline_syn
 from .offline_sync import OfflineBodySyncCoordinator, OfflineSyncProgress
 from .search import (
     MessageSearchQuery,
+    SearchProgressCallback,
     filter_messages_by_query,
     query_requires_body_scan,
 )
@@ -334,12 +335,10 @@ class MailService:
             self._preempt_background_work,
             self.schedule_offline_body_sync,
         )
-        get_mail_io_thread().set_priority_preempt_callback(self.cancel_folder_list)
         self._mail_io_callbacks_registered = True
 
     def _preempt_background_work(self) -> None:
         self.cancel_folder_search()
-        self.cancel_folder_list()
         self.offline_sync.cancel_all()
         if self._sync_setup_cancel is not None:
             self._sync_setup_cancel()
@@ -2334,6 +2333,7 @@ class MailService:
         query: MessageSearchQuery,
         *,
         sync: bool,
+        on_progress: SearchProgressCallback | None = None,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
         cancellable = self._begin_folder_search_unlocked()
         try:
@@ -2406,6 +2406,7 @@ class MailService:
                     query,
                     body_text_for_uid=body_text_for_uid if needs_body else None,
                     is_cancelled=cancellable.is_cancelled,
+                    on_progress=on_progress,
                 )
                 if cancellable.is_cancelled():
                     search_trace(
@@ -2433,10 +2434,15 @@ class MailService:
         query: MessageSearchQuery,
         *,
         sync: bool = False,
+        on_progress: SearchProgressCallback | None = None,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
         if is_mail_io_thread():
             return self._search_folder_messages_unlocked(
-                account_uid, folder_name, query, sync=sync
+                account_uid,
+                folder_name,
+                query,
+                sync=sync,
+                on_progress=on_progress,
             )
         return get_mail_io_thread().run_sync(
             self._search_folder_messages_unlocked,
@@ -2444,6 +2450,7 @@ class MailService:
             folder_name,
             query,
             sync=sync,
+            on_progress=on_progress,
         )
 
     def list_messages_with_stats(

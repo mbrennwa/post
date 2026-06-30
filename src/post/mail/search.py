@@ -12,6 +12,25 @@ from dataclasses import dataclass
 
 from post.mail.search_debug import search_debug_enabled, search_trace
 
+SEARCH_FILTER_PROGRESS_INTERVAL = 100
+
+SearchProgressCallback = Callable[["SearchFilterProgress"], None]
+
+
+@dataclass(frozen=True)
+class SearchFilterProgress:
+    scanned: int
+    message_count: int
+    matches: int
+
+
+def format_search_filter_progress(progress: SearchFilterProgress) -> str:
+    match_word = "match" if progress.matches == 1 else "matches"
+    return (
+        f"Searching… {progress.scanned:,} / {progress.message_count:,}"
+        f" · {progress.matches:,} {match_word}"
+    )
+
 # Optional whitespace after ":" so "subject: Auburn" works like "subject:Auburn".
 _QUERY_PATTERN = re.compile(
     r"""
@@ -237,6 +256,8 @@ def filter_messages_by_query(
     *,
     body_text_for_uid: Callable[[str], str | None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    on_progress: SearchProgressCallback | None = None,
+    progress_interval: int = SEARCH_FILTER_PROGRESS_INTERVAL,
 ) -> list[dict]:
     """Filter folder index messages locally, checking cancellation between body loads."""
     if not query.terms:
@@ -244,25 +265,36 @@ def filter_messages_by_query(
 
     needs_body = query_requires_body_scan(query)
     matched: list[dict] = []
+    message_count = len(messages)
     search_trace(
         "filter_messages_begin",
-        message_count=len(messages),
+        message_count=message_count,
         term_count=len(query.terms),
         needs_body=needs_body,
     )
+    if on_progress is not None and message_count > 0:
+        on_progress(SearchFilterProgress(0, message_count, 0))
     for index, message in enumerate(messages):
         if is_cancelled is not None and is_cancelled():
             search_trace(
                 "filter_messages_cancelled",
                 scanned=index,
-                message_count=len(messages),
+                message_count=message_count,
             )
             break
-        if search_debug_enabled() and index > 0 and index % 100 == 0:
+        if (
+            on_progress is not None
+            and index > 0
+            and index % progress_interval == 0
+        ):
+            on_progress(
+                SearchFilterProgress(index, message_count, len(matched))
+            )
+        if search_debug_enabled() and index > 0 and index % progress_interval == 0:
             search_trace(
                 "filter_messages_progress",
                 scanned=index,
-                message_count=len(messages),
+                message_count=message_count,
                 matches=len(matched),
             )
         uid = message.get("uid")
@@ -276,9 +308,13 @@ def filter_messages_by_query(
             for term in query.terms
         ):
             matched.append(message)
+    if on_progress is not None and message_count > 0:
+        on_progress(
+            SearchFilterProgress(message_count, message_count, len(matched))
+        )
     search_trace(
         "filter_messages_done",
-        scanned=len(messages),
+        scanned=message_count,
         matches=len(matched),
     )
     return matched

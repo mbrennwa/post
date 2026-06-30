@@ -106,7 +106,6 @@ class MailIoThread:
         self._background_preempted = False
         self._on_background_preempt: Callable[[], None] | None = None
         self._on_background_resume: Callable[[], None] | None = None
-        self._on_priority_preempt: Callable[[], None] | None = None
         self._ready = threading.Event()
         self._thread = threading.Thread(
             target=self._thread_main,
@@ -125,18 +124,9 @@ class MailIoThread:
             self._on_background_preempt = on_preempt
             self._on_background_resume = on_resume
 
-    def set_priority_preempt_callback(
-        self, on_priority_preempt: Callable[[], None] | None
-    ) -> None:
-        with self._lock:
-            self._on_priority_preempt = on_priority_preempt
-
     def _enqueue_interactive(self, task: _IoTask, *, front: bool = False) -> None:
         preempt: Callable[[], None] | None = None
-        priority_preempt: Callable[[], None] | None = None
         with self._work_available:
-            if front and self._on_priority_preempt is not None:
-                priority_preempt = self._on_priority_preempt
             if (
                 self._current_is_background
                 and self._on_background_preempt is not None
@@ -149,8 +139,6 @@ class MailIoThread:
             else:
                 self._interactive.append(task)
             self._work_available.notify()
-        if priority_preempt is not None:
-            priority_preempt()
         if preempt is not None:
             preempt()
 
