@@ -653,7 +653,23 @@ class BuildReaderDocumentTests(unittest.TestCase):
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
         self.assertIn('class="post-adapt-text"', doc)
-        self.assertIn(".message-body a.post-adapt-text", doc)
+        self.assertIn(".message-body .post-adapt-text", doc)
+
+    def test_adapt_text_adapts_table_color_with_unstyled_cells(self) -> None:
+        doc = build_reader_document(
+            body_html=(
+                '<table style="color:#000000">'
+                "<tr><td>Dear Sir or Madam,</td></tr>"
+                "</table>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('class="post-adapt-text"', doc)
+        self.assertIn(".message-body .post-adapt-text", doc)
+        self.assertIn("color: inherit !important", doc)
 
     def test_adapt_text_renders_attachment_placeholder_with_brackets(self) -> None:
         doc = build_reader_document(

@@ -202,6 +202,9 @@ span.post-bracketed {
 """
 
 _ADAPT_TEXT_CSS = """
+.message-body .post-adapt-text {
+  color: inherit !important;
+}
 .message-body :where(
   p, div, span, li, td, th, font, blockquote, pre,
   h1, h2, h3, h4, h5, h6
@@ -212,9 +215,6 @@ _ADAPT_TEXT_CSS = """
   p, div, span, li, td, th, font, blockquote, pre,
   h1, h2, h3, h4, h5, h6
 ):not(.post-keep-color) {
-  color: inherit !important;
-}
-.message-body a.post-adapt-text {
   color: inherit !important;
 }
 """
