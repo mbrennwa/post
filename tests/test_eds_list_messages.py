@@ -7,7 +7,6 @@ import unittest
 from unittest import mock
 
 from post.mail.eds import MailService
-from post.mail.search import MessageSearchQuery, SearchTerm
 
 
 class ListMessagesPageDispatchTests(unittest.TestCase):
@@ -70,6 +69,7 @@ class ListFoldersDispatchTests(unittest.TestCase):
         run_on_mail_thread.assert_called_once_with(
             service._list_folders_unlocked,
             "acct-1",
+            cancellable=None,
         )
         self.assertEqual(result, [{"full_name": "INBOX"}])
 
@@ -85,7 +85,7 @@ class ListFoldersDispatchTests(unittest.TestCase):
         ) as unlocked:
             result = service.list_folders("acct-1")
 
-        unlocked.assert_called_once_with("acct-1")
+        unlocked.assert_called_once_with("acct-1", cancellable=None)
         self.assertEqual(result, expected)
 
 
@@ -119,31 +119,6 @@ class ReadPathDispatchTests(unittest.TestCase):
             "INBOX",
         )
         self.assertEqual(result, (3, 10))
-
-    @mock.patch("post.mail.eds.run_on_mail_thread")
-    def test_search_messages_page_uses_mail_thread(self, run_on_mail_thread) -> None:
-        run_on_mail_thread.return_value = ([], 0, 0, False)
-        service = MailService(registry=mock.Mock())
-        query = MessageSearchQuery(terms=(SearchTerm(field="text", value="hello"),))
-
-        service.search_messages_page(
-            "acct-1",
-            "INBOX",
-            query,
-            offset=5,
-            limit=20,
-            sync=False,
-        )
-
-        run_on_mail_thread.assert_called_once_with(
-            service._search_messages_page_unlocked,
-            "acct-1",
-            "INBOX",
-            query,
-            offset=5,
-            limit=20,
-            sync=False,
-        )
 
 
 class FolderStatsOfflineFallbackTests(unittest.TestCase):

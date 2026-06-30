@@ -128,7 +128,12 @@ from .folders import (
 from post.preferences import get_account_user_online
 from .offline_settings import apply_offline_settings_to_store, apply_offline_sync_to_folder
 from .offline_sync import OfflineBodySyncCoordinator, OfflineSyncProgress
-from .search import MessageSearchQuery, filter_messages_by_query, query_to_sexp
+from .search import (
+    MessageSearchQuery,
+    filter_messages_by_query,
+    query_requires_body_scan,
+)
+from .search_debug import search_trace, search_trace_timer
 
 log = logging.getLogger(__name__)
 
@@ -306,6 +311,15 @@ class MailService:
     _folder_search_state_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
+    _sync_setup_cancel: Callable[[], None] | None = field(
+        default=None, init=False, repr=False
+    )
+    _folder_list_cancellable: Gio.Cancellable | None = field(
+        default=None, init=False, repr=False
+    )
+    _folder_list_state_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
 
     @property
     def offline_sync(self) -> OfflineBodySyncCoordinator:
@@ -320,17 +334,55 @@ class MailService:
             self._preempt_background_work,
             self.schedule_offline_body_sync,
         )
+        get_mail_io_thread().set_priority_preempt_callback(self.cancel_folder_list)
         self._mail_io_callbacks_registered = True
 
     def _preempt_background_work(self) -> None:
         self.cancel_folder_search()
+        self.cancel_folder_list()
         self.offline_sync.cancel_all()
+        if self._sync_setup_cancel is not None:
+            self._sync_setup_cancel()
+
+    def cancel_folder_list(self) -> None:
+        with self._folder_list_state_lock:
+            cancellable = self._folder_list_cancellable
+            self._folder_list_cancellable = None
+        if cancellable is not None:
+            search_trace("folder_list_cancel")
+            cancellable.cancel()
+
+    def _register_folder_list_cancellable(
+        self, cancellable: Gio.Cancellable
+    ) -> None:
+        with self._folder_list_state_lock:
+            previous = self._folder_list_cancellable
+            self._folder_list_cancellable = cancellable
+        if previous is not None and previous is not cancellable:
+            previous.cancel()
+
+    def _unregister_folder_list_cancellable(
+        self, cancellable: Gio.Cancellable
+    ) -> None:
+        with self._folder_list_state_lock:
+            if self._folder_list_cancellable is cancellable:
+                self._folder_list_cancellable = None
+
+    def set_sync_setup_cancel_callback(
+        self, callback: Callable[[], None] | None
+    ) -> None:
+        self._sync_setup_cancel = callback
 
     def cancel_folder_search(self) -> None:
         """Abort an in-flight Camel folder search so interactive reads can proceed."""
         with self._folder_search_state_lock:
             cancellable = self._folder_search_cancellable
             self._folder_search_cancellable = None
+        search_trace(
+            "search_cancel",
+            had_cancellable=cancellable is not None,
+            was_cancelled=cancellable.is_cancelled() if cancellable is not None else None,
+        )
         if cancellable is not None:
             cancellable.cancel()
 
@@ -745,6 +797,35 @@ class MailService:
         """Return a connected store for sync signal wiring."""
         return self.get_store(account_uid)
 
+    def get_store_for_sync_if_ready(self, account_uid: str) -> Camel.Store | None:
+        """Return a connected store without opening a new connection."""
+        with self._lock:
+            store = self._stores.get(account_uid)
+        if store is None:
+            return None
+        if (
+            store.get_connection_status()
+            != Camel.ServiceConnectionStatus.CONNECTED
+        ):
+            return None
+        return store
+
+    def seed_folder_index(
+        self,
+        account_uid: str,
+        folder_name: str,
+        messages: list[dict],
+        unread: int,
+        total: int,
+    ) -> None:
+        """Install a folder index from disk cache without touching Camel."""
+        with self._lock:
+            self._folder_indexes[(account_uid, folder_name)] = _FolderMessageIndex(
+                messages=list(messages),
+                unread=unread,
+                total=total,
+            )
+
     def invalidate_folder_index(self, account_uid: str, folder_name: str) -> None:
         with self._lock:
             self._invalidate_folder_index(account_uid, folder_name)
@@ -761,6 +842,14 @@ class MailService:
             return guess_inbox_name(cached)
         return guess_inbox_name(self.list_folders(account_uid))
 
+    def get_inbox_folder_name_cached(self, account_uid: str) -> str | None:
+        """Return INBOX from cache, or ``INBOX`` without a server folder list."""
+        with self._lock:
+            cached = self._folder_tree_cache.get(account_uid)
+        if cached is not None:
+            return guess_inbox_name(cached)
+        return "INBOX"
+
     def prepare_account_credentials(self, account_uid: str) -> None:
         """Refresh GOA tokens before mail I/O (may show account sign-in UI)."""
         source = self.registry.ref_source(account_uid)
@@ -776,11 +865,16 @@ class MailService:
         if source.has_extension("GNOME Online Accounts"):
             ensure_goa_credentials(self.registry, source, None)
 
-    def _get_store_unlocked(self, account_uid: str) -> Camel.Store:
+    def _get_store_unlocked(
+        self,
+        account_uid: str,
+        *,
+        cancellable: Gio.Cancellable | None = None,
+    ) -> Camel.Store:
         if account_uid in self._stores:
             store = self._stores[account_uid]
             if store.get_connection_status() == Camel.ServiceConnectionStatus.CONNECTED:
-                self._sync_store_online_state_unlocked(store)
+                self._sync_store_online_state_unlocked(store, cancellable=cancellable)
                 self._configure_store_settings_unlocked(store, account_uid)
                 return store
             del self._stores[account_uid]
@@ -801,17 +895,22 @@ class MailService:
         source.camel_configure_service(service)
         store = service
 
-        self._sync_store_online_state_unlocked(store)
+        self._sync_store_online_state_unlocked(store, cancellable=cancellable)
 
         self._configure_store_settings_unlocked(store, account_uid)
         self._stores[account_uid] = store
         return store
 
-    def _sync_store_online_state_unlocked(self, store: Camel.Store) -> None:
+    def _sync_store_online_state_unlocked(
+        self,
+        store: Camel.Store,
+        *,
+        cancellable: Gio.Cancellable | None = None,
+    ) -> None:
         if isinstance(store, Camel.OfflineStore):
-            store.set_online_sync(self._network_available, None)
+            store.set_online_sync(self._network_available, cancellable)
         elif self._network_available:
-            store.connect_sync(None)
+            store.connect_sync(cancellable)
 
     @staticmethod
     def _configure_store_settings_unlocked(
@@ -1770,10 +1869,21 @@ class MailService:
         correspondents = collect_correspondents(messages, exclude_emails=exclude_emails)
         return correspondents[:_MAX_CORRESPONDENTS]
 
-    def list_folders(self, account_uid: str) -> list[dict]:
+    def list_folders(
+        self,
+        account_uid: str,
+        *,
+        cancellable: Gio.Cancellable | None = None,
+    ) -> list[dict]:
         if is_mail_io_thread():
-            return self._list_folders_unlocked(account_uid)
-        return run_on_mail_thread(self._list_folders_unlocked, account_uid)
+            return self._list_folders_unlocked(
+                account_uid, cancellable=cancellable
+            )
+        return run_on_mail_thread(
+            self._list_folders_unlocked,
+            account_uid,
+            cancellable=cancellable,
+        )
 
     def _list_folders_from_local_store_unlocked(
         self, account_uid: str
@@ -1855,7 +1965,17 @@ class MailService:
 
         return []
 
-    def _list_folders_unlocked(self, account_uid: str) -> list[dict]:
+    def _list_folders_unlocked(
+        self,
+        account_uid: str,
+        *,
+        cancellable: Gio.Cancellable | None = None,
+    ) -> list[dict]:
+        if cancellable is not None and cancellable.is_cancelled():
+            with self._lock:
+                cached = self._folder_tree_cache.get(account_uid)
+            return list(cached) if cached is not None else []
+
         with self._lock:
             cached = self._folder_tree_cache.get(account_uid)
 
@@ -1872,7 +1992,9 @@ class MailService:
             with self._lock:
                 store = self._get_store_unlocked(account_uid)
             root = store.get_folder_info_sync(
-                None, Camel.StoreGetFolderInfoFlags.RECURSIVE, None
+                None,
+                Camel.StoreGetFolderInfoFlags.RECURSIVE,
+                cancellable,
             )
             folders: list[dict] = []
             if root is not None:
@@ -1882,6 +2004,11 @@ class MailService:
                 self._folder_tree_cache[account_uid] = result
             return result
         except GLib.Error as exc:
+            if cancellable is not None and exc.matches(
+                Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
+            ):
+                search_trace("folder_list_cancelled", account=account_uid)
+                return list(cached) if cached is not None else []
             if cached is not None and is_network_unavailable_error(exc):
                 log.debug(
                     "Using cached folder list for account %s while offline",
@@ -2210,50 +2337,92 @@ class MailService:
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
         cancellable = self._begin_folder_search_unlocked()
         try:
-            with self._lock:
-                key = (account_uid, folder_name)
-                index = self._folder_indexes.get(key)
-                if index is None:
-                    index, source = self._get_folder_index_unlocked(
-                        account_uid, folder_name, sync=False
+            with search_trace_timer(
+                "search_folder",
+                account=account_uid,
+                folder=folder_name,
+                terms=len(query.terms),
+            ):
+                with self._lock:
+                    key = (account_uid, folder_name)
+                    index = self._folder_indexes.get(key)
+                    if index is None:
+                        search_trace(
+                            "search_index_load",
+                            account=account_uid,
+                            folder=folder_name,
+                            source="missing_memory",
+                        )
+                        index, source = self._get_folder_index_unlocked(
+                            account_uid, folder_name, sync=False
+                        )
+                    else:
+                        source = "memory"
+                    messages = list(index.messages)
+                    unread = index.unread
+
+                needs_body = query_requires_body_scan(query)
+                folder = (
+                    self._try_get_folder_for_search_unlocked(
+                        account_uid, folder_name
                     )
-                else:
-                    source = "memory"
-
-                folder = self._require_folder_unlocked(account_uid, folder_name)
-                messages = list(index.messages)
-                unread = index.unread
-
-
-            def body_text_for_uid(uid: str) -> str | None:
-                if cancellable.is_cancelled():
-                    return None
-                from .helpers import extract_message_bodies, searchable_body_text
-
-                try:
-                    api_uid = camel_uid_to_api(uid)
-                    mime = folder.get_message_cached(api_uid, None)
-                    if mime is None:
-                        return None
-                except Exception:
-                    return None
-                bodies = extract_message_bodies(mime)
-                return searchable_body_text(
-                    plain=bodies.get("plain"),
-                    html=bodies.get("html"),
+                    if needs_body
+                    else None
+                )
+                search_trace(
+                    "search_filter_begin",
+                    account=account_uid,
+                    folder=folder_name,
+                    message_count=len(messages),
+                    needs_body=needs_body,
+                    has_folder=folder is not None,
+                    source=source,
                 )
 
-            filtered = filter_messages_by_query(
-                messages,
-                query,
-                body_text_for_uid=body_text_for_uid,
-                is_cancelled=cancellable.is_cancelled,
-            )
-            if cancellable.is_cancelled():
-                return [], unread, 0, source
+                def body_text_for_uid(uid: str) -> str | None:
+                    if (
+                        not needs_body
+                        or folder is None
+                        or cancellable.is_cancelled()
+                    ):
+                        return None
+                    from .helpers import extract_message_bodies, searchable_body_text
 
-            match_count = len(filtered)
-            return filtered, unread, match_count, source
+                    try:
+                        api_uid = camel_uid_to_api(uid)
+                        mime = folder.get_message_cached(api_uid, None)
+                        if mime is None:
+                            return None
+                    except Exception:
+                        return None
+                    bodies = extract_message_bodies(mime)
+                    return searchable_body_text(
+                        plain=bodies.get("plain"),
+                        html=bodies.get("html"),
+                    )
+
+                filtered = filter_messages_by_query(
+                    messages,
+                    query,
+                    body_text_for_uid=body_text_for_uid if needs_body else None,
+                    is_cancelled=cancellable.is_cancelled,
+                )
+                if cancellable.is_cancelled():
+                    search_trace(
+                        "search_filter_cancelled",
+                        account=account_uid,
+                        folder=folder_name,
+                    )
+                    return [], unread, 0, source
+
+                match_count = len(filtered)
+                search_trace(
+                    "search_filter_result",
+                    account=account_uid,
+                    folder=folder_name,
+                    match_count=match_count,
+                )
+                return filtered, unread, match_count, source
         finally:
             self._end_folder_search_unlocked(cancellable)
 
@@ -2287,57 +2456,6 @@ class MailService:
             account_uid, folder_name, offset=0, limit=limit
         )
         return messages, unread, total
-
-    def search_messages_page(
-        self,
-        account_uid: str,
-        folder_name: str,
-        query: MessageSearchQuery,
-        *,
-        offset: int = 0,
-        limit: int = DEFAULT_MESSAGE_PAGE_SIZE,
-        sync: bool = False,
-    ) -> tuple[list[dict], int, int, bool]:
-        return run_on_mail_thread(
-            self._search_messages_page_unlocked,
-            account_uid,
-            folder_name,
-            query,
-            offset=offset,
-            limit=limit,
-            sync=sync,
-        )
-
-    def _search_messages_page_unlocked(
-        self,
-        account_uid: str,
-        folder_name: str,
-        query: MessageSearchQuery,
-        *,
-        offset: int,
-        limit: int,
-        sync: bool,
-    ) -> tuple[list[dict], int, int, bool]:
-        with self._lock:
-            key = (account_uid, folder_name)
-            index = self._folder_indexes.get(key)
-            if index is None:
-                index, _source = self._get_folder_index_unlocked(
-                    account_uid, folder_name, sync=False
-                )
-
-            folder = self._require_folder_unlocked(account_uid, folder_name)
-            uid_set = self._folder_search_uids_unlocked(
-                folder,
-                query_to_sexp(query),
-                self._index_message_uids(index),
-            )
-            filtered = [
-                msg for msg in index.messages if msg.get("uid") in uid_set
-            ]
-            page, has_more = paginate_messages(filtered, offset, limit)
-            match_count = len(filtered)
-            return page, match_count, match_count, has_more
 
     def _list_messages_page_unlocked(
         self,
@@ -2489,6 +2607,38 @@ class MailService:
                     folder_name,
                     account_uid,
                 )
+                return None
+            raise
+
+    def _try_get_folder_for_search_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> Camel.Folder | None:
+        """Open a folder only when its store is already connected (no connect_sync)."""
+        with self._lock:
+            store = self._stores.get(account_uid)
+        if store is None:
+            search_trace(
+                "search_folder_skip",
+                account=account_uid,
+                folder=folder_name,
+                reason="store_not_open",
+            )
+            return None
+        if (
+            store.get_connection_status()
+            != Camel.ServiceConnectionStatus.CONNECTED
+        ):
+            search_trace(
+                "search_folder_skip",
+                account=account_uid,
+                folder=folder_name,
+                reason="store_not_connected",
+            )
+            return None
+        try:
+            return store.get_folder_sync(folder_name, 0, None)
+        except GLib.Error as exc:
+            if self._is_missing_folder_error(exc):
                 return None
             raise
 

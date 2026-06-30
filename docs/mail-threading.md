@@ -23,7 +23,8 @@ Post runs blocking Camel / Evolution Data Server (EDS) work on a **single dedica
 4. **Password / OAuth prompts** — use `GLib.idle_add` to show dialogs on the GTK thread; mail thread waits on the result.
 5. **Outbound send** — compose persists to outbox first, then delivers via Camel `transport.send_to_sync` on the mail I/O thread. No `smtplib` send path.
 6. **Offline body download** — `OfflineBodySyncCoordinator` runs `downsync_sync` on the mail I/O thread only. See [offline-body-cache.md](offline-body-cache.md).
-7. **Search** — all folder search runs on the mail I/O thread via `query_to_sexp()` and `camel_folder_search_by_expression()` (libcamel). See [offline-body-cache.md](offline-body-cache.md).
+7. **Sync watcher setup** — `MailSyncWatcher` store/folder signal wiring runs as **background** mail-I/O work so folder search can preempt it.
+8. **Search** — interactive mail-I/O work: filter the in-memory folder index (`filter_messages_by_query`), loading cached MIME for body terms. Cancellable; preempts offline downsync. See [offline-body-cache.md](offline-body-cache.md).
 
 ## Debugging
 
@@ -34,6 +35,14 @@ POST_LOG_LEVEL=DEBUG PYTHONPATH=src python3 -m post.main
 # or
 POST_LOG_LEVEL=DEBUG ./run.sh
 ```
+
+For folder search diagnostics (#120), also set `POST_DEBUG_SEARCH=1` (or use `POST_LOG_LEVEL=DEBUG`):
+
+```bash
+POST_DEBUG_SEARCH=1 PYTHONPATH=src python3 -m post.main
+```
+
+Search trace lines use the `post.search` logger and show load scheduling, mail-thread work, filter progress, and UI callback drops.
 
 Default log level is quiet (no console handler unless `POST_LOG_LEVEL` is set).
 

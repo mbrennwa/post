@@ -12,15 +12,17 @@ from dataclasses import dataclass, field
 import gi
 
 gi.require_version("Camel", "1.2")
+gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
 gi.require_version("GObject", "2.0")
 
-from gi.repository import Camel, GLib, GObject
+from gi.repository import Camel, Gio, GLib, GObject
 
 from .eds import MailService
 from .folders import is_post_local_folder
 from .io_thread import get_mail_io_thread
 from .offline_settings import account_is_user_offline
+from .search_debug import search_trace
 from .send_queue import is_network_unavailable_error, log_mail_error
 
 log = logging.getLogger(__name__)
@@ -63,6 +65,13 @@ class MailSyncWatcher:
         self._folder_to_account: dict[int, tuple[str, str]] = {}
         self._debounce_ids: dict[tuple[str, str], int] = {}
         self._setup_generation = 0
+        self._setup_cancellable: Gio.Cancellable | None = None
+
+    def cancel_setup(self) -> None:
+        cancellable = self._setup_cancellable
+        if cancellable is not None:
+            search_trace("sync_watcher_setup_cancel")
+            cancellable.cancel()
 
     @property
     def running(self) -> bool:
@@ -107,33 +116,57 @@ class MailSyncWatcher:
         current_folder_name = self._current_folder_name
 
         def worker() -> None:
+            cancellable = Gio.Cancellable()
+            self._setup_cancellable = cancellable
+            search_trace("sync_watcher_setup_start", generation=generation)
             setups: list[tuple[str, Camel.Store, str | None, str | None]] = []
-            for account_uid in account_uids:
-                if account_is_user_offline(account_uid):
-                    continue
-                inbox_name: str | None = None
-                current_name: str | None = None
-                try:
-                    store = self._mail.get_store_for_sync(account_uid)
-                    inbox_name = self._mail.get_inbox_folder_name(account_uid)
+            try:
+                for account_uid in account_uids:
+                    if cancellable.is_cancelled():
+                        search_trace(
+                            "sync_watcher_setup_aborted",
+                            generation=generation,
+                            reason="cancelled",
+                        )
+                        return
+                    if get_mail_io_thread().has_interactive_work_pending():
+                        search_trace(
+                            "sync_watcher_setup_yield",
+                            generation=generation,
+                        )
+                        return
+                    if account_is_user_offline(account_uid):
+                        continue
+                    inbox_name: str | None = None
+                    current_name: str | None = None
+                    store = self._mail.get_store_for_sync_if_ready(account_uid)
+                    if store is None:
+                        search_trace(
+                            "sync_watcher_setup_skip_account",
+                            account=account_uid,
+                            reason="store_not_ready",
+                        )
+                        continue
+                    inbox_name = self._mail.get_inbox_folder_name_cached(account_uid)
                     if account_uid == current_account_uid and current_folder_name:
                         current_name = current_folder_name
-                except Exception as exc:
-                    log_mail_error(
-                        log,
-                        f"Could not prepare sync watch for account {account_uid}",
-                        exc,
-                    )
-                    continue
-                setups.append((account_uid, store, inbox_name, current_name))
+                    setups.append((account_uid, store, inbox_name, current_name))
+            finally:
+                if self._setup_cancellable is cancellable:
+                    self._setup_cancellable = None
 
+            search_trace(
+                "sync_watcher_setup_idle_add",
+                generation=generation,
+                account_count=len(setups),
+            )
             GLib.idle_add(
                 self._apply_setup,
                 generation,
                 setups,
             )
 
-        get_mail_io_thread().submit(worker)
+        get_mail_io_thread().submit_background(worker)
 
     def _apply_setup(
         self,

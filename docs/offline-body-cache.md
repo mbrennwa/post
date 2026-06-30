@@ -26,11 +26,11 @@ On first launch, Post offers a one-time prompt to enable offline download.
 - **`post.preferences`** — per-account `offline_body_sync` in `~/.config/post/preferences.json`
 - **`post.mail.offline_settings`** — maps preferences to `Camel.OfflineSettings` and folder `offline_sync`
 - **`post.mail.offline_sync`** — background `OfflineFolder.downsync_sync()` on the mail I/O thread
-- **`post.mail.search`** — `query_to_sexp()` compiles the search bar DSL to Camel S-expressions; all search runs via `camel_folder_search_by_expression()` (libcamel, not PyGObject `FolderSearch.search()`, which corrupts Camel's UID string pool on repeated searches)
+- **`post.mail.search`** — `parse_search_query()` and `filter_messages_by_query()` filter the in-memory folder index; bare-word and `body:` terms load cached MIME and match via `searchable_body_text()` (human-readable body text, not raw base64 — [#111](https://github.com/mbrennwa/post/issues/111)). `query_to_sexp()` remains for libcamel integration tests.
 
 ## Search
 
-All search (headers, flags, body) goes through Camel `search_by_expression`. Bare words match headers **and** body.
+Folder search filters the in-memory folder index. Header and flag terms match index metadata directly. Bare-word and `body:` terms load cached MIME and match human-readable body text via `searchable_body_text()`.
 
 Limits: per-folder only; attachment content not searched; offline body matches require cached MIME.
 

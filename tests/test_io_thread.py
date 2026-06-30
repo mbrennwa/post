@@ -145,6 +145,17 @@ class MailIoThreadTests(unittest.TestCase):
         self._io.run_sync(lambda: None)
         self.assertFalse(self._io.has_interactive_work_pending())
 
+    def test_submit_front_invokes_priority_preempt(self) -> None:
+        preempted = threading.Event()
+
+        def on_priority_preempt() -> None:
+            preempted.set()
+
+        self._io.set_priority_preempt_callback(on_priority_preempt)
+        self._io.submit_front(lambda: None)
+        self.assertTrue(preempted.wait(timeout=5.0))
+        self._io.set_priority_preempt_callback(None)
+
     def test_interactive_preempts_running_background(self) -> None:
         gate = threading.Event()
         started = threading.Event()
