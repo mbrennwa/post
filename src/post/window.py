@@ -82,6 +82,7 @@ from post.mail.helpers import (
     read_menu_items,
     read_menu_label,
     reader_toggle_button_state,
+    write_temp_attachment,
 )
 from post.reader import build_reader_document
 from post.wrap_label import WrappingLabel, configure_ellipsize_label, set_label_wrap_mode
@@ -2129,7 +2130,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         try:
-            path = self._write_temp_attachment(filename, data)
+            path = write_temp_attachment(filename, data)
             file = Gio.File.new_for_path(path)
             Gio.AppInfo.launch_default_for_uri(file.get_uri(), None)
         except (OSError, GLib.Error) as exc:
@@ -2198,7 +2199,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         try:
-            path = self._write_temp_attachment(filename, data)
+            path = write_temp_attachment(filename, data)
         except OSError as exc:
             show_error_toast(self, f"Could not open attachment: {exc}")
             return
@@ -2241,22 +2242,6 @@ class MainWindow(Adw.ApplicationWindow):
             return mime_hint
         guessed, _certain = Gio.content_type_guess(filename, data)
         return guessed or "application/octet-stream"
-
-    @staticmethod
-    def _write_temp_attachment(filename: str, data: bytes) -> str:
-        directory = os.path.join(GLib.get_tmp_dir(), "post")
-        os.makedirs(directory, exist_ok=True)
-        basename = os.path.basename(filename.replace("/", "_").replace("\\", "_")) or "attachment"
-        path = os.path.join(directory, basename)
-        if os.path.exists(path):
-            stem, ext = os.path.splitext(basename)
-            counter = 1
-            while os.path.exists(path):
-                path = os.path.join(directory, f"{stem}-{counter}{ext}")
-                counter += 1
-        with open(path, "wb") as handle:
-            handle.write(data)
-        return path
 
     def _on_refresh(self, *_args) -> None:
         if self._current_account and self._current_folder:

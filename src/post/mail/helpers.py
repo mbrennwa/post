@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import html
+import os
 import re
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -1024,6 +1025,28 @@ def format_attachment_size(size: int | None) -> str:
     if size < 1024 * 1024:
         return f"{size / 1024:.1f} KB"
     return f"{size / (1024 * 1024):.1f} MB"
+
+
+def write_temp_attachment(filename: str, data: bytes) -> str:
+    """Write attachment bytes to a temp file and return its path."""
+    import gi
+
+    gi.require_version("GLib", "2.0")
+    from gi.repository import GLib
+
+    directory = os.path.join(GLib.get_tmp_dir(), "post")
+    os.makedirs(directory, exist_ok=True)
+    basename = os.path.basename(filename.replace("/", "_").replace("\\", "_")) or "attachment"
+    path = os.path.join(directory, basename)
+    if os.path.exists(path):
+        stem, ext = os.path.splitext(basename)
+        counter = 1
+        while os.path.exists(path):
+            path = os.path.join(directory, f"{stem}-{counter}{ext}")
+            counter += 1
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return path
 
 
 def _decode_text_part(part: Any) -> str | None:

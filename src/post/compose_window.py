@@ -46,7 +46,7 @@ from post.mail.compose import (
     quote_plain_reply,
     validate_compose_mime_fields,
 )
-from post.mail.helpers import format_attachment_size
+from post.mail.helpers import format_attachment_size, write_temp_attachment
 from post.mail.correspondents import (
     Correspondent,
     apply_address_completion,
@@ -476,10 +476,14 @@ class ComposeWindow(Adw.Window):
         self._send_btn.add_css_class("suggested-action")
         self._send_btn.connect("clicked", self._on_send_clicked)
 
+        self._attach_files_btn = Gtk.Button(label="Attach Files")
+        self._attach_files_btn.connect("clicked", self._on_attach_clicked)
+
         send_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         send_actions.add_css_class("linked")
         send_actions.append(self._send_btn)
         send_actions.append(self._save_draft_btn)
+        send_actions.append(self._attach_files_btn)
         header.pack_start(send_actions)
 
         scrolled = Gtk.ScrolledWindow()
@@ -566,6 +570,10 @@ class ComposeWindow(Adw.Window):
         self._subject_entry.add_controller(subject_focus)
         form.append(self._labeled_row("Subject", self._subject_entry))
 
+        self._attachments_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._attachments_box.set_visible(False)
+        form.append(self._attachments_box)
+
         self._body_view = Gtk.TextView()
         self._body_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self._body_view.set_vexpand(True)
@@ -574,14 +582,6 @@ class ComposeWindow(Adw.Window):
         body_focus.connect("enter", self._on_body_focus_in)
         self._body_view.add_controller(body_focus)
         form.append(self._body_view)
-
-        self._attach_files_btn = Gtk.Button(label="Attach Files")
-        self._attach_files_btn.connect("clicked", self._on_attach_clicked)
-        form.append(self._attach_files_btn)
-
-        self._attachments_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        self._attachments_box.set_visible(False)
-        form.append(self._attachments_box)
 
         self._focus_body_at_start_on_enter = False
 
@@ -653,23 +653,49 @@ class ComposeWindow(Adw.Window):
         self._attachments_box.set_visible(True)
         for index, attachment in enumerate(self._attachments):
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            row.add_css_class("linked")
+
+            open_btn = Gtk.Button()
+            open_btn.add_css_class("flat")
+            open_btn.set_tooltip_text("Open Attachment")
+            open_btn.set_hexpand(True)
+            open_btn.set_halign(Gtk.Align.FILL)
+            open_btn.connect("clicked", self._on_open_attachment_clicked, index)
+
+            open_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             icon = Gtk.Image.new_from_icon_name("mail-attachment-symbolic")
             icon.add_css_class("dim-label")
-            row.append(icon)
+            open_content.append(icon)
             label = Gtk.Label(
                 label=f"{attachment.filename} ({format_attachment_size(len(attachment.data))})"
             )
             label.set_xalign(0)
             label.set_hexpand(True)
             label.set_ellipsize(3)  # Pango.EllipsizeMode.END
-            row.append(label)
+            open_content.append(label)
+            open_btn.set_child(open_content)
+            row.append(open_btn)
+
             remove_btn = Gtk.Button(icon_name="window-close-symbolic")
             remove_btn.set_tooltip_text("Remove Attachment")
             remove_btn.add_css_class("flat")
             remove_btn.connect("clicked", self._on_remove_attachment, index)
             row.append(remove_btn)
             self._attachments_box.append(row)
+
+    def _on_open_attachment_clicked(self, _button: Gtk.Button, index: int) -> None:
+        if self._saving_draft:
+            return
+        if index < 0 or index >= len(self._attachments):
+            return
+        attachment = self._attachments[index]
+        try:
+            path = write_temp_attachment(attachment.filename, attachment.data)
+            file = Gio.File.new_for_path(path)
+            Gio.AppInfo.launch_default_for_uri(file.get_uri(), None)
+        except (OSError, GLib.Error) as exc:
+            show_error_toast(self, f"Could not open attachment: {exc}")
+            return
+        self._set_status(f"Opened {os.path.basename(attachment.filename)}")
 
     def _on_remove_attachment(self, _button: Gtk.Button, index: int) -> None:
         if self._saving_draft:
