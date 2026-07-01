@@ -637,23 +637,82 @@ def merge_user_body_with_signature(user: str, signature: str | None) -> str:
     return f"{user}\n\n{block}"
 
 
-def extract_user_body_from_auto_signature(
+def _signature_prefixes(block: str) -> tuple[str, str]:
+    return f"\n\n{block}", block
+
+
+def find_auto_signature_offset(
     body: str,
     *,
     tracked_signature: str | None,
     known_signatures: list[str],
-) -> str | None:
-    """Return user body when still auto-managed; None after manual signature edits."""
-    if not body.strip():
-        return ""
-    if _is_signature_delimiter_remaint(body):
-        return ""
+) -> int | None:
+    """Return the buffer offset where a trailing auto signature block starts."""
+    normalized = _normalize_body_for_signature_match(body)
+    if not normalized.strip():
+        return None
 
     signatures_to_try: list[str] = []
     if tracked_signature:
         signatures_to_try.append(tracked_signature)
     for signature in known_signatures:
-        if signature not in signatures_to_try:
+        if signature and signature not in signatures_to_try:
+            signatures_to_try.append(signature)
+
+    for signature in signatures_to_try:
+        block = format_signature_block(signature)
+        if not block:
+            continue
+        for prefix in _signature_prefixes(block):
+            if normalized == prefix:
+                return 0
+            if normalized.endswith(prefix):
+                return len(normalized) - len(prefix)
+    return None
+
+
+def strip_signature_suffix(body: str, signature: str | None) -> str | None:
+    """If body ends with the given signature block, return the user part."""
+    if not signature:
+        return None
+    normalized = _normalize_body_for_signature_match(body)
+    block = format_signature_block(signature)
+    if not block:
+        return None
+    for prefix in _signature_prefixes(block):
+        if normalized == prefix:
+            return ""
+        if normalized.endswith(prefix):
+            return normalized[: -len(prefix)]
+    return None
+
+
+def _normalize_body_for_signature_match(body: str) -> str:
+    """Gtk.TextView buffers often end with a trailing newline."""
+    return body.rstrip("\n")
+
+
+def extract_user_body_from_auto_signature(
+    body: str,
+    *,
+    tracked_signature: str | None,
+    known_signatures: list[str],
+    previous_signature: str | None = None,
+) -> str | None:
+    """Return user body when still auto-managed; None after manual signature edits."""
+    normalized = _normalize_body_for_signature_match(body)
+    if not normalized.strip():
+        return ""
+    if _is_signature_delimiter_remaint(normalized):
+        return ""
+
+    signatures_to_try: list[str] = []
+    for signature in (
+        tracked_signature,
+        previous_signature,
+        *known_signatures,
+    ):
+        if signature and signature not in signatures_to_try:
             signatures_to_try.append(signature)
 
     for signature in signatures_to_try:
@@ -665,14 +724,73 @@ def extract_user_body_from_auto_signature(
             quoted_body="",
             signature=signature,
         )
-        if body == expected:
+        if normalized == expected:
             return ""
-        suffix = f"\n\n{block}"
-        if body.endswith(suffix):
-            return body[: -len(suffix)]
-        if is_truncated_auto_signature_body(body, expected):
+        for prefix in _signature_prefixes(block):
+            if normalized.endswith(prefix):
+                return normalized[: -len(prefix)]
+        if is_truncated_auto_signature_body(normalized, expected):
             return ""
     return None
+
+
+def replace_new_message_signature(
+    body: str,
+    *,
+    new_signature: str | None,
+    tracked_signature: str | None,
+    previous_signature: str | None,
+    known_signatures: list[str],
+) -> tuple[str, str | None] | None:
+    """Swap the trailing signature block when the From account changes."""
+    result = sync_new_message_body_signature(
+        body,
+        tracked_signature=tracked_signature,
+        new_signature=new_signature,
+        known_signatures=known_signatures,
+        previous_signature=previous_signature,
+    )
+    if result is not None:
+        return result
+    if previous_signature:
+        user = strip_signature_suffix(body, previous_signature)
+        if user is not None:
+            normalized = normalize_signature_text(new_signature)
+            return (
+                merge_user_body_with_signature(user, normalized),
+                normalized or None,
+            )
+    if not previous_signature and not tracked_signature:
+        return append_new_message_signature_if_needed(
+            body,
+            new_signature=new_signature,
+            known_signatures=known_signatures,
+        )
+    return None
+
+
+def append_new_message_signature_if_needed(
+    body: str,
+    *,
+    new_signature: str | None,
+    known_signatures: list[str],
+) -> tuple[str, str | None] | None:
+    """Append a signature to user-authored text that has no trailing signature yet."""
+    normalized = normalize_signature_text(new_signature)
+    if not normalized:
+        return None
+    normalized_body = _normalize_body_for_signature_match(body)
+    if not normalized_body.strip():
+        return merge_user_body_with_signature("", normalized), normalized
+    if "\n-- \n" in normalized_body or normalized_body.startswith("-- \n"):
+        return None
+    if find_auto_signature_offset(
+        normalized_body,
+        tracked_signature=normalized,
+        known_signatures=known_signatures,
+    ) is not None:
+        return None
+    return merge_user_body_with_signature(normalized_body, normalized), normalized
 
 
 def sync_new_message_body_signature(
@@ -681,12 +799,14 @@ def sync_new_message_body_signature(
     tracked_signature: str | None,
     new_signature: str | None,
     known_signatures: list[str],
+    previous_signature: str | None = None,
 ) -> tuple[str, str | None] | None:
     """Replace the auto-managed signature in a new-message body, if still unedited."""
     user = extract_user_body_from_auto_signature(
         body,
         tracked_signature=tracked_signature,
         known_signatures=known_signatures,
+        previous_signature=previous_signature,
     )
     if user is None:
         return None
@@ -721,16 +841,17 @@ def _is_signature_delimiter_remaint(body: str) -> bool:
 
 def is_truncated_auto_signature_body(body: str, expected: str) -> bool:
     """True when body is empty, delimiter-only, or a prefix of an auto signature body."""
+    normalized = _normalize_body_for_signature_match(body)
     if not expected:
-        return not body.strip()
-    if body == expected:
+        return not normalized.strip()
+    if normalized == expected:
         return True
-    if _is_signature_delimiter_remaint(body):
+    if _is_signature_delimiter_remaint(normalized):
         return True
-    prefix = "\n\n-- \n"
-    if expected.startswith(prefix) and body.startswith(prefix):
-        if not body[len(prefix) :].strip():
-            return True
+    for prefix in ("\n\n-- \n", "-- \n"):
+        if expected.startswith(prefix) and normalized.startswith(prefix):
+            if not normalized[len(prefix) :].strip():
+                return True
     return False
 
 
