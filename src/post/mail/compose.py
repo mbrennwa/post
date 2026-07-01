@@ -606,12 +606,92 @@ def build_reply_references(message_id: str | None, references: str | None = None
     return " ".join(pruned) if pruned else normalized_id
 
 
+def normalize_signature_text(signature: str | None) -> str:
+    """Return stripped signature text, or empty when there is no printable content."""
+    if not signature:
+        return ""
+    text = signature.strip()
+    if not text:
+        return ""
+    if not any(char.isprintable() and not char.isspace() for char in text):
+        return ""
+    return text
+
+
 def format_signature_block(signature: str) -> str:
     """Return a plain-text signature block with the conventional delimiter."""
-    text = signature.strip("\n")
+    text = normalize_signature_text(signature)
     if not text:
         return ""
     return f"-- \n{text}"
+
+
+def merge_user_body_with_signature(user: str, signature: str | None) -> str:
+    """Combine user-authored body text with a trailing signature block."""
+    block = format_signature_block(signature or "")
+    user = user.rstrip("\n")
+    if not block:
+        return user
+    if not user.strip():
+        return f"\n\n{block}"
+    return f"{user}\n\n{block}"
+
+
+def extract_user_body_from_auto_signature(
+    body: str,
+    *,
+    tracked_signature: str | None,
+    known_signatures: list[str],
+) -> str | None:
+    """Return user body when still auto-managed; None after manual signature edits."""
+    if not body.strip():
+        return ""
+    if _is_signature_delimiter_remaint(body):
+        return ""
+
+    signatures_to_try: list[str] = []
+    if tracked_signature:
+        signatures_to_try.append(tracked_signature)
+    for signature in known_signatures:
+        if signature not in signatures_to_try:
+            signatures_to_try.append(signature)
+
+    for signature in signatures_to_try:
+        block = format_signature_block(signature)
+        if not block:
+            continue
+        expected = compose_body_with_signature(
+            mode="new",
+            quoted_body="",
+            signature=signature,
+        )
+        if body == expected:
+            return ""
+        suffix = f"\n\n{block}"
+        if body.endswith(suffix):
+            return body[: -len(suffix)]
+        if is_truncated_auto_signature_body(body, expected):
+            return ""
+    return None
+
+
+def sync_new_message_body_signature(
+    body: str,
+    *,
+    tracked_signature: str | None,
+    new_signature: str | None,
+    known_signatures: list[str],
+) -> tuple[str, str | None] | None:
+    """Replace the auto-managed signature in a new-message body, if still unedited."""
+    user = extract_user_body_from_auto_signature(
+        body,
+        tracked_signature=tracked_signature,
+        known_signatures=known_signatures,
+    )
+    if user is None:
+        return None
+    normalized = normalize_signature_text(new_signature)
+    return merge_user_body_with_signature(user, normalized), normalized or None
 
 
 def compose_body_with_signature(
@@ -633,9 +713,52 @@ def compose_body_with_signature(
     return quoted_body
 
 
+def _is_signature_delimiter_remaint(body: str) -> bool:
+    """True when only the auto-inserted delimiter line remains after partial edits."""
+    content_lines = [line.strip() for line in body.splitlines() if line.strip()]
+    return content_lines in (["--"], ["-- "])
+
+
+def is_truncated_auto_signature_body(body: str, expected: str) -> bool:
+    """True when body is empty, delimiter-only, or a prefix of an auto signature body."""
+    if not expected:
+        return not body.strip()
+    if body == expected:
+        return True
+    if _is_signature_delimiter_remaint(body):
+        return True
+    prefix = "\n\n-- \n"
+    if expected.startswith(prefix) and body.startswith(prefix):
+        if not body[len(prefix) :].strip():
+            return True
+    return False
+
+
+def body_should_follow_account_signature(
+    body: str,
+    *,
+    known_signatures: list[str],
+    tracked_account_signature: str | None = None,
+) -> bool:
+    """True when the compose body should be replaced on From account change."""
+    if body_is_unedited_signature_template(body, known_signatures):
+        return True
+    if tracked_account_signature is not None:
+        expected = compose_body_with_signature(
+            mode="new",
+            quoted_body="",
+            signature=tracked_account_signature,
+        )
+        if is_truncated_auto_signature_body(body, expected):
+            return True
+    return False
+
+
 def body_is_unedited_signature_template(body: str, signatures: list[str]) -> bool:
     """True when the body is empty or still matches an auto-inserted signature."""
     if not body.strip():
+        return True
+    if _is_signature_delimiter_remaint(body):
         return True
     for signature in signatures:
         if body == compose_body_with_signature(

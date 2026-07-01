@@ -254,6 +254,10 @@ class PreferencesTests(unittest.TestCase):
                 )
                 set_account_signature("acct-1", "")
                 self.assertEqual(get_account_signatures(), {})
+                set_account_signature("acct-1", " ")
+                self.assertEqual(get_account_signatures(), {})
+                set_account_signature("acct-1", "\u200b")
+                self.assertEqual(get_account_signatures(), {})
 
 
 if __name__ == "__main__":

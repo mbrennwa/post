@@ -1206,13 +1206,63 @@ class SignatureComposeTests(unittest.TestCase):
         from post.mail.compose import compose_body_with_signature, format_signature_block
 
         self.assertEqual(format_signature_block(""), "")
+        self.assertEqual(format_signature_block(" "), "")
+        self.assertEqual(format_signature_block("\u200b"), "")
         self.assertEqual(
             format_signature_block("Alice\nExample Corp"),
             "-- \nAlice\nExample Corp",
         )
 
+    def test_body_is_unedited_signature_template_accepts_delimiter_remaint(self) -> None:
+        from post.mail.compose import body_is_unedited_signature_template
+
+        signatures = ["Alice"]
+        self.assertTrue(body_is_unedited_signature_template("\n\n-- \n", signatures))
+        self.assertTrue(body_is_unedited_signature_template("\n\n-- \nAlice", signatures))
+        self.assertFalse(
+            body_is_unedited_signature_template("Hello\n\n-- \nAlice", signatures)
+        )
+
+    def test_body_should_follow_account_signature_after_account_switch(self) -> None:
+        from post.mail.compose import (
+            body_should_follow_account_signature,
+            compose_body_with_signature,
+        )
+
+        signature_a = "Alice\nExample Corp"
+        body_a = compose_body_with_signature(
+            mode="new",
+            quoted_body="",
+            signature=signature_a,
+        )
+        self.assertTrue(
+            body_should_follow_account_signature(
+                body_a,
+                known_signatures=[signature_a],
+                tracked_account_signature=signature_a,
+            )
+        )
+        self.assertTrue(
+            body_should_follow_account_signature(
+                "\n\n-- \n",
+                known_signatures=[signature_a],
+                tracked_account_signature=signature_a,
+            )
+        )
+        self.assertFalse(
+            body_should_follow_account_signature(
+                "Hello there",
+                known_signatures=[signature_a],
+                tracked_account_signature=signature_a,
+            )
+        )
+
     def test_new_message_body(self) -> None:
-        from post.mail.compose import compose_body_with_signature
+        from post.mail.compose import (
+            compose_body_with_signature,
+            merge_user_body_with_signature,
+            sync_new_message_body_signature,
+        )
 
         self.assertEqual(
             compose_body_with_signature(
@@ -1225,6 +1275,53 @@ class SignatureComposeTests(unittest.TestCase):
         self.assertEqual(
             compose_body_with_signature(mode="new", quoted_body="", signature=""),
             "",
+        )
+        self.assertEqual(
+            merge_user_body_with_signature("Hello", "Bob"),
+            "Hello\n\n-- \nBob",
+        )
+        self.assertEqual(merge_user_body_with_signature("", ""), "")
+        self.assertEqual(merge_user_body_with_signature("Hello", ""), "Hello")
+
+        signature_a = "Alice\nExample Corp"
+        body_a = compose_body_with_signature(
+            mode="new",
+            quoted_body="",
+            signature=signature_a,
+        )
+        cleared = sync_new_message_body_signature(
+            body_a,
+            tracked_signature=signature_a,
+            new_signature="",
+            known_signatures=[signature_a],
+        )
+        self.assertEqual(cleared, ("", None))
+        self.assertEqual(
+            sync_new_message_body_signature(
+                "\n\n-- \n",
+                tracked_signature=signature_a,
+                new_signature="",
+                known_signatures=[signature_a],
+            ),
+            ("", None),
+        )
+        self.assertEqual(
+            sync_new_message_body_signature(
+                "Hello there",
+                tracked_signature=signature_a,
+                new_signature="Bob",
+                known_signatures=[signature_a],
+            ),
+            None,
+        )
+        self.assertEqual(
+            sync_new_message_body_signature(
+                f"Hello{body_a}",
+                tracked_signature=signature_a,
+                new_signature="Bob",
+                known_signatures=[signature_a],
+            ),
+            ("Hello\n\n-- \nBob", "Bob"),
         )
 
     def test_reply_inserts_signature_before_quote(self) -> None:
