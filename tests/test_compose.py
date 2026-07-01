@@ -1210,17 +1210,16 @@ class SignatureComposeTests(unittest.TestCase):
         self.assertEqual(format_signature_block("\u200b"), "")
         self.assertEqual(
             format_signature_block("Alice\nExample Corp"),
-            "-- \nAlice\nExample Corp",
+            "Alice\nExample Corp",
         )
 
-    def test_body_is_unedited_signature_template_accepts_delimiter_remaint(self) -> None:
+    def test_body_is_unedited_signature_template(self) -> None:
         from post.mail.compose import body_is_unedited_signature_template
 
         signatures = ["Alice"]
-        self.assertTrue(body_is_unedited_signature_template("\n\n-- \n", signatures))
-        self.assertTrue(body_is_unedited_signature_template("\n\n-- \nAlice", signatures))
+        self.assertTrue(body_is_unedited_signature_template("\n\nAlice", signatures))
         self.assertFalse(
-            body_is_unedited_signature_template("Hello\n\n-- \nAlice", signatures)
+            body_is_unedited_signature_template("Hello\n\nAlice", signatures)
         )
 
     def test_body_should_follow_account_signature_after_account_switch(self) -> None:
@@ -1244,7 +1243,7 @@ class SignatureComposeTests(unittest.TestCase):
         )
         self.assertTrue(
             body_should_follow_account_signature(
-                "\n\n-- \n",
+                "\n\n",
                 known_signatures=[signature_a],
                 tracked_account_signature=signature_a,
             )
@@ -1261,6 +1260,7 @@ class SignatureComposeTests(unittest.TestCase):
         from post.mail.compose import (
             append_new_message_signature_if_needed,
             compose_body_with_signature,
+            finalize_body_after_signature_sync,
             find_auto_signature_offset,
             merge_user_body_with_signature,
             replace_new_message_signature,
@@ -1273,7 +1273,7 @@ class SignatureComposeTests(unittest.TestCase):
                 quoted_body="",
                 signature="Alice",
             ),
-            "\n\n-- \nAlice",
+            "\n\nAlice",
         )
         self.assertEqual(
             compose_body_with_signature(mode="new", quoted_body="", signature=""),
@@ -1281,11 +1281,11 @@ class SignatureComposeTests(unittest.TestCase):
         )
         self.assertEqual(
             merge_user_body_with_signature("Hello", "Bob"),
-            "Hello\n\n-- \nBob",
+            "Hello\n\nBob",
         )
         self.assertEqual(
             merge_user_body_with_signature("", "Alice"),
-            "\n\n-- \nAlice",
+            "\n\nAlice",
         )
         self.assertEqual(merge_user_body_with_signature("", ""), "")
         self.assertEqual(merge_user_body_with_signature("Hello", ""), "Hello")
@@ -1306,11 +1306,19 @@ class SignatureComposeTests(unittest.TestCase):
         )
         self.assertEqual(
             find_auto_signature_offset(
-                f"Hello\n\n-- \n{signature_a}",
+                f"Hello\n\n{signature_a}",
                 tracked_signature=signature_a,
                 known_signatures=[signature_a],
             ),
             5,
+        )
+        self.assertEqual(
+            find_auto_signature_offset(
+                f"\n\n{signature_a}",
+                tracked_signature=signature_a,
+                known_signatures=[signature_a],
+            ),
+            0,
         )
         cleared = sync_new_message_body_signature(
             body_a,
@@ -1321,7 +1329,7 @@ class SignatureComposeTests(unittest.TestCase):
         self.assertEqual(cleared, ("", None))
         self.assertEqual(
             sync_new_message_body_signature(
-                "\n\n-- \n",
+                "\n\n",
                 tracked_signature=signature_a,
                 new_signature="",
                 known_signatures=[signature_a],
@@ -1339,16 +1347,16 @@ class SignatureComposeTests(unittest.TestCase):
         )
         self.assertEqual(
             sync_new_message_body_signature(
-                f"Hello\n\n-- \n{signature_a}",
+                f"Hello\n\n{signature_a}",
                 tracked_signature=signature_a,
                 new_signature="Bob",
                 known_signatures=[signature_a],
             ),
-            ("Hello\n\n-- \nBob", "Bob"),
+            ("Hello\n\nBob", "Bob"),
         )
         self.assertEqual(
             sync_new_message_body_signature(
-                f"Hello\n\n-- \n{signature_a}\n",
+                f"Hello\n\n{signature_a}\n",
                 tracked_signature=signature_a,
                 new_signature="",
                 known_signatures=[signature_a],
@@ -1357,13 +1365,13 @@ class SignatureComposeTests(unittest.TestCase):
         )
         self.assertEqual(
             replace_new_message_signature(
-                f"Hello\n\n-- \n{signature_a}\n",
+                f"Hello\n\n{signature_a}\n",
                 new_signature="Bob",
                 tracked_signature=None,
                 previous_signature=signature_a,
                 known_signatures=[signature_a],
             ),
-            ("Hello\n\n-- \nBob", "Bob"),
+            ("Hello\n\nBob", "Bob"),
         )
         self.assertEqual(
             append_new_message_signature_if_needed(
@@ -1371,8 +1379,10 @@ class SignatureComposeTests(unittest.TestCase):
                 new_signature="Bob",
                 known_signatures=[],
             ),
-            ("Hello there\n\n-- \nBob", "Bob"),
+            ("Hello there\n\nBob", "Bob"),
         )
+        self.assertEqual(finalize_body_after_signature_sync("\n\n", ""), "")
+        self.assertEqual(finalize_body_after_signature_sync("Hello", ""), "Hello")
         self.assertEqual(
             replace_new_message_signature(
                 "Hello there",
@@ -1381,7 +1391,7 @@ class SignatureComposeTests(unittest.TestCase):
                 previous_signature="",
                 known_signatures=[],
             ),
-            ("Hello there\n\n-- \nBob", "Bob"),
+            ("Hello there\n\nBob", "Bob"),
         )
 
     def test_reply_inserts_signature_before_quote(self) -> None:
@@ -1393,7 +1403,7 @@ class SignatureComposeTests(unittest.TestCase):
             quoted_body=quoted,
             signature="Alice",
         )
-        self.assertTrue(body.startswith("\n\n-- \nAlice\n\n"))
+        self.assertTrue(body.startswith("\n\nAlice\n\n"))
         self.assertTrue(body.endswith("> hi\n"))
 
     def test_forward_keeps_quote_without_signature(self) -> None:
