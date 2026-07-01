@@ -359,6 +359,15 @@ def count_queued_for_account(account_uid: str) -> int:
     )
 
 
+def list_pending_delayed_outbound_messages() -> list[tuple[str, QueuedOutboundMessage]]:
+    """Outbox items waiting on send delay (not offline-only queue entries)."""
+    return [
+        (queue_id, message)
+        for queue_id, message in list_queued_outbound_messages()
+        if message.send_after is not None
+    ]
+
+
 def list_queued_for_account(
     account_uid: str,
 ) -> list[tuple[str, QueuedOutboundMessage]]:

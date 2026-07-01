@@ -62,7 +62,9 @@ from post.mail.send_queue import (
     OFFLINE_CACHED_LIST_STATUS,
     OFFLINE_MAIL_MESSAGE,
     OFFLINE_SEARCHING_LOCAL_CACHE,
+    QueuedOutboundMessage,
     is_network_unavailable_error,
+    list_pending_delayed_outbound_messages,
     list_queued_messages,
     list_queued_outbound_messages,
     load_queued_attachments,
@@ -174,6 +176,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.connect("notify::width", self._on_window_size_changed)
         self.connect("notify::height", self._on_window_size_changed)
         self._close_after_outbound_send = False
+        self._delayed_send_close_dialog: Adw.AlertDialog | None = None
 
         self._mail = MailService.connect()
         self._send_delay_scheduler = OutboundSendDelayScheduler(
@@ -676,7 +679,77 @@ class MainWindow(Adw.ApplicationWindow):
                 )
             return True
 
+        if self._close_after_outbound_send:
+            return True
+
+        pending_delayed = list_pending_delayed_outbound_messages()
+        if pending_delayed and self._delayed_send_close_dialog is None:
+            self._prompt_send_delayed_before_close(pending_delayed)
+            return True
+
         return self._finish_close()
+
+    def _prompt_send_delayed_before_close(
+        self,
+        pending: list[tuple[str, QueuedOutboundMessage]],
+    ) -> None:
+        count = len(pending)
+        if count == 1:
+            heading = "Send delayed message?"
+        else:
+            heading = f"Send {count} delayed messages?"
+        if self._network_available:
+            body = (
+                "These messages are waiting for the send delay. "
+                "Send them now before quitting?"
+            )
+        else:
+            body = (
+                "These messages are waiting for the send delay. "
+                "They will stay in the outbox until Post is online."
+            )
+        dialog = Adw.AlertDialog(
+            heading=heading,
+            body=body,
+            close_response="cancel",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("leave", "Leave in Outbox")
+        if self._network_available:
+            dialog.add_response("send", "Send Now")
+            dialog.set_response_appearance("send", Adw.ResponseAppearance.SUGGESTED)
+            dialog.set_default_response("send")
+        else:
+            dialog.set_default_response("leave")
+        dialog.set_response_appearance("leave", Adw.ResponseAppearance.DESTRUCTIVE)
+        self._delayed_send_close_dialog = dialog
+        dialog.connect("response", self._on_delayed_send_close_response)
+        dialog.present(self)
+
+    def _on_delayed_send_close_response(
+        self, dialog: Adw.AlertDialog, response: str
+    ) -> None:
+        self._delayed_send_close_dialog = None
+        if response == "cancel":
+            return
+        if response == "leave":
+            GLib.idle_add(self._destroy_after_close_cleanup)
+            return
+        if response == "send":
+            self._send_delay_scheduler.cancel_all()
+            self._set_status(
+                "Sending message… Post will close when sending finishes."
+            )
+            self._close_after_outbound_send = True
+
+            def worker() -> None:
+                try:
+                    self._mail.flush_send_queue(force=True)
+                except Exception:
+                    log.exception("Failed to send delayed messages before quit")
+                GLib.idle_add(self._continue_close_after_outbound_send)
+
+            get_mail_io_thread().submit(worker)
 
     def _continue_close_after_outbound_send(self) -> None:
         self._close_after_outbound_send = False
