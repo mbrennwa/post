@@ -23,6 +23,7 @@ from post.mail.send_queue import (
     enqueue_outbound_message,
     is_outbound_ready_to_send,
     is_queueable_network_error,
+    list_pending_delayed_outbound_messages,
     list_queued_for_account,
     list_queued_messages_page,
     list_queued_outbound_messages,
@@ -304,3 +305,28 @@ class OutboxAccountFilterTests(unittest.TestCase):
                     send_after=time.time() - 1,
                 )
                 self.assertTrue(is_outbound_ready_to_send(ready))
+
+    def test_list_pending_delayed_outbound_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                persist_outbound_send(
+                    account_uid="account-1",
+                    to=["offline@example.com"],
+                    cc=None,
+                    bcc=None,
+                    subject="Offline",
+                    body="Body",
+                )
+                delayed_id = persist_outbound_send(
+                    account_uid="account-1",
+                    to=["delayed@example.com"],
+                    cc=None,
+                    bcc=None,
+                    subject="Delayed",
+                    body="Body",
+                    send_after=time.time() + 120,
+                )
+                pending = list_pending_delayed_outbound_messages()
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0][0], delayed_id)
+                self.assertEqual(pending[0][1].subject, "Delayed")
