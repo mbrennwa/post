@@ -1037,7 +1037,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_settings_clicked(self, *_args) -> None:
         if self._settings_dialog is not None:
-            self._settings_dialog.present(self)
+            self._settings_dialog.present()
             return
         dialog = SettingsWindow(
             parent=self,
@@ -1049,8 +1049,8 @@ class MainWindow(Adw.ApplicationWindow):
             on_offline_body_sync_changed=self._on_offline_body_sync_changed,
         )
         self._settings_dialog = dialog
-        dialog.connect("closed", self._on_settings_closed)
-        dialog.present(self)
+        dialog.connect("destroy", self._on_settings_closed)
+        dialog.present()
 
     def _on_settings_closed(self, *_args) -> None:
         self._settings_dialog = None

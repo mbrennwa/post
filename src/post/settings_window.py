@@ -18,6 +18,8 @@ gi.require_version("Gio", "2.0")
 
 from gi.repository import Adw, GLib, Gio, Gtk
 
+from post import _ISSUE_TRACKER_URL, _PROJECT_HOMEPAGE, get_app_description, get_version
+
 from post.mail import MailService
 from post.mail.accounts import (
     EDS_LOCAL_DISPLAY_NAME,
@@ -89,7 +91,7 @@ _REMOTE_OFFLINE_BACKENDS = frozenset(
 )
 
 
-class SettingsDialog(Adw.PreferencesDialog):
+class SettingsDialog(Adw.PreferencesWindow):
     def __init__(
         self,
         *,
@@ -101,7 +103,9 @@ class SettingsDialog(Adw.PreferencesDialog):
         on_message_appearance_changed: OnMessageAppearanceChanged | None = None,
         on_offline_body_sync_changed: OnOfflineBodySyncChanged | None = None,
     ) -> None:
-        super().__init__()
+        super().__init__(transient_for=parent, modal=True)
+        self.set_title("Settings")
+        self.set_default_size(760, 520)
         self._parent = parent
         self._mail = mail
         self._set_status = set_status
@@ -120,8 +124,9 @@ class SettingsDialog(Adw.PreferencesDialog):
         self.add(self._build_composing_page())
         self.add(self._build_offline_mail_page())
         self.add(self._build_local_mail_page())
+        self.add(self._build_about_page())
         self._loading_settings = False
-        self.connect("closed", self._on_signature_dialog_closed)
+        self.connect("destroy", self._on_signature_dialog_closed)
 
     def _build_reading_page(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage()
@@ -418,6 +423,57 @@ class SettingsDialog(Adw.PreferencesDialog):
         self._type_row.connect("notify::selected", self._on_type_changed)
         self._on_type_changed()
         return page
+
+    def _build_about_page(self) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage()
+        page.set_title("About")
+        page.set_icon_name("help-about-symbolic")
+
+        info_group = Adw.PreferencesGroup()
+        app_row = Adw.ActionRow(title="Post")
+        app_row.set_subtitle(get_app_description())
+        info_group.add(app_row)
+
+        version_row = Adw.ActionRow(title="Version")
+        version_row.set_subtitle(get_version())
+        info_group.add(version_row)
+
+        license_row = Adw.ActionRow(title="License")
+        license_row.set_subtitle("GPL-3.0-or-later")
+        info_group.add(license_row)
+
+        website_row = Adw.ActionRow(title="Website")
+        website_row.set_subtitle("mbrennwa.github.io/post")
+        website_row.set_activatable(True)
+        website_row.connect(
+            "activated",
+            lambda *_args: self._open_uri_externally(_PROJECT_HOMEPAGE),
+        )
+        info_group.add(website_row)
+        page.add(info_group)
+
+        bugs_group = Adw.PreferencesGroup()
+        bugs_group.set_title("Report Bugs")
+        issues_row = Adw.ActionRow(title="Issue Tracker")
+        issues_row.set_subtitle(
+            "Report bugs on GitHub. Include the Post version, your OS or distro, "
+            "and steps to reproduce. Crash logs and screenshots help when relevant."
+        )
+        issues_row.set_activatable(True)
+        issues_row.connect(
+            "activated",
+            lambda *_args: self._open_uri_externally(_ISSUE_TRACKER_URL),
+        )
+        bugs_group.add(issues_row)
+        page.add(bugs_group)
+        return page
+
+    @staticmethod
+    def _open_uri_externally(uri: str) -> None:
+        try:
+            Gio.AppInfo.launch_default_for_uri(uri, None)
+        except GLib.Error as exc:
+            log.warning("Could not open link %s: %s", uri, exc.message)
 
     def _on_type_changed(self, *_args) -> None:
         is_spool = self._type_row.get_selected() == 0

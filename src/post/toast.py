@@ -12,7 +12,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, Gtk
 
-ToastParent = Gtk.Window | Adw.ApplicationWindow | Adw.Window | Adw.PreferencesDialog
+ToastParent = Gtk.Window | Adw.ApplicationWindow | Adw.Window | Adw.PreferencesWindow
 
 
 def show_toast(
@@ -47,7 +47,7 @@ def show_error_toast(
 
 
 def _toast_host_window(parent: ToastParent) -> Gtk.Window | Adw.ApplicationWindow | Adw.Window:
-    if isinstance(parent, Adw.PreferencesDialog):
+    if isinstance(parent, Adw.PreferencesWindow):
         host = parent.get_transient_for()
         if host is not None:
             return host
