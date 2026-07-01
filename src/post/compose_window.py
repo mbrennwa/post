@@ -82,7 +82,7 @@ from post.toast import show_error_toast, show_toast
 
 log = logging.getLogger(__name__)
 
-ComposeMode = Literal["new", "reply", "reply-all", "forward", "draft", "outbox"]
+ComposeMode = Literal["new", "reply", "reply-all", "forward", "draft", "outbox", "send-again"]
 SetStatus = Callable[[str], None]
 
 
@@ -467,6 +467,8 @@ class ComposeWindow(Adw.Window):
             title = "Draft"
         elif mode == "outbox":
             title = "Edit Queued Message"
+        elif mode == "send-again":
+            title = "Send Again"
         else:
             title = "New Message"
         self.set_title(title)
@@ -609,7 +611,7 @@ class ComposeWindow(Adw.Window):
         self.connect("close-request", self._on_close_request)
         GLib.idle_add(self._set_initial_focus)
         GLib.idle_add(self._preflight_account_credentials)
-        if self._mode == "draft":
+        if self._mode in ("draft", "send-again"):
             GLib.idle_add(self._begin_load_draft_attachments)
 
     def _on_attach_clicked(self, *_args) -> None:
@@ -714,7 +716,7 @@ class ComposeWindow(Adw.Window):
         self._refresh_attachments_ui()
 
     def _begin_load_draft_attachments(self) -> bool:
-        if self._mode != "draft" or self._draft_message is None:
+        if self._mode not in ("draft", "send-again") or self._draft_message is None:
             return False
         attachments_meta = self._draft_message.get("attachments") or []
         if not attachments_meta:
@@ -786,6 +788,11 @@ class ComposeWindow(Adw.Window):
             self._to_entry.grab_focus()
             return False
         if self._mode == "draft":
+            self._body_view.grab_focus()
+            buffer = self._body_view.get_buffer()
+            buffer.place_cursor(buffer.get_start_iter())
+            return False
+        if self._mode == "send-again":
             self._body_view.grab_focus()
             buffer = self._body_view.get_buffer()
             buffer.place_cursor(buffer.get_start_iter())
@@ -1240,6 +1247,24 @@ class ComposeWindow(Adw.Window):
             self._draft_body_plain_snapshot = plain_body
             self._quoted_html_source = None
             self._quoted_plain_expected = ""
+        elif self._mode == "send-again" and self._draft_message is not None:
+            msg = self._draft_message
+            if msg.get("to"):
+                self._to_entry.set_text(str(msg["to"]))
+            if msg.get("cc"):
+                self._show_cc_field(str(msg["cc"]))
+            if msg.get("bcc"):
+                self._bcc_entry.set_text(str(msg["bcc"]))
+                self._bcc_row.set_visible(True)
+                self._bcc_entry.set_can_focus(True)
+                self._bcc_toggle_btn.set_label("Hide Bcc")
+            self._subject_entry.set_text(str(msg.get("subject") or ""))
+            plain_body = str(msg.get("body_plain") or "")
+            self._body_view.get_buffer().set_text(plain_body)
+            self._draft_body_html = (msg.get("body_html") or "").strip() or None
+            self._draft_body_plain_snapshot = plain_body
+            self._quoted_html_source = None
+            self._quoted_plain_expected = ""
         elif self._mode == "outbox" and self._outbox_queue_id is not None:
             queued = load_queued_outbound_message(self._outbox_queue_id)
             if queued.to:
@@ -1372,7 +1397,7 @@ class ComposeWindow(Adw.Window):
                 quoted_html_source=self._quoted_html_source,
                 quoted_plain_expected=self._quoted_plain_expected,
             )
-        if self._mode == "draft":
+        if self._mode in ("draft", "send-again"):
             if body_plain == self._draft_body_plain_snapshot and self._draft_body_html:
                 return self._draft_body_html
             if body_plain.strip():
@@ -1469,8 +1494,8 @@ class ComposeWindow(Adw.Window):
         self._pending_draft_body_html = body_html
 
         account_uid = account.uid
-        existing_uid = self._draft_message_uid
-        drafts_folder_name = self._draft_folder_name
+        existing_uid = self._draft_message_uid if self._mode == "draft" else None
+        drafts_folder_name = self._draft_folder_name if self._mode == "draft" else None
         attachments = list(self._attachments)
 
         if self._on_draft_save_started is not None:
@@ -1633,8 +1658,8 @@ class ComposeWindow(Adw.Window):
             in_reply_to=in_reply_to,
             references=references,
             attachments=list(self._attachments) or None,
-            draft_folder=self._draft_folder_name,
-            draft_uid=self._draft_message_uid,
+            draft_folder=self._draft_folder_name if self._mode == "draft" else None,
+            draft_uid=self._draft_message_uid if self._mode == "draft" else None,
             queue_id=self._outbox_queue_id,
         )
 
