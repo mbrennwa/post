@@ -387,7 +387,7 @@ def _complete_outbound_send_success(
 
 
 _LABEL_WIDTH = 72
-_TO_PLACEHOLDER = "Add a recipient in the To field."
+_TO_PLACEHOLDER = "Add a recipient in the To field"
 _CC_PLACEHOLDER = "Optional"
 _BCC_PLACEHOLDER = "Optional"
 _SUBJECT_PLACEHOLDER = "Subject is required"
@@ -467,7 +467,7 @@ class ComposeWindow(Adw.Window):
 
         header = Adw.HeaderBar()
         header.set_show_end_title_buttons(True)
-        header.set_title_widget(Gtk.Label(label=title))
+        header.set_show_title(False)
 
         self._save_draft_btn = Gtk.Button(label="Save Draft")
         self._save_draft_btn.connect("clicked", self._on_save_draft_clicked)
@@ -959,10 +959,10 @@ class ComposeWindow(Adw.Window):
     def _required_address_hint(text: str) -> str | None:
         stripped = text.strip()
         if not stripped:
-            return "Add a recipient in the To field."
+            return _TO_PLACEHOLDER
         try:
             if not parse_address_list(text):
-                return "Add a recipient in the To field."
+                return _TO_PLACEHOLDER
         except ValueError as exc:
             return str(exc)
         return None
@@ -1494,7 +1494,7 @@ class ComposeWindow(Adw.Window):
             return
 
         if not to_addrs:
-            self._show_error("Add a recipient in the To field.")
+            self._show_error(_TO_PLACEHOLDER)
             return
 
         if not subject:
