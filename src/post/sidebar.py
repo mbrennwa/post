@@ -22,6 +22,11 @@ from post.mail import MailService
 from post.mail.eds import MailAccount
 from post.mail.io_thread import get_mail_io_thread
 from post.folder_dialogs import confirm_action, prompt_folder_name, show_error
+from post.mail.dnd import (
+    MESSAGE_TRANSFER_MIME,
+    decode_message_transfer,
+    validate_message_drop,
+)
 from post.mail.folders import (
     POST_OUTBOX_FOLDER,
     account_supports_folder_crud,
@@ -65,6 +70,7 @@ OnFolderContentsChanged = Callable[[str, str], None]
 OnMoveStarted = Callable[[str, str], None]
 OnMoveUndoAvailable = Callable[[str, str, dict, str], None]
 OnAccountOnlineChanged = Callable[[str, bool], None]
+OnMessagesDropped = Callable[[str, str, str, list[str]], None]
 FolderRefreshComplete = Callable[[int, int, Exception | None], None]
 AccountRefreshComplete = Callable[[int, Exception | None], None]
 
@@ -86,6 +92,7 @@ class MailSidebar:
         on_move_started: OnMoveStarted | None = None,
         on_move_undo_available: OnMoveUndoAvailable | None = None,
         on_account_online_changed: OnAccountOnlineChanged | None = None,
+        on_messages_dropped: OnMessagesDropped | None = None,
     ) -> None:
         self._mail = mail
         self._on_folder_selected = on_folder_selected
@@ -100,6 +107,7 @@ class MailSidebar:
         self._on_move_started = on_move_started
         self._on_move_undo_available = on_move_undo_available
         self._on_account_online_changed = on_account_online_changed
+        self._on_messages_dropped = on_messages_dropped
         self._network_available = True
         self._account_offline_icons: dict[str, Gtk.Image] = {}
 
@@ -1500,7 +1508,60 @@ class MailSidebar:
                 account_uid=account_uid,
                 folder_name=row.folder_name,
             )
+            self._setup_folder_row_drop(row)
         return row
+
+    def _setup_folder_row_drop(self, row: Gtk.ListBoxRow) -> None:
+        if self._on_messages_dropped is None:
+            return
+
+        formats = Gdk.ContentFormats.new([MESSAGE_TRANSFER_MIME])
+        drop_target = Gtk.DropTarget.new(formats, Gdk.DragAction.MOVE)
+
+        def enter(
+            _target: Gtk.DropTarget, _x: float, _y: float
+        ) -> Gdk.DragAction:
+            row.add_css_class("drop-highlight")
+            return Gdk.DragAction.MOVE
+
+        def leave(_target: Gtk.DropTarget) -> None:
+            row.remove_css_class("drop-highlight")
+
+        def drop(
+            _target: Gtk.DropTarget,
+            value: object,
+            _x: float,
+            _y: float,
+        ) -> bool:
+            row.remove_css_class("drop-highlight")
+            if not isinstance(value, GLib.Bytes):
+                return False
+            payload = decode_message_transfer(bytes(value.get_data()))
+            if payload is None:
+                return False
+            account_uid = getattr(row, "account_uid", None)
+            folder_name = getattr(row, "folder_name", None)
+            if not account_uid or not folder_name:
+                return False
+            if not validate_message_drop(
+                payload,
+                dest_account_uid=account_uid,
+                dest_folder=folder_name,
+                dest_is_outbox=is_post_outbox_folder(folder_name),
+            ):
+                return False
+            self._on_messages_dropped(
+                payload.account_uid,
+                payload.source_folder,
+                folder_name,
+                list(payload.uids),
+            )
+            return True
+
+        drop_target.connect("enter", enter)
+        drop_target.connect("leave", leave)
+        drop_target.connect("drop", drop)
+        row.add_controller(drop_target)
 
     def _add_outbox_row(self, account_uid: str) -> None:
         folder_list = self._folder_lists.get(account_uid)
