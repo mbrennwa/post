@@ -261,6 +261,7 @@ def find_folder_by_type(
     return None
 
 
+_TYPE_SENT = 5120  # Camel.FolderInfoFlags.TYPE_SENT
 _TYPE_DRAFTS = 12288  # Camel.FolderInfoFlags.TYPE_DRAFTS
 _DRAFTS_NAME_FALLBACKS = frozenset({"drafts", "draft"})
 _SENT_NAME_FALLBACKS = frozenset({"sent", "sent mail", "sent messages"})
@@ -277,7 +278,7 @@ def _folder_matches_name_fallbacks(
 
 _SYSTEM_FOLDER_TYPES: tuple[int, ...] = (
     1024,   # TYPE_INBOX
-    5120,   # TYPE_SENT
+    _TYPE_SENT,
     3072,   # TYPE_TRASH
     4096,   # TYPE_JUNK
     _TYPE_DRAFTS,
@@ -307,6 +308,27 @@ def is_drafts_folder_name(
             return is_drafts_folder(folder, type_mask=type_mask)
     base = folder_name.rsplit("/", 1)[-1].lower()
     return base in _DRAFTS_NAME_FALLBACKS
+
+
+def is_sent_folder(folder: dict, *, type_mask: int = 64512) -> bool:
+    """Return True when Camel marks a folder as Sent (or name matches)."""
+    if folder_matches_type(folder, _TYPE_SENT, type_mask=type_mask):
+        return True
+    return _folder_matches_name_fallbacks(folder, _SENT_NAME_FALLBACKS)
+
+
+def is_sent_folder_name(
+    folders: list[dict],
+    folder_name: str,
+    *,
+    type_mask: int = 64512,
+) -> bool:
+    """Return True when folder_name refers to a Sent folder."""
+    for folder in folders:
+        if folder.get("full_name") == folder_name:
+            return is_sent_folder(folder, type_mask=type_mask)
+    base = folder_name.rsplit("/", 1)[-1].lower()
+    return base in _SENT_NAME_FALLBACKS
 
 
 def is_system_folder(

@@ -1680,6 +1680,10 @@ class MainWindow(Adw.ApplicationWindow):
         forward_action.connect("activate", self._on_message_menu_forward)
         self.add_action(forward_action)
 
+        send_again_action = Gio.SimpleAction.new("message-send-again", None)
+        send_again_action.connect("activate", self._on_message_menu_send_again)
+        self.add_action(send_again_action)
+
         self._outbox_edit_action = Gio.SimpleAction.new("message-outbox-edit", None)
         self._outbox_edit_action.connect("activate", self._on_message_menu_outbox_edit)
         self.add_action(self._outbox_edit_action)
@@ -3361,6 +3365,14 @@ class MainWindow(Adw.ApplicationWindow):
                 menu.append("Reply", "win.message-reply")
                 menu.append("Reply All", "win.message-reply-all")
                 menu.append("Forward", "win.message-forward")
+                if (
+                    self._current_account is not None
+                    and self._current_folder is not None
+                    and self._sidebar.folder_is_sent(
+                        self._current_account.uid, self._current_folder
+                    )
+                ):
+                    menu.append("Send Again", "win.message-send-again")
         if can_archive:
             menu.append(
                 self._count_menu_label("Archive", count), "win.message-archive"
@@ -3430,6 +3442,19 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_message_menu_forward(self, *_args) -> None:
         self._open_compose_on_message("forward")
+
+    def _on_message_menu_send_again(self, *_args) -> None:
+        if len(self._context_message_uids) != 1:
+            return
+        if not self._mail.list_sendable_accounts():
+            self._set_status("No mail account configured for sending")
+            return
+        if not self._current_account or not self._current_folder:
+            return
+        if not self._current_account.can_send:
+            self._set_status("Selected account has no mail transport configured")
+            return
+        self._open_send_again(self._context_message_uids[0])
 
     def _on_message_menu_outbox_edit(self, *_args) -> None:
         if len(self._context_message_uids) != 1 or not self._current_account:
@@ -4136,6 +4161,66 @@ class MainWindow(Adw.ApplicationWindow):
         self._present_compose_window(
             account,
             mode="draft",
+            draft_folder_name=folder_name,
+            draft_message_uid=message_uid,
+            draft_message=msg,
+        )
+        return False
+
+    def _open_send_again(self, uid: str) -> None:
+        if not self._current_account or not self._current_folder:
+            return
+
+        account = self._current_account
+        folder_name = self._current_folder
+
+        def worker() -> None:
+            error: Exception | None = None
+            msg: dict | None = None
+            try:
+                msg = self._mail.read_message(
+                    account.uid,
+                    folder_name,
+                    uid,
+                    mark_seen=False,
+                )
+            except MessageNotAvailableError as exc:
+                log.warning(
+                    "Sent message %s no longer available in %r",
+                    uid,
+                    folder_name,
+                )
+                error = exc
+            except Exception as exc:
+                log.exception("Failed to read sent message for send again")
+                error = exc
+            GLib.idle_add(
+                self._on_send_again_compose_loaded,
+                account,
+                folder_name,
+                uid,
+                msg,
+                error,
+            )
+
+        get_mail_io_thread().submit(worker)
+
+    def _on_send_again_compose_loaded(
+        self,
+        account: MailAccount,
+        folder_name: str,
+        message_uid: str,
+        msg: dict | None,
+        error: Exception | None,
+    ) -> bool:
+        if error is not None:
+            show_error_toast(self, f"Could not open message: {error}")
+            return False
+        if msg is None:
+            return False
+        self._present_compose_window(
+            account,
+            mode="send-again",
             draft_folder_name=folder_name,
             draft_message_uid=message_uid,
             draft_message=msg,

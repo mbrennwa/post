@@ -29,6 +29,7 @@ from post.mail.folders import (
     find_inbox_folder,
     format_folder_label,
     is_drafts_folder_name,
+    is_sent_folder_name,
     is_post_outbox_folder,
     outbox_folder_dict,
     resolve_folder_display_name,
@@ -257,6 +258,12 @@ class MailSidebar:
 
     def folder_is_drafts(self, account_uid: str, folder_name: str) -> bool:
         return is_drafts_folder_name(
+            self._account_folders.get(account_uid, []),
+            folder_name,
+        )
+
+    def folder_is_sent(self, account_uid: str, folder_name: str) -> bool:
+        return is_sent_folder_name(
             self._account_folders.get(account_uid, []),
             folder_name,
         )

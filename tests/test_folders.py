@@ -26,6 +26,8 @@ from post.mail.folders import (
     is_post_local_folder,
     is_drafts_folder,
     is_drafts_folder_name,
+    is_sent_folder,
+    is_sent_folder_name,
     is_system_folder,
     outbox_folder_dict,
     resolve_folder_display_name,
@@ -562,6 +564,24 @@ class DraftsFolderTests(unittest.TestCase):
         ]
         self.assertTrue(is_drafts_folder_name(folders, "Drafts"))
         self.assertFalse(is_drafts_folder_name(folders, "INBOX"))
+
+
+class SentFolderTests(unittest.TestCase):
+    def test_is_sent_folder_by_type(self) -> None:
+        folder = {"full_name": "Sent", "display_name": "Sent", "flags": 5120}
+        self.assertTrue(is_sent_folder(folder))
+
+    def test_is_sent_folder_by_name(self) -> None:
+        folder = {"full_name": "mail/sent", "display_name": "Sent", "flags": 0}
+        self.assertTrue(is_sent_folder(folder))
+
+    def test_is_sent_folder_name_lookup(self) -> None:
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 1024},
+            {"full_name": "[Gmail]/Sent Mail", "display_name": "Sent", "flags": 5120},
+        ]
+        self.assertTrue(is_sent_folder_name(folders, "[Gmail]/Sent Mail"))
+        self.assertFalse(is_sent_folder_name(folders, "INBOX"))
 
 
 class PostOutboxFolderTests(unittest.TestCase):
