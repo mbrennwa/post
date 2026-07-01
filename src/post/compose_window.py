@@ -24,6 +24,7 @@ from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.compose import (
     ComposeAttachment,
+    body_mentions_attachment,
     body_html_for_quoting,
     body_text_for_quoting,
     build_forward_subject,
@@ -439,6 +440,7 @@ class ComposeWindow(Adw.Window):
         self._attachments: list[ComposeAttachment] = []
         self._close_when_saved = False
         self._unsaved_dialog: Adw.AlertDialog | None = None
+        self._missing_attachment_dialog: Adw.AlertDialog | None = None
         self._user_edited = False
         self._tracking_edits = False
         self._tracked_signature: str | None = None
@@ -1646,6 +1648,129 @@ class ComposeWindow(Adw.Window):
             self._show_error(str(exc))
             return
 
+        if not self._attachments and body_mentions_attachment(body, mode=self._mode):
+            self._prompt_send_without_attachments(
+                account=account,
+                to_addrs=to_addrs,
+                cc_addrs=cc_addrs,
+                bcc_addrs=bcc_addrs,
+                subject=subject,
+                body=body,
+                body_html=body_html,
+                in_reply_to=in_reply_to,
+                references=references,
+            )
+            return
+
+        self._proceed_with_send(
+            account=account,
+            to_addrs=to_addrs,
+            cc_addrs=cc_addrs,
+            bcc_addrs=bcc_addrs,
+            subject=subject,
+            body=body,
+            body_html=body_html,
+            in_reply_to=in_reply_to,
+            references=references,
+        )
+
+    def _prompt_send_without_attachments(
+        self,
+        *,
+        account: MailAccount,
+        to_addrs: list[str],
+        cc_addrs: list[str],
+        bcc_addrs: list[str],
+        subject: str,
+        body: str,
+        body_html: str | None,
+        in_reply_to: str | None,
+        references: str | None,
+    ) -> None:
+        if self._missing_attachment_dialog is not None:
+            return
+        dialog = Adw.AlertDialog(
+            heading="Send without attachments?",
+            body="Your message mentions an attachment, but no files are attached.",
+            close_response="cancel",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("send", "Send Anyway")
+        dialog.set_default_response("cancel")
+        self._missing_attachment_dialog = dialog
+        pending = (
+            account,
+            to_addrs,
+            cc_addrs,
+            bcc_addrs,
+            subject,
+            body,
+            body_html,
+            in_reply_to,
+            references,
+        )
+        dialog.connect(
+            "response",
+            self._on_send_without_attachments_response,
+            pending,
+        )
+        dialog.present(self)
+
+    def _on_send_without_attachments_response(
+        self,
+        dialog: Adw.AlertDialog,
+        response: str,
+        pending: tuple[
+            MailAccount,
+            list[str],
+            list[str],
+            list[str],
+            str,
+            str,
+            str | None,
+            str | None,
+            str | None,
+        ],
+    ) -> None:
+        self._missing_attachment_dialog = None
+        if response != "send":
+            return
+        (
+            account,
+            to_addrs,
+            cc_addrs,
+            bcc_addrs,
+            subject,
+            body,
+            body_html,
+            in_reply_to,
+            references,
+        ) = pending
+        self._proceed_with_send(
+            account=account,
+            to_addrs=to_addrs,
+            cc_addrs=cc_addrs,
+            bcc_addrs=bcc_addrs,
+            subject=subject,
+            body=body,
+            body_html=body_html,
+            in_reply_to=in_reply_to,
+            references=references,
+        )
+
+    def _proceed_with_send(
+        self,
+        *,
+        account: MailAccount,
+        to_addrs: list[str],
+        cc_addrs: list[str],
+        bcc_addrs: list[str],
+        subject: str,
+        body: str,
+        body_html: str | None,
+        in_reply_to: str | None,
+        references: str | None,
+    ) -> None:
         parent = self.get_transient_for()
         request = OutboundSendRequest(
             account_uid=account.uid,
