@@ -792,7 +792,7 @@ class MailSidebar:
         noun = "message" if total == 1 else "messages"
         if not confirm_action(
             parent,
-            heading="Archive All Messages?",
+            heading="Archive all Messages?",
             body=f"Archive all {total} {noun} from this inbox?",
             confirm_label="Archive",
         ):

@@ -1690,7 +1690,7 @@ class ComposeWindow(Adw.Window):
         if self._missing_attachment_dialog is not None:
             return
         dialog = Adw.AlertDialog(
-            heading="Send without attachments?",
+            heading="Send Without Attachments?",
             body="Your message mentions an attachment, but no files are attached.",
             close_response="cancel",
         )
