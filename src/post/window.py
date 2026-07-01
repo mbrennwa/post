@@ -1690,6 +1690,14 @@ class MainWindow(Adw.ApplicationWindow):
         )
         self.add_action(self._outbox_drafts_action)
 
+        self._outbox_send_now_action = Gio.SimpleAction.new(
+            "message-outbox-send-now", None
+        )
+        self._outbox_send_now_action.connect(
+            "activate", self._on_message_menu_outbox_send_now
+        )
+        self.add_action(self._outbox_send_now_action)
+
         self._message_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
         self._message_popover.set_parent(self._message_scroll)
 
@@ -3323,8 +3331,17 @@ class MainWindow(Adw.ApplicationWindow):
         viewing_outbox = is_post_outbox_folder(self._current_folder or "")
         flags_for_uid = self._message_flags_for_uid
         if viewing_outbox and count == 1:
+            queue_id = uids[0]
+            list_message = self._message_list_view.get_message(queue_id)
+            show_send_now = False
+            if list_message is not None:
+                send_after = list_message.get("send_after")
+                if send_after is not None:
+                    show_send_now = float(send_after) > time.time()
             menu.append("Edit", "win.message-outbox-edit")
             menu.append("Move to Drafts", "win.message-outbox-drafts")
+            if show_send_now:
+                menu.append("Send Now", "win.message-outbox-send-now")
         if not viewing_outbox:
             for action in read_menu_items(
                 self._message_seen_states_for_uids(uids, flags_for_uid)
@@ -3423,6 +3440,13 @@ class MainWindow(Adw.ApplicationWindow):
         if len(self._context_message_uids) != 1 or not self._current_account:
             return
         self._move_outbox_to_drafts(self._context_message_uids[0])
+
+    def _on_message_menu_outbox_send_now(self, *_args) -> None:
+        if len(self._context_message_uids) != 1:
+            return
+        queue_id = self._context_message_uids[0]
+        self._send_delay_scheduler.send_now(queue_id)
+        self._set_status("Sending message…")
 
     def _open_compose_from_outbox(self, queue_id: str) -> None:
         if not self._current_account:

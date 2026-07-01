@@ -17,6 +17,7 @@ from gi.repository import GLib
 
 from .io_thread import get_mail_io_thread
 from .send_queue import (
+    clear_outbound_send_delay,
     is_outbound_ready_to_send,
     list_queued_outbound_messages,
     load_queued_outbound_message,
@@ -64,6 +65,11 @@ class OutboundSendDelayScheduler:
         if timer_id is not None:
             GLib.source_remove(timer_id)
 
+    def send_now(self, queue_id: str) -> None:
+        """Cancel send delay and deliver one outbox item immediately."""
+        self.cancel(queue_id)
+        get_mail_io_thread().submit(self._send_now_worker, queue_id)
+
     def cancel_all(self) -> None:
         for timer_id in self._timer_ids.values():
             GLib.source_remove(timer_id)
@@ -73,6 +79,14 @@ class OutboundSendDelayScheduler:
         self._timer_ids.pop(queue_id, None)
         get_mail_io_thread().submit(self._deliver_worker, queue_id)
         return False
+
+    def _send_now_worker(self, queue_id: str) -> None:
+        try:
+            clear_outbound_send_delay(queue_id)
+        except Exception:
+            log.exception("Could not clear send delay for outbox item %s", queue_id)
+            return
+        self._deliver_worker(queue_id)
 
     def _deliver_worker(self, queue_id: str) -> None:
         try:

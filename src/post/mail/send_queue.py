@@ -106,6 +106,17 @@ def is_outbound_ready_to_send(
     return message.send_after <= now
 
 
+def has_pending_send_delay(
+    message: QueuedOutboundMessage,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Return True when a queued message is still waiting on send delay."""
+    if now is None:
+        now = time.time()
+    return message.send_after is not None and message.send_after > now
+
+
 def outbox_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".config", "post", "outbox")
 
@@ -318,6 +329,38 @@ def enqueue_outbound_message(
     return queue_id
 
 
+def _rewrite_queued_outbound_message(
+    queue_id: str,
+    message: QueuedOutboundMessage,
+) -> None:
+    directory = outbox_dir()
+    os.makedirs(directory, exist_ok=True)
+    payload = message.to_dict()
+    payload["queued_at"] = message.queued_at or time.time()
+    if message.send_after is not None:
+        payload["send_after"] = message.send_after
+    path = os.path.join(directory, f"{queue_id}.json")
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".post-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def clear_outbound_send_delay(queue_id: str) -> bool:
+    """Clear send_after so a queued message may be delivered immediately."""
+    message = load_queued_outbound_message(queue_id)
+    if not has_pending_send_delay(message):
+        return False
+    message.send_after = None
+    _rewrite_queued_outbound_message(queue_id, message)
+    return True
+
+
 def list_queued_outbound_messages() -> list[tuple[str, QueuedOutboundMessage]]:
     directory = outbox_dir()
     if not os.path.isdir(directory):
@@ -399,7 +442,7 @@ def queued_to_list_dict(
     from_label: str,
 ) -> dict[str, Any]:
     to_text = _format_address_field(message.to)
-    return {
+    item: dict[str, Any] = {
         "uid": queue_id,
         "subject": message.subject or "(No subject)",
         "from": from_label,
@@ -408,6 +451,9 @@ def queued_to_list_dict(
         "sort_date": message.queued_at,
         "flags": {"seen": True},
     }
+    if message.send_after is not None:
+        item["send_after"] = message.send_after
+    return item
 
 
 def read_queued_message(
