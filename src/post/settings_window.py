@@ -117,19 +117,18 @@ class SettingsDialog(Adw.PreferencesDialog):
         self._config = existing or default_local_mail_config()
 
         self.add(self._build_reading_page())
-        self.add(self._build_offline_mail_page())
         self.add(self._build_composing_page())
+        self.add(self._build_offline_mail_page())
         self.add(self._build_local_mail_page())
         self._loading_settings = False
         self.connect("closed", self._on_signature_dialog_closed)
 
     def _build_reading_page(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage()
-        page.set_title("Reading")
+        page.set_title("Display")
         page.set_icon_name("mail-read-symbolic")
 
         group = Adw.PreferencesGroup()
-        group.set_title("Message Display")
 
         self._remote_content_row = Adw.SwitchRow(title="Load Remote Content")
         self._remote_content_row.set_subtitle(
@@ -162,7 +161,7 @@ class SettingsDialog(Adw.PreferencesDialog):
 
     def _build_offline_mail_page(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage()
-        page.set_title("Offline Mail")
+        page.set_title("Offline")
         page.set_icon_name("network-offline-symbolic")
 
         group = Adw.PreferencesGroup()
@@ -220,7 +219,7 @@ class SettingsDialog(Adw.PreferencesDialog):
 
     def _build_composing_page(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage()
-        page.set_title("Composing")
+        page.set_title("Outgoing")
         page.set_icon_name("mail-message-new-symbolic")
 
         group = Adw.PreferencesGroup()
