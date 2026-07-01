@@ -36,7 +36,7 @@ _EXEMPT_STRINGS = frozenset(
         "(no subject)",
         "Search…  from: to: subject: …",
         "recipient@example.com",
-        "Add a recipient in the To field.",
+        "Add a recipient in the To field",
         "Subject is required",
         "Optional",
         "Password",

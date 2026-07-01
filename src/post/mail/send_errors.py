@@ -105,7 +105,7 @@ def user_send_error_message(exc: BaseException) -> str:
             or "no recipients" in lowered
             or "to address" in lowered
         ):
-            return "Add a recipient in the To field."
+            return "Add a recipient in the To field"
         if "line break" in lowered:
             return text
         if "linefeed" in lowered or "carriage return" in lowered:
@@ -148,10 +148,10 @@ def user_send_error_message(exc: BaseException) -> str:
         return "This account has no From address configured."
 
     if "at least one recipient" in lowered:
-        return "Add a recipient in the To field."
+        return "Add a recipient in the To field"
 
     if "to address" in lowered:
-        return "Add a recipient in the To field."
+        return "Add a recipient in the To field"
 
     return _GENERIC_SEND_FAILED
 

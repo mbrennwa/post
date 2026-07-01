@@ -55,7 +55,7 @@ class SendErrorMessageTests(unittest.TestCase):
         exc = ValueError("At least one To address is required")
         self.assertEqual(
             user_send_error_message(exc),
-            "Add a recipient in the To field.",
+            "Add a recipient in the To field",
         )
 
     def test_header_line_break_value_error(self) -> None:
