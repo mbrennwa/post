@@ -438,13 +438,18 @@ def register_inbox_accounts(saved: list[str], present: list[str]) -> list[str]:
 
 def get_account_signatures() -> dict[str, str]:
     """Return per-account compose signatures keyed by account UID."""
+    from post.mail.compose import normalize_signature_text
+
     raw = _load_raw().get("account_signatures")
     if not isinstance(raw, dict):
         return {}
     signatures: dict[str, str] = {}
     for uid, text in raw.items():
-        if isinstance(uid, str) and isinstance(text, str):
-            signatures[uid] = text
+        if not isinstance(uid, str) or not isinstance(text, str):
+            continue
+        normalized = normalize_signature_text(text)
+        if normalized:
+            signatures[uid] = normalized
     return signatures
 
 
@@ -453,15 +458,21 @@ def get_account_signature(account_uid: str) -> str:
 
 
 def set_account_signature(account_uid: str, signature: str) -> None:
+    from post.mail.compose import normalize_signature_text
+
     data = _load_raw()
     signatures_raw = data.get("account_signatures")
     signatures: dict[str, str] = {}
     if isinstance(signatures_raw, dict):
         for uid, text in signatures_raw.items():
-            if isinstance(uid, str) and isinstance(text, str):
-                signatures[uid] = text
-    if signature:
-        signatures[account_uid] = signature
+            if not isinstance(uid, str) or not isinstance(text, str):
+                continue
+            normalized = normalize_signature_text(text)
+            if normalized:
+                signatures[uid] = normalized
+    normalized = normalize_signature_text(signature)
+    if normalized:
+        signatures[account_uid] = normalized
     else:
         signatures.pop(account_uid, None)
     data["account_signatures"] = signatures

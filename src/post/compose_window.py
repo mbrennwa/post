@@ -25,7 +25,6 @@ from post.mail import MailService
 from post.mail.compose import (
     ComposeAttachment,
     body_html_for_quoting,
-    body_is_unedited_signature_template,
     body_text_for_quoting,
     build_forward_subject,
     build_outbound_html_for_compose,
@@ -35,15 +34,19 @@ from post.mail.compose import (
     normalize_references_header,
     build_reply_subject,
     compose_body_with_signature,
+    extract_user_body_from_auto_signature,
     extract_reply_target_addresses,
     format_address_list,
     guess_attachment_mime_type,
+    is_truncated_auto_signature_body,
+    normalize_signature_text,
     normalize_email,
     parse_address_list,
     parse_draft_address_list,
     plain_to_simple_html,
     quote_plain_forward,
     quote_plain_reply,
+    sync_new_message_body_signature,
     validate_compose_mime_fields,
 )
 from post.mail.helpers import format_attachment_size, write_temp_attachment
@@ -436,6 +439,7 @@ class ComposeWindow(Adw.Window):
         self._unsaved_dialog: Adw.AlertDialog | None = None
         self._user_edited = False
         self._tracking_edits = False
+        self._tracked_signature: str | None = None
         self._quoted_html_source: str | None = None
         self._quoted_plain_expected = ""
         self._draft_body_html: str | None = None
@@ -577,7 +581,7 @@ class ComposeWindow(Adw.Window):
         self._body_view = Gtk.TextView()
         self._body_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self._body_view.set_vexpand(True)
-        self._body_view.get_buffer().connect("changed", self._mark_user_edited)
+        self._body_view.get_buffer().connect("changed", self._on_body_buffer_changed)
         body_focus = Gtk.EventControllerFocus()
         body_focus.connect("enter", self._on_body_focus_in)
         self._body_view.add_controller(body_focus)
@@ -851,29 +855,66 @@ class ComposeWindow(Adw.Window):
                 completion.set_model(model)
 
     def _on_from_account_changed(self, *_args) -> None:
-        self._mark_user_edited()
-        self._load_correspondents()
         if self._mode == "new":
-            self._refresh_signature_for_account(self._selected_account())
+            self._sync_signature_for_account()
+        else:
+            self._mark_user_edited()
+        self._load_correspondents()
         self._update_send_enabled()
+
+    def _set_body_plain_text(self, text: str) -> None:
+        self._tracking_edits = False
+        self._body_view.get_buffer().set_text(text)
+        self._tracking_edits = True
 
     def _known_signatures(self) -> list[str]:
         return list(get_account_signatures().values())
 
-    def _refresh_signature_for_account(self, account: MailAccount) -> None:
-        buffer = self._body_view.get_buffer()
-        start, end = buffer.get_bounds()
-        current = buffer.get_text(start, end, False)
-        if not body_is_unedited_signature_template(current, self._known_signatures()):
+    def _sync_signature_for_account(self) -> None:
+        if self._mode != "new":
             return
-        body = compose_body_with_signature(
-            mode="new",
-            quoted_body="",
-            signature=get_account_signature(account.uid),
+        buffer = self._body_view.get_buffer()
+        current = buffer.get_text(*buffer.get_bounds(), False)
+        new_signature = get_account_signature(self._selected_account().uid)
+        result = sync_new_message_body_signature(
+            current,
+            tracked_signature=self._tracked_signature,
+            new_signature=new_signature,
+            known_signatures=self._known_signatures(),
         )
-        self._tracking_edits = False
-        buffer.set_text(body)
-        self._tracking_edits = True
+        if result is None:
+            self._tracked_signature = None
+            return
+        new_body, new_tracked = result
+        self._set_body_plain_text(new_body)
+        self._tracked_signature = new_tracked
+        if not new_body.strip():
+            self._place_body_cursor_at_start()
+
+    def _on_body_buffer_changed(self, *_args) -> None:
+        if not self._tracking_edits:
+            return
+        if self._mode == "new" and self._tracked_signature is not None:
+            buffer = self._body_view.get_buffer()
+            current = buffer.get_text(*buffer.get_bounds(), False)
+            expected = compose_body_with_signature(
+                mode="new",
+                quoted_body="",
+                signature=self._tracked_signature,
+            )
+            if current != expected and not is_truncated_auto_signature_body(
+                current, expected
+            ):
+                if (
+                    extract_user_body_from_auto_signature(
+                        current,
+                        tracked_signature=self._tracked_signature,
+                        known_signatures=self._known_signatures(),
+                    )
+                    is None
+                ):
+                    self._tracked_signature = None
+        self._mark_user_edited()
 
     def _load_correspondents(self) -> None:
         account = self._selected_account()
@@ -1165,7 +1206,8 @@ class ComposeWindow(Adw.Window):
                 quoted_body="",
                 signature=signature,
             )
-            self._body_view.get_buffer().set_text(body)
+            self._set_body_plain_text(body)
+            self._tracked_signature = normalize_signature_text(signature) or None
             self._place_body_cursor_at_start()
 
     def _place_body_cursor_at_start(self) -> None:
