@@ -19,8 +19,10 @@ from gi.repository import GLib
 from post.mail.compose import ComposeAttachment
 from post.mail.send_queue import (
     QueuedOutboundMessage,
+    clear_outbound_send_delay,
     count_queued_for_account,
     enqueue_outbound_message,
+    has_pending_send_delay,
     is_outbound_ready_to_send,
     is_queueable_network_error,
     list_pending_delayed_outbound_messages,
@@ -330,3 +332,84 @@ class OutboxAccountFilterTests(unittest.TestCase):
                 self.assertEqual(len(pending), 1)
                 self.assertEqual(pending[0][0], delayed_id)
                 self.assertEqual(pending[0][1].subject, "Delayed")
+
+    def test_has_pending_send_delay(self) -> None:
+        future = time.time() + 120
+        delayed = QueuedOutboundMessage(
+            account_uid="account-1",
+            to=["user@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Delayed",
+            body="Body",
+            send_after=future,
+        )
+        ready = QueuedOutboundMessage(
+            account_uid="account-1",
+            to=["user@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Ready",
+            body="Body",
+            send_after=time.time() - 1,
+        )
+        immediate = QueuedOutboundMessage(
+            account_uid="account-1",
+            to=["user@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Immediate",
+            body="Body",
+        )
+        self.assertTrue(has_pending_send_delay(delayed))
+        self.assertFalse(has_pending_send_delay(ready))
+        self.assertFalse(has_pending_send_delay(immediate))
+
+    def test_clear_outbound_send_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                send_after = time.time() + 120
+                queue_id = persist_outbound_send(
+                    account_uid="account-1",
+                    to=["user@example.com"],
+                    cc=None,
+                    bcc=None,
+                    subject="Delayed",
+                    body="Body",
+                    send_after=send_after,
+                )
+                self.assertTrue(clear_outbound_send_delay(queue_id))
+                loaded = load_queued_outbound_message(queue_id)
+                self.assertIsNone(loaded.send_after)
+                self.assertTrue(is_outbound_ready_to_send(loaded))
+                self.assertEqual(list_pending_delayed_outbound_messages(), [])
+                self.assertFalse(clear_outbound_send_delay(queue_id))
+
+    def test_queued_to_list_dict_includes_send_after(self) -> None:
+        send_after = time.time() + 60
+        message = QueuedOutboundMessage(
+            account_uid="account-1",
+            to=["user@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Delayed",
+            body="Body",
+            queued_at=1000.0,
+            send_after=send_after,
+        )
+        item = queued_to_list_dict("queue-1", message, from_label="me@example.com")
+        self.assertEqual(item["send_after"], send_after)
+        immediate = queued_to_list_dict(
+            "queue-2",
+            QueuedOutboundMessage(
+                account_uid="account-1",
+                to=["user@example.com"],
+                cc=None,
+                bcc=None,
+                subject="Immediate",
+                body="Body",
+                queued_at=1000.0,
+            ),
+            from_label="me@example.com",
+        )
+        self.assertNotIn("send_after", immediate)
