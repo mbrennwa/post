@@ -1259,8 +1259,11 @@ class SignatureComposeTests(unittest.TestCase):
 
     def test_new_message_body(self) -> None:
         from post.mail.compose import (
+            append_new_message_signature_if_needed,
             compose_body_with_signature,
+            find_auto_signature_offset,
             merge_user_body_with_signature,
+            replace_new_message_signature,
             sync_new_message_body_signature,
         )
 
@@ -1280,6 +1283,10 @@ class SignatureComposeTests(unittest.TestCase):
             merge_user_body_with_signature("Hello", "Bob"),
             "Hello\n\n-- \nBob",
         )
+        self.assertEqual(
+            merge_user_body_with_signature("", "Alice"),
+            "\n\n-- \nAlice",
+        )
         self.assertEqual(merge_user_body_with_signature("", ""), "")
         self.assertEqual(merge_user_body_with_signature("Hello", ""), "Hello")
 
@@ -1288,6 +1295,22 @@ class SignatureComposeTests(unittest.TestCase):
             mode="new",
             quoted_body="",
             signature=signature_a,
+        )
+        self.assertEqual(
+            find_auto_signature_offset(
+                body_a,
+                tracked_signature=signature_a,
+                known_signatures=[signature_a],
+            ),
+            0,
+        )
+        self.assertEqual(
+            find_auto_signature_offset(
+                f"Hello\n\n-- \n{signature_a}",
+                tracked_signature=signature_a,
+                known_signatures=[signature_a],
+            ),
+            5,
         )
         cleared = sync_new_message_body_signature(
             body_a,
@@ -1316,12 +1339,49 @@ class SignatureComposeTests(unittest.TestCase):
         )
         self.assertEqual(
             sync_new_message_body_signature(
-                f"Hello{body_a}",
+                f"Hello\n\n-- \n{signature_a}",
                 tracked_signature=signature_a,
                 new_signature="Bob",
                 known_signatures=[signature_a],
             ),
             ("Hello\n\n-- \nBob", "Bob"),
+        )
+        self.assertEqual(
+            sync_new_message_body_signature(
+                f"Hello\n\n-- \n{signature_a}\n",
+                tracked_signature=signature_a,
+                new_signature="",
+                known_signatures=[signature_a],
+            ),
+            ("Hello", None),
+        )
+        self.assertEqual(
+            replace_new_message_signature(
+                f"Hello\n\n-- \n{signature_a}\n",
+                new_signature="Bob",
+                tracked_signature=None,
+                previous_signature=signature_a,
+                known_signatures=[signature_a],
+            ),
+            ("Hello\n\n-- \nBob", "Bob"),
+        )
+        self.assertEqual(
+            append_new_message_signature_if_needed(
+                "Hello there",
+                new_signature="Bob",
+                known_signatures=[],
+            ),
+            ("Hello there\n\n-- \nBob", "Bob"),
+        )
+        self.assertEqual(
+            replace_new_message_signature(
+                "Hello there",
+                new_signature="Bob",
+                tracked_signature=None,
+                previous_signature="",
+                known_signatures=[],
+            ),
+            ("Hello there\n\n-- \nBob", "Bob"),
         )
 
     def test_reply_inserts_signature_before_quote(self) -> None:
