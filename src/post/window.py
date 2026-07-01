@@ -14,11 +14,10 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-gi.require_version("WebKit", "6.0")
 gi.require_version("Gio", "2.0")
 gi.require_version("Gdk", "4.0")
 
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, WebKit
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from post.compose_window import ComposeWindow, SavedDraftNotification
 from post.credentials import prompt_password_sync
@@ -79,15 +78,16 @@ from post.settings_window import SettingsWindow
 from post.mail.helpers import (
     flag_menu_items,
     flag_menu_label,
-    format_attachment_size,
-    format_reader_header,
     read_menu_items,
     read_menu_label,
-    reader_toggle_button_state,
     write_temp_attachment,
 )
-from post.reader import build_reader_document
-from post.wrap_label import WrappingLabel, configure_ellipsize_label, set_label_wrap_mode
+from post.message_list_activate import (
+    MessageListActivateAction,
+    message_list_activate_action,
+)
+from post.reader.pane import MessageReaderPane
+from post.reader_window import ReaderWindow
 from post.preferences import (
     MessageAppearance,
     OFFLINE_BODY_SYNC_ALL,
@@ -156,6 +156,9 @@ button.message-flagged {{
 button.message-read-action {{
   opacity: 1;
 }}
+list.navigation-sidebar row.drop-highlight {{
+  background-color: alpha(@accent_bg_color, 0.18);
+}}
 """
 
 
@@ -194,7 +197,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._current_folder: str | None = None
         self._current_message_uid: str | None = None
         self._current_message: dict | None = None
-        self._current_body: dict[str, str | None] = {"plain": None, "html": None}
         self._messages_load_generation = 0
         self._message_read_generation = 0
         self._pending_message_read_uid: str | None = None
@@ -212,6 +214,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._undo_toast: Adw.Toast | None = None
         self._settings_dialog: SettingsWindow | None = None
         self._compose_windows: list[ComposeWindow] = []
+        self._reader_windows: list[ReaderWindow] = []
         self._load_remote_content = get_load_remote_content()
         self._message_appearance = get_message_appearance()
         self._restore_message_folder: tuple[str, str] | None = None
@@ -304,6 +307,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_move_started=self._on_sidebar_move_started,
             on_move_undo_available=self._on_sidebar_move_undo_available,
             on_account_online_changed=self._on_account_online_changed,
+            on_messages_dropped=self._on_messages_dropped,
         )
         sidebar_widget = self._sidebar.widget
         sidebar_widget.set_margin_top(_SIDEBAR_TOP_INSET)
@@ -402,79 +406,26 @@ class MainWindow(Adw.ApplicationWindow):
         sep2.set_vexpand(True)
         content_panes.append(sep2)
 
-        reader = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        reader.set_hexpand(True)
-        reader.set_margin_start(16)
-        reader.set_margin_end(16)
-        reader.set_margin_top(_SIDEBAR_TOP_INSET)
-        reader.set_margin_bottom(12)
-
-        self._reader_subject = WrappingLabel(
-            label="",
-            xalign=0,
-            wrap=True,
-            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+        self._reader_pane = MessageReaderPane(
+            on_read_toggle=self._on_read_toggle_clicked,
+            on_flag_toggle=self._on_flag_toggle_clicked,
+            on_reply=self._on_reply_clicked,
+            on_reply_all=self._on_reply_all_clicked,
+            on_forward=self._on_forward_clicked,
+            on_attachment_clicked=self._on_reader_attachment_clicked,
+            on_attachment_context_menu=self._on_reader_attachment_context_menu,
+            on_open_uri=self._open_uri_externally,
         )
-        self._reader_subject.add_css_class("title-2")
-        self._reader_subject.set_hexpand(True)
-        self._reader_subject.set_halign(Gtk.Align.FILL)
-        self._reader_subject.set_visible(False)
-
-        header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        header_row.set_hexpand(True)
-        subject_box = Gtk.Box()
-        subject_box.set_hexpand(True)
-        subject_box.append(self._reader_subject)
-        header_row.append(subject_box)
-        self._message_actions = self._build_message_action_buttons()
-        self._message_actions.set_valign(Gtk.Align.START)
-        self._message_actions.set_halign(Gtk.Align.END)
-        header_row.append(self._message_actions)
-        reader.append(header_row)
-
-        self._reader_meta = Gtk.Label(label="", xalign=0, wrap=True)
-        set_label_wrap_mode(self._reader_meta, Gtk.WrapMode.WORD_CHAR)
-        self._reader_meta.add_css_class("dim-label")
-        self._reader_meta.set_width_chars(1)
-        self._reader_meta.set_hexpand(True)
-        self._reader_meta.set_halign(Gtk.Align.FILL)
-        reader.append(self._reader_meta)
-
-        self._reader_attachments = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self._reader_attachments.set_visible(False)
-        reader.append(self._reader_attachments)
-
-        self._reader_body_stack = Gtk.Stack()
-        self._reader_body_stack.set_vexpand(True)
-        self._reader_body_stack.set_hexpand(True)
-
-        reader_empty_box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=12,
-            halign=Gtk.Align.CENTER,
-            valign=Gtk.Align.CENTER,
-        )
-        reader_empty_label = Gtk.Label(label="No Message Selected")
-        reader_empty_label.add_css_class("dim-label")
-        reader_empty_box.append(reader_empty_label)
-        self._reader_body_stack.add_named(reader_empty_box, "empty")
-
-        self._web_view = WebKit.WebView()
-        settings = self._web_view.get_settings()
-        settings.set_enable_javascript(False)
-        settings.set_enable_html5_database(False)
-        settings.set_enable_html5_local_storage(False)
-        self._web_view.connect("decide-policy", self._on_web_view_decide_policy)
-        self._web_view.set_vexpand(True)
-        self._reader_body_stack.add_named(self._web_view, "content")
-        self._reader_body_stack.set_visible_child_name("empty")
-
-        reader.append(self._reader_body_stack)
+        self._reader_pane.set_hexpand(True)
+        self._reader_pane.set_margin_start(16)
+        self._reader_pane.set_margin_end(16)
+        self._reader_pane.set_margin_top(_SIDEBAR_TOP_INSET)
+        self._reader_pane.set_margin_bottom(12)
 
         style_manager = Adw.StyleManager.get_default()
         style_manager.connect("notify::dark", self._on_app_dark_changed)
 
-        content_panes.append(reader)
+        content_panes.append(self._reader_pane)
 
         self._status = Gtk.Label(label="", xalign=0, margin_start=12, margin_bottom=6)
         self._status.add_css_class("dim-label")
@@ -885,89 +836,13 @@ class MainWindow(Adw.ApplicationWindow):
         self._apply_search_from_entry()
         return True
 
-    def _build_message_action_buttons(self) -> Gtk.Widget:
-        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-
-        flag_group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        flag_group.add_css_class("linked")
-
-        self._read_toggle_btn = self._make_message_action_button(
-            "mail-mark-read-symbolic",
-            "Mark as Read",
-            self._on_read_toggle_clicked,
-        )
-        self._read_toggle_btn.add_css_class("message-read-action")
-        self._flag_toggle_btn = self._make_message_action_button(
-            "mail-flag-symbolic",
-            "Flag",
-            self._on_flag_toggle_clicked,
-        )
-        self._flag_toggle_btn.add_css_class("message-flagged")
-        flag_group.append(self._read_toggle_btn)
-        flag_group.append(self._flag_toggle_btn)
-        outer.append(flag_group)
-
-        reply_group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        reply_group.add_css_class("linked")
-
-        self._reply_btn = self._make_message_action_button(
-            "mail-reply-sender-symbolic",
-            "Reply",
-            self._on_reply_clicked,
-        )
-        self._reply_all_btn = self._make_message_action_button(
-            "mail-reply-all-symbolic",
-            "Reply All",
-            self._on_reply_all_clicked,
-        )
-        self._forward_btn = self._make_message_action_button(
-            "mail-forward-symbolic",
-            "Forward",
-            self._on_forward_clicked,
-        )
-        reply_group.append(self._reply_btn)
-        reply_group.append(self._reply_all_btn)
-        reply_group.append(self._forward_btn)
-        outer.append(reply_group)
-        return outer
-
-    @staticmethod
-    def _make_message_action_button(
-        icon_name: str, tooltip: str, handler: Callable[..., None]
-    ) -> Gtk.Button:
-        button = Gtk.Button()
-        button.set_icon_name(icon_name)
-        button.set_tooltip_text(tooltip)
-        button.set_sensitive(False)
-        button.connect("clicked", handler)
-        return button
-
     def _set_message_actions_sensitive(self, sensitive: bool) -> None:
-        self._read_toggle_btn.set_sensitive(sensitive)
-        self._flag_toggle_btn.set_sensitive(sensitive)
-        self._reply_btn.set_sensitive(sensitive)
-        self._reply_all_btn.set_sensitive(sensitive)
-        self._forward_btn.set_sensitive(sensitive)
-        if sensitive:
-            self._update_reader_toggle_buttons()
+        self._reader_pane.set_actions_sensitive(sensitive)
 
     def _reader_message_flags(self) -> dict:
         if self._current_message_uid is None:
             return {}
         return self._message_flags_for_uid(self._current_message_uid)
-
-    def _update_reader_toggle_buttons(self) -> None:
-        toggles = reader_toggle_button_state(self._reader_message_flags())
-        for button, state in (
-            (self._read_toggle_btn, toggles["read"]),
-            (self._flag_toggle_btn, toggles["flag"]),
-        ):
-            button.set_icon_name(state["icon"])
-            button.set_tooltip_text(state["tooltip"])
-            if state["styled_action"]:
-                button.add_css_class(state["action_class"])
-            else:
-                button.remove_css_class(state["action_class"])
 
     def _reader_action_uid(self) -> str | None:
         if self._current_message_uid is None:
@@ -1348,13 +1223,11 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_load_remote_content_changed(self, enabled: bool) -> None:
         self._load_remote_content = enabled
-        if self._current_body.get("html") or self._current_body.get("plain"):
-            self._show_reader_document()
+        self._reader_pane.refresh_document(allow_remote=enabled)
 
     def _on_message_appearance_changed(self, appearance: MessageAppearance) -> None:
         self._message_appearance = appearance
-        if self._current_body.get("html") or self._current_body.get("plain"):
-            self._show_reader_document()
+        self._reader_pane.refresh_document(message_appearance=appearance)
 
     def _on_reply_action(self, *_args) -> None:
         self._open_compose_on_message("reply")
@@ -1783,6 +1656,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._pre_search_folder = None
         self._current_account = account
         self._current_folder = folder_name
+        self._message_list_view.set_drag_context(account.uid, folder_name)
         if self._sync_watcher.running:
             self._sync_watcher.set_current_folder(account.uid, folder_name)
         self._update_search_entry_state()
@@ -1990,22 +1864,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._load_messages(account.uid, folder_name)
 
     def _show_message_unavailable_reader(self, message: str) -> None:
-        self._reader_subject.set_label("Message unavailable")
-        self._reader_subject.set_visible(True)
-        self._reader_meta.set_label(message)
-        self._clear_attachments()
         self._current_message = None
-        self._message_actions.set_visible(False)
-        self._set_message_actions_sensitive(False)
-        self._current_body = {"plain": None, "html": None}
-        self._reader_body_stack.set_visible_child_name("content")
-        error_color = "#aaaaaa" if self._app_prefers_dark() else "#666666"
-        self._web_view.load_html(
-            "<body style='font-family:sans-serif;"
-            f"color:{error_color};padding:1em'>"
-            f"{message}</body>",
-            None,
-        )
+        self._reader_pane.show_unavailable(message, dark=self._app_prefers_dark())
 
     def _remove_vanished_message(self, uid: str) -> None:
         if not self._current_account or not self._current_folder:
@@ -2041,79 +1901,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_read_generation += 1
         self._pending_message_read_uid = None
         self._inflight_message_read_id = None
-        self._reader_subject.set_label("")
-        self._reader_subject.set_visible(False)
-        self._reader_meta.set_label("")
         self._current_message_uid = None
         self._current_message = None
-        self._message_actions.set_visible(False)
-        self._set_message_actions_sensitive(False)
+        self._reader_pane.clear()
         self._update_message_toolbar()
-        self._clear_attachments()
-        self._current_body = {"plain": None, "html": None}
-        self._show_reader_document()
 
-    def _clear_attachments(self) -> None:
-        while child := self._reader_attachments.get_first_child():
-            self._reader_attachments.remove(child)
-        self._reader_attachments.set_visible(False)
-
-    def _show_attachments(self, attachments: list[dict]) -> None:
-        self._clear_attachments()
-        if not attachments:
-            return
-
-        heading = Gtk.Label(label="Attachments", xalign=0)
-        heading.add_css_class("heading")
-        self._reader_attachments.append(heading)
-
-        list_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        list_column.set_hexpand(True)
-        list_column.set_halign(Gtk.Align.FILL)
-
-        for attachment in attachments:
-            index = attachment.get("index", 0)
-            name = attachment.get("filename") or "attachment"
-            mime_type = attachment.get("mime_type")
-            size = format_attachment_size(attachment.get("size"))
-            label_text = f"{name} ({size})" if size else name
-
-            btn = Gtk.Button()
-            btn.add_css_class("flat")
-            btn.set_tooltip_text("Open Attachment")
-            btn.set_hexpand(True)
-            btn.set_halign(Gtk.Align.FILL)
-            btn.connect("clicked", self._on_attachment_clicked, index)
-
-            menu_gesture = Gtk.GestureClick()
-            menu_gesture.set_button(Gdk.BUTTON_SECONDARY)
-            menu_gesture.connect(
-                "pressed",
-                self._on_attachment_menu_pressed,
-                index,
-                mime_type,
-                name,
-            )
-            btn.add_controller(menu_gesture)
-
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            icon = Gtk.Image.new_from_icon_name("mail-attachment-symbolic")
-            icon.add_css_class("dim-label")
-            label = Gtk.Label(label=label_text, xalign=0, ellipsize=3)
-            configure_ellipsize_label(label)
-            label.set_halign(Gtk.Align.FILL)
-            row.append(icon)
-            row.append(label)
-            btn.set_child(row)
-            list_column.append(btn)
-
-        self._reader_attachments.append(list_column)
-        self._reader_attachments.set_visible(True)
-
-    def _on_attachment_menu_pressed(
+    def _on_reader_attachment_context_menu(
         self,
-        gesture: Gtk.GestureClick,
-        _n_press: int,
+        widget: Gtk.Widget,
         x: float,
         y: float,
         index: int,
@@ -2123,9 +1918,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._context_attachment_index = index
         self._context_attachment_mime = mime_type
         self._context_attachment_name = name
-        widget = gesture.get_widget()
-        if widget is None:
-            return
         self._ensure_popover_parent(self._attachment_popover, widget)
         rect = Gdk.Rectangle()
         rect.x = int(x)
@@ -2134,6 +1926,9 @@ class MainWindow(Adw.ApplicationWindow):
         rect.height = 1
         self._attachment_popover.set_pointing_to(rect)
         self._attachment_popover.popup()
+
+    def _on_reader_attachment_clicked(self, attachment_index: int) -> None:
+        self._fetch_attachment(attachment_index, self._open_attachment_direct)
 
     def _on_attachment_menu_save(self, *_args) -> None:
         if self._context_attachment_index is None:
@@ -2197,9 +1992,6 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> bool:
         on_ready(filename, data, error)
         return False
-
-    def _on_attachment_clicked(self, _button: Gtk.Button, attachment_index: int) -> None:
-        self._fetch_attachment(attachment_index, self._open_attachment_direct)
 
     def _open_attachment_direct(
         self,
@@ -3544,21 +3336,32 @@ class MainWindow(Adw.ApplicationWindow):
             self._set_status(f"Removed {count} queued messages")
         self._on_outbox_changed()
 
-    def _move_messages(self, destination: str, uids: list[str]) -> None:
-        if not uids or not self._current_account or not self._current_folder:
+    def _move_messages(
+        self,
+        destination: str,
+        uids: list[str],
+        *,
+        account_uid: str | None = None,
+        folder_name: str | None = None,
+    ) -> None:
+        if not uids:
             return
+        if account_uid is None:
+            if not self._current_account:
+                return
+            account_uid = self._current_account.uid
+        if folder_name is None:
+            if not self._current_folder:
+                return
+            folder_name = self._current_folder
 
-        state = self._sidebar.get_move_menu_state(
-            self._current_account.uid, self._current_folder
-        )
+        state = self._sidebar.get_move_menu_state(account_uid, folder_name)
         if destination == "archive" and not state.get("can_archive"):
             return
         if destination == "trash" and not state.get("can_trash"):
             return
 
         uids = list(uids)
-        account_uid = self._current_account.uid
-        folder_name = self._current_folder
         self._message_popover.popdown()
 
         if is_post_outbox_folder(folder_name) and destination == "trash":
@@ -3596,6 +3399,85 @@ class MainWindow(Adw.ApplicationWindow):
         label = "Trash" if destination == "trash" else "Archive"
         self._set_status(f"Moving {len(uids)} message(s) to {label}…")
         get_mail_io_thread().submit(worker)
+
+    def _on_messages_dropped(
+        self,
+        account_uid: str,
+        source_folder: str,
+        dest_folder: str,
+        uids: list[str],
+    ) -> None:
+        self._move_messages_to_folder(
+            account_uid, source_folder, dest_folder, uids
+        )
+
+    def _move_messages_to_folder(
+        self,
+        account_uid: str,
+        source_folder: str,
+        dest_folder: str,
+        uids: list[str],
+    ) -> None:
+        if not uids or source_folder == dest_folder:
+            return
+
+        uids = list(uids)
+        self._clear_move_undo()
+        self._suppress_sync_list_reload = (account_uid, source_folder)
+
+        def worker() -> None:
+            error: Exception | None = None
+            result: dict | None = None
+            try:
+                result = self._mail.move_messages(
+                    account_uid, source_folder, dest_folder, uids
+                )
+            except Exception as exc:
+                log.exception(
+                    "Failed to move messages to folder %r", dest_folder
+                )
+                error = exc
+            GLib.idle_add(
+                self._on_folder_messages_moved,
+                account_uid,
+                source_folder,
+                dest_folder,
+                uids,
+                result,
+                error,
+            )
+
+        display = self._sidebar.folder_display_name(account_uid, dest_folder)
+        if len(uids) == 1:
+            self._set_status(f"Moving message to {display}…")
+        else:
+            self._set_status(f"Moving {len(uids)} messages to {display}…")
+        get_mail_io_thread().submit(worker)
+
+    def _on_folder_messages_moved(
+        self,
+        account_uid: str,
+        source_folder: str,
+        dest_folder: str,
+        uids: list[str],
+        result: dict | None,
+        error: Exception | None,
+    ) -> bool:
+        moved_count = len(uids)
+        display = self._sidebar.folder_display_name(account_uid, dest_folder)
+        if moved_count > 1:
+            status_label = f"Moved {moved_count} messages to {display}"
+        else:
+            status_label = f"Moved message to {display}"
+        return self._on_messages_moved(
+            account_uid,
+            source_folder,
+            uids,
+            dest_folder,
+            result,
+            error,
+            status_label=status_label,
+        )
 
     def _dismiss_undo_toast_only(self) -> None:
         if self._undo_toast is not None:
@@ -3807,6 +3689,8 @@ class MainWindow(Adw.ApplicationWindow):
         destination: str,
         result: dict | None,
         error: Exception | None,
+        *,
+        status_label: str | None = None,
     ) -> bool:
         suppress_key = (account_uid, folder_name)
 
@@ -3857,9 +3741,15 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._update_sidebar_from_move_result(account_uid, result)
         self._finalize_move_status_and_undo(
-            account_uid, folder_name, destination, uids, result
+            account_uid,
+            folder_name,
+            destination,
+            uids,
+            result,
+            status_label=status_label,
         )
         self._update_message_toolbar()
+        self._notify_reader_windows_message_moved(uids)
 
         if self._suppress_sync_list_reload == suppress_key:
             self._suppress_sync_list_reload = None
@@ -3935,7 +3825,13 @@ class MainWindow(Adw.ApplicationWindow):
                 self._current_message["flags"] = current_flags
 
         if self._current_message_uid in updates_by_uid:
-            self._update_reader_toggle_buttons()
+            self._reader_pane.update_message_flags(
+                dict(updates_by_uid[self._current_message_uid])
+            )
+
+        for uid, flags in updates_by_uid.items():
+            for window in self._reader_windows:
+                window.notify_flags_updated(uid, dict(flags))
 
         if self._current_account and self._current_folder:
             self._suppress_sync_list_reload = (
@@ -3998,17 +3894,20 @@ class MainWindow(Adw.ApplicationWindow):
             return
         if len(self._message_list_view.get_selected_uids()) != 1:
             return
-        if self._sidebar.folder_is_drafts(
-            self._current_account.uid, self._current_folder
-        ):
+
+        account = self._current_account
+        folder_name = self._current_folder
+        action = message_list_activate_action(
+            is_drafts_folder=self._sidebar.folder_is_drafts(account.uid, folder_name),
+            is_outbox_folder=is_post_outbox_folder(folder_name),
+        )
+        if action == MessageListActivateAction.DRAFT_COMPOSE:
             self._open_draft_for_editing(uid)
             return
-        mark_seen = self._user_message_click_pending
-        self._user_message_click_pending = False
-        if uid == self._current_message_uid and self._current_message is not None:
+        if action == MessageListActivateAction.OUTBOX_EDIT:
+            self._open_compose_from_outbox(uid)
             return
-        self._current_message_uid = uid
-        self._load_message_body_for_uid(uid, mark_seen=mark_seen)
+        self._present_reader_window(uid)
 
     def _update_message_toolbar(self) -> bool:
         selected = self._message_list_view.get_selected_uids()
@@ -4055,10 +3954,7 @@ class MainWindow(Adw.ApplicationWindow):
         read_id = self._message_read_generation
         self._pending_message_read_uid = uid
         self._inflight_message_read_id = read_id
-        self._reader_subject.set_label("Loading message…")
-        self._reader_subject.set_visible(True)
-        self._reader_meta.set_label("")
-        self._reader_body_stack.set_visible_child_name("empty")
+        self._reader_pane.show_loading()
         viewing_outbox = is_post_outbox_folder(folder_name)
         viewing_drafts = self._sidebar.folder_is_drafts(account.uid, folder_name)
         from_label = account.email or account.display_label
@@ -4267,22 +4163,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         if error is not None:
             self._pending_message_read_uid = None
-            self._reader_subject.set_label("Could not read message")
-            self._reader_subject.set_visible(True)
-            self._reader_meta.set_label(str(error))
-            self._clear_attachments()
-            self._current_message = None
-            self._message_actions.set_visible(False)
-            self._set_message_actions_sensitive(False)
-            self._current_body = {"plain": None, "html": None}
-            self._reader_body_stack.set_visible_child_name("content")
-            error_color = "#aaaaaa" if self._app_prefers_dark() else "#666666"
-            self._web_view.load_html(
-                "<body style='font-family:sans-serif;"
-                f"color:{error_color};padding:1em'>"
-                "This message could not be loaded.</body>",
-                None,
-            )
+            self._reader_pane.show_error(error, dark=self._app_prefers_dark())
             show_error_toast(self, f"Read error: {error}")
             return False
 
@@ -4306,88 +4187,123 @@ class MainWindow(Adw.ApplicationWindow):
         if (msg.get("flags") or {}).get("seen"):
             self._mark_message_read(uid)
 
-        self._reader_subject.set_label(msg.get("subject") or "(no subject)")
-        self._reader_subject.set_visible(True)
-        self._reader_meta.set_label(format_reader_header(msg))
         self._current_message = msg
-        self._message_actions.set_visible(True)
-        self._set_message_actions_sensitive(True)
-        self._show_attachments(msg.get("attachments") or [])
-        self._current_body = {
+        body = {
             "plain": msg.get("body_plain"),
             "html": msg.get("body_html"),
         }
-        self._show_reader_document()
+        self._reader_pane.show_message(
+            msg,
+            body=body,
+            allow_remote=self._load_remote_content,
+            dark=self._app_prefers_dark(),
+            message_appearance=self._message_appearance,
+        )
         return False
 
     def _app_prefers_dark(self) -> bool:
         return Adw.StyleManager.get_default().get_dark()
 
     def _on_app_dark_changed(self, *_args) -> None:
-        if self._current_message is not None:
-            self._show_reader_document()
+        self._reader_pane.refresh_document(dark=self._app_prefers_dark())
 
-    def _show_reader_document(self) -> None:
-        if self._current_message is None:
-            self._reader_body_stack.set_visible_child_name("empty")
+    def _present_reader_window(self, uid: str) -> None:
+        if not self._current_account or not self._current_folder:
             return
 
-        self._reader_body_stack.set_visible_child_name("content")
-        document = build_reader_document(
-            body_html=self._current_body.get("html"),
-            body_plain=self._current_body.get("plain"),
-            allow_remote=self._load_remote_content,
-            dark=self._app_prefers_dark(),
-            message_appearance=self._message_appearance,
-            inline_images=self._current_message.get("inline_images"),
-        )
-        self._web_view.load_html(document, None)
+        account = self._current_account
+        folder_name = self._current_folder
+        viewing_drafts = self._sidebar.folder_is_drafts(account.uid, folder_name)
 
-    @staticmethod
-    def _uri_opens_externally(uri: str) -> bool:
-        lower = uri.lower()
-        return lower.startswith(("http://", "https://", "mailto:"))
+        window = ReaderWindow(
+            parent=self,
+            mail=self._mail,
+            account=account,
+            folder_name=folder_name,
+            message_uid=uid,
+            set_status=self._set_status,
+            on_compose=self._on_reader_window_compose,
+            on_request_move=self._on_reader_window_request_move,
+            on_flags_updated=self._on_reader_window_flags_updated,
+            on_message_loaded=self._on_reader_window_message_loaded,
+            get_move_state=lambda: self._sidebar.get_move_menu_state(
+                account.uid, folder_name
+            ),
+            get_message_flags=self._message_flags_for_uid,
+            viewing_drafts=viewing_drafts,
+        )
+        self._reader_windows.append(window)
+        window.connect(
+            "destroy",
+            lambda *_args, w=window: self._reader_windows.remove(w)
+            if w in self._reader_windows
+            else None,
+        )
+        window.present()
+
+    def _on_reader_window_compose(self, mode: str, msg: dict) -> None:
+        if not self._current_account:
+            return
+        self._present_compose_window(self._current_account, mode=mode, reply_to=msg)
+
+    def _on_reader_window_request_move(
+        self,
+        destination: str,
+        message_uid: str,
+        account_uid: str,
+        folder_name: str,
+    ) -> None:
+        self._move_messages(
+            destination,
+            [message_uid],
+            account_uid=account_uid,
+            folder_name=folder_name,
+        )
+
+    def _on_reader_window_flags_updated(self, uid: str, flags: dict) -> None:
+        self._message_list_view.update_message_flags(uid, flags)
+        self._update_message_flags_in_folder_cache(uid, flags)
+        if uid == self._current_message_uid and self._current_message is not None:
+            current_flags = dict(self._current_message.get("flags") or {})
+            current_flags.update(flags)
+            self._current_message["flags"] = current_flags
+            self._reader_pane.update_message_flags(flags)
+
+    def _on_reader_window_message_loaded(
+        self,
+        uid: str,
+        account_uid: str,
+        folder_name: str,
+        msg: dict,
+    ) -> None:
+        if (
+            self._current_account
+            and self._current_folder
+            and self._current_account.uid == account_uid
+            and self._current_folder == folder_name
+            and self._current_message_uid == uid
+        ):
+            self._current_message = msg
+            body = {
+                "plain": msg.get("body_plain"),
+                "html": msg.get("body_html"),
+            }
+            self._reader_pane.show_message(
+                msg,
+                body=body,
+                allow_remote=self._load_remote_content,
+                dark=self._app_prefers_dark(),
+                message_appearance=self._message_appearance,
+            )
+            self._reader_pane.set_actions_sensitive(True)
+
+    def _notify_reader_windows_message_moved(self, uids: list[str]) -> None:
+        for window in self._reader_windows:
+            for uid in uids:
+                window.notify_message_moved(uid)
 
     def _open_uri_externally(self, uri: str) -> None:
         try:
             Gio.AppInfo.launch_default_for_uri(uri, None)
         except GLib.Error as exc:
             show_error_toast(self, f"Could not open link: {exc.message}")
-
-    def _on_web_view_decide_policy(
-        self,
-        _web_view: WebKit.WebView,
-        decision: WebKit.NavigationPolicyDecision,
-        decision_type: WebKit.PolicyDecisionType,
-    ) -> bool:
-        if decision_type not in (
-            WebKit.PolicyDecisionType.NAVIGATION_ACTION,
-            WebKit.PolicyDecisionType.NEW_WINDOW_ACTION,
-        ):
-            return False
-
-        navigation = decision.get_navigation_action()
-        if navigation is None:
-            return False
-
-        if decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
-            nav_type = navigation.get_navigation_type()
-            if nav_type not in (
-                WebKit.NavigationType.LINK_CLICKED,
-                WebKit.NavigationType.FORM_SUBMITTED,
-                WebKit.NavigationType.FORM_RESUBMITTED,
-            ):
-                return False
-
-        request = navigation.get_request()
-        if request is None:
-            return False
-
-        uri = request.get_uri()
-        if not uri or not self._uri_opens_externally(uri):
-            decision.ignore()
-            return True
-
-        self._open_uri_externally(uri)
-        decision.ignore()
-        return True
