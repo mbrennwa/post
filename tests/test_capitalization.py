@@ -67,8 +67,8 @@ _EXEMPT_STRINGS = frozenset(
         "Unflag",
         "Settings",
         "Inboxes",
-        "Reading",
-        "Composing",
+        "Display",
+        "Outgoing",
         "Attachments",
         "Post",
         "Email",
@@ -590,7 +590,7 @@ class UISourceCapitalizationTests(unittest.TestCase):
             (module, text)
             for module, _style, text, _lineno in _collect_ui_strings()
         }
-        self.assertIn(("settings_window.py", "Message Display"), collected)
+        self.assertIn(("settings_window.py", "Load Remote Content"), collected)
         self.assertIn(("settings_window.py", "No Sendable Accounts"), collected)
         self.assertIn(("window.py", "No Messages in Inbox"), collected)
 
