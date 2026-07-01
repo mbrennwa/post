@@ -300,6 +300,17 @@ def plain_quoted_as_html(quoted_plain: str) -> str:
 
 _REPLY_QUOTE_MARKER_RE = re.compile(r"\n\nOn .+ wrote:\n", re.DOTALL)
 
+_ATTACHMENT_MENTION_RE = re.compile(
+    r"\b(attachments?|attached|enclosed|anhänge?|anhang|beilage[n]?)\b",
+    re.IGNORECASE,
+)
+
+
+def body_mentions_attachment(body_plain: str, *, mode: str = "new") -> bool:
+    """Return True when user-written compose text mentions file attachments."""
+    user_part, _ = split_compose_body_at_quote(body_plain, mode)
+    return bool(_ATTACHMENT_MENTION_RE.search(user_part))
+
 
 def split_compose_body_at_quote(body_plain: str, mode: str) -> tuple[str, str]:
     """Split compose body into user content and the quoted section."""

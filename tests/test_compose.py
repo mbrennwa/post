@@ -8,6 +8,7 @@ from unittest import mock
 
 from post.mail.compose import (
     ComposeAttachment,
+    body_mentions_attachment,
     body_html_for_quoting,
     body_text_for_quoting,
     build_draft_mime_message,
@@ -1582,6 +1583,52 @@ class HtmlForwardReplyTests(unittest.TestCase):
         assert html is not None
         self.assertNotIn(source, html)
         self.assertIn("edited quote", html)
+
+
+class BodyMentionsAttachmentTests(unittest.TestCase):
+    def test_detects_english_keywords(self) -> None:
+        self.assertTrue(body_mentions_attachment("Please see the attachment"))
+        self.assertTrue(body_mentions_attachment("files attached"))
+        self.assertTrue(body_mentions_attachment("Document enclosed"))
+
+    def test_detects_german_keywords(self) -> None:
+        self.assertTrue(body_mentions_attachment("im Anhang finden Sie die Rechnung"))
+        self.assertTrue(body_mentions_attachment("siehe Anhänge"))
+
+    def test_no_match_without_keywords(self) -> None:
+        self.assertFalse(body_mentions_attachment("Hello, no files here"))
+        self.assertFalse(body_mentions_attachment(""))
+
+    def test_excludes_bare_attach(self) -> None:
+        self.assertFalse(body_mentions_attachment("please attach"))
+
+    def test_ignores_quoted_reply_text(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "date_received": "2026-06-17 16:49:57",
+        }
+        quoted = quote_plain_reply(original, "Please see the attachment")
+        body = f"Thanks{quoted}"
+        self.assertFalse(body_mentions_attachment(body, mode="reply"))
+
+    def test_detects_user_text_in_reply(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "date_received": "2026-06-17 16:49:57",
+        }
+        quoted = quote_plain_reply(original, "Plain body")
+        body = f"See the attachment{quoted}"
+        self.assertTrue(body_mentions_attachment(body, mode="reply"))
+
+    def test_forward_ignores_quoted_attachment_mention(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "to": "Bob <bob@example.com>",
+            "date_received": "2026-06-17",
+        }
+        quoted = quote_plain_forward(original, "Please see the attachment")
+        body = f"FYI{quoted}"
+        self.assertFalse(body_mentions_attachment(body, mode="forward"))
 
 
 class OutboundMimeParityTests(unittest.TestCase):
