@@ -18,6 +18,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
+from post.mail.dnd import MESSAGE_TRANSFER_MIME, MessageTransferPayload, encode_message_transfer
 from post.mail.folders import is_post_outbox_folder
 from post.wrap_label import WrappingLabel, configure_ellipsize_label
 from post.mail.helpers import (
@@ -83,6 +84,8 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self._on_item_pressed: OnItemPressed | None = None
         self._on_item_context_menu: OnItemContextMenu | None = None
         self._restoring_selection = False
+        self._drag_account_uid: str | None = None
+        self._drag_folder_name: str | None = None
 
         self._store = Gio.ListStore(item_type=MessageListItem)
         self._selection = Gtk.MultiSelection.new(self._store)
@@ -97,7 +100,41 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self._list_view.add_css_class("message-list")
         self._list_view.set_can_focus(True)
         self._list_view.connect("activate", self._on_list_view_activate)
+        self._setup_list_drag_source()
         self.set_child(self._list_view)
+
+    def set_drag_context(
+        self, account_uid: str | None, folder_name: str | None
+    ) -> None:
+        self._drag_account_uid = account_uid
+        self._drag_folder_name = folder_name
+
+    def _setup_list_drag_source(self) -> None:
+        drag_source = Gtk.DragSource()
+        drag_source.set_actions(Gdk.DragAction.MOVE)
+
+        def prepare(
+            _source: Gtk.DragSource, _x: float, _y: float
+        ) -> Gdk.ContentProvider | None:
+            if not self._drag_account_uid or not self._drag_folder_name:
+                return None
+            if is_post_outbox_folder(self._drag_folder_name):
+                return None
+            uids = self.get_selected_uids()
+            if not uids:
+                return None
+            payload = MessageTransferPayload(
+                account_uid=self._drag_account_uid,
+                source_folder=self._drag_folder_name,
+                uids=tuple(uids),
+            )
+            return Gdk.ContentProvider.new_for_bytes(
+                MESSAGE_TRANSFER_MIME,
+                GLib.Bytes.new(encode_message_transfer(payload)),
+            )
+
+        drag_source.connect("prepare", prepare)
+        self._list_view.add_controller(drag_source)
 
     @property
     def list_view(self) -> Gtk.ListView:
