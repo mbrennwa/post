@@ -4,5 +4,6 @@
 """Message reading pane (HTML rendering)."""
 
 from .html import build_reader_document
+from .pane import MessageReaderPane
 
-__all__ = ["build_reader_document"]
+__all__ = ["MessageReaderPane", "build_reader_document"]
