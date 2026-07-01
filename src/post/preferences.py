@@ -192,10 +192,10 @@ def format_send_delay_status(seconds: int) -> str:
         return "Message sent"
     if seconds < 60:
         unit = "second" if seconds == 1 else "seconds"
-        return f"Message will send in {seconds} {unit}"
+        return f"Message will be sent in {seconds} {unit}"
     minutes = seconds // 60
     unit = "minute" if minutes == 1 else "minutes"
-    return f"Message will send in {minutes} {unit}"
+    return f"Message will be sent in {minutes} {unit}"
 
 
 def _offline_body_sync_raw() -> dict[str, Any]:
