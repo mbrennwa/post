@@ -3316,6 +3316,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         can_archive = False
         can_trash = False
+        viewing_outbox = is_post_outbox_folder(self._current_folder or "")
         if self._current_account and self._current_folder:
             state = self._sidebar.get_move_menu_state(
                 self._current_account.uid, self._current_folder
@@ -3328,7 +3329,6 @@ class MainWindow(Adw.ApplicationWindow):
 
         menu = Gio.Menu()
         count = len(uids)
-        viewing_outbox = is_post_outbox_folder(self._current_folder or "")
         flags_for_uid = self._message_flags_for_uid
         if viewing_outbox and count == 1:
             queue_id = uids[0]

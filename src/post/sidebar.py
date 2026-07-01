@@ -457,6 +457,7 @@ class MailSidebar:
             ("delete-folder", self._on_delete_folder_activate),
             ("archive-read", self._on_archive_read_activate),
             ("archive-read-unflagged", self._on_archive_read_unflagged_activate),
+            ("archive-all", self._on_archive_all_activate),
             ("send-now", self._on_send_now_activate),
             ("empty-trash", self._on_empty_trash_activate),
             ("refresh", self._on_refresh_menu_activate),
@@ -525,9 +526,10 @@ class MailSidebar:
         append_item("Refresh", "sidebar.refresh", "refresh")
         append_item("Take Offline", "sidebar.take-offline", "take_offline")
         append_item("Take Online", "sidebar.take-online", "take_online")
-        append_item("Archive all Read", "sidebar.archive-read", "archive_read")
+        append_item("Archive All", "sidebar.archive-all", "archive_all")
+        append_item("Archive All Read", "sidebar.archive-read", "archive_read")
         append_item(
-            "Archive all Read and Unflagged",
+            "Archive All Read and Unflagged",
             "sidebar.archive-read-unflagged",
             "archive_read_unflagged",
         )
@@ -762,6 +764,37 @@ class MailSidebar:
             lambda: self._mail.archive_read_unflagged_messages(
                 account_uid, folder_name
             ),
+            success_status=status_label,
+            on_success=lambda result: self._after_bulk_archive(
+                account_uid, folder_name, result, status_label
+            ),
+            error_heading="Could not archive messages",
+        )
+
+    def _on_archive_all_activate(self, *_args) -> None:
+        if self._context_target is None:
+            return
+        parent = self._dialog_parent(self._widget)
+        if parent is None:
+            return
+        account_uid = self._context_target["account_uid"]
+        folder_name = self._context_target["folder_name"]
+        total = int(self._context_target.get("total") or 0)
+        if not folder_name or total <= 0:
+            return
+        noun = "message" if total == 1 else "messages"
+        if not confirm_action(
+            parent,
+            heading="Archive All Messages?",
+            body=f"Archive all {total} {noun} from this inbox?",
+            confirm_label="Archive",
+        ):
+            return
+        status_label = f"Archived {total} {noun}"
+        if self._on_move_started is not None:
+            self._on_move_started(account_uid, folder_name)
+        self._run_folder_operation(
+            lambda: self._mail.archive_all_messages(account_uid, folder_name),
             success_status=status_label,
             on_success=lambda result: self._after_bulk_archive(
                 account_uid, folder_name, result, status_label

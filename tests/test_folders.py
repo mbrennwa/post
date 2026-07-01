@@ -267,6 +267,8 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
         self.assertTrue(with_archive["enable_archive_read"])
         self.assertTrue(with_archive["show_archive_read_unflagged"])
         self.assertTrue(with_archive["enable_archive_read_unflagged"])
+        self.assertTrue(with_archive["show_archive_all"])
+        self.assertTrue(with_archive["enable_archive_all"])
 
         without_archive = resolve_sidebar_context_menu(
             folders=folders,
@@ -281,6 +283,7 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
         )
         self.assertFalse(without_archive["show_archive_read"])
         self.assertFalse(without_archive["show_archive_read_unflagged"])
+        self.assertFalse(without_archive["show_archive_all"])
 
     def test_inbox_archive_read_disabled_without_read_messages(self) -> None:
         state = resolve_sidebar_context_menu(
@@ -298,6 +301,23 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
         self.assertFalse(state["enable_archive_read"])
         self.assertTrue(state["show_archive_read_unflagged"])
         self.assertFalse(state["enable_archive_read_unflagged"])
+        self.assertTrue(state["show_archive_all"])
+        self.assertTrue(state["enable_archive_all"])
+
+    def test_inbox_archive_all_disabled_when_empty(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=self._folders(),
+            folder_name="INBOX",
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=0,
+            total=0,
+            outbox_count=0,
+            folder_crud_enabled=True,
+        )
+        self.assertTrue(state["show_archive_all"])
+        self.assertFalse(state["enable_archive_all"])
 
     def test_outbox_send_now_enabled_with_queue(self) -> None:
         state = resolve_sidebar_context_menu(
