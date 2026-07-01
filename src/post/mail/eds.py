@@ -2082,6 +2082,13 @@ class MailService:
             folder_name,
         )
 
+    def archive_all_messages(
+        self, account_uid: str, folder_name: str
+    ) -> dict[str, Any]:
+        return run_on_mail_thread(
+            self._archive_all_messages_unlocked, account_uid, folder_name
+        )
+
     def _create_folder_unlocked(
         self,
         account_uid: str,
@@ -2197,6 +2204,27 @@ class MailService:
             }
         result = self._archive_messages_unlocked(account_uid, folder_name, uids)
         result["archived_count"] = len(uids)
+        return result
+
+    def _archive_all_messages_unlocked(
+        self, account_uid: str, folder_name: str
+    ) -> dict[str, Any]:
+        index = self._build_folder_index_unlocked(account_uid, folder_name)
+        all_uids = [
+            message["uid"]
+            for message in index.messages
+            if message.get("uid")
+        ]
+        if not all_uids:
+            return {
+                "archived_count": 0,
+                "source_folder_unread": index.unread,
+                "source_folder_total": index.total,
+            }
+        result = self._archive_messages_unlocked(
+            account_uid, folder_name, all_uids
+        )
+        result["archived_count"] = len(all_uids)
         return result
 
     def _invalidate_account_folder_tree(

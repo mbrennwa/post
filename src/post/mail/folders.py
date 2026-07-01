@@ -406,6 +406,7 @@ def resolve_sidebar_context_menu(
     show_delete = show_rename
     show_archive_read = is_inbox and archive_name is not None
     show_archive_read_unflagged = show_archive_read
+    show_archive_all = show_archive_read
     show_send_now = is_outbox
     show_empty_trash = is_trash
     show_refresh = True
@@ -429,6 +430,8 @@ def resolve_sidebar_context_menu(
         "enable_archive_read": show_archive_read and read_count > 0,
         "show_archive_read_unflagged": show_archive_read_unflagged,
         "enable_archive_read_unflagged": show_archive_read_unflagged and read_count > 0,
+        "show_archive_all": show_archive_all,
+        "enable_archive_all": show_archive_all and total > 0,
         "show_send_now": show_send_now,
         "enable_send_now": show_send_now and outbox_count > 0,
         "show_empty_trash": show_empty_trash,
