@@ -34,10 +34,11 @@ from post.mail.compose import (
     normalize_references_header,
     build_reply_subject,
     compose_body_with_signature,
+    extract_user_body_from_auto_signature,
     extract_reply_target_addresses,
     find_auto_signature_offset,
+    finalize_body_after_signature_sync,
     format_address_list,
-    format_signature_block,
     guess_attachment_mime_type,
     normalize_signature_text,
     normalize_email,
@@ -880,21 +881,6 @@ class ComposeWindow(Adw.Window):
         if mark is not None:
             buffer.delete_mark(mark)
 
-    def _signature_mark_is_valid(self) -> bool:
-        buffer = self._body_view.get_buffer()
-        mark = buffer.get_mark(_SIGNATURE_MARK_NAME)
-        if mark is None:
-            return False
-        text = buffer.get_text(*buffer.get_bounds(), False)
-        offset = find_auto_signature_offset(
-            text,
-            tracked_signature=self._tracked_signature,
-            known_signatures=self._known_signatures(),
-        )
-        if offset is None:
-            return False
-        return buffer.get_iter_at_mark(mark).get_offset() == offset
-
     def _place_signature_mark(self) -> None:
         if self._mode != "new" or self._tracked_signature is None:
             return
@@ -920,38 +906,35 @@ class ComposeWindow(Adw.Window):
         if self._mode != "new":
             return
         buffer = self._body_view.get_buffer()
+        current = buffer.get_text(*buffer.get_bounds(), False)
         new_signature = get_account_signature(self._selected_account().uid)
-        block = format_signature_block(new_signature)
-        mark = buffer.get_mark(_SIGNATURE_MARK_NAME)
-        if mark is not None and not self._signature_mark_is_valid():
-            self._clear_signature_mark()
-            mark = None
 
-        self._tracking_edits = False
-        try:
-            if mark is not None:
-                start = buffer.get_iter_at_mark(mark)
-                end = buffer.get_end_iter()
-                buffer.delete(start, end)
-                if block:
-                    begin = buffer.get_start_iter()
-                    prefix = "\n\n" if start.compare(begin) > 0 else ""
-                    buffer.insert(start, f"{prefix}{block}")
-                    self._tracked_signature = normalize_signature_text(new_signature) or None
-                    self._place_signature_mark()
-                else:
-                    self._tracked_signature = None
-                    self._clear_signature_mark()
-                return
-
-            current = buffer.get_text(*buffer.get_bounds(), False)
-            result = replace_new_message_signature(
+        result = replace_new_message_signature(
+            current,
+            new_signature=new_signature,
+            tracked_signature=self._tracked_signature,
+            previous_signature=previous_signature,
+            known_signatures=self._known_signatures(),
+        )
+        if result is None:
+            user = extract_user_body_from_auto_signature(
                 current,
-                new_signature=new_signature,
                 tracked_signature=self._tracked_signature,
                 previous_signature=previous_signature,
                 known_signatures=self._known_signatures(),
             )
+            if user is not None:
+                normalized = normalize_signature_text(new_signature)
+                result = (
+                    finalize_body_after_signature_sync(
+                        merge_user_body_with_signature(user, normalized),
+                        new_signature,
+                    ),
+                    normalized or None,
+                )
+
+        self._tracking_edits = False
+        try:
             if result is None:
                 self._clear_signature_mark()
                 self._tracked_signature = None
@@ -959,7 +942,10 @@ class ComposeWindow(Adw.Window):
             new_body, new_tracked = result
             self._set_body_plain_text(new_body)
             self._tracked_signature = new_tracked
-            self._place_signature_mark()
+            if new_tracked:
+                self._place_signature_mark()
+            else:
+                self._clear_signature_mark()
             if not new_body.strip():
                 self._place_body_cursor_at_start()
         finally:

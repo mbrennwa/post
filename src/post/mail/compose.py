@@ -619,11 +619,8 @@ def normalize_signature_text(signature: str | None) -> str:
 
 
 def format_signature_block(signature: str) -> str:
-    """Return a plain-text signature block with the conventional delimiter."""
-    text = normalize_signature_text(signature)
-    if not text:
-        return ""
-    return f"-- \n{text}"
+    """Return normalized plain-text signature content from settings."""
+    return normalize_signature_text(signature)
 
 
 def merge_user_body_with_signature(user: str, signature: str | None) -> str:
@@ -639,6 +636,24 @@ def merge_user_body_with_signature(user: str, signature: str | None) -> str:
 
 def _signature_prefixes(block: str) -> tuple[str, str]:
     return f"\n\n{block}", block
+
+
+def _strip_trailing_signature_block(normalized: str, block: str) -> str | None:
+    """Return user text before a trailing signature block, if present."""
+    long_prefix = f"\n\n{block}"
+    if normalized in (long_prefix, block):
+        return ""
+    if normalized.endswith(long_prefix):
+        return normalized[: -len(long_prefix)]
+    return None
+
+
+def _find_trailing_signature_offset(normalized: str, block: str) -> int | None:
+    """Return the start offset of a trailing signature block."""
+    user = _strip_trailing_signature_block(normalized, block)
+    if user is None:
+        return None
+    return len(user)
 
 
 def find_auto_signature_offset(
@@ -663,11 +678,9 @@ def find_auto_signature_offset(
         block = format_signature_block(signature)
         if not block:
             continue
-        for prefix in _signature_prefixes(block):
-            if normalized == prefix:
-                return 0
-            if normalized.endswith(prefix):
-                return len(normalized) - len(prefix)
+        offset = _find_trailing_signature_offset(normalized, block)
+        if offset is not None:
+            return offset
     return None
 
 
@@ -679,11 +692,9 @@ def strip_signature_suffix(body: str, signature: str | None) -> str | None:
     block = format_signature_block(signature)
     if not block:
         return None
-    for prefix in _signature_prefixes(block):
-        if normalized == prefix:
-            return ""
-        if normalized.endswith(prefix):
-            return normalized[: -len(prefix)]
+    user = _strip_trailing_signature_block(normalized, block)
+    if user is not None:
+        return user
     return None
 
 
@@ -703,8 +714,6 @@ def extract_user_body_from_auto_signature(
     normalized = _normalize_body_for_signature_match(body)
     if not normalized.strip():
         return ""
-    if _is_signature_delimiter_remaint(normalized):
-        return ""
 
     signatures_to_try: list[str] = []
     for signature in (
@@ -716,9 +725,6 @@ def extract_user_body_from_auto_signature(
             signatures_to_try.append(signature)
 
     for signature in signatures_to_try:
-        block = format_signature_block(signature)
-        if not block:
-            continue
         expected = compose_body_with_signature(
             mode="new",
             quoted_body="",
@@ -726,9 +732,11 @@ def extract_user_body_from_auto_signature(
         )
         if normalized == expected:
             return ""
-        for prefix in _signature_prefixes(block):
-            if normalized.endswith(prefix):
-                return normalized[: -len(prefix)]
+        block = format_signature_block(signature)
+        if block:
+            user = _strip_trailing_signature_block(normalized, block)
+            if user is not None:
+                return user
         if is_truncated_auto_signature_body(normalized, expected):
             return ""
     return None
@@ -757,7 +765,10 @@ def replace_new_message_signature(
         if user is not None:
             normalized = normalize_signature_text(new_signature)
             return (
-                merge_user_body_with_signature(user, normalized),
+                finalize_body_after_signature_sync(
+                    merge_user_body_with_signature(user, normalized),
+                    new_signature,
+                ),
                 normalized or None,
             )
     if not previous_signature and not tracked_signature:
@@ -782,8 +793,6 @@ def append_new_message_signature_if_needed(
     normalized_body = _normalize_body_for_signature_match(body)
     if not normalized_body.strip():
         return merge_user_body_with_signature("", normalized), normalized
-    if "\n-- \n" in normalized_body or normalized_body.startswith("-- \n"):
-        return None
     if find_auto_signature_offset(
         normalized_body,
         tracked_signature=normalized,
@@ -811,7 +820,23 @@ def sync_new_message_body_signature(
     if user is None:
         return None
     normalized = normalize_signature_text(new_signature)
-    return merge_user_body_with_signature(user, normalized), normalized or None
+    return (
+        finalize_body_after_signature_sync(
+            merge_user_body_with_signature(user, normalized),
+            new_signature,
+        ),
+        normalized or None,
+    )
+
+
+def finalize_body_after_signature_sync(body: str, new_signature: str | None) -> str:
+    """Normalize body text after swapping or removing an auto signature."""
+    body = _normalize_body_for_signature_match(body)
+    if normalize_signature_text(new_signature):
+        return body
+    if not body.strip():
+        return ""
+    return body
 
 
 def compose_body_with_signature(
@@ -833,25 +858,18 @@ def compose_body_with_signature(
     return quoted_body
 
 
-def _is_signature_delimiter_remaint(body: str) -> bool:
-    """True when only the auto-inserted delimiter line remains after partial edits."""
-    content_lines = [line.strip() for line in body.splitlines() if line.strip()]
-    return content_lines in (["--"], ["-- "])
-
-
 def is_truncated_auto_signature_body(body: str, expected: str) -> bool:
-    """True when body is empty, delimiter-only, or a prefix of an auto signature body."""
+    """True when body is empty or still a prefix of an auto signature body."""
     normalized = _normalize_body_for_signature_match(body)
     if not expected:
         return not normalized.strip()
     if normalized == expected:
         return True
-    if _is_signature_delimiter_remaint(normalized):
+    if normalized in ("\n\n", ""):
         return True
-    for prefix in ("\n\n-- \n", "-- \n"):
-        if expected.startswith(prefix) and normalized.startswith(prefix):
-            if not normalized[len(prefix) :].strip():
-                return True
+    if expected.startswith("\n\n") and normalized.startswith("\n\n"):
+        if expected.startswith(normalized):
+            return True
     return False
 
 
@@ -878,8 +896,6 @@ def body_should_follow_account_signature(
 def body_is_unedited_signature_template(body: str, signatures: list[str]) -> bool:
     """True when the body is empty or still matches an auto-inserted signature."""
     if not body.strip():
-        return True
-    if _is_signature_delimiter_remaint(body):
         return True
     for signature in signatures:
         if body == compose_body_with_signature(
