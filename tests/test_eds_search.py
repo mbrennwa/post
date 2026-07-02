@@ -140,6 +140,35 @@ class SearchFolderMessagesTests(unittest.TestCase):
         self.assertEqual(unread, 0)
         self.assertEqual(source, "memory")
 
+    def test_forwards_on_matches_to_filter(self) -> None:
+        messages = [
+            {
+                "uid": "1",
+                "subject": "Invoice due",
+                "from": "a@b.c",
+                "flags": {"seen": True},
+            },
+        ]
+        service, folder = self._service_with_index(messages)
+        query = MessageSearchQuery(terms=(SearchTerm(field="subject", value="Invoice"),))
+        on_matches = mock.Mock()
+
+        with (
+            mock.patch.object(service, "_require_folder_unlocked", return_value=folder),
+            mock.patch("post.mail.eds.filter_messages_by_query") as filter_query,
+        ):
+            filter_query.return_value = [messages[0]]
+            service._search_folder_messages_unlocked(
+                "acct-1",
+                "INBOX",
+                query,
+                sync=False,
+                on_matches=on_matches,
+            )
+
+        _args, kwargs = filter_query.call_args
+        self.assertIs(kwargs.get("on_matches"), on_matches)
+
     def test_text_query_loads_body_text_for_candidates(self) -> None:
         messages = [
             {"uid": "1", "subject": "Hello", "flags": {"seen": True}},

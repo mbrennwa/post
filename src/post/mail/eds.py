@@ -130,6 +130,7 @@ from .offline_settings import apply_offline_settings_to_store, apply_offline_syn
 from .offline_sync import OfflineBodySyncCoordinator, OfflineSyncProgress
 from .search import (
     MessageSearchQuery,
+    SearchMatchCallback,
     SearchProgressCallback,
     filter_messages_by_query,
     query_requires_body_scan,
@@ -2362,6 +2363,7 @@ class MailService:
         *,
         sync: bool,
         on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
         cancellable = self._begin_folder_search_unlocked()
         try:
@@ -2435,6 +2437,7 @@ class MailService:
                     body_text_for_uid=body_text_for_uid if needs_body else None,
                     is_cancelled=cancellable.is_cancelled,
                     on_progress=on_progress,
+                    on_matches=on_matches,
                 )
                 if cancellable.is_cancelled():
                     search_trace(
@@ -2463,6 +2466,7 @@ class MailService:
         *,
         sync: bool = False,
         on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
         if is_mail_io_thread():
             return self._search_folder_messages_unlocked(
@@ -2471,6 +2475,7 @@ class MailService:
                 query,
                 sync=sync,
                 on_progress=on_progress,
+                on_matches=on_matches,
             )
         return get_mail_io_thread().run_sync(
             self._search_folder_messages_unlocked,
@@ -2479,6 +2484,7 @@ class MailService:
             query,
             sync=sync,
             on_progress=on_progress,
+            on_matches=on_matches,
         )
 
     def list_messages_with_stats(

@@ -21,6 +21,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from post.compose_window import ComposeWindow, SavedDraftNotification
 from post.credentials import prompt_password_sync
+from post.gtk_schedule import schedule_on_gtk_main
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.eds import MailAccount, MessageNotAvailableError, OfflineSyncProgress
@@ -115,6 +116,7 @@ MESSAGE_LIST_SYNC_STATUS = "Syncing with Server"
 
 _SIDEBAR_TOP_INSET = 12
 _SEARCH_PROGRESS_UI_INTERVAL_US = 100_000
+_CACHED_HEADER_SEARCH_CHUNK_SIZE = 200
 
 _MESSAGE_LIST_CSS = f"""
 listview.message-list row {{
@@ -228,6 +230,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._pre_search_snapshot: tuple[list[dict], int, int, str] | None = None
         self._pre_search_folder: tuple[str, str] | None = None
         self._search_progress_last_ui_time = 0
+        self._search_results_streamed = False
         self._offline_download_status = ""
         self._status_hint = ""
         self._network_available = Gio.NetworkMonitor.get_default().get_network_available()
@@ -2314,7 +2317,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _report_search_progress(
         self, load_id: int, progress: SearchFilterProgress
     ) -> None:
-        GLib.idle_add(self._apply_search_progress, load_id, progress)
+        schedule_on_gtk_main(self._apply_search_progress, load_id, progress)
 
     def _apply_search_progress(
         self, load_id: int, progress: SearchFilterProgress
@@ -2340,6 +2343,96 @@ class MainWindow(Adw.ApplicationWindow):
         self._show_search_progress_ui(fraction=fraction, label=progress_text)
         self._set_status(progress_text)
         return False
+
+    def _report_search_matches(self, load_id: int, batch: list[dict]) -> None:
+        schedule_on_gtk_main(self._apply_search_matches, load_id, batch)
+
+    def _apply_search_matches(self, load_id: int, batch: list[dict]) -> bool:
+        if load_id != self._messages_load_generation:
+            return False
+        if self._search_query is None or not batch:
+            return False
+        account = self._current_account
+        folder_name = self._current_folder
+        if account is None or folder_name is None:
+            return False
+
+        first_batch = not self._search_results_streamed
+        self._search_results_streamed = True
+        if first_batch:
+            self._message_stack.set_visible_child_name("list")
+
+        self._message_list_view.append_messages(batch, folder_name=folder_name)
+        if self._current_folder_messages is None:
+            self._current_folder_messages = []
+        self._current_folder_messages.extend(batch)
+        return False
+
+    def _begin_chunked_cached_header_search(
+        self,
+        load_id: int,
+        account_uid: str,
+        folder_name: str,
+        snapshot: tuple[list[dict], int, int] | None,
+        fallback_worker: Callable[[], None],
+    ) -> None:
+        if load_id != self._messages_load_generation:
+            return
+        if snapshot is None:
+            self._mail.cancel_folder_list()
+            get_mail_io_thread().submit_front(fallback_worker)
+            return
+        search_query = self._search_query
+        if search_query is None:
+            return
+
+        cached_messages, cached_unread, _cached_total = snapshot
+        state = {"offset": 0, "matched": []}
+
+        def process_chunk() -> bool:
+            if load_id != self._messages_load_generation:
+                return False
+            if self._search_query is not search_query:
+                return False
+            start = state["offset"]
+            end = min(
+                start + _CACHED_HEADER_SEARCH_CHUNK_SIZE,
+                len(cached_messages),
+            )
+            chunk_matched = filter_messages_by_query(
+                list(cached_messages[start:end]),
+                search_query,
+                on_matches=lambda batch: self._apply_search_matches(load_id, batch),
+            )
+            state["matched"].extend(chunk_matched)
+            state["offset"] = end
+            self._apply_search_progress(
+                load_id,
+                SearchFilterProgress(
+                    end, len(cached_messages), len(state["matched"])
+                ),
+            )
+            if end < len(cached_messages):
+                return True
+            self._on_messages_loaded(
+                load_id,
+                account_uid,
+                folder_name,
+                state["matched"],
+                cached_unread,
+                len(state["matched"]),
+                "disk_cache",
+                False,
+                None,
+            )
+            return False
+
+        if cached_messages:
+            self._apply_search_progress(
+                load_id,
+                SearchFilterProgress(0, len(cached_messages), 0),
+            )
+        GLib.idle_add(process_chunk)
 
     def _message_load_status_detail(self) -> str:
         parts: list[str] = []
@@ -2397,6 +2490,8 @@ class MainWindow(Adw.ApplicationWindow):
             )
         )
         search_query = self._search_query
+        if search_query is not None:
+            self._search_results_streamed = False
         if search_query is None:
             self._mail.cancel_folder_search()
         viewing_outbox = is_post_outbox_folder(folder_name)
@@ -2413,6 +2508,9 @@ class MainWindow(Adw.ApplicationWindow):
         def on_search_progress(progress: SearchFilterProgress) -> None:
             self._report_search_progress(load_id, progress)
 
+        def on_search_matches(batch: list[dict]) -> None:
+            self._report_search_matches(load_id, batch)
+
         def fetch_messages(sync_flag: bool) -> tuple[list[dict], int, int, str]:
             if viewing_outbox:
                 messages, unread, total = list_queued_messages(
@@ -2427,6 +2525,7 @@ class MainWindow(Adw.ApplicationWindow):
                     search_query,
                     sync=sync_flag,
                     on_progress=on_search_progress,
+                    on_matches=on_search_matches,
                 )
                 return messages, unread, total, source
             messages, unread, total, source = self._mail.get_folder_messages(
@@ -2594,41 +2693,43 @@ class MainWindow(Adw.ApplicationWindow):
                 and folder_index_has_cache(account_uid, folder_name)
                 and not query_requires_body_scan(search_query)
             ):
-                def run_cached_header_search() -> bool:
+                def worker_load_cached_header_index() -> None:
                     if load_id != self._messages_load_generation:
-                        return False
+                        schedule_on_gtk_main(
+                            self._stop_superseded_message_loading, load_id
+                        )
+                        return
                     search_trace(
-                        "search_main_thread_start",
+                        "search_worker_start",
                         load_id=load_id,
                         path="disk_cache_headers",
                     )
-                    snapshot = load_folder_index_cache(account_uid, folder_name)
-                    if snapshot is None:
-                        self._mail.cancel_folder_list()
-                        get_mail_io_thread().submit_front(worker_initial)
-                        return False
-                    cached_messages, cached_unread, cached_total = snapshot
-                    filtered = filter_messages_by_query(
-                        list(cached_messages),
-                        search_query,
-                        on_progress=lambda progress: self._report_search_progress(
-                            load_id, progress
-                        ),
-                    )
-                    self._on_messages_loaded(
+                    try:
+                        snapshot = load_folder_index_cache(account_uid, folder_name)
+                    except Exception as exc:
+                        schedule_on_gtk_main(
+                            self._on_messages_loaded,
+                            load_id,
+                            account_uid,
+                            folder_name,
+                            None,
+                            -1,
+                            -1,
+                            initial_source,
+                            False,
+                            exc,
+                        )
+                        return
+                    schedule_on_gtk_main(
+                        self._begin_chunked_cached_header_search,
                         load_id,
                         account_uid,
                         folder_name,
-                        filtered,
-                        cached_unread,
-                        len(filtered),
-                        "disk_cache",
-                        False,
-                        None,
+                        snapshot,
+                        worker_initial,
                     )
-                    return False
 
-                GLib.idle_add(run_cached_header_search)
+                get_mail_io_thread().submit_front(worker_load_cached_header_index)
                 return
             if search_query is not None:
                 self._mail.cancel_folder_list()
@@ -2818,6 +2919,12 @@ class MainWindow(Adw.ApplicationWindow):
                                     folder_name,
                                     search_query,
                                     sync=False,
+                                    on_progress=lambda progress: self._report_search_progress(
+                                        load_id, progress
+                                    ),
+                                    on_matches=lambda batch: self._report_search_matches(
+                                        load_id, batch
+                                    ),
                                 )
                             else:
                                 (
@@ -2889,6 +2996,25 @@ class MainWindow(Adw.ApplicationWindow):
                 view="empty",
                 searching=True,
             )
+            return False
+
+        if self._search_query is not None and self._search_results_streamed:
+            def streamed_after_list() -> None:
+                if self._search_query is None:
+                    self._try_restore_selected_message(account.uid, folder_name)
+
+            on_complete = after_list_complete or streamed_after_list
+            search_trace(
+                "search_loaded_complete",
+                load_id=load_id,
+                match_count=len(messages),
+                view="list",
+                searching=True,
+                streamed=True,
+            )
+            self._message_stack.set_visible_child_name("list")
+            self._update_message_status(account, folder_name)
+            on_complete()
             return False
 
         self._message_stack.set_visible_child_name("list")

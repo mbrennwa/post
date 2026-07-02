@@ -13,8 +13,10 @@ from dataclasses import dataclass
 from post.mail.search_debug import search_debug_enabled, search_trace
 
 SEARCH_FILTER_PROGRESS_INTERVAL = 100
+SEARCH_MATCH_BATCH_SIZE = 25
 
 SearchProgressCallback = Callable[["SearchFilterProgress"], None]
+SearchMatchCallback = Callable[[list[dict]], None]
 
 
 @dataclass(frozen=True)
@@ -257,7 +259,9 @@ def filter_messages_by_query(
     body_text_for_uid: Callable[[str], str | None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     on_progress: SearchProgressCallback | None = None,
+    on_matches: SearchMatchCallback | None = None,
     progress_interval: int = SEARCH_FILTER_PROGRESS_INTERVAL,
+    match_batch_size: int = SEARCH_MATCH_BATCH_SIZE,
 ) -> list[dict]:
     """Filter folder index messages locally, checking cancellation between body loads."""
     if not query.terms:
@@ -265,7 +269,13 @@ def filter_messages_by_query(
 
     needs_body = query_requires_body_scan(query)
     matched: list[dict] = []
+    pending_batch: list[dict] = []
     message_count = len(messages)
+
+    def flush_matches() -> None:
+        if on_matches is not None and pending_batch:
+            on_matches(list(pending_batch))
+            pending_batch.clear()
     search_trace(
         "filter_messages_begin",
         message_count=message_count,
@@ -308,6 +318,10 @@ def filter_messages_by_query(
             for term in query.terms
         ):
             matched.append(message)
+            pending_batch.append(message)
+            if len(matched) == 1 or len(pending_batch) >= match_batch_size:
+                flush_matches()
+    flush_matches()
     if on_progress is not None and message_count > 0:
         on_progress(
             SearchFilterProgress(message_count, message_count, len(matched))
