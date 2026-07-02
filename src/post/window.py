@@ -196,6 +196,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.connect("notify::height", self._on_window_size_changed)
         self._close_after_outbound_send = False
         self._delayed_send_close_dialog: Adw.AlertDialog | None = None
+        self._is_closing = False
 
         self._mail = MailService.connect()
         self._send_delay_scheduler = OutboundSendDelayScheduler(
@@ -668,7 +669,16 @@ class MainWindow(Adw.ApplicationWindow):
             self._prompt_send_delayed_before_close(pending_delayed)
             return True
 
-        return self._finish_close()
+        GLib.idle_add(self._destroy_after_close_cleanup)
+        return True
+
+    def _abort_inflight_search(self) -> None:
+        if self._is_closing:
+            return
+        self._is_closing = True
+        self._messages_load_generation += 1
+        self._search_query = None
+        self._mail.cancel_folder_search()
 
     def _prompt_send_delayed_before_close(
         self,
@@ -737,6 +747,7 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._destroy_after_close_cleanup)
 
     def _destroy_after_close_cleanup(self) -> bool:
+        self._abort_inflight_search()
         self._finish_close()
         self.destroy()
         return False
@@ -2367,6 +2378,8 @@ class MainWindow(Adw.ApplicationWindow):
     def _apply_search_progress(
         self, load_id: int, progress: SearchFilterProgress
     ) -> bool:
+        if self._is_closing:
+            return False
         if load_id != self._messages_load_generation:
             return False
         if self._search_query is None:
@@ -2396,6 +2409,8 @@ class MainWindow(Adw.ApplicationWindow):
         schedule_on_gtk_main(self._apply_search_matches, load_id, batch)
 
     def _apply_search_matches(self, load_id: int, batch: list[dict]) -> bool:
+        if self._is_closing:
+            return False
         if load_id != self._messages_load_generation:
             return False
         if self._search_query is None or not batch:
@@ -2430,6 +2445,8 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> None:
         if load_id != self._messages_load_generation:
             return
+        if self._is_closing:
+            return
         if snapshot is None:
             self._mail.cancel_folder_list()
             get_mail_io_thread().submit_front(fallback_worker)
@@ -2443,7 +2460,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         def is_search_cancelled() -> bool:
             return (
-                load_id != self._messages_load_generation
+                self._is_closing
+                or load_id != self._messages_load_generation
                 or self._search_query is not search_query
             )
 
