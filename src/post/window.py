@@ -152,6 +152,14 @@ separator.header-divider {{
 .message-flagged-icon {{
   color: @error_color;
 }}
+progressbar.search-progress {{
+  min-height: 3px;
+}}
+progressbar.search-progress trough,
+progressbar.search-progress progress {{
+  min-height: 3px;
+  border-radius: 2px;
+}}
 button.message-flagged {{
   color: @error_color;
 }}
@@ -251,13 +259,18 @@ class MainWindow(Adw.ApplicationWindow):
         self._header_search_entry.connect("search-changed", self._on_search_changed)
         self._header_search_entry.connect("activate", self._on_search_activate)
         self._header_search_entry.connect("stop-search", self._on_search_stopped)
-        search_title = Gtk.Box()
+        self._header_search_progress = Gtk.ProgressBar()
+        self._header_search_progress.set_show_text(False)
+        self._header_search_progress.add_css_class("search-progress")
+        self._header_search_progress.set_visible(False)
+        search_title = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         search_title.set_halign(Gtk.Align.CENTER)
         search_title.set_hexpand(True)
         search_title.set_valign(Gtk.Align.CENTER)
         search_title.set_margin_start(48)
         search_title.set_margin_end(48)
         search_title.append(self._header_search_entry)
+        search_title.append(self._header_search_progress)
         header.set_title_widget(search_title)
 
         settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
@@ -2307,6 +2320,12 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_loading_progress.set_fraction(0.0)
         self._message_loading_spinner.set_visible(True)
         self._search_progress_last_ui_time = 0
+        self._header_search_progress.set_visible(False)
+        self._header_search_progress.set_fraction(0.0)
+
+    def _show_header_search_progress(self, *, fraction: float) -> None:
+        self._header_search_progress.set_fraction(fraction)
+        self._header_search_progress.set_visible(True)
 
     def _show_search_progress_ui(self, *, fraction: float, label: str) -> None:
         self._message_loading_spinner.set_visible(False)
@@ -2340,7 +2359,10 @@ class MainWindow(Adw.ApplicationWindow):
             if progress.message_count > 0
             else 0.0
         )
-        self._show_search_progress_ui(fraction=fraction, label=progress_text)
+        if self._search_results_streamed:
+            self._show_header_search_progress(fraction=fraction)
+        else:
+            self._show_search_progress_ui(fraction=fraction, label=progress_text)
         self._set_status(progress_text)
         return False
 
@@ -2361,6 +2383,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._search_results_streamed = True
         if first_batch:
             self._message_stack.set_visible_child_name("list")
+            loading_fraction = self._message_loading_progress.get_fraction()
+            self._message_loading_progress.set_visible(False)
+            if loading_fraction > 0.0:
+                self._show_header_search_progress(fraction=loading_fraction)
 
         self._message_list_view.append_messages(batch, folder_name=folder_name)
         if self._current_folder_messages is None:
