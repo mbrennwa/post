@@ -24,12 +24,50 @@ class SearchFilterProgress:
     scanned: int
     message_count: int
     matches: int
+    folder_label: str | None = None
+    folders_done: int | None = None
+    folders_total: int | None = None
+
+
+def make_search_row_key(account_uid: str, folder_name: str, uid: str) -> str:
+    return f"{account_uid}\0{folder_name}\0{uid}"
+
+
+def annotate_search_match(
+    message: dict,
+    *,
+    account_uid: str,
+    folder_name: str,
+) -> dict:
+    uid = str(message.get("uid") or "")
+    annotated = dict(message)
+    annotated["_search_account_uid"] = account_uid
+    annotated["_search_folder"] = folder_name
+    annotated["_search_row_key"] = make_search_row_key(account_uid, folder_name, uid)
+    return annotated
+
+
+def format_search_result_meta(
+    account_label: str,
+    folder_display: str,
+    sender: str,
+) -> str:
+    parts = [part for part in (account_label, folder_display, sender) if part]
+    return " · ".join(parts)
 
 
 def format_search_filter_progress(progress: SearchFilterProgress) -> str:
     match_word = "match" if progress.matches == 1 else "matches"
+    if progress.folders_total is not None and progress.folders_done is not None:
+        folder_part = progress.folder_label or "folders"
+        prefix = (
+            f"Searching {folder_part}…"
+            f" ({progress.folders_done:,} / {progress.folders_total:,} folders)"
+        )
+    else:
+        prefix = "Searching…"
     return (
-        f"Searching… {progress.scanned:,} / {progress.message_count:,}"
+        f"{prefix} {progress.scanned:,} / {progress.message_count:,}"
         f" · {progress.matches:,} {match_word}"
     )
 

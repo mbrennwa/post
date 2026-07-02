@@ -80,6 +80,16 @@ def get_show_evolution_local() -> bool | None:
     return bool(value)
 
 
+def get_search_all_mail() -> bool:
+    return bool(_load_raw().get("search_all_mail"))
+
+
+def set_search_all_mail(value: bool) -> None:
+    data = _load_raw()
+    data["search_all_mail"] = value
+    _save_raw(data)
+
+
 def get_load_remote_content() -> bool:
     return bool(_load_raw().get("load_remote_content"))
 

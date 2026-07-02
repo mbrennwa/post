@@ -52,6 +52,7 @@ from post.mail.search import (
     SearchFilterProgress,
     filter_messages_by_query,
     format_search_filter_progress,
+    format_search_result_meta,
     parse_search_query,
     query_requires_body_scan,
 )
@@ -98,11 +99,13 @@ from post.preferences import (
     OfflineBodySyncMode,
     get_load_remote_content,
     get_message_appearance,
+    get_search_all_mail,
     get_sidebar_state,
     get_window_state,
     set_account_offline_body_sync,
     set_active_message_uid,
     set_offline_body_sync_prompt_declined,
+    set_search_all_mail,
     should_show_offline_body_sync_prompt,
     set_window_state,
 )
@@ -240,6 +243,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._local_draft_sync_suppress_until: dict[tuple[str, str], float] = {}
         self._user_message_click_pending = False
         self._search_query: MessageSearchQuery | None = None
+        self._search_all_mail = get_search_all_mail()
+        self._search_all_mail_switch_updating = False
+        self._folder_before_all_mail: tuple[str, str] | None = None
         self._search_entry_updating = False
         self._messages_load_expects_search = False
         self._pre_search_snapshot: tuple[list[dict], int, int, str] | None = None
@@ -267,7 +273,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._header_search_entry.connect("activate", self._on_search_activate)
         self._header_search_entry.connect("stop-search", self._on_search_stopped)
         search_overlay = Gtk.Overlay()
-        search_overlay.set_halign(Gtk.Align.CENTER)
         search_overlay.set_hexpand(True)
         search_overlay.set_child(self._header_search_entry)
         self._header_search_progress = Gtk.ProgressBar()
@@ -279,13 +284,39 @@ class MainWindow(Adw.ApplicationWindow):
         self._header_search_progress.set_hexpand(True)
         self._header_search_progress.set_can_target(False)
         search_overlay.add_overlay(self._header_search_progress)
+
+        self._search_all_mail_label = Gtk.Label(label="Search all mail")
+        self._search_all_mail_label.add_css_class("dim-label")
+        self._search_all_mail_label.set_valign(Gtk.Align.CENTER)
+        self._search_all_mail_switch = Gtk.Switch()
+        self._search_all_mail_switch.set_active(self._search_all_mail)
+        self._search_all_mail_switch.set_valign(Gtk.Align.CENTER)
+        self._search_all_mail_switch.set_tooltip_text(
+            "Search all folders on all accounts"
+        )
+        self._search_all_mail_switch.set_sensitive(False)
+        self._search_all_mail_switch.connect(
+            "notify::active", self._on_search_all_mail_switch_changed
+        )
+        search_scope = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        search_scope.set_valign(Gtk.Align.CENTER)
+        search_scope.append(self._search_all_mail_switch)
+        search_scope.append(self._search_all_mail_label)
+
+        search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        search_row.set_halign(Gtk.Align.CENTER)
+        search_row.set_hexpand(True)
+        search_row.set_valign(Gtk.Align.CENTER)
+        search_row.append(search_overlay)
+        search_row.append(search_scope)
+
         search_title = Gtk.Box()
         search_title.set_halign(Gtk.Align.CENTER)
         search_title.set_hexpand(True)
         search_title.set_valign(Gtk.Align.CENTER)
         search_title.set_margin_start(48)
         search_title.set_margin_end(48)
-        search_title.append(search_overlay)
+        search_title.append(search_row)
         header.set_title_widget(search_title)
 
         settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
@@ -1765,6 +1796,139 @@ class MainWindow(Adw.ApplicationWindow):
         self._sidebar.load()
         return False
 
+    def _search_empty_label(self, folder_label: str) -> str:
+        if self._search_all_mail:
+            return "No Matches in All Mail"
+        return f"No Matches in {folder_label}"
+
+    def _is_all_mail_search_active(self) -> bool:
+        return self._search_all_mail and self._search_query is not None
+
+    def _message_list_key(self, message: dict) -> str:
+        row_key = message.get("_search_row_key")
+        if row_key:
+            return str(row_key)
+        return str(message.get("uid") or "")
+
+    def _message_location_for_list_key(
+        self, list_key: str
+    ) -> tuple[str, str, str] | None:
+        if self._current_folder_messages:
+            for message in self._current_folder_messages:
+                if self._message_list_key(message) == list_key:
+                    account_uid = message.get("_search_account_uid")
+                    folder_name = message.get("_search_folder")
+                    message_uid = str(message.get("uid") or "")
+                    if account_uid and folder_name and message_uid:
+                        return str(account_uid), str(folder_name), message_uid
+                    if self._current_account and self._current_folder:
+                        return (
+                            self._current_account.uid,
+                            self._current_folder,
+                            message_uid,
+                        )
+        if (
+            self._current_account
+            and self._current_folder
+            and "\0" not in list_key
+        ):
+            return self._current_account.uid, self._current_folder, list_key
+        return None
+
+    def _search_result_meta_label(self, message: dict) -> str | None:
+        account_uid = message.get("_search_account_uid")
+        folder_name = message.get("_search_folder")
+        if not account_uid or not folder_name:
+            return None
+        account_label = self._sidebar.account_display_label(str(account_uid))
+        folder_display = self._sidebar.folder_display_name(
+            str(account_uid), str(folder_name)
+        )
+        if is_post_outbox_folder(str(folder_name)):
+            sender = message.get("preview_to") or message.get("to") or ""
+        else:
+            sender = message.get("from") or ""
+        return format_search_result_meta(account_label, folder_display, sender)
+
+    def _update_search_scope_ui(self) -> None:
+        if self._is_all_mail_search_active():
+            self._message_list_view.set_search_meta_label_resolver(
+                self._search_result_meta_label
+            )
+            self._message_list_view.set_drag_context(None, None)
+        else:
+            self._message_list_view.set_search_meta_label_resolver(None)
+            if self._current_account and self._current_folder:
+                self._message_list_view.set_drag_context(
+                    self._current_account.uid, self._current_folder
+                )
+
+    def _selected_message_source_matches_sidebar(self) -> bool:
+        if not self._is_all_mail_search_active():
+            return True
+        selected = self._message_list_view.get_selected_uids()
+        if len(selected) != 1:
+            return False
+        location = self._message_location_for_list_key(selected[0])
+        if location is None:
+            return False
+        account_uid, folder_name, _message_uid = location
+        return (
+            self._current_account is not None
+            and self._current_folder is not None
+            and account_uid == self._current_account.uid
+            and folder_name == self._current_folder
+        )
+
+    def _enter_all_mail_sidebar_mode(self) -> None:
+        if self._current_account and self._current_folder:
+            self._folder_before_all_mail = (
+                self._current_account.uid,
+                self._current_folder,
+            )
+        self._sidebar.clear_folder_selection()
+
+    def _leave_all_mail_sidebar_mode(self) -> None:
+        saved = self._folder_before_all_mail
+        self._folder_before_all_mail = None
+        if saved is None:
+            return
+        account_uid, folder_name = saved
+        if not self._sidebar.restore_folder_selection(account_uid, folder_name):
+            self._sidebar.mark_folder_active(account_uid, folder_name)
+
+    def _sync_all_mail_sidebar_selection(self) -> None:
+        if self._search_all_mail:
+            self._enter_all_mail_sidebar_mode()
+        else:
+            self._leave_all_mail_sidebar_mode()
+
+    def _set_search_all_mail_switch_active(self, active: bool) -> None:
+        self._search_all_mail_switch_updating = True
+        try:
+            self._search_all_mail_switch.set_active(active)
+        finally:
+            self._search_all_mail_switch_updating = False
+
+    def _on_search_all_mail_switch_changed(
+        self, switch: Gtk.Switch, *_args
+    ) -> None:
+        if self._search_all_mail_switch_updating:
+            return
+        active = switch.get_active()
+        self._search_all_mail = active
+        set_search_all_mail(active)
+        switch.set_tooltip_text(
+            "Search all folders on all accounts"
+            if active
+            else "Search only the selected folder"
+        )
+        self._sync_all_mail_sidebar_selection()
+        if active and self._parse_search_from_entry() is not None:
+            self._apply_search_from_entry()
+        elif not active:
+            self._update_search_scope_ui()
+
     def _update_search_entry_state(self) -> None:
         enabled = (
             self._current_account is not None
@@ -1772,11 +1936,17 @@ class MainWindow(Adw.ApplicationWindow):
             and not is_post_outbox_folder(self._current_folder)
         )
         self._header_search_entry.set_sensitive(enabled)
+        self._search_all_mail_switch.set_sensitive(enabled)
         if not enabled:
             self._search_entry_updating = True
             self._header_search_entry.set_text("")
             self._search_entry_updating = False
             self._search_query = None
+            if self._search_all_mail:
+                self._search_all_mail = False
+                set_search_all_mail(False)
+                self._set_search_all_mail_switch_active(False)
+            self._leave_all_mail_sidebar_mode()
 
     def _parse_search_from_entry(self) -> MessageSearchQuery | None:
         raw = self._header_search_entry.get_text()
@@ -1873,6 +2043,9 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._preserve_pre_search_snapshot()
         self._search_query = query
+        self._update_search_scope_ui()
+        if self._search_all_mail:
+            self._enter_all_mail_sidebar_mode()
         search_trace(
             "search_apply",
             raw=raw,
@@ -1894,6 +2067,9 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _exit_search_mode(self) -> None:
         self._search_query = None
+        self._update_search_scope_ui()
+        if self._search_all_mail:
+            self._sync_all_mail_sidebar_selection()
         self._search_entry_updating = True
         self._header_search_entry.set_text("")
         self._search_entry_updating = False
@@ -1923,7 +2099,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._current_folder_messages = [
                 message
                 for message in self._current_folder_messages
-                if message.get("uid") != uid
+                if self._message_list_key(message) != uid
             ]
 
         if removed and self._message_total >= 0:
@@ -2333,12 +2509,16 @@ class MainWindow(Adw.ApplicationWindow):
         source: str,
     ) -> str:
         action = "Searching" if searching else "Loading"
+        if searching and self._search_all_mail:
+            target = "All Mail"
+        else:
+            target = display_folder
         if searching and not self._network_available:
-            return f"Searching {display_folder} · {OFFLINE_SEARCHING_LOCAL_CACHE}…"
+            return f"Searching {target} · {OFFLINE_SEARCHING_LOCAL_CACHE}…"
         detail = self._load_source_label(source)
         if detail:
-            return f"{action} {display_folder} {detail}…"
-        return f"{action} {display_folder}…"
+            return f"{action} {target} {detail}…"
+        return f"{action} {target}…"
 
     def _reset_search_progress_ui(self) -> None:
         self._message_loading_progress.set_visible(False)
@@ -2423,6 +2603,7 @@ class MainWindow(Adw.ApplicationWindow):
         first_batch = not self._search_results_streamed
         self._search_results_streamed = True
         if first_batch:
+            self._update_search_scope_ui()
             self._message_stack.set_visible_child_name("list")
             loading_fraction = self._message_loading_progress.get_fraction()
             self._message_loading_progress.set_visible(False)
@@ -2625,14 +2806,21 @@ class MainWindow(Adw.ApplicationWindow):
                 )
                 return messages, unread, total, "outbox"
             if search_query is not None:
-                messages, unread, total, source = self._mail.search_folder_messages(
-                    account_uid,
-                    folder_name,
-                    search_query,
-                    sync=sync_flag,
-                    on_progress=on_search_progress,
-                    on_matches=on_search_matches,
-                )
+                if self._search_all_mail:
+                    messages, unread, total, source = self._mail.search_all_messages(
+                        search_query,
+                        on_progress=on_search_progress,
+                        on_matches=on_search_matches,
+                    )
+                else:
+                    messages, unread, total, source = self._mail.search_folder_messages(
+                        account_uid,
+                        folder_name,
+                        search_query,
+                        sync=sync_flag,
+                        on_progress=on_search_progress,
+                        on_matches=on_search_matches,
+                    )
                 return messages, unread, total, source
             messages, unread, total, source = self._mail.get_folder_messages(
                 account_uid,
@@ -3026,23 +3214,39 @@ class MainWindow(Adw.ApplicationWindow):
                         cached_source = "disk_cache"
                         try:
                             if search_query is not None:
-                                (
-                                    cached_messages,
-                                    cached_unread,
-                                    cached_total,
-                                    cached_source,
-                                ) = self._mail.search_folder_messages(
-                                    account_uid,
-                                    folder_name,
-                                    search_query,
-                                    sync=False,
-                                    on_progress=lambda progress: self._report_search_progress(
-                                        load_id, progress
-                                    ),
-                                    on_matches=lambda batch: self._report_search_matches(
-                                        load_id, batch
-                                    ),
-                                )
+                                if self._search_all_mail:
+                                    (
+                                        cached_messages,
+                                        cached_unread,
+                                        cached_total,
+                                        cached_source,
+                                    ) = self._mail.search_all_messages(
+                                        search_query,
+                                        on_progress=lambda progress: self._report_search_progress(
+                                            load_id, progress
+                                        ),
+                                        on_matches=lambda batch: self._report_search_matches(
+                                            load_id, batch
+                                        ),
+                                    )
+                                else:
+                                    (
+                                        cached_messages,
+                                        cached_unread,
+                                        cached_total,
+                                        cached_source,
+                                    ) = self._mail.search_folder_messages(
+                                        account_uid,
+                                        folder_name,
+                                        search_query,
+                                        sync=False,
+                                        on_progress=lambda progress: self._report_search_progress(
+                                            load_id, progress
+                                        ),
+                                        on_matches=lambda batch: self._report_search_matches(
+                                            load_id, batch
+                                        ),
+                                    )
                             else:
                                 (
                                     cached_messages,
@@ -3101,7 +3305,9 @@ class MainWindow(Adw.ApplicationWindow):
             if is_post_outbox_folder(folder_name):
                 self._message_empty_label.set_label("No Queued Messages")
             elif self._search_query is not None:
-                self._message_empty_label.set_label(f"No Matches in {folder_label}")
+                self._message_empty_label.set_label(
+                    self._search_empty_label(folder_label)
+                )
             else:
                 self._message_empty_label.set_label(f"No Messages in {folder_label}")
             self._message_stack.set_visible_child_name("empty")
@@ -3216,7 +3422,9 @@ class MainWindow(Adw.ApplicationWindow):
             if is_post_outbox_folder(folder_name):
                 self._message_empty_label.set_label("No Queued Messages")
             elif self._search_query is not None:
-                self._message_empty_label.set_label(f"No Matches in {folder_label}")
+                self._message_empty_label.set_label(
+                    self._search_empty_label(folder_label)
+                )
             else:
                 self._message_empty_label.set_label(f"No Messages in {folder_label}")
             self._message_list_view.clear()
@@ -3328,7 +3536,7 @@ class MainWindow(Adw.ApplicationWindow):
         if self._current_folder_messages is None:
             return
         for message in self._current_folder_messages:
-            if message.get("uid") == uid:
+            if self._message_list_key(message) == uid:
                 merged = dict(message.get("flags") or {})
                 merged.update(flags)
                 message["flags"] = merged
@@ -4133,22 +4341,25 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_message_list_item_activated(self, uid: str) -> None:
         if self._message_list_view.is_restoring_selection():
             return
-        if not self._current_account or not self._current_folder:
-            return
         if len(self._message_list_view.get_selected_uids()) != 1:
             return
-
-        account = self._current_account
-        folder_name = self._current_folder
+        location = self._message_location_for_list_key(uid)
+        if location is None:
+            return
+        account_uid, folder_name, message_uid = location
+        try:
+            account = self._mail.get_account(account_uid)
+        except ValueError:
+            return
         action = message_list_activate_action(
             is_drafts_folder=self._sidebar.folder_is_drafts(account.uid, folder_name),
             is_outbox_folder=is_post_outbox_folder(folder_name),
         )
         if action == MessageListActivateAction.DRAFT_COMPOSE:
-            self._open_draft_for_editing(uid)
+            self._open_draft_for_editing(message_uid, account=account, folder_name=folder_name)
             return
         if action == MessageListActivateAction.OUTBOX_EDIT:
-            self._open_compose_from_outbox(uid)
+            self._open_compose_from_outbox(message_uid)
             return
         self._present_reader_window(uid)
 
@@ -4165,11 +4376,12 @@ class MainWindow(Adw.ApplicationWindow):
         can_archive = False
         can_trash = False
         if has_selection and self._current_account and self._current_folder:
-            state = self._sidebar.get_move_menu_state(
-                self._current_account.uid, self._current_folder
-            )
-            can_archive = bool(state.get("can_archive"))
-            can_trash = bool(state.get("can_trash"))
+            if self._selected_message_source_matches_sidebar():
+                state = self._sidebar.get_move_menu_state(
+                    self._current_account.uid, self._current_folder
+                )
+                can_archive = bool(state.get("can_archive"))
+                can_trash = bool(state.get("can_trash"))
 
         self._header_archive_btn.set_sensitive(can_archive)
         self._header_trash_btn.set_sensitive(can_trash)
@@ -4181,7 +4393,13 @@ class MainWindow(Adw.ApplicationWindow):
         *,
         mark_seen: bool,
     ) -> None:
-        if not self._current_account or not self._current_folder:
+        location = self._message_location_for_list_key(uid)
+        if location is None:
+            return
+        account_uid, folder_name, message_uid = location
+        try:
+            account = self._mail.get_account(account_uid)
+        except ValueError:
             return
         if (
             uid == self._pending_message_read_uid
@@ -4191,8 +4409,6 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         self._mail.cancel_folder_search()
-        account = self._current_account
-        folder_name = self._current_folder
         self._message_read_generation += 1
         read_id = self._message_read_generation
         self._pending_message_read_uid = uid
@@ -4215,7 +4431,7 @@ class MainWindow(Adw.ApplicationWindow):
             try:
                 if viewing_outbox:
                     msg = read_queued_message(
-                        uid,
+                        message_uid,
                         account_uid=account.uid,
                         from_label=from_label,
                     )
@@ -4223,7 +4439,7 @@ class MainWindow(Adw.ApplicationWindow):
                     msg = self._mail.read_message(
                         account.uid,
                         folder_name,
-                        uid,
+                        message_uid,
                         mark_seen=mark_seen and not viewing_drafts,
                     )
             except MessageNotAvailableError as exc:
@@ -4246,12 +4462,21 @@ class MainWindow(Adw.ApplicationWindow):
 
         get_mail_io_thread().submit_front(worker)
 
-    def _open_draft_for_editing(self, uid: str) -> None:
-        if not self._current_account or not self._current_folder:
-            return
-
-        account = self._current_account
-        folder_name = self._current_folder
+    def _open_draft_for_editing(
+        self,
+        uid: str,
+        *,
+        account: MailAccount | None = None,
+        folder_name: str | None = None,
+    ) -> None:
+        if account is None:
+            if not self._current_account:
+                return
+            account = self._current_account
+        if folder_name is None:
+            if not self._current_folder:
+                return
+            folder_name = self._current_folder
 
         def worker() -> None:
             error: Exception | None = None
@@ -4420,7 +4645,16 @@ class MainWindow(Adw.ApplicationWindow):
             self._current_account.uid,
             self._current_folder,
         )
-        if "folder_unread" in msg and "folder_total" in msg:
+        location = self._message_location_for_list_key(uid)
+        if location is not None and "folder_unread" in msg and "folder_total" in msg:
+            src_account_uid, src_folder_name, _message_uid = location
+            self._sidebar.update_folder_row(
+                src_account_uid,
+                src_folder_name,
+                msg["folder_unread"],
+                msg["folder_total"],
+            )
+        elif "folder_unread" in msg and "folder_total" in msg:
             self._sidebar.update_folder_row(
                 self._current_account.uid,
                 self._current_folder,
@@ -4450,12 +4684,15 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_app_dark_changed(self, *_args) -> None:
         self._reader_pane.refresh_document(dark=self._app_prefers_dark())
 
-    def _present_reader_window(self, uid: str) -> None:
-        if not self._current_account or not self._current_folder:
+    def _present_reader_window(self, list_key: str) -> None:
+        location = self._message_location_for_list_key(list_key)
+        if location is None:
             return
-
-        account = self._current_account
-        folder_name = self._current_folder
+        account_uid, folder_name, message_uid = location
+        try:
+            account = self._mail.get_account(account_uid)
+        except ValueError:
+            return
         viewing_drafts = self._sidebar.folder_is_drafts(account.uid, folder_name)
 
         window = ReaderWindow(
@@ -4463,7 +4700,7 @@ class MainWindow(Adw.ApplicationWindow):
             mail=self._mail,
             account=account,
             folder_name=folder_name,
-            message_uid=uid,
+            message_uid=message_uid,
             set_status=self._set_status,
             on_compose=self._on_reader_window_compose,
             on_request_move=self._on_reader_window_request_move,

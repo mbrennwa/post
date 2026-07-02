@@ -215,6 +215,110 @@ class SearchFolderMessagesTests(unittest.TestCase):
         self.assertEqual(total, 1)
 
 
+class SearchAllMessagesTests(unittest.TestCase):
+    def test_merges_and_annotates_matches_from_multiple_folders(self) -> None:
+        inbox_messages = [
+            {
+                "uid": "1",
+                "subject": "Invoice due",
+                "from": "a@b.c",
+                "sort_date": 200,
+                "flags": {"seen": True},
+            },
+        ]
+        sent_messages = [
+            {
+                "uid": "1",
+                "subject": "Invoice copy",
+                "from": "a@b.c",
+                "sort_date": 100,
+                "flags": {"seen": True},
+            },
+        ]
+        service = MailService(registry=mock.Mock())
+        service._folder_indexes[("acct-1", "INBOX")] = _FolderMessageIndex(
+            messages=inbox_messages,
+            unread=0,
+            total=1,
+        )
+        service._folder_indexes[("acct-1", "Sent")] = _FolderMessageIndex(
+            messages=sent_messages,
+            unread=0,
+            total=1,
+        )
+        query = MessageSearchQuery(terms=(SearchTerm(field="subject", value="Invoice"),))
+
+        with (
+            mock.patch.object(
+                service,
+                "list_accounts",
+                return_value=[mock.Mock(uid="acct-1")],
+            ),
+            mock.patch.object(
+                service,
+                "_ordered_searchable_folders_unlocked",
+                return_value=[
+                    {"full_name": "INBOX", "display_name": "Inbox"},
+                    {"full_name": "Sent", "display_name": "Sent"},
+                ],
+            ),
+            mock.patch.object(
+                service,
+                "_search_single_folder_index_unlocked",
+                side_effect=[
+                    (inbox_messages, 0, "memory"),
+                    (sent_messages, 0, "memory"),
+                ],
+            ),
+        ):
+            matched, unread, total, source = service._search_all_messages_unlocked(
+                query
+            )
+
+        self.assertEqual(unread, 0)
+        self.assertEqual(total, 2)
+        self.assertEqual(source, "memory")
+        self.assertEqual(len(matched), 2)
+        self.assertEqual(matched[0]["_search_folder"], "INBOX")
+        self.assertEqual(matched[1]["_search_folder"], "Sent")
+        self.assertNotEqual(matched[0]["_search_row_key"], matched[1]["_search_row_key"])
+
+    def test_skips_virtual_folders_via_ordered_searchable_folders(self) -> None:
+        service = MailService(registry=mock.Mock())
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 0},
+            {
+                "full_name": ".#evolution/Junk",
+                "display_name": "Junk",
+                "flags": 0,
+            },
+        ]
+        with mock.patch.object(service, "_list_folders_unlocked", return_value=folders):
+            ordered = service._ordered_searchable_folders_unlocked("acct-1")
+        self.assertEqual([folder["full_name"] for folder in ordered], ["INBOX"])
+
+    def test_cancelled_search_returns_empty(self) -> None:
+        service = MailService(registry=mock.Mock())
+        query = MessageSearchQuery(terms=(SearchTerm(field="subject", value="x"),))
+        cancellable = Gio.Cancellable()
+        cancellable.cancel()
+
+        with (
+            mock.patch.object(
+                service, "_begin_folder_search_unlocked", return_value=cancellable
+            ),
+            mock.patch.object(service, "list_accounts", return_value=[]),
+        ):
+            matched, unread, total, source = service._search_all_messages_unlocked(
+                query
+            )
+
+        self.assertEqual(matched, [])
+        self.assertEqual(unread, 0)
+        self.assertEqual(total, 0)
+        self.assertEqual(source, "memory")
+
+
 class PreemptBackgroundWorkTests(unittest.TestCase):
     def test_does_not_cancel_folder_list(self) -> None:
         service = MailService(registry=mock.Mock())

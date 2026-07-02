@@ -1608,6 +1608,25 @@ class MailSidebar:
         """Record active folder without firing on_folder_selected (eager launch restore)."""
         self._activated_folder = (account_uid, folder_name)
 
+    def clear_folder_selection(self) -> None:
+        """Clear sidebar highlights without dropping the saved folder for restore."""
+        self._sidebar_selecting = True
+        try:
+            for listbox in self._all_folder_listboxes():
+                listbox.unselect_all()
+        finally:
+            self._sidebar_selecting = False
+        self._activated_folder = None
+
+    def restore_folder_selection(self, account_uid: str, folder_name: str) -> bool:
+        """Re-select a folder row and notify via on_folder_selected."""
+        for listbox in self._all_folder_listboxes():
+            row = self._find_folder_row(listbox, account_uid, folder_name)
+            if row is not None:
+                self._activate_folder_row(listbox, row)
+                return True
+        return False
+
     def _sync_folder_row_selection(
         self, listbox: Gtk.ListBox, row: Gtk.ListBoxRow
     ) -> None:

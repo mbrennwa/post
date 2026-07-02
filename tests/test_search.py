@@ -451,5 +451,31 @@ class FilterMessagesByQueryTests(unittest.TestCase):
         self.assertLess(sum(len(batch) for batch in batches), 100)
 
 
+class SearchScopeHelpersTests(unittest.TestCase):
+    def test_format_search_result_meta_joins_parts(self) -> None:
+        from post.mail.search import format_search_result_meta
+
+        self.assertEqual(
+            format_search_result_meta("Work", "Inbox", "alice@example.com"),
+            "Work · Inbox · alice@example.com",
+        )
+
+    def test_format_all_mail_progress_includes_folder_counts(self) -> None:
+        from post.mail.search import SearchFilterProgress, format_search_filter_progress
+
+        progress = SearchFilterProgress(
+            40,
+            120,
+            3,
+            folder_label="Sent",
+            folders_done=2,
+            folders_total=5,
+        )
+        self.assertEqual(
+            format_search_filter_progress(progress),
+            "Searching Sent… (2 / 5 folders) 40 / 120 · 3 matches",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

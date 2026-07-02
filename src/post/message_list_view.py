@@ -32,6 +32,7 @@ OnSelectionChanged = Callable[[], None]
 OnItemActivated = Callable[[str], None]
 OnItemPressed = Callable[[str], None]
 OnItemContextMenu = Callable[[str, Gtk.Widget, float, float], None]
+SearchMetaLabelResolver = Callable[[dict[str, Any]], str | None]
 
 
 def _list_scroll_to_flags() -> Gtk.ListScrollFlags:
@@ -65,6 +66,16 @@ class MessageListItem(GObject.Object):
             return ""
         return str(msg.get("uid") or "")
 
+    @property
+    def list_key(self) -> str:
+        msg = self.message
+        if not isinstance(msg, dict):
+            return ""
+        row_key = msg.get("_search_row_key")
+        if row_key:
+            return str(row_key)
+        return str(msg.get("uid") or "")
+
     def set_message(self, message: dict[str, Any]) -> None:
         self.message = message
 
@@ -78,7 +89,8 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self.set_vexpand(True)
 
         self._folder_name = ""
-        self._uid_positions: dict[str, int] = {}
+        self._list_key_positions: dict[str, int] = {}
+        self._search_meta_label_resolver: SearchMetaLabelResolver | None = None
         self._on_selection_changed: OnSelectionChanged | None = None
         self._on_item_activated: OnItemActivated | None = None
         self._on_item_pressed: OnItemPressed | None = None
@@ -102,6 +114,11 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self._list_view.connect("activate", self._on_list_view_activate)
         self._setup_list_drag_source()
         self.set_child(self._list_view)
+
+    def set_search_meta_label_resolver(
+        self, resolver: SearchMetaLabelResolver | None
+    ) -> None:
+        self._search_meta_label_resolver = resolver
 
     def set_drag_context(
         self, account_uid: str | None, folder_name: str | None
@@ -164,7 +181,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         return self._restoring_selection
 
     def clear(self) -> None:
-        self._uid_positions.clear()
+        self._list_key_positions.clear()
         self._selection.unselect_all()
         self._store.remove_all()
 
@@ -175,14 +192,14 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         at_top = self._is_scrolled_to_top()
         self._folder_name = folder_name
         items = [MessageListItem(message) for message in messages]
-        self._uid_positions.clear()
+        self._list_key_positions.clear()
         self._selection.unselect_all()
         count = self._store.get_n_items()
         if count:
             self._store.splice(0, count, items)
         elif items:
             self._store.splice(0, 0, items)
-        self._rebuild_uid_positions()
+        self._rebuild_list_key_positions()
         if at_top and self._store.get_n_items() > 0:
             self._scroll_to_top_after_layout()
 
@@ -198,7 +215,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         at_top = self._is_scrolled_to_top()
         self._folder_name = folder_name
         self._store.splice(0, 0, items)
-        self._rebuild_uid_positions()
+        self._rebuild_list_key_positions()
         if at_top:
             self._scroll_to_top_after_layout()
 
@@ -214,7 +231,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self._folder_name = folder_name
         position = self._store.get_n_items()
         self._store.splice(position, 0, items)
-        self._rebuild_uid_positions()
+        self._rebuild_list_key_positions()
 
     def remove_uids(self, uids: Iterable[str]) -> int:
         uid_set = set(uids)
@@ -224,12 +241,12 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         position = self._store.get_n_items() - 1
         while position >= 0:
             item = self._store.get_item(position)
-            if isinstance(item, MessageListItem) and item.uid in uid_set:
+            if isinstance(item, MessageListItem) and item.list_key in uid_set:
                 self._store.remove(position)
                 removed += 1
             position -= 1
         if removed:
-            self._rebuild_uid_positions()
+            self._rebuild_list_key_positions()
         return removed
 
     def upsert_message(
@@ -246,17 +263,18 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         message = dict(message)
 
         if replace_uid:
-            replace_position = self._uid_positions.get(replace_uid)
+            replace_position = self._list_key_positions.get(replace_uid)
             if replace_position is not None:
                 item = self._store.get_item(replace_position)
                 if isinstance(item, MessageListItem):
                     item.set_message(message)
-                    if replace_uid != uid:
-                        del self._uid_positions[replace_uid]
-                        self._uid_positions[uid] = replace_position
+                    new_key = item.list_key
+                    if replace_uid != new_key:
+                        del self._list_key_positions[replace_uid]
+                        self._list_key_positions[new_key] = replace_position
                     return
 
-        position = self._uid_positions.get(uid)
+        position = self._list_key_positions.get(message.get("_search_row_key") or uid)
         if position is not None:
             item = self._store.get_item(position)
             if isinstance(item, MessageListItem):
@@ -266,7 +284,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self.prepend_messages([message], folder_name=folder_name)
 
     def update_message_flags(self, uid: str, flags: dict[str, Any]) -> None:
-        position = self._uid_positions.get(uid)
+        position = self._list_key_positions.get(uid)
         if position is None:
             return
         item = self._store.get_item(position)
@@ -279,7 +297,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         item.set_message(message)
 
     def get_message(self, uid: str) -> dict[str, Any] | None:
-        position = self._uid_positions.get(uid)
+        position = self._list_key_positions.get(uid)
         if position is None:
             return None
         item = self._store.get_item(position)
@@ -293,8 +311,8 @@ class VirtualMessageList(Gtk.ScrolledWindow):
             if not self._selection.is_selected(position):
                 continue
             item = self._store.get_item(position)
-            if isinstance(item, MessageListItem) and item.uid:
-                uids.append(item.uid)
+            if isinstance(item, MessageListItem) and item.list_key:
+                uids.append(item.list_key)
         return uids
 
     def get_primary_selected_uid(self) -> str | None:
@@ -305,7 +323,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         if not uid:
             self._selection.unselect_all()
             return False
-        position = self._uid_positions.get(uid)
+        position = self._list_key_positions.get(uid)
         if position is None:
             self._selection.unselect_all()
             return False
@@ -349,12 +367,12 @@ class VirtualMessageList(Gtk.ScrolledWindow):
 
         GLib.idle_add(_do_scroll)
 
-    def _rebuild_uid_positions(self) -> None:
-        self._uid_positions.clear()
+    def _rebuild_list_key_positions(self) -> None:
+        self._list_key_positions.clear()
         for position in range(self._store.get_n_items()):
             item = self._store.get_item(position)
-            if isinstance(item, MessageListItem) and item.uid:
-                self._uid_positions[item.uid] = position
+            if isinstance(item, MessageListItem) and item.list_key:
+                self._list_key_positions[item.list_key] = position
 
     def _handle_selection_changed(
         self,
@@ -373,8 +391,8 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         if self._restoring_selection or self._on_item_activated is None:
             return
         item = self._store.get_item(position)
-        if isinstance(item, MessageListItem) and item.uid:
-            self._on_item_activated(item.uid)
+        if isinstance(item, MessageListItem) and item.list_key:
+            self._on_item_activated(item.list_key)
 
     @staticmethod
     def _make_unread_dot(*, visible: bool) -> Gtk.Box:
@@ -523,7 +541,10 @@ class VirtualMessageList(Gtk.ScrolledWindow):
 
         meta_label = list_item.meta_label
         if isinstance(meta_label, Gtk.Label):
-            meta_label.set_label(sender)
+            search_meta = None
+            if self._search_meta_label_resolver is not None:
+                search_meta = self._search_meta_label_resolver(message)
+            meta_label.set_label(search_meta if search_meta else sender)
 
         unread_dot = list_item.unread_dot
         if isinstance(unread_dot, Gtk.Widget):
@@ -537,7 +558,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         if isinstance(flag_icon, Gtk.Image):
             flag_icon.set_visible(message_is_flagged(message))
 
-        list_item.message_uid = store_item.uid
+        list_item.message_uid = store_item.list_key
         list_item.message_flags = dict(flags)
 
     def _on_list_item_bind(self, _factory: Gtk.ListItemFactory, list_item: Gtk.ListItem) -> None:

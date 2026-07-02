@@ -122,6 +122,7 @@ from .folders import (
     folder_can_contain_messages,
     folder_name_from_uri,
     guess_inbox_name,
+    is_post_outbox_folder,
     is_virtual_folder,
     validate_folder_display_name,
 )
@@ -130,8 +131,10 @@ from .offline_settings import apply_offline_settings_to_store, apply_offline_syn
 from .offline_sync import OfflineBodySyncCoordinator, OfflineSyncProgress
 from .search import (
     MessageSearchQuery,
+    SearchFilterProgress,
     SearchMatchCallback,
     SearchProgressCallback,
+    annotate_search_match,
     filter_messages_by_query,
     query_requires_body_scan,
 )
@@ -2373,6 +2376,132 @@ class MailService:
             sync=sync,
         )
 
+    def _ordered_searchable_folders_unlocked(self, account_uid: str) -> list[dict]:
+        folders = self._list_folders_unlocked(account_uid)
+        searchable = [
+            folder
+            for folder in folders
+            if folder_can_contain_messages(folder)
+            and not is_post_outbox_folder(folder.get("full_name"))
+        ]
+        priority: list[dict] = []
+        seen: set[str] = set()
+        for folder_type, fallbacks in (
+            (Camel.FolderInfoFlags.TYPE_INBOX, frozenset({"inbox"})),
+            (
+                Camel.FolderInfoFlags.TYPE_SENT,
+                frozenset({"sent", "sent mail", "sent messages"}),
+            ),
+        ):
+            info = find_folder_by_type(
+                searchable,
+                folder_type,
+                type_mask=Camel.FOLDER_TYPE_MASK,
+                name_fallbacks=fallbacks,
+            )
+            if info is None:
+                continue
+            full_name = info.get("full_name")
+            if not full_name or full_name in seen:
+                continue
+            seen.add(full_name)
+            priority.append(info)
+        remaining = sorted(
+            (
+                folder
+                for folder in searchable
+                if (folder.get("full_name") or "") not in seen
+            ),
+            key=lambda folder: str(folder.get("full_name") or ""),
+        )
+        return priority + remaining
+
+    def _search_single_folder_index_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        query: MessageSearchQuery,
+        *,
+        cancellable: Gio.Cancellable,
+        on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
+    ) -> tuple[list[dict], int, FolderIndexSource]:
+        with self._lock:
+            key = (account_uid, folder_name)
+            index = self._folder_indexes.get(key)
+            if index is None:
+                search_trace(
+                    "search_index_load",
+                    account=account_uid,
+                    folder=folder_name,
+                    source="missing_memory",
+                )
+                index, source = self._get_folder_index_unlocked(
+                    account_uid, folder_name, sync=False
+                )
+            else:
+                source = "memory"
+            messages = list(index.messages)
+            unread = index.unread
+
+        needs_body = query_requires_body_scan(query)
+        folder = (
+            self._try_get_folder_for_search_unlocked(account_uid, folder_name)
+            if needs_body
+            else None
+        )
+        search_trace(
+            "search_filter_begin",
+            account=account_uid,
+            folder=folder_name,
+            message_count=len(messages),
+            needs_body=needs_body,
+            has_folder=folder is not None,
+            source=source,
+        )
+
+        def body_text_for_uid(uid: str) -> str | None:
+            if not needs_body or folder is None or cancellable.is_cancelled():
+                return None
+            from .helpers import extract_message_bodies, searchable_body_text
+
+            try:
+                api_uid = camel_uid_to_api(uid)
+                mime = folder.get_message_cached(api_uid, None)
+                if mime is None:
+                    return None
+            except Exception:
+                return None
+            bodies = extract_message_bodies(mime)
+            return searchable_body_text(
+                plain=bodies.get("plain"),
+                html=bodies.get("html"),
+            )
+
+        filtered = filter_messages_by_query(
+            messages,
+            query,
+            body_text_for_uid=body_text_for_uid if needs_body else None,
+            is_cancelled=cancellable.is_cancelled,
+            on_progress=on_progress,
+            on_matches=on_matches,
+        )
+        if cancellable.is_cancelled():
+            search_trace(
+                "search_filter_cancelled",
+                account=account_uid,
+                folder=folder_name,
+            )
+            return [], unread, source
+
+        search_trace(
+            "search_filter_result",
+            account=account_uid,
+            folder=folder_name,
+            match_count=len(filtered),
+        )
+        return filtered, unread, source
+
     def _search_folder_messages_unlocked(
         self,
         account_uid: str,
@@ -2391,90 +2520,145 @@ class MailService:
                 folder=folder_name,
                 terms=len(query.terms),
             ):
-                with self._lock:
-                    key = (account_uid, folder_name)
-                    index = self._folder_indexes.get(key)
-                    if index is None:
-                        search_trace(
-                            "search_index_load",
-                            account=account_uid,
-                            folder=folder_name,
-                            source="missing_memory",
-                        )
-                        index, source = self._get_folder_index_unlocked(
-                            account_uid, folder_name, sync=False
-                        )
-                    else:
-                        source = "memory"
-                    messages = list(index.messages)
-                    unread = index.unread
-
-                needs_body = query_requires_body_scan(query)
-                folder = (
-                    self._try_get_folder_for_search_unlocked(
-                        account_uid, folder_name
-                    )
-                    if needs_body
-                    else None
-                )
-                search_trace(
-                    "search_filter_begin",
-                    account=account_uid,
-                    folder=folder_name,
-                    message_count=len(messages),
-                    needs_body=needs_body,
-                    has_folder=folder is not None,
-                    source=source,
-                )
-
-                def body_text_for_uid(uid: str) -> str | None:
-                    if (
-                        not needs_body
-                        or folder is None
-                        or cancellable.is_cancelled()
-                    ):
-                        return None
-                    from .helpers import extract_message_bodies, searchable_body_text
-
-                    try:
-                        api_uid = camel_uid_to_api(uid)
-                        mime = folder.get_message_cached(api_uid, None)
-                        if mime is None:
-                            return None
-                    except Exception:
-                        return None
-                    bodies = extract_message_bodies(mime)
-                    return searchable_body_text(
-                        plain=bodies.get("plain"),
-                        html=bodies.get("html"),
-                    )
-
-                filtered = filter_messages_by_query(
-                    messages,
+                filtered, unread, source = self._search_single_folder_index_unlocked(
+                    account_uid,
+                    folder_name,
                     query,
-                    body_text_for_uid=body_text_for_uid if needs_body else None,
-                    is_cancelled=cancellable.is_cancelled,
+                    cancellable=cancellable,
                     on_progress=on_progress,
                     on_matches=on_matches,
                 )
                 if cancellable.is_cancelled():
-                    search_trace(
-                        "search_filter_cancelled",
-                        account=account_uid,
-                        folder=folder_name,
-                    )
                     return [], unread, 0, source
-
-                match_count = len(filtered)
-                search_trace(
-                    "search_filter_result",
-                    account=account_uid,
-                    folder=folder_name,
-                    match_count=match_count,
-                )
-                return filtered, unread, match_count, source
+                return filtered, unread, len(filtered), source
         finally:
             self._end_folder_search_unlocked(cancellable)
+
+    def _search_all_messages_unlocked(
+        self,
+        query: MessageSearchQuery,
+        *,
+        on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
+    ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        cancellable = self._begin_folder_search_unlocked()
+        try:
+            with search_trace_timer("search_all", terms=len(query.terms)):
+                folder_jobs: list[tuple[str, str, str]] = []
+                for account in self.list_accounts():
+                    for folder in self._ordered_searchable_folders_unlocked(
+                        account.uid
+                    ):
+                        full_name = folder.get("full_name")
+                        if not full_name:
+                            continue
+                        display = folder.get("display_name") or full_name
+                        folder_jobs.append((account.uid, full_name, display))
+
+                folders_total = len(folder_jobs)
+                matched: list[dict] = []
+
+                def report_folder_progress(
+                    progress: SearchFilterProgress,
+                    *,
+                    folder_label: str,
+                    folders_done: int,
+                    matched_before_folder: int,
+                ) -> None:
+                    if on_progress is None:
+                        return
+                    on_progress(
+                        SearchFilterProgress(
+                            progress.scanned,
+                            progress.message_count,
+                            matched_before_folder + progress.matches,
+                            folder_label=folder_label,
+                            folders_done=folders_done,
+                            folders_total=folders_total,
+                        )
+                    )
+
+                for folders_done, (account_uid, folder_name, folder_label) in enumerate(
+                    folder_jobs, start=1
+                ):
+                    if cancellable.is_cancelled():
+                        break
+                    matched_before_folder = len(matched)
+
+                    def folder_on_matches(
+                        batch: list[dict],
+                        *,
+                        _account_uid: str = account_uid,
+                        _folder_name: str = folder_name,
+                    ) -> None:
+                        if not batch or on_matches is None:
+                            return
+                        annotated = [
+                            annotate_search_match(
+                                message,
+                                account_uid=_account_uid,
+                                folder_name=_folder_name,
+                            )
+                            for message in batch
+                        ]
+                        matched.extend(annotated)
+                        on_matches(annotated)
+
+                    filtered, _unread, _source = (
+                        self._search_single_folder_index_unlocked(
+                            account_uid,
+                            folder_name,
+                            query,
+                            cancellable=cancellable,
+                            on_progress=lambda progress, fl=folder_label, fd=folders_done, mbf=matched_before_folder: report_folder_progress(
+                                progress,
+                                folder_label=fl,
+                                folders_done=fd,
+                                matched_before_folder=mbf,
+                            ),
+                            on_matches=folder_on_matches,
+                        )
+                    )
+                    if cancellable.is_cancelled():
+                        break
+                    if on_matches is None:
+                        matched.extend(
+                            annotate_search_match(
+                                message,
+                                account_uid=account_uid,
+                                folder_name=folder_name,
+                            )
+                            for message in filtered
+                        )
+
+                if cancellable.is_cancelled():
+                    return [], 0, 0, "memory"
+
+                sorted_matches = sort_messages_newest_first(matched)
+                match_count = len(sorted_matches)
+                return sorted_matches, 0, match_count, "memory"
+        finally:
+            self._end_folder_search_unlocked(cancellable)
+
+    def search_all_messages(
+        self,
+        query: MessageSearchQuery,
+        *,
+        on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
+    ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        if is_mail_io_thread():
+            return self._search_all_messages_unlocked(
+                query,
+                on_progress=on_progress,
+                on_matches=on_matches,
+            )
+        return get_mail_io_thread().run_sync(
+            self._search_all_messages_unlocked,
+            query,
+            on_progress=on_progress,
+            on_matches=on_matches,
+        )
 
     def search_folder_messages(
         self,
