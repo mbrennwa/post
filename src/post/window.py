@@ -154,6 +154,8 @@ separator.header-divider {{
 }}
 progressbar.search-progress {{
   min-height: 3px;
+  margin-left: 9px;
+  margin-right: 9px;
 }}
 progressbar.search-progress trough,
 progressbar.search-progress progress {{
