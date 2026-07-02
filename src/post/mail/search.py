@@ -295,7 +295,7 @@ def filter_messages_by_query(
         if (
             on_progress is not None
             and index > 0
-            and index % progress_interval == 0
+            and (index == 1 or index % progress_interval == 0)
         ):
             on_progress(
                 SearchFilterProgress(index, message_count, len(matched))

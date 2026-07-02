@@ -169,6 +169,22 @@ class SearchFolderMessagesTests(unittest.TestCase):
         _args, kwargs = filter_query.call_args
         self.assertIs(kwargs.get("on_matches"), on_matches)
 
+    def test_get_folder_index_snapshot_returns_memory_index(self) -> None:
+        messages = [
+            {"uid": "1", "subject": "Hello", "flags": {"seen": True}},
+        ]
+        service, _folder = self._service_with_index(messages)
+        snapshot = service.get_folder_index_snapshot("acct-1", "INBOX")
+        assert snapshot is not None
+        loaded_messages, unread, total = snapshot
+        self.assertEqual([message["uid"] for message in loaded_messages], ["1"])
+        self.assertEqual(unread, 0)
+        self.assertEqual(total, 1)
+
+    def test_get_folder_index_snapshot_returns_none_when_missing(self) -> None:
+        service = MailService(registry=mock.Mock())
+        self.assertIsNone(service.get_folder_index_snapshot("acct-1", "INBOX"))
+
     def test_text_query_loads_body_text_for_candidates(self) -> None:
         messages = [
             {"uid": "1", "subject": "Hello", "flags": {"seen": True}},
