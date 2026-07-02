@@ -826,6 +826,27 @@ class MailService:
                 total=total,
             )
 
+    def get_folder_index_snapshot(
+        self,
+        account_uid: str,
+        folder_name: str,
+    ) -> tuple[list[dict], int, int] | None:
+        """Return the in-memory folder index when already loaded."""
+        return self._get_folder_index_snapshot_unlocked(
+            account_uid, folder_name
+        )
+
+    def _get_folder_index_snapshot_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+    ) -> tuple[list[dict], int, int] | None:
+        with self._lock:
+            index = self._folder_indexes.get((account_uid, folder_name))
+        if index is None:
+            return None
+        return list(index.messages), index.unread, index.total
+
     def invalidate_folder_index(self, account_uid: str, folder_name: str) -> None:
         with self._lock:
             self._invalidate_folder_index(account_uid, folder_name)

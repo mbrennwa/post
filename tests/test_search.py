@@ -393,8 +393,9 @@ class FilterMessagesByQueryTests(unittest.TestCase):
 
         self.assertEqual(len(matched), 250)
         self.assertEqual(seen[0], SearchFilterProgress(0, 250, 0))
-        self.assertEqual(seen[1], SearchFilterProgress(100, 250, 100))
-        self.assertEqual(seen[2], SearchFilterProgress(200, 250, 200))
+        self.assertEqual(seen[1], SearchFilterProgress(1, 250, 1))
+        self.assertEqual(seen[2], SearchFilterProgress(100, 250, 100))
+        self.assertEqual(seen[3], SearchFilterProgress(200, 250, 200))
         self.assertEqual(seen[-1], SearchFilterProgress(250, 250, 250))
         self.assertEqual(
             format_search_filter_progress(seen[-1]),
