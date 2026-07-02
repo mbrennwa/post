@@ -156,11 +156,15 @@ progressbar.search-progress {{
   min-height: 3px;
   margin-left: 9px;
   margin-right: 9px;
+  margin-bottom: 2px;
 }}
 progressbar.search-progress trough,
 progressbar.search-progress progress {{
   min-height: 3px;
-  border-radius: 2px;
+  border-radius: 1px;
+}}
+progressbar.search-progress trough {{
+  background-color: alpha(@window_fg_color, 0.1);
 }}
 button.message-flagged {{
   color: @error_color;
@@ -261,18 +265,26 @@ class MainWindow(Adw.ApplicationWindow):
         self._header_search_entry.connect("search-changed", self._on_search_changed)
         self._header_search_entry.connect("activate", self._on_search_activate)
         self._header_search_entry.connect("stop-search", self._on_search_stopped)
+        search_overlay = Gtk.Overlay()
+        search_overlay.set_halign(Gtk.Align.CENTER)
+        search_overlay.set_hexpand(True)
+        search_overlay.set_child(self._header_search_entry)
         self._header_search_progress = Gtk.ProgressBar()
         self._header_search_progress.set_show_text(False)
         self._header_search_progress.add_css_class("search-progress")
         self._header_search_progress.set_visible(False)
-        search_title = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self._header_search_progress.set_valign(Gtk.Align.END)
+        self._header_search_progress.set_halign(Gtk.Align.FILL)
+        self._header_search_progress.set_hexpand(True)
+        self._header_search_progress.set_can_target(False)
+        search_overlay.add_overlay(self._header_search_progress)
+        search_title = Gtk.Box()
         search_title.set_halign(Gtk.Align.CENTER)
         search_title.set_hexpand(True)
         search_title.set_valign(Gtk.Align.CENTER)
         search_title.set_margin_start(48)
         search_title.set_margin_end(48)
-        search_title.append(self._header_search_entry)
-        search_title.append(self._header_search_progress)
+        search_title.append(search_overlay)
         header.set_title_widget(search_title)
 
         settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
