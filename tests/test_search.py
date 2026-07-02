@@ -401,6 +401,54 @@ class FilterMessagesByQueryTests(unittest.TestCase):
             "Searching… 250 / 250 · 250 matches",
         )
 
+    def test_reports_match_batches(self) -> None:
+        query = parse_search_query("invoice")
+        assert query is not None
+        messages = [
+            {"uid": str(index), "subject": "monthly invoice", "flags": {}}
+            for index in range(52)
+        ]
+        batches: list[list[dict]] = []
+
+        matched = filter_messages_by_query(
+            messages,
+            query,
+            on_matches=batches.append,
+            match_batch_size=25,
+        )
+
+        self.assertEqual(len(matched), 52)
+        self.assertGreaterEqual(len(batches), 3)
+        self.assertEqual(len(batches[0]), 1)
+        streamed = [message for batch in batches for message in batch]
+        self.assertEqual(streamed, matched)
+
+    def test_cancellation_stops_match_batches(self) -> None:
+        query = parse_search_query("invoice")
+        assert query is not None
+        messages = [
+            {"uid": str(index), "subject": "monthly invoice", "flags": {}}
+            for index in range(100)
+        ]
+        batches: list[list[dict]] = []
+        cancelled = {"value": False}
+
+        def on_matches(batch: list[dict]) -> None:
+            batches.append(batch)
+            if sum(len(item) for item in batches) >= 20:
+                cancelled["value"] = True
+
+        matched = filter_messages_by_query(
+            messages,
+            query,
+            is_cancelled=lambda: cancelled["value"],
+            on_matches=on_matches,
+            match_batch_size=10,
+        )
+
+        self.assertLess(len(matched), 100)
+        self.assertLess(sum(len(batch) for batch in batches), 100)
+
 
 if __name__ == "__main__":
     unittest.main()
