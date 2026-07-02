@@ -182,7 +182,7 @@ class ShutdownSyncTests(unittest.TestCase):
         io_thread.submit_background.assert_called_once_with(service._flush_stores_on_shutdown)
         run_sync.assert_not_called()
 
-    def test_shutdown_flushes_synchronously_when_offline_sync_idle(self) -> None:
+    def test_shutdown_flushes_in_background_when_offline_sync_idle(self) -> None:
         from post.mail.eds import MailService
 
         service = MailService(registry=mock.Mock())
@@ -191,18 +191,21 @@ class ShutdownSyncTests(unittest.TestCase):
         service._offline_sync = coordinator
 
         with mock.patch.object(service, "wait_for_outbound_sends"):
-            with mock.patch.object(service, "wait_for_pending_mail_ops") as wait_ops:
-                with mock.patch("post.mail.eds.get_mail_io_thread") as get_io:
-                    io_thread = mock.Mock()
-                    get_io.return_value = io_thread
-                    with mock.patch("post.mail.eds.run_on_mail_thread") as run_sync:
-                        service.shutdown_sync()
+            with mock.patch.object(service, "cancel_folder_search") as cancel_search:
+                with mock.patch.object(service, "wait_for_pending_mail_ops") as wait_ops:
+                    with mock.patch("post.mail.eds.get_mail_io_thread") as get_io:
+                        io_thread = mock.Mock()
+                        get_io.return_value = io_thread
+                        with mock.patch("post.mail.eds.run_on_mail_thread") as run_sync:
+                            service.shutdown_sync()
 
+        cancel_search.assert_called_once_with()
         coordinator.cancel_all.assert_called_once()
-        wait_ops.assert_called_once_with(timeout=10.0)
-        run_sync.assert_called_once_with(service._flush_stores_on_shutdown)
-        io_thread.submit.assert_not_called()
-        io_thread.submit_background.assert_not_called()
+        wait_ops.assert_called_once_with(timeout=1.0)
+        io_thread.submit_background.assert_called_once_with(
+            service._flush_stores_on_shutdown
+        )
+        run_sync.assert_not_called()
 
 
 class QueryToSexpTests(unittest.TestCase):

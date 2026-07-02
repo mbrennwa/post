@@ -551,15 +551,12 @@ class MailService:
     def shutdown_sync(self) -> None:
         """Best-effort store flush before exit; never wait for offline body download."""
         self.wait_for_outbound_sends()
+        self.cancel_folder_search()
         offline_sync_active = self.offline_sync.is_active()
         self.offline_sync.cancel_all()
-        self.wait_for_pending_mail_ops(timeout=2.0 if offline_sync_active else 10.0)
-        if offline_sync_active:
-            # Downsync runs on the mail I/O thread; flushing would queue behind it and
-            # block exit. Camel persists cache incrementally — resume on next launch.
-            get_mail_io_thread().submit_background(self._flush_stores_on_shutdown)
-            return
-        run_on_mail_thread(self._flush_stores_on_shutdown)
+        self.wait_for_pending_mail_ops(timeout=2.0 if offline_sync_active else 1.0)
+        # Never block GTK exit behind a long in-flight search or folder scan.
+        get_mail_io_thread().submit_background(self._flush_stores_on_shutdown)
 
     def _flush_stores_on_shutdown(self) -> None:
         with self._lock:
