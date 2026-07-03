@@ -3371,12 +3371,33 @@ class MainWindow(Adw.ApplicationWindow):
             else:
                 self._sidebar.update_folder_row(account_uid, folder_name, unread, total)
 
-        self._current_folder_messages = messages
-        self._message_total = total
-        self._message_list_source = source
-        self._message_sync_in_progress = sync_pending
-
         if not messages:
+            if self._search_query is not None and (
+                self._search_results_streamed
+                or self._message_list_view.item_count() > 0
+            ):
+                # Search was cancelled after partial streaming (e.g. opening a result).
+                self._message_sync_in_progress = sync_pending
+                self._message_list_source = source
+                if self._current_folder_messages:
+                    self._message_total = len(self._current_folder_messages)
+                self._message_stack.set_visible_child_name("list")
+                self._update_message_status(account, folder_name)
+                search_trace(
+                    "search_loaded_complete",
+                    load_id=load_id,
+                    match_count=self._message_list_view.item_count(),
+                    view="list",
+                    searching=True,
+                    streamed=True,
+                    reason="preserve_streamed_results",
+                )
+                return False
+
+            self._current_folder_messages = messages
+            self._message_total = total
+            self._message_list_source = source
+            self._message_sync_in_progress = sync_pending
             folder_label = "Outbox" if is_post_outbox_folder(folder_name) else folder_name
             if is_post_outbox_folder(folder_name):
                 self._message_empty_label.set_label("No Queued Messages")
@@ -3396,6 +3417,11 @@ class MainWindow(Adw.ApplicationWindow):
                 searching=True,
             )
             return False
+
+        self._current_folder_messages = messages
+        self._message_total = total
+        self._message_list_source = source
+        self._message_sync_in_progress = sync_pending
 
         if self._search_query is not None and self._search_results_streamed:
             def streamed_after_list() -> None:
