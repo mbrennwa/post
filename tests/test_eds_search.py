@@ -352,20 +352,28 @@ class SearchAccountMessagesTests(unittest.TestCase):
         )
         query = MessageSearchQuery(terms=(SearchTerm(field="subject", value="Invoice"),))
 
-        with mock.patch.object(
-            service,
-            "_ordered_searchable_folders_unlocked",
-            return_value=[
-                {"full_name": "INBOX", "display_name": "Inbox"},
-                {"full_name": "Sent", "display_name": "Sent"},
-            ],
-        ), mock.patch.object(
-            service,
-            "_search_single_folder_index_unlocked",
-            side_effect=[
-                (inbox_messages, 0, "memory"),
-                (sent_messages, 0, "memory"),
-            ],
+        with (
+            mock.patch.object(
+                service,
+                "get_account",
+                return_value=mock.Mock(display_label="Test Account"),
+            ),
+            mock.patch.object(
+                service,
+                "_ordered_searchable_folders_unlocked",
+                return_value=[
+                    {"full_name": "INBOX", "display_name": "Inbox"},
+                    {"full_name": "Sent", "display_name": "Sent"},
+                ],
+            ),
+            mock.patch.object(
+                service,
+                "_search_single_folder_index_unlocked",
+                side_effect=[
+                    (inbox_messages, 0, "memory"),
+                    (sent_messages, 0, "memory"),
+                ],
+            ),
         ):
             matched, unread, total, source = service._search_account_messages_unlocked(
                 "acct-1",

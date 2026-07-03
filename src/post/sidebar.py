@@ -64,6 +64,7 @@ OnRefreshAccount = Callable[[str], None]
 OnRefreshFolder = Callable[[str, str], None]
 OnAccountsLoaded = Callable[[list[str]], None]
 OnInitialFolderLoadComplete = Callable[[], None]
+OnFolderTreeReady = Callable[[], None]
 OnSendOutbox = Callable[[], None]
 OnFolderTreeChanged = Callable[[str, str | None], None]
 OnFolderContentsChanged = Callable[[str, str], None]
@@ -86,6 +87,7 @@ class MailSidebar:
         on_refresh_folder: OnRefreshFolder | None = None,
         on_accounts_loaded: OnAccountsLoaded | None = None,
         on_initial_folder_load_complete: OnInitialFolderLoadComplete | None = None,
+        on_folder_tree_ready: OnFolderTreeReady | None = None,
         on_send_outbox: OnSendOutbox | None = None,
         on_folder_tree_changed: OnFolderTreeChanged | None = None,
         on_folder_contents_changed: OnFolderContentsChanged | None = None,
@@ -101,6 +103,7 @@ class MailSidebar:
         self._on_refresh_folder = on_refresh_folder
         self._on_accounts_loaded = on_accounts_loaded
         self._on_initial_folder_load_complete = on_initial_folder_load_complete
+        self._on_folder_tree_ready = on_folder_tree_ready
         self._on_send_outbox = on_send_outbox
         self._on_folder_tree_changed = on_folder_tree_changed
         self._on_folder_contents_changed = on_folder_contents_changed
@@ -149,6 +152,10 @@ class MailSidebar:
     @property
     def widget(self) -> Gtk.ScrolledWindow:
         return self._widget
+
+    @property
+    def folder_tree_ready(self) -> bool:
+        return self._folder_loads_pending == 0
 
     def account_uids(self) -> list[str]:
         return [account.uid for account in self._accounts]
@@ -1160,10 +1167,11 @@ class MailSidebar:
         if self._folder_loads_pending > 0:
             return
         callback = self._on_initial_folder_load_complete
-        if callback is None:
-            return
-        self._on_initial_folder_load_complete = None
-        callback()
+        if callback is not None:
+            self._on_initial_folder_load_complete = None
+            callback()
+        if self._on_folder_tree_ready is not None:
+            self._on_folder_tree_ready()
 
     def _save_expanded_state(self) -> None:
         if self._inbox_expander is not None:

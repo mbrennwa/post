@@ -364,6 +364,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_send_outbox=self._on_sidebar_send_outbox,
             on_accounts_loaded=self._on_accounts_loaded,
             on_initial_folder_load_complete=self._on_initial_folder_load_complete,
+            on_folder_tree_ready=self._on_folder_tree_ready,
             on_folder_tree_changed=self._on_sidebar_folder_tree_changed,
             on_folder_contents_changed=self._on_sidebar_folder_contents_changed,
             on_move_started=self._on_sidebar_move_started,
@@ -1154,6 +1155,9 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_initial_folder_load_complete(self) -> None:
         self._mail.schedule_offline_body_sync()
+
+    def _on_folder_tree_ready(self) -> None:
+        self._update_search_entry_state()
 
     def _remote_sync_account_backends(self) -> frozenset[str]:
         return frozenset({"imap", "imapx", "ews", "microsoft365", "pop3"})
@@ -2047,6 +2051,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._current_account is not None
             and self._current_folder is not None
             and not is_post_outbox_folder(self._current_folder)
+            and self._sidebar.folder_tree_ready
         )
         self._header_search_entry.set_sensitive(enabled)
         self._search_scope_dropdown.set_sensitive(enabled)
@@ -2176,6 +2181,8 @@ class MainWindow(Adw.ApplicationWindow):
         if self._search_entry_updating:
             return
         if not self._current_account or not self._current_folder:
+            return
+        if not self._sidebar.folder_tree_ready:
             return
 
         raw = self._header_search_entry.get_text()
