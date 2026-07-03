@@ -131,6 +131,7 @@ from .offline_settings import apply_offline_settings_to_store, apply_offline_syn
 from .offline_sync import OfflineBodySyncCoordinator, OfflineSyncProgress
 from .search import (
     MessageSearchQuery,
+    SearchCompleteCallback,
     SearchFilterProgress,
     SearchMatchCallback,
     SearchProgressCallback,
@@ -2624,6 +2625,231 @@ class MailService:
         match_count = len(sorted_matches)
         return sorted_matches, 0, match_count, "memory"
 
+    def _folder_jobs_for_all_unlocked(self) -> list[tuple[str, str, str]]:
+        folder_jobs: list[tuple[str, str, str]] = []
+        for account in self.list_accounts():
+            for folder in self._ordered_searchable_folders_unlocked(account.uid):
+                full_name = folder.get("full_name")
+                if not full_name:
+                    continue
+                display = folder.get("display_name") or full_name
+                folder_jobs.append((account.uid, full_name, display))
+        return folder_jobs
+
+    def _folder_jobs_for_account_unlocked(
+        self, account_uid: str
+    ) -> list[tuple[str, str, str]]:
+        folder_jobs: list[tuple[str, str, str]] = []
+        for folder in self._ordered_searchable_folders_unlocked(account_uid):
+            full_name = folder.get("full_name")
+            if not full_name:
+                continue
+            display = folder.get("display_name") or full_name
+            folder_jobs.append((account_uid, full_name, display))
+        return folder_jobs
+
+    def _start_search_folder_jobs(
+        self,
+        folder_jobs: list[tuple[str, str, str]],
+        query: MessageSearchQuery,
+        *,
+        on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
+        on_complete: SearchCompleteCallback | None = None,
+    ) -> None:
+        """Search one folder per mail-I/O task so interactive reads can interleave."""
+        cancellable = self._begin_folder_search_unlocked()
+        matched: list[dict] = []
+        folders_total = len(folder_jobs)
+        state = {"index": 0}
+
+        def finish(*, cancelled: bool = False) -> None:
+            try:
+                if cancelled or cancellable.is_cancelled():
+                    if on_complete is not None:
+                        on_complete(([], 0, 0, "memory"))
+                    return
+                sorted_matches = sort_messages_newest_first(matched)
+                match_count = len(sorted_matches)
+                if on_complete is not None:
+                    on_complete((sorted_matches, 0, match_count, "memory"))
+            finally:
+                self._end_folder_search_unlocked(cancellable)
+
+        def report_folder_progress(
+            progress: SearchFilterProgress,
+            *,
+            folder_label: str,
+            folders_done: int,
+            matched_before_folder: int,
+        ) -> None:
+            if on_progress is None:
+                return
+            on_progress(
+                SearchFilterProgress(
+                    progress.scanned,
+                    progress.message_count,
+                    matched_before_folder + progress.matches,
+                    folder_label=folder_label,
+                    folders_done=folders_done,
+                    folders_total=folders_total,
+                )
+            )
+
+        def run_folder() -> None:
+            if cancellable.is_cancelled():
+                finish(cancelled=True)
+                return
+            folder_index = state["index"]
+            if folder_index >= len(folder_jobs):
+                finish()
+                return
+
+            account_uid, folder_name, folder_label = folder_jobs[folder_index]
+            folders_done = folder_index + 1
+            matched_before_folder = len(matched)
+
+            def folder_on_matches(
+                batch: list[dict],
+                *,
+                _account_uid: str = account_uid,
+                _folder_name: str = folder_name,
+            ) -> None:
+                if not batch or on_matches is None:
+                    return
+                annotated = [
+                    annotate_search_match(
+                        message,
+                        account_uid=_account_uid,
+                        folder_name=_folder_name,
+                    )
+                    for message in batch
+                ]
+                matched.extend(annotated)
+                on_matches(annotated)
+
+            filtered, _unread, _source = self._search_single_folder_index_unlocked(
+                account_uid,
+                folder_name,
+                query,
+                cancellable=cancellable,
+                on_progress=lambda progress, fl=folder_label, fd=folders_done, mbf=matched_before_folder: report_folder_progress(
+                    progress,
+                    folder_label=fl,
+                    folders_done=fd,
+                    matched_before_folder=mbf,
+                ),
+                on_matches=folder_on_matches,
+            )
+            if cancellable.is_cancelled():
+                finish(cancelled=True)
+                return
+            if on_matches is None:
+                matched.extend(
+                    annotate_search_match(
+                        message,
+                        account_uid=account_uid,
+                        folder_name=folder_name,
+                    )
+                    for message in filtered
+                )
+
+            state["index"] = folder_index + 1
+            get_mail_io_thread().submit(run_folder)
+
+        if is_mail_io_thread():
+            run_folder()
+        else:
+            get_mail_io_thread().submit_front(run_folder)
+
+    def start_search_all_messages(
+        self,
+        query: MessageSearchQuery,
+        *,
+        on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
+        on_complete: SearchCompleteCallback | None = None,
+    ) -> None:
+        if is_mail_io_thread():
+            folder_jobs = self._folder_jobs_for_all_unlocked()
+            self._start_search_folder_jobs(
+                folder_jobs,
+                query,
+                on_progress=on_progress,
+                on_matches=on_matches,
+                on_complete=on_complete,
+            )
+            return
+        get_mail_io_thread().submit_front(
+            self.start_search_all_messages,
+            query,
+            on_progress=on_progress,
+            on_matches=on_matches,
+            on_complete=on_complete,
+        )
+
+    def start_search_account_messages(
+        self,
+        account_uid: str,
+        query: MessageSearchQuery,
+        *,
+        on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
+        on_complete: SearchCompleteCallback | None = None,
+    ) -> None:
+        if is_mail_io_thread():
+            folder_jobs = self._folder_jobs_for_account_unlocked(account_uid)
+            self._start_search_folder_jobs(
+                folder_jobs,
+                query,
+                on_progress=on_progress,
+                on_matches=on_matches,
+                on_complete=on_complete,
+            )
+            return
+        get_mail_io_thread().submit_front(
+            self.start_search_account_messages,
+            account_uid,
+            query,
+            on_progress=on_progress,
+            on_matches=on_matches,
+            on_complete=on_complete,
+        )
+
+    def start_search_folder_messages(
+        self,
+        account_uid: str,
+        folder_name: str,
+        query: MessageSearchQuery,
+        *,
+        on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
+        on_complete: SearchCompleteCallback | None = None,
+    ) -> None:
+        if is_mail_io_thread():
+            display = folder_name
+            for folder in self._ordered_searchable_folders_unlocked(account_uid):
+                if folder.get("full_name") == folder_name:
+                    display = folder.get("display_name") or folder_name
+                    break
+            self._start_search_folder_jobs(
+                [(account_uid, folder_name, display)],
+                query,
+                on_progress=on_progress,
+                on_matches=on_matches,
+                on_complete=on_complete,
+            )
+            return
+        get_mail_io_thread().submit_front(
+            self.start_search_folder_messages,
+            account_uid,
+            folder_name,
+            query,
+            on_progress=on_progress,
+            on_matches=on_matches,
+            on_complete=on_complete,
+        )
+
     def _search_all_messages_unlocked(
         self,
         query: MessageSearchQuery,
@@ -2634,17 +2860,7 @@ class MailService:
         cancellable = self._begin_folder_search_unlocked()
         try:
             with search_trace_timer("search_all", terms=len(query.terms)):
-                folder_jobs: list[tuple[str, str, str]] = []
-                for account in self.list_accounts():
-                    for folder in self._ordered_searchable_folders_unlocked(
-                        account.uid
-                    ):
-                        full_name = folder.get("full_name")
-                        if not full_name:
-                            continue
-                        display = folder.get("display_name") or full_name
-                        folder_jobs.append((account.uid, full_name, display))
-
+                folder_jobs = self._folder_jobs_for_all_unlocked()
                 return self._search_folder_jobs_unlocked(
                     folder_jobs,
                     query,
@@ -2670,14 +2886,7 @@ class MailService:
                 account=account_uid,
                 terms=len(query.terms),
             ):
-                folder_jobs: list[tuple[str, str, str]] = []
-                for folder in self._ordered_searchable_folders_unlocked(account_uid):
-                    full_name = folder.get("full_name")
-                    if not full_name:
-                        continue
-                    display = folder.get("display_name") or full_name
-                    folder_jobs.append((account_uid, full_name, display))
-
+                folder_jobs = self._folder_jobs_for_account_unlocked(account_uid)
                 return self._search_folder_jobs_unlocked(
                     folder_jobs,
                     query,

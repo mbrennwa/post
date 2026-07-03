@@ -17,6 +17,7 @@ SEARCH_MATCH_BATCH_SIZE = 25
 
 SearchProgressCallback = Callable[["SearchFilterProgress"], None]
 SearchMatchCallback = Callable[[list[dict]], None]
+SearchCompleteCallback = Callable[[tuple[list[dict], int, int, str]], None]
 
 
 @dataclass(frozen=True)
