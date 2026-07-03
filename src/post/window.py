@@ -166,6 +166,14 @@ progressbar.search-progress {{
   margin-right: 9px;
   margin-bottom: 2px;
 }}
+.message-panel-search-progress {{
+  padding: 8px 12px 4px 12px;
+}}
+.message-panel-search-progress progressbar.search-progress {{
+  margin-left: 0;
+  margin-right: 0;
+  margin-bottom: 4px;
+}}
 progressbar.search-progress trough,
 progressbar.search-progress progress {{
   min-height: 3px;
@@ -281,15 +289,6 @@ class MainWindow(Adw.ApplicationWindow):
         search_overlay = Gtk.Overlay()
         search_overlay.set_hexpand(True)
         search_overlay.set_child(self._header_search_entry)
-        self._header_search_progress = Gtk.ProgressBar()
-        self._header_search_progress.set_show_text(False)
-        self._header_search_progress.add_css_class("search-progress")
-        self._header_search_progress.set_visible(False)
-        self._header_search_progress.set_valign(Gtk.Align.END)
-        self._header_search_progress.set_halign(Gtk.Align.FILL)
-        self._header_search_progress.set_hexpand(True)
-        self._header_search_progress.set_can_target(False)
-        search_overlay.add_overlay(self._header_search_progress)
 
         self._search_scope_dropdown = Gtk.DropDown()
         self._search_scope_dropdown.set_sensitive(False)
@@ -414,7 +413,30 @@ class MainWindow(Adw.ApplicationWindow):
         )
         self._setup_message_shortcuts()
 
+        self._message_search_progress_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=4,
+        )
+        self._message_search_progress_box.add_css_class("message-panel-search-progress")
+        self._message_search_progress_box.set_visible(False)
+        self._message_panel_search_spinner = Gtk.Spinner()
+        self._message_panel_search_spinner.set_size_request(24, 24)
+        self._message_panel_search_spinner.set_halign(Gtk.Align.CENTER)
+        self._message_panel_search_spinner.set_visible(False)
+        self._message_search_progress_box.append(self._message_panel_search_spinner)
+        self._message_panel_search_progress = Gtk.ProgressBar()
+        self._message_panel_search_progress.set_show_text(False)
+        self._message_panel_search_progress.add_css_class("search-progress")
+        self._message_panel_search_progress.set_visible(False)
+        self._message_search_progress_box.append(self._message_panel_search_progress)
+        self._message_panel_search_label = Gtk.Label()
+        self._message_panel_search_label.set_wrap(True)
+        self._message_panel_search_label.add_css_class("dim-label")
+        self._message_panel_search_label.set_halign(Gtk.Align.START)
+        self._message_search_progress_box.append(self._message_panel_search_label)
+
         message_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        message_panel.append(self._message_search_progress_box)
         message_panel.append(self._message_list_view)
 
         self._message_stack.add_named(message_panel, "list")
@@ -2577,30 +2599,51 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_loading_progress.set_fraction(0.0)
         self._message_loading_spinner.set_visible(True)
         self._search_progress_last_ui_time = 0
-        self._header_search_progress.set_visible(False)
-        self._header_search_progress.set_fraction(0.0)
+        self._hide_message_panel_search_progress()
 
-    def _show_header_search_progress(self, *, fraction: float) -> None:
-        self._header_search_progress.set_fraction(fraction)
-        self._header_search_progress.set_visible(True)
+    def _hide_message_panel_search_progress(self) -> None:
+        self._message_search_progress_box.set_visible(False)
+        self._message_panel_search_spinner.stop()
+        self._message_panel_search_spinner.set_visible(False)
+        self._message_panel_search_progress.set_visible(False)
+        self._message_panel_search_progress.set_fraction(0.0)
+        self._message_panel_search_label.set_label("")
+
+    def _show_message_panel_search_progress(
+        self, *, fraction: float, label: str, index_loading: bool = False
+    ) -> None:
+        self._message_stack.set_visible_child_name("list")
+        self._message_search_progress_box.set_visible(True)
+        self._message_panel_search_label.set_label(label)
+        if index_loading:
+            self._message_panel_search_spinner.start()
+            self._message_panel_search_spinner.set_visible(True)
+            self._message_panel_search_progress.set_visible(False)
+            self._message_panel_search_progress.set_fraction(0.0)
+            return
+        self._message_panel_search_spinner.stop()
+        self._message_panel_search_spinner.set_visible(False)
+        self._message_panel_search_progress.set_visible(True)
+        self._message_panel_search_progress.set_fraction(fraction)
 
     def _show_search_progress_ui(self, *, fraction: float, label: str) -> None:
-        self._message_loading_spinner.stop()
-        self._message_loading_spinner.set_visible(False)
-        self._message_loading_progress.set_visible(True)
-        self._message_loading_progress.set_fraction(fraction)
-        self._message_loading_label.set_label(label)
+        self._show_message_panel_search_progress(
+            fraction=fraction,
+            label=label,
+        )
 
     def _show_search_index_loading_ui(self, load_id: int, display_folder: str) -> None:
         if load_id != self._messages_load_generation:
             return
         if self._search_query is None:
             return
-        self._message_loading_progress.set_visible(False)
-        self._message_loading_spinner.set_visible(True)
-        self._message_loading_spinner.start()
-        self._message_loading_label.set_label(f"Loading Index for {display_folder}…")
-        self._set_status(f"Loading Index for {display_folder}…")
+        label = f"Loading Index for {display_folder}…"
+        self._show_message_panel_search_progress(
+            fraction=0.0,
+            label=label,
+            index_loading=True,
+        )
+        self._set_status(label)
 
     def _report_search_progress(
         self, load_id: int, progress: SearchFilterProgress
@@ -2626,10 +2669,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._search_progress_last_ui_time = now
         progress_text = format_search_filter_progress(progress)
         fraction = search_filter_progress_fraction(progress)
-        if self._search_results_streamed:
-            self._show_header_search_progress(fraction=fraction)
-        else:
-            self._show_search_progress_ui(fraction=fraction, label=progress_text)
+        self._show_message_panel_search_progress(
+            fraction=fraction,
+            label=progress_text,
+        )
         self._set_status(progress_text)
         return False
 
@@ -2653,10 +2696,6 @@ class MainWindow(Adw.ApplicationWindow):
         if first_batch:
             self._update_search_scope_ui()
             self._message_stack.set_visible_child_name("list")
-            loading_fraction = self._message_loading_progress.get_fraction()
-            self._message_loading_progress.set_visible(False)
-            if loading_fraction > 0.0:
-                self._show_header_search_progress(fraction=loading_fraction)
 
         self._message_list_view.append_messages(batch, folder_name=folder_name)
         if self._current_folder_messages is None:
@@ -2940,13 +2979,17 @@ class MainWindow(Adw.ApplicationWindow):
         self._reset_search_progress_ui()
         self._message_loading_label.set_label(loading_label)
         if search_query is not None:
+            self._message_stack.set_visible_child_name("list")
             if self._mail.get_folder_index_snapshot(account_uid, folder_name) is None:
                 self._show_search_index_loading_ui(load_id, display_folder)
             else:
-                self._show_search_progress_ui(fraction=0.0, label=loading_label)
+                self._show_message_panel_search_progress(
+                    fraction=0.0,
+                    label=loading_label,
+                )
         else:
             self._message_loading_spinner.start()
-        self._message_stack.set_visible_child_name("loading")
+            self._message_stack.set_visible_child_name("loading")
 
         send_pending = self._mail.outbound_sends_pending()
         defer_mail_io = (
@@ -3378,6 +3421,7 @@ class MainWindow(Adw.ApplicationWindow):
                 self._message_list_source = source
                 if self._current_folder_messages:
                     self._message_total = len(self._current_folder_messages)
+                self._hide_message_panel_search_progress()
                 self._message_stack.set_visible_child_name("list")
                 self._update_message_status(account, folder_name)
                 search_trace(
