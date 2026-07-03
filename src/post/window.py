@@ -51,6 +51,7 @@ from post.mail.search import (
     MessageSearchQuery,
     SearchFilterProgress,
     filter_messages_by_query,
+    filter_search_matches_for_folder,
     format_search_filter_progress,
     format_search_result_meta,
     parse_search_query,
@@ -2105,6 +2106,36 @@ class MainWindow(Adw.ApplicationWindow):
             sync=False,
         )
 
+    def _narrow_search_to_folder(
+        self,
+        account: MailAccount,
+        folder_name: str,
+        query: MessageSearchQuery,
+        *,
+        seed_matches: list[dict],
+    ) -> None:
+        folder_scope = SearchScope(SEARCH_SCOPE_FOLDER)
+        self._search_scope = folder_scope
+        set_search_scope(folder_scope)
+        self._set_search_scope_dropdown_selected(folder_scope)
+        self._folder_before_multi_folder_search = None
+        self._search_query = query
+        self._update_search_scope_ui()
+        search_trace(
+            "search_narrow_to_folder",
+            account=account.uid,
+            folder=folder_name,
+            terms=len(query.terms),
+            seed_count=len(seed_matches),
+        )
+        self._load_messages(
+            account.uid,
+            folder_name,
+            offset=0,
+            sync=False,
+            seed_search_matches=seed_matches or None,
+        )
+
     def _apply_search_from_entry(self) -> None:
         if self._search_entry_updating:
             return
@@ -2153,8 +2184,26 @@ class MainWindow(Adw.ApplicationWindow):
         self._restore_messages_after_search()
 
     def _on_folder_selected(self, account: MailAccount, folder_name: str) -> None:
+        query = self._parse_search_from_entry()
+        narrowing = self._is_multi_folder_scope() and query is not None
+        seed_source = (
+            list(self._current_folder_messages or []) if narrowing else []
+        )
         self._prepare_folder_selection(account, folder_name)
-        self._search_query = self._parse_search_from_entry()
+        if narrowing and query is not None:
+            seed_matches = filter_search_matches_for_folder(
+                seed_source,
+                account_uid=account.uid,
+                folder_name=folder_name,
+            )
+            self._narrow_search_to_folder(
+                account,
+                folder_name,
+                query,
+                seed_matches=seed_matches,
+            )
+            return
+        self._search_query = query
         self._load_messages(account.uid, folder_name)
 
     def _show_message_unavailable_reader(self, message: str) -> None:
@@ -2869,6 +2918,7 @@ class MainWindow(Adw.ApplicationWindow):
         sync: bool | None = None,
         force_sync: bool = False,
         skip_disk_cache: bool = False,
+        seed_search_matches: list[dict] | None = None,
     ) -> None:
         account = self._current_account
         if account is None or account.uid != account_uid:
@@ -2895,8 +2945,13 @@ class MainWindow(Adw.ApplicationWindow):
             )
         )
         search_query = self._search_query
+        seed_matches = (
+            list(seed_search_matches)
+            if search_query is not None and seed_search_matches
+            else None
+        )
         if search_query is not None:
-            self._search_results_streamed = False
+            self._search_results_streamed = bool(seed_matches)
             if (
                 self._pre_search_snapshot is not None
                 and self._pre_search_folder == (account_uid, folder_name)
@@ -2984,7 +3039,22 @@ class MainWindow(Adw.ApplicationWindow):
             self._restore_message_folder = (account_uid, folder_name)
         self._message_popover.popdown()
         self._message_list_view.clear()
-        self._clear_reader()
+        if seed_matches:
+            seed_keys = {self._message_list_key(message) for message in seed_matches}
+            if (
+                self._current_message_uid
+                and self._current_message_uid not in seed_keys
+            ):
+                self._clear_reader()
+            self._current_folder_messages = seed_matches
+            self._message_total = len(seed_matches)
+            self._message_list_view.set_messages(
+                seed_matches,
+                folder_name=folder_name,
+            )
+            self._message_stack.set_visible_child_name("list")
+        else:
+            self._clear_reader()
 
         disk_cache_eligible = (
             not skip_disk_cache

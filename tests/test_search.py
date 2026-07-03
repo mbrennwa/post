@@ -553,5 +553,35 @@ class FilterMessagesYieldTests(unittest.TestCase):
         self.assertEqual(cursor.index, 5)
 
 
+class FilterSearchMatchesForFolderTests(unittest.TestCase):
+    def test_keeps_matches_for_requested_folder(self) -> None:
+        from post.mail.search import (
+            annotate_search_match,
+            filter_search_matches_for_folder,
+        )
+
+        inbox_match = annotate_search_match(
+            {"uid": "1", "subject": "a"},
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        sent_match = annotate_search_match(
+            {"uid": "2", "subject": "b"},
+            account_uid="acct-1",
+            folder_name="Sent",
+        )
+        other_account = annotate_search_match(
+            {"uid": "3", "subject": "c"},
+            account_uid="acct-2",
+            folder_name="INBOX",
+        )
+        filtered = filter_search_matches_for_folder(
+            [inbox_match, sent_match, other_account],
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        self.assertEqual([message["uid"] for message in filtered], ["1"])
+
+
 if __name__ == "__main__":
     unittest.main()

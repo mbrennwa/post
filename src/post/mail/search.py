@@ -55,6 +55,21 @@ def annotate_search_match(
     return annotated
 
 
+def filter_search_matches_for_folder(
+    messages: list[dict],
+    *,
+    account_uid: str,
+    folder_name: str,
+) -> list[dict]:
+    """Keep streamed cross-folder matches that belong to one folder."""
+    return [
+        message
+        for message in messages
+        if str(message.get("_search_account_uid") or "") == account_uid
+        and str(message.get("_search_folder") or "") == folder_name
+    ]
+
+
 def format_search_result_meta(
     account_label: str,
     folder_display: str,
