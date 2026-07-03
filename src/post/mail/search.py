@@ -30,6 +30,13 @@ class SearchFilterProgress:
     folders_total: int | None = None
 
 
+@dataclass
+class SearchScanCursor:
+    """Resume position for incremental folder filtering."""
+
+    index: int = 0
+
+
 def make_search_row_key(account_uid: str, folder_name: str, uid: str) -> str:
     return f"{account_uid}\0{folder_name}\0{uid}"
 
@@ -305,12 +312,18 @@ def filter_messages_by_query(
     *,
     body_text_for_uid: Callable[[str], str | None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    should_yield: Callable[[], bool] | None = None,
+    cursor: SearchScanCursor | None = None,
     on_progress: SearchProgressCallback | None = None,
     on_matches: SearchMatchCallback | None = None,
     progress_interval: int = SEARCH_FILTER_PROGRESS_INTERVAL,
     match_batch_size: int = SEARCH_MATCH_BATCH_SIZE,
 ) -> list[dict]:
-    """Filter folder index messages locally, checking cancellation between body loads."""
+    """Filter folder index messages locally, checking cancellation between body loads.
+
+    When ``cursor`` and ``should_yield`` are set, scanning can pause mid-folder and
+    resume from ``cursor.index`` on a later call.
+    """
     if not query.terms:
         return list(messages)
 
@@ -329,9 +342,11 @@ def filter_messages_by_query(
         term_count=len(query.terms),
         needs_body=needs_body,
     )
-    if on_progress is not None and message_count > 0:
+    start_index = cursor.index if cursor is not None else 0
+    if on_progress is not None and message_count > 0 and start_index == 0:
         on_progress(SearchFilterProgress(0, message_count, 0))
-    for index, message in enumerate(messages):
+    for index in range(start_index, message_count):
+        message = messages[index]
         if is_cancelled is not None and is_cancelled():
             search_trace(
                 "filter_messages_cancelled",
@@ -339,6 +354,17 @@ def filter_messages_by_query(
                 message_count=message_count,
             )
             break
+        if should_yield is not None and should_yield():
+            if cursor is not None:
+                cursor.index = index
+            flush_matches()
+            search_trace(
+                "filter_messages_yield",
+                scanned=index,
+                message_count=message_count,
+                matches=len(matched),
+            )
+            return matched
         if (
             on_progress is not None
             and index > 0
@@ -360,6 +386,17 @@ def filter_messages_by_query(
             body_text = body_text_for_uid(str(uid))
             if is_cancelled is not None and is_cancelled():
                 break
+            if should_yield is not None and should_yield():
+                if cursor is not None:
+                    cursor.index = index
+                flush_matches()
+                search_trace(
+                    "filter_messages_yield",
+                    scanned=index,
+                    message_count=message_count,
+                    matches=len(matched),
+                )
+                return matched
         if all(
             _message_matches_term(message, term, body_text=body_text)
             for term in query.terms
@@ -369,6 +406,8 @@ def filter_messages_by_query(
             if len(matched) == 1 or len(pending_batch) >= match_batch_size:
                 flush_matches()
     flush_matches()
+    if cursor is not None:
+        cursor.index = message_count
     if on_progress is not None and message_count > 0:
         on_progress(
             SearchFilterProgress(message_count, message_count, len(matched))

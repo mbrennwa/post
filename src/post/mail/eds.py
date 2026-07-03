@@ -135,6 +135,7 @@ from .search import (
     SearchFilterProgress,
     SearchMatchCallback,
     SearchProgressCallback,
+    SearchScanCursor,
     annotate_search_match,
     filter_messages_by_query,
     query_requires_body_scan,
@@ -2417,16 +2418,12 @@ class MailService:
         )
         return priority + remaining
 
-    def _search_single_folder_index_unlocked(
+    def _prepare_single_folder_search_unlocked(
         self,
         account_uid: str,
         folder_name: str,
         query: MessageSearchQuery,
-        *,
-        cancellable: Gio.Cancellable,
-        on_progress: SearchProgressCallback | None = None,
-        on_matches: SearchMatchCallback | None = None,
-    ) -> tuple[list[dict], int, FolderIndexSource]:
+    ) -> tuple[list[dict], int, FolderIndexSource, Any | None, bool]:
         with self._lock:
             key = (account_uid, folder_name)
             index = self._folder_indexes.get(key)
@@ -2451,21 +2448,22 @@ class MailService:
             if needs_body
             else None
         )
-        search_trace(
-            "search_filter_begin",
-            account=account_uid,
-            folder=folder_name,
-            message_count=len(messages),
-            needs_body=needs_body,
-            has_folder=folder is not None,
-            source=source,
-        )
+        return messages, unread, source, folder, needs_body
+
+    def _body_text_for_uid_loader(
+        self,
+        folder: Any | None,
+        *,
+        needs_body: bool,
+        cancellable: Gio.Cancellable,
+    ) -> Callable[[str], str | None] | None:
+        if not needs_body:
+            return None
+        from .helpers import extract_message_bodies, searchable_body_text
 
         def body_text_for_uid(uid: str) -> str | None:
-            if not needs_body or folder is None or cancellable.is_cancelled():
+            if folder is None or cancellable.is_cancelled():
                 return None
-            from .helpers import extract_message_bodies, searchable_body_text
-
             try:
                 api_uid = camel_uid_to_api(uid)
                 mime = folder.get_message_cached(api_uid, None)
@@ -2479,10 +2477,43 @@ class MailService:
                 html=bodies.get("html"),
             )
 
+        return body_text_for_uid
+
+    def _search_single_folder_index_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        query: MessageSearchQuery,
+        *,
+        cancellable: Gio.Cancellable,
+        on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
+    ) -> tuple[list[dict], int, FolderIndexSource]:
+        messages, unread, source, folder, needs_body = (
+            self._prepare_single_folder_search_unlocked(
+                account_uid,
+                folder_name,
+                query,
+            )
+        )
+        search_trace(
+            "search_filter_begin",
+            account=account_uid,
+            folder=folder_name,
+            message_count=len(messages),
+            needs_body=needs_body,
+            has_folder=folder is not None,
+            source=source,
+        )
+
         filtered = filter_messages_by_query(
             messages,
             query,
-            body_text_for_uid=body_text_for_uid if needs_body else None,
+            body_text_for_uid=self._body_text_for_uid_loader(
+                folder,
+                needs_body=needs_body,
+                cancellable=cancellable,
+            ),
             is_cancelled=cancellable.is_cancelled,
             on_progress=on_progress,
             on_matches=on_matches,
@@ -2661,7 +2692,11 @@ class MailService:
         cancellable = self._begin_folder_search_unlocked()
         matched: list[dict] = []
         folders_total = len(folder_jobs)
-        state = {"index": 0}
+        state: dict[str, Any] = {
+            "index": 0,
+            "folder_ctx": None,
+            "scan_cursor": None,
+        }
 
         def finish(*, cancelled: bool = False) -> None:
             try:
@@ -2709,6 +2744,36 @@ class MailService:
             folders_done = folder_index + 1
             matched_before_folder = len(matched)
 
+            if state["folder_ctx"] is None:
+                messages, unread, source, folder, needs_body = (
+                    self._prepare_single_folder_search_unlocked(
+                        account_uid,
+                        folder_name,
+                        query,
+                    )
+                )
+                state["folder_ctx"] = (
+                    messages,
+                    unread,
+                    source,
+                    folder,
+                    needs_body,
+                )
+                state["scan_cursor"] = SearchScanCursor()
+                search_trace(
+                    "search_filter_begin",
+                    account=account_uid,
+                    folder=folder_name,
+                    message_count=len(messages),
+                    needs_body=needs_body,
+                    has_folder=folder is not None,
+                    source=source,
+                )
+
+            messages, _unread, _source, folder, needs_body = state["folder_ctx"]
+            cursor = state["scan_cursor"]
+            assert isinstance(cursor, SearchScanCursor)
+
             def folder_on_matches(
                 batch: list[dict],
                 *,
@@ -2728,11 +2793,17 @@ class MailService:
                 matched.extend(annotated)
                 on_matches(annotated)
 
-            filtered, _unread, _source = self._search_single_folder_index_unlocked(
-                account_uid,
-                folder_name,
+            filter_messages_by_query(
+                messages,
                 query,
-                cancellable=cancellable,
+                body_text_for_uid=self._body_text_for_uid_loader(
+                    folder,
+                    needs_body=needs_body,
+                    cancellable=cancellable,
+                ),
+                is_cancelled=cancellable.is_cancelled,
+                should_yield=get_mail_io_thread().has_interactive_work_pending,
+                cursor=cursor,
                 on_progress=lambda progress, fl=folder_label, fd=folders_done, mbf=matched_before_folder: report_folder_progress(
                     progress,
                     folder_label=fl,
@@ -2744,16 +2815,12 @@ class MailService:
             if cancellable.is_cancelled():
                 finish(cancelled=True)
                 return
-            if on_matches is None:
-                matched.extend(
-                    annotate_search_match(
-                        message,
-                        account_uid=account_uid,
-                        folder_name=folder_name,
-                    )
-                    for message in filtered
-                )
+            if cursor.index < len(messages):
+                get_mail_io_thread().submit(run_folder)
+                return
 
+            state["folder_ctx"] = None
+            state["scan_cursor"] = None
             state["index"] = folder_index + 1
             get_mail_io_thread().submit(run_folder)
 
