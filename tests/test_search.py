@@ -476,6 +476,42 @@ class SearchScopeHelpersTests(unittest.TestCase):
             "Searching Sent… (2 / 5 folders) 40 / 120 · 3 matches",
         )
 
+    def test_search_filter_progress_fraction_single_folder(self) -> None:
+        from post.mail.search import SearchFilterProgress, search_filter_progress_fraction
+
+        self.assertEqual(
+            search_filter_progress_fraction(SearchFilterProgress(50, 100, 2)),
+            0.5,
+        )
+
+    def test_search_filter_progress_fraction_multi_folder(self) -> None:
+        from post.mail.search import SearchFilterProgress, search_filter_progress_fraction
+
+        progress = SearchFilterProgress(
+            40,
+            120,
+            3,
+            folder_label="Sent",
+            folders_done=2,
+            folders_total=5,
+        )
+        self.assertAlmostEqual(
+            search_filter_progress_fraction(progress),
+            (1 + 40 / 120) / 5,
+        )
+
+    def test_search_filter_progress_fraction_empty_folder(self) -> None:
+        from post.mail.search import SearchFilterProgress, search_filter_progress_fraction
+
+        progress = SearchFilterProgress(
+            0,
+            0,
+            0,
+            folders_done=3,
+            folders_total=5,
+        )
+        self.assertAlmostEqual(search_filter_progress_fraction(progress), 0.6)
+
 
 if __name__ == "__main__":
     unittest.main()

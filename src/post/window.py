@@ -55,6 +55,7 @@ from post.mail.search import (
     format_search_result_meta,
     parse_search_query,
     query_requires_body_scan,
+    search_filter_progress_fraction,
 )
 from post.mail.search_debug import search_trace, search_trace_timer
 from post.mail.operation_queue import offline_queue_status_text
@@ -2624,11 +2625,7 @@ class MainWindow(Adw.ApplicationWindow):
             return False
         self._search_progress_last_ui_time = now
         progress_text = format_search_filter_progress(progress)
-        fraction = (
-            progress.scanned / progress.message_count
-            if progress.message_count > 0
-            else 0.0
-        )
+        fraction = search_filter_progress_fraction(progress)
         if self._search_results_streamed:
             self._show_header_search_progress(fraction=fraction)
         else:
