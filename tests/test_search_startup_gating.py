@@ -13,6 +13,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
 
 from post.mail.eds import MailAccount
+from post.preferences import SEARCH_SCOPE_ALL, SEARCH_SCOPE_FOLDER, SearchScope
 from post.sidebar import MailSidebar
 from post.window import MainWindow
 
@@ -125,6 +126,24 @@ class SearchEntryStartupGatingTests(unittest.TestCase):
 
         self.window._load_messages.assert_not_called()
         self.window._preserve_pre_search_snapshot.assert_not_called()
+
+    def test_all_mail_scope_preserved_while_folder_tree_loading(self) -> None:
+        self.window._search_scope = SearchScope(SEARCH_SCOPE_ALL)
+        self.window._search_scope_items = [
+            SearchScope(SEARCH_SCOPE_FOLDER),
+            SearchScope(SEARCH_SCOPE_ALL),
+        ]
+        self.window._is_multi_folder_scope = mock.Mock(return_value=True)
+        self.window._set_search_scope_dropdown_selected = mock.Mock()
+        self.window._leave_multi_folder_sidebar_mode = mock.Mock()
+
+        with mock.patch("post.window.set_search_scope") as set_search_scope:
+            MainWindow._update_search_entry_state(self.window)
+
+        self.assertIs(self.window._search_scope.kind, SEARCH_SCOPE_ALL)
+        set_search_scope.assert_not_called()
+        self.window._set_search_scope_dropdown_selected.assert_not_called()
+        self.window._leave_multi_folder_sidebar_mode.assert_not_called()
 
 
 if __name__ == "__main__":

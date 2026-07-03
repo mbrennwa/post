@@ -2047,12 +2047,12 @@ class MainWindow(Adw.ApplicationWindow):
             self._update_search_scope_ui()
 
     def _update_search_entry_state(self) -> None:
-        enabled = (
+        folder_selected = (
             self._current_account is not None
             and self._current_folder is not None
             and not is_post_outbox_folder(self._current_folder)
-            and self._sidebar.folder_tree_ready
         )
+        enabled = folder_selected and self._sidebar.folder_tree_ready
         self._header_search_entry.set_sensitive(enabled)
         self._search_scope_dropdown.set_sensitive(enabled)
         if not enabled:
@@ -2060,12 +2060,12 @@ class MainWindow(Adw.ApplicationWindow):
             self._header_search_entry.set_text("")
             self._search_entry_updating = False
             self._search_query = None
-            if self._is_multi_folder_scope():
+            if not folder_selected and self._is_multi_folder_scope():
                 folder_scope = SearchScope(SEARCH_SCOPE_FOLDER)
                 self._search_scope = folder_scope
                 set_search_scope(folder_scope)
                 self._set_search_scope_dropdown_selected(folder_scope)
-            self._leave_multi_folder_sidebar_mode()
+                self._leave_multi_folder_sidebar_mode()
 
     def _parse_search_from_entry(self) -> MessageSearchQuery | None:
         raw = self._header_search_entry.get_text()
