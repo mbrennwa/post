@@ -285,14 +285,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._header_search_progress.set_can_target(False)
         search_overlay.add_overlay(self._header_search_progress)
 
-        self._search_all_mail_label = Gtk.Label(label="Search all mail")
+        self._search_all_mail_label = Gtk.Label(label="Search all Mail")
         self._search_all_mail_label.add_css_class("dim-label")
         self._search_all_mail_label.set_valign(Gtk.Align.CENTER)
         self._search_all_mail_switch = Gtk.Switch()
         self._search_all_mail_switch.set_active(self._search_all_mail)
         self._search_all_mail_switch.set_valign(Gtk.Align.CENTER)
         self._search_all_mail_switch.set_tooltip_text(
-            "Search all folders on all accounts"
+            "Search all Folders on all Accounts"
         )
         self._search_all_mail_switch.set_sensitive(False)
         self._search_all_mail_switch.connect(
@@ -1919,9 +1919,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._search_all_mail = active
         set_search_all_mail(active)
         switch.set_tooltip_text(
-            "Search all folders on all accounts"
+            "Search all Folders on all Accounts"
             if active
-            else "Search only the selected folder"
+            else "Search only the Selected Folder"
         )
         self._sync_all_mail_sidebar_selection()
         if active and self._parse_search_from_entry() is not None:
@@ -2547,8 +2547,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_loading_progress.set_visible(False)
         self._message_loading_spinner.set_visible(True)
         self._message_loading_spinner.start()
-        self._message_loading_label.set_label(f"Loading index for {display_folder}…")
-        self._set_status(f"Loading index for {display_folder}…")
+        self._message_loading_label.set_label(f"Loading Index for {display_folder}…")
+        self._set_status(f"Loading Index for {display_folder}…")
 
     def _report_search_progress(
         self, load_id: int, progress: SearchFilterProgress
