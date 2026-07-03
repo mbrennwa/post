@@ -513,5 +513,45 @@ class SearchScopeHelpersTests(unittest.TestCase):
         self.assertAlmostEqual(search_filter_progress_fraction(progress), 0.6)
 
 
+class FilterMessagesYieldTests(unittest.TestCase):
+    def test_filter_messages_resumes_after_yield(self) -> None:
+        from post.mail.search import SearchScanCursor
+
+        query = parse_search_query("needle")
+        assert query is not None
+        messages = [
+            {
+                "uid": str(index),
+                "subject": f"needle {index}",
+                "flags": {"seen": True},
+            }
+            for index in range(5)
+        ]
+        cursor = SearchScanCursor()
+        yield_checks = 0
+
+        def should_yield() -> bool:
+            nonlocal yield_checks
+            yield_checks += 1
+            return yield_checks >= 3
+
+        first = filter_messages_by_query(
+            messages,
+            query,
+            cursor=cursor,
+            should_yield=should_yield,
+        )
+        self.assertEqual([message["uid"] for message in first], ["0", "1"])
+        self.assertEqual(cursor.index, 2)
+
+        second = filter_messages_by_query(
+            messages,
+            query,
+            cursor=cursor,
+        )
+        self.assertEqual([message["uid"] for message in second], ["2", "3", "4"])
+        self.assertEqual(cursor.index, 5)
+
+
 if __name__ == "__main__":
     unittest.main()

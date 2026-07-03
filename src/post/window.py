@@ -3801,9 +3801,15 @@ class MainWindow(Adw.ApplicationWindow):
         self._user_message_click_pending = True
         selected = self._message_list_view.get_selected_uids()
         if len(selected) == 1 and selected[0] == uid:
-            if uid != self._current_message_uid or self._current_message is None:
-                self._current_message_uid = uid
-                self._load_message_body_for_uid(uid, mark_seen=True)
+            if uid == self._current_message_uid and self._current_message is not None:
+                return
+            if (
+                uid == self._pending_message_read_uid
+                and self._inflight_message_read_id is not None
+            ):
+                return
+            self._current_message_uid = uid
+            self._load_message_body_for_uid(uid, mark_seen=True)
             return
         self._message_list_view.select_uid(uid)
 
@@ -4484,6 +4490,11 @@ class MainWindow(Adw.ApplicationWindow):
         uid = selected[0]
         if uid == self._current_message_uid and self._current_message is not None:
             return False
+        if (
+            uid == self._pending_message_read_uid
+            and self._inflight_message_read_id is not None
+        ):
+            return False
 
         mark_seen = self._user_message_click_pending
         self._user_message_click_pending = False
@@ -4556,8 +4567,8 @@ class MainWindow(Adw.ApplicationWindow):
             return
         if (
             uid == self._pending_message_read_uid
+            and self._inflight_message_read_id is not None
             and self._inflight_message_read_id == self._message_read_generation
-            and self._current_message is None
         ):
             return
 
@@ -4743,24 +4754,31 @@ class MainWindow(Adw.ApplicationWindow):
         )
         return False
 
-    def _on_message_read_worker_stale(self, read_id: int, uid: str) -> bool:
+    def _mark_seen_when_reading_uid(self, uid: str) -> bool:
+        location = self._message_location_for_list_key(uid)
+        if location is None:
+            return True
+        account_uid, folder_name, _message_uid = location
+        return not self._sidebar.folder_is_drafts(account_uid, folder_name)
+
+    def _recover_stale_message_read(self, read_id: int, uid: str) -> bool:
         if read_id == self._message_read_generation:
             return False
-        if not self._current_account or not self._current_folder:
+        if self._current_message_uid != uid or self._current_message is not None:
             return False
-        if self._current_message_uid != uid:
+        if (
+            self._inflight_message_read_id is not None
+            and self._inflight_message_read_id != read_id
+        ):
             return False
-        if self._current_message is not None:
-            return False
-        if self._pending_message_read_uid != uid:
-            return False
-        if self._inflight_message_read_id != read_id:
-            return False
-        mark_seen = not self._sidebar.folder_is_drafts(
-            self._current_account.uid, self._current_folder
+        self._load_message_body_for_uid(
+            uid,
+            mark_seen=self._mark_seen_when_reading_uid(uid),
         )
-        self._load_message_body_for_uid(uid, mark_seen=mark_seen)
         return False
+
+    def _on_message_read_worker_stale(self, read_id: int, uid: str) -> bool:
+        return self._recover_stale_message_read(read_id, uid)
 
     def _on_message_read(
         self,
@@ -4770,7 +4788,7 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> bool:
         if read_id != self._message_read_generation:
-            return False
+            return self._recover_stale_message_read(read_id, uid)
 
         self._pending_message_read_uid = None
         self._inflight_message_read_id = None
@@ -4788,16 +4806,17 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         assert msg is not None
-        if not self._current_account or not self._current_folder:
-            return False
 
         self._current_message_uid = uid
         set_active_message_uid(uid)
-        self._restore_message_folder = (
-            self._current_account.uid,
-            self._current_folder,
-        )
         location = self._message_location_for_list_key(uid)
+        if location is not None:
+            self._restore_message_folder = location[:2]
+        elif self._current_account and self._current_folder:
+            self._restore_message_folder = (
+                self._current_account.uid,
+                self._current_folder,
+            )
         if location is not None and "folder_unread" in msg and "folder_total" in msg:
             src_account_uid, src_folder_name, _message_uid = location
             self._sidebar.update_folder_row(
@@ -4806,7 +4825,12 @@ class MainWindow(Adw.ApplicationWindow):
                 msg["folder_unread"],
                 msg["folder_total"],
             )
-        elif "folder_unread" in msg and "folder_total" in msg:
+        elif (
+            self._current_account is not None
+            and self._current_folder is not None
+            and "folder_unread" in msg
+            and "folder_total" in msg
+        ):
             self._sidebar.update_folder_row(
                 self._current_account.uid,
                 self._current_folder,
