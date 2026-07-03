@@ -2808,6 +2808,58 @@ class MainWindow(Adw.ApplicationWindow):
             return f"{text} · {detail}"
         return text
 
+    def _start_mail_search(
+        self,
+        load_id: int,
+        account_uid: str,
+        folder_name: str,
+        query: MessageSearchQuery,
+        scope: SearchScope,
+        *,
+        sync_pending: bool,
+    ) -> None:
+        def on_progress(progress: SearchFilterProgress) -> None:
+            self._report_search_progress(load_id, progress)
+
+        def on_matches(batch: list[dict]) -> None:
+            self._report_search_matches(load_id, batch)
+
+        def on_complete(result: tuple[list[dict], int, int, str]) -> None:
+            messages, unread, total, source = result
+            GLib.idle_add(
+                self._on_messages_loaded,
+                load_id,
+                account_uid,
+                folder_name,
+                messages,
+                unread,
+                total,
+                source,
+                sync_pending,
+                None,
+            )
+
+        kwargs = {
+            "on_progress": on_progress,
+            "on_matches": on_matches,
+            "on_complete": on_complete,
+        }
+        if scope.kind == SEARCH_SCOPE_ALL:
+            self._mail.start_search_all_messages(query, **kwargs)
+        elif scope.kind == SEARCH_SCOPE_ACCOUNT:
+            self._mail.start_search_account_messages(
+                scope.account_uid or account_uid,
+                query,
+                **kwargs,
+            )
+        else:
+            self._mail.start_search_folder_messages(
+                account_uid,
+                folder_name,
+                query,
+                **kwargs,
+            )
+
     def _load_messages(
         self,
         account_uid: str,
@@ -2879,12 +2931,6 @@ class MainWindow(Adw.ApplicationWindow):
         )
         from_label = account.email or account.display_label
 
-        def on_search_progress(progress: SearchFilterProgress) -> None:
-            self._report_search_progress(load_id, progress)
-
-        def on_search_matches(batch: list[dict]) -> None:
-            self._report_search_matches(load_id, batch)
-
         def fetch_messages(sync_flag: bool) -> tuple[list[dict], int, int, str]:
             if viewing_outbox:
                 messages, unread, total = list_queued_messages(
@@ -2892,31 +2938,6 @@ class MainWindow(Adw.ApplicationWindow):
                     from_label=from_label,
                 )
                 return messages, unread, total, "outbox"
-            if search_query is not None:
-                scope = self._search_scope
-                if scope.kind == SEARCH_SCOPE_ALL:
-                    messages, unread, total, source = self._mail.search_all_messages(
-                        search_query,
-                        on_progress=on_search_progress,
-                        on_matches=on_search_matches,
-                    )
-                elif scope.kind == SEARCH_SCOPE_ACCOUNT:
-                    messages, unread, total, source = self._mail.search_account_messages(
-                        scope.account_uid or account_uid,
-                        search_query,
-                        on_progress=on_search_progress,
-                        on_matches=on_search_matches,
-                    )
-                else:
-                    messages, unread, total, source = self._mail.search_folder_messages(
-                        account_uid,
-                        folder_name,
-                        search_query,
-                        sync=sync_flag,
-                        on_progress=on_search_progress,
-                        on_matches=on_search_matches,
-                    )
-                return messages, unread, total, source
             messages, unread, total, source = self._mail.get_folder_messages(
                 account_uid,
                 folder_name,
@@ -3029,6 +3050,22 @@ class MainWindow(Adw.ApplicationWindow):
                     generation=self._messages_load_generation,
                 )
                 GLib.idle_add(self._stop_superseded_message_loading, load_id)
+                return
+            if search_query is not None:
+                search_trace(
+                    "search_worker_start",
+                    load_id=load_id,
+                    searching=True,
+                    path="incremental",
+                )
+                self._start_mail_search(
+                    load_id,
+                    account_uid,
+                    folder_name,
+                    search_query,
+                    self._search_scope,
+                    sync_pending=use_background_sync and not send_pending,
+                )
                 return
             search_trace(
                 "search_worker_start",
@@ -3308,72 +3345,45 @@ class MainWindow(Adw.ApplicationWindow):
                     def cache_worker() -> None:
                         if load_id != self._messages_load_generation:
                             return
+                        if search_query is not None:
+                            try:
+                                self._start_mail_search(
+                                    load_id,
+                                    account_uid,
+                                    folder_name,
+                                    search_query,
+                                    search_scope,
+                                    sync_pending=False,
+                                )
+                            except Exception:
+                                GLib.idle_add(
+                                    self._on_messages_loaded,
+                                    load_id,
+                                    account_uid,
+                                    folder_name,
+                                    None,
+                                    -1,
+                                    -1,
+                                    "disk_cache",
+                                    False,
+                                    None,
+                                )
+                            return
                         cached_messages: list[dict] | None = None
                         cached_unread = -1
                         cached_total = -1
                         cached_source = "disk_cache"
                         try:
-                            if search_query is not None:
-                                if search_scope.kind == SEARCH_SCOPE_ALL:
-                                    (
-                                        cached_messages,
-                                        cached_unread,
-                                        cached_total,
-                                        cached_source,
-                                    ) = self._mail.search_all_messages(
-                                        search_query,
-                                        on_progress=lambda progress: self._report_search_progress(
-                                            load_id, progress
-                                        ),
-                                        on_matches=lambda batch: self._report_search_matches(
-                                            load_id, batch
-                                        ),
-                                    )
-                                elif search_scope.kind == SEARCH_SCOPE_ACCOUNT:
-                                    (
-                                        cached_messages,
-                                        cached_unread,
-                                        cached_total,
-                                        cached_source,
-                                    ) = self._mail.search_account_messages(
-                                        search_scope.account_uid or account_uid,
-                                        search_query,
-                                        on_progress=lambda progress: self._report_search_progress(
-                                            load_id, progress
-                                        ),
-                                        on_matches=lambda batch: self._report_search_matches(
-                                            load_id, batch
-                                        ),
-                                    )
-                                else:
-                                    (
-                                        cached_messages,
-                                        cached_unread,
-                                        cached_total,
-                                        cached_source,
-                                    ) = self._mail.search_folder_messages(
-                                        account_uid,
-                                        folder_name,
-                                        search_query,
-                                        sync=False,
-                                        on_progress=lambda progress: self._report_search_progress(
-                                            load_id, progress
-                                        ),
-                                        on_matches=lambda batch: self._report_search_matches(
-                                            load_id, batch
-                                        ),
-                                    )
-                            else:
-                                (
-                                    cached_messages,
-                                    cached_unread,
-                                    cached_total,
-                                    cached_source,
-                                ) = self._mail.get_folder_messages(
-                                    account_uid,
-                                    folder_name,
-                                    sync=False,
-                                )
+                            (
+                                cached_messages,
+                                cached_unread,
+                                cached_total,
+                                cached_source,
+                            ) = self._mail.get_folder_messages(
+                                account_uid,
+                                folder_name,
+                                sync=False,
+                            )
                         except Exception:
                             cached_messages = None
                         GLib.idle_add(
@@ -4551,7 +4561,6 @@ class MainWindow(Adw.ApplicationWindow):
         ):
             return
 
-        self._mail.cancel_folder_search()
         self._message_read_generation += 1
         read_id = self._message_read_generation
         self._pending_message_read_uid = uid
