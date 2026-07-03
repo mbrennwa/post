@@ -2534,6 +2534,96 @@ class MailService:
         finally:
             self._end_folder_search_unlocked(cancellable)
 
+    def _search_folder_jobs_unlocked(
+        self,
+        folder_jobs: list[tuple[str, str, str]],
+        query: MessageSearchQuery,
+        *,
+        cancellable: Gio.Cancellable,
+        on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
+    ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        folders_total = len(folder_jobs)
+        matched: list[dict] = []
+
+        def report_folder_progress(
+            progress: SearchFilterProgress,
+            *,
+            folder_label: str,
+            folders_done: int,
+            matched_before_folder: int,
+        ) -> None:
+            if on_progress is None:
+                return
+            on_progress(
+                SearchFilterProgress(
+                    progress.scanned,
+                    progress.message_count,
+                    matched_before_folder + progress.matches,
+                    folder_label=folder_label,
+                    folders_done=folders_done,
+                    folders_total=folders_total,
+                )
+            )
+
+        for folders_done, (account_uid, folder_name, folder_label) in enumerate(
+            folder_jobs, start=1
+        ):
+            if cancellable.is_cancelled():
+                break
+            matched_before_folder = len(matched)
+
+            def folder_on_matches(
+                batch: list[dict],
+                *,
+                _account_uid: str = account_uid,
+                _folder_name: str = folder_name,
+            ) -> None:
+                if not batch or on_matches is None:
+                    return
+                annotated = [
+                    annotate_search_match(
+                        message,
+                        account_uid=_account_uid,
+                        folder_name=_folder_name,
+                    )
+                    for message in batch
+                ]
+                matched.extend(annotated)
+                on_matches(annotated)
+
+            filtered, _unread, _source = self._search_single_folder_index_unlocked(
+                account_uid,
+                folder_name,
+                query,
+                cancellable=cancellable,
+                on_progress=lambda progress, fl=folder_label, fd=folders_done, mbf=matched_before_folder: report_folder_progress(
+                    progress,
+                    folder_label=fl,
+                    folders_done=fd,
+                    matched_before_folder=mbf,
+                ),
+                on_matches=folder_on_matches,
+            )
+            if cancellable.is_cancelled():
+                break
+            if on_matches is None:
+                matched.extend(
+                    annotate_search_match(
+                        message,
+                        account_uid=account_uid,
+                        folder_name=folder_name,
+                    )
+                    for message in filtered
+                )
+
+        if cancellable.is_cancelled():
+            return [], 0, 0, "memory"
+
+        sorted_matches = sort_messages_newest_first(matched)
+        match_count = len(sorted_matches)
+        return sorted_matches, 0, match_count, "memory"
+
     def _search_all_messages_unlocked(
         self,
         query: MessageSearchQuery,
@@ -2555,88 +2645,46 @@ class MailService:
                         display = folder.get("display_name") or full_name
                         folder_jobs.append((account.uid, full_name, display))
 
-                folders_total = len(folder_jobs)
-                matched: list[dict] = []
+                return self._search_folder_jobs_unlocked(
+                    folder_jobs,
+                    query,
+                    cancellable=cancellable,
+                    on_progress=on_progress,
+                    on_matches=on_matches,
+                )
+        finally:
+            self._end_folder_search_unlocked(cancellable)
 
-                def report_folder_progress(
-                    progress: SearchFilterProgress,
-                    *,
-                    folder_label: str,
-                    folders_done: int,
-                    matched_before_folder: int,
-                ) -> None:
-                    if on_progress is None:
-                        return
-                    on_progress(
-                        SearchFilterProgress(
-                            progress.scanned,
-                            progress.message_count,
-                            matched_before_folder + progress.matches,
-                            folder_label=folder_label,
-                            folders_done=folders_done,
-                            folders_total=folders_total,
-                        )
-                    )
+    def _search_account_messages_unlocked(
+        self,
+        account_uid: str,
+        query: MessageSearchQuery,
+        *,
+        on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
+    ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        cancellable = self._begin_folder_search_unlocked()
+        try:
+            with search_trace_timer(
+                "search_account",
+                account=account_uid,
+                terms=len(query.terms),
+            ):
+                folder_jobs: list[tuple[str, str, str]] = []
+                for folder in self._ordered_searchable_folders_unlocked(account_uid):
+                    full_name = folder.get("full_name")
+                    if not full_name:
+                        continue
+                    display = folder.get("display_name") or full_name
+                    folder_jobs.append((account_uid, full_name, display))
 
-                for folders_done, (account_uid, folder_name, folder_label) in enumerate(
-                    folder_jobs, start=1
-                ):
-                    if cancellable.is_cancelled():
-                        break
-                    matched_before_folder = len(matched)
-
-                    def folder_on_matches(
-                        batch: list[dict],
-                        *,
-                        _account_uid: str = account_uid,
-                        _folder_name: str = folder_name,
-                    ) -> None:
-                        if not batch or on_matches is None:
-                            return
-                        annotated = [
-                            annotate_search_match(
-                                message,
-                                account_uid=_account_uid,
-                                folder_name=_folder_name,
-                            )
-                            for message in batch
-                        ]
-                        matched.extend(annotated)
-                        on_matches(annotated)
-
-                    filtered, _unread, _source = (
-                        self._search_single_folder_index_unlocked(
-                            account_uid,
-                            folder_name,
-                            query,
-                            cancellable=cancellable,
-                            on_progress=lambda progress, fl=folder_label, fd=folders_done, mbf=matched_before_folder: report_folder_progress(
-                                progress,
-                                folder_label=fl,
-                                folders_done=fd,
-                                matched_before_folder=mbf,
-                            ),
-                            on_matches=folder_on_matches,
-                        )
-                    )
-                    if cancellable.is_cancelled():
-                        break
-                    if on_matches is None:
-                        matched.extend(
-                            annotate_search_match(
-                                message,
-                                account_uid=account_uid,
-                                folder_name=folder_name,
-                            )
-                            for message in filtered
-                        )
-
-                if cancellable.is_cancelled():
-                    return [], 0, 0, "memory"
-
-                sorted_matches = sort_messages_newest_first(matched)
-                match_count = len(sorted_matches)
-                return sorted_matches, 0, match_count, "memory"
+                return self._search_folder_jobs_unlocked(
+                    folder_jobs,
+                    query,
+                    cancellable=cancellable,
+                    on_progress=on_progress,
+                    on_matches=on_matches,
+                )
         finally:
             self._end_folder_search_unlocked(cancellable)
 
@@ -2655,6 +2703,29 @@ class MailService:
             )
         return get_mail_io_thread().run_sync(
             self._search_all_messages_unlocked,
+            query,
+            on_progress=on_progress,
+            on_matches=on_matches,
+        )
+
+    def search_account_messages(
+        self,
+        account_uid: str,
+        query: MessageSearchQuery,
+        *,
+        on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
+    ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        if is_mail_io_thread():
+            return self._search_account_messages_unlocked(
+                account_uid,
+                query,
+                on_progress=on_progress,
+                on_matches=on_matches,
+            )
+        return get_mail_io_thread().run_sync(
+            self._search_account_messages_unlocked,
+            account_uid,
             query,
             on_progress=on_progress,
             on_matches=on_matches,

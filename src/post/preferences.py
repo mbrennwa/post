@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from dataclasses import dataclass
 from typing import Any, Literal
 
 _PREF_PATH = os.path.join(os.path.expanduser("~"), ".config", "post", "preferences.json")
@@ -80,13 +81,69 @@ def get_show_evolution_local() -> bool | None:
     return bool(value)
 
 
-def get_search_all_mail() -> bool:
-    return bool(_load_raw().get("search_all_mail"))
+SearchScopeKind = Literal["folder", "all", "account"]
+
+SEARCH_SCOPE_FOLDER: SearchScopeKind = "folder"
+SEARCH_SCOPE_ALL: SearchScopeKind = "all"
+SEARCH_SCOPE_ACCOUNT: SearchScopeKind = "account"
+
+_SEARCH_SCOPE_KINDS: frozenset[str] = frozenset(
+    {SEARCH_SCOPE_FOLDER, SEARCH_SCOPE_ALL, SEARCH_SCOPE_ACCOUNT}
+)
 
 
-def set_search_all_mail(value: bool) -> None:
+@dataclass(frozen=True)
+class SearchScope:
+    kind: SearchScopeKind
+    account_uid: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in _SEARCH_SCOPE_KINDS:
+            raise ValueError(f"Invalid search scope kind: {self.kind!r}")
+        if self.kind == SEARCH_SCOPE_ACCOUNT:
+            if not self.account_uid:
+                raise ValueError("account_uid required for account search scope")
+        elif self.account_uid is not None:
+            raise ValueError("account_uid only valid for account search scope")
+
+
+def _search_scope_to_storage(scope: SearchScope) -> str:
+    if scope.kind == SEARCH_SCOPE_FOLDER:
+        return SEARCH_SCOPE_FOLDER
+    if scope.kind == SEARCH_SCOPE_ALL:
+        return SEARCH_SCOPE_ALL
+    assert scope.account_uid is not None
+    return f"{SEARCH_SCOPE_ACCOUNT}:{scope.account_uid}"
+
+
+def _search_scope_from_storage(value: str) -> SearchScope | None:
+    if value == SEARCH_SCOPE_FOLDER:
+        return SearchScope(SEARCH_SCOPE_FOLDER)
+    if value == SEARCH_SCOPE_ALL:
+        return SearchScope(SEARCH_SCOPE_ALL)
+    if value.startswith(f"{SEARCH_SCOPE_ACCOUNT}:"):
+        account_uid = value[len(SEARCH_SCOPE_ACCOUNT) + 1 :]
+        if account_uid:
+            return SearchScope(SEARCH_SCOPE_ACCOUNT, account_uid=account_uid)
+    return None
+
+
+def get_search_scope() -> SearchScope:
     data = _load_raw()
-    data["search_all_mail"] = value
+    stored = data.get("search_scope")
+    if isinstance(stored, str):
+        scope = _search_scope_from_storage(stored)
+        if scope is not None:
+            return scope
+    if bool(data.get("search_all_mail")):
+        return SearchScope(SEARCH_SCOPE_ALL)
+    return SearchScope(SEARCH_SCOPE_FOLDER)
+
+
+def set_search_scope(scope: SearchScope) -> None:
+    data = _load_raw()
+    data["search_scope"] = _search_scope_to_storage(scope)
+    data.pop("search_all_mail", None)
     _save_raw(data)
 
 

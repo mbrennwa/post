@@ -97,15 +97,19 @@ from post.preferences import (
     OFFLINE_BODY_SYNC_LAST_YEAR,
     OFFLINE_BODY_SYNC_OFF,
     OfflineBodySyncMode,
+    SEARCH_SCOPE_ACCOUNT,
+    SEARCH_SCOPE_ALL,
+    SEARCH_SCOPE_FOLDER,
+    SearchScope,
     get_load_remote_content,
     get_message_appearance,
-    get_search_all_mail,
+    get_search_scope,
     get_sidebar_state,
     get_window_state,
     set_account_offline_body_sync,
     set_active_message_uid,
     set_offline_body_sync_prompt_declined,
-    set_search_all_mail,
+    set_search_scope,
     should_show_offline_body_sync_prompt,
     set_window_state,
 )
@@ -243,9 +247,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._local_draft_sync_suppress_until: dict[tuple[str, str], float] = {}
         self._user_message_click_pending = False
         self._search_query: MessageSearchQuery | None = None
-        self._search_all_mail = get_search_all_mail()
-        self._search_all_mail_switch_updating = False
-        self._folder_before_all_mail: tuple[str, str] | None = None
+        self._search_scope = get_search_scope()
+        self._search_scope_items: list[SearchScope] = []
+        self._search_scope_dropdown_updating = False
+        self._folder_before_multi_folder_search: tuple[str, str] | None = None
         self._search_entry_updating = False
         self._messages_load_expects_search = False
         self._pre_search_snapshot: tuple[list[dict], int, int, str] | None = None
@@ -285,23 +290,15 @@ class MainWindow(Adw.ApplicationWindow):
         self._header_search_progress.set_can_target(False)
         search_overlay.add_overlay(self._header_search_progress)
 
-        self._search_all_mail_label = Gtk.Label(label="Search all Mail")
-        self._search_all_mail_label.add_css_class("dim-label")
-        self._search_all_mail_label.set_valign(Gtk.Align.CENTER)
-        self._search_all_mail_switch = Gtk.Switch()
-        self._search_all_mail_switch.set_active(self._search_all_mail)
-        self._search_all_mail_switch.set_valign(Gtk.Align.CENTER)
-        self._search_all_mail_switch.set_tooltip_text(
-            "Search all Folders on all Accounts"
-        )
-        self._search_all_mail_switch.set_sensitive(False)
-        self._search_all_mail_switch.connect(
-            "notify::active", self._on_search_all_mail_switch_changed
+        self._search_scope_dropdown = Gtk.DropDown()
+        self._search_scope_dropdown.set_sensitive(False)
+        self._search_scope_dropdown.set_valign(Gtk.Align.CENTER)
+        self._search_scope_dropdown.connect(
+            "notify::selected", self._on_search_scope_changed
         )
         search_scope = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         search_scope.set_valign(Gtk.Align.CENTER)
-        search_scope.append(self._search_all_mail_switch)
-        search_scope.append(self._search_all_mail_label)
+        search_scope.append(self._search_scope_dropdown)
 
         search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         search_row.set_halign(Gtk.Align.CENTER)
@@ -1118,6 +1115,7 @@ class MainWindow(Adw.ApplicationWindow):
                 self._sync_watcher.start()
         elif self._sync_watcher.running:
             self._sync_watcher.stop()
+        self._rebuild_search_scope_dropdown(account_uids)
         self._maybe_show_offline_body_sync_prompt(account_uids)
 
     def _on_initial_folder_load_complete(self) -> None:
@@ -1797,12 +1795,32 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _search_empty_label(self, folder_label: str) -> str:
-        if self._search_all_mail:
+        if self._search_scope.kind == SEARCH_SCOPE_ALL:
             return "No Matches in All Mail"
+        if self._search_scope.kind == SEARCH_SCOPE_ACCOUNT:
+            account_label = self._sidebar.account_display_label(
+                self._search_scope.account_uid or ""
+            )
+            return f"No Matches in {account_label}"
         return f"No Matches in {folder_label}"
 
-    def _is_all_mail_search_active(self) -> bool:
-        return self._search_all_mail and self._search_query is not None
+    def _search_target_label(self, folder_label: str) -> str:
+        if self._search_scope.kind == SEARCH_SCOPE_ALL:
+            return "All Mail"
+        if self._search_scope.kind == SEARCH_SCOPE_ACCOUNT:
+            return self._sidebar.account_display_label(
+                self._search_scope.account_uid or ""
+            )
+        return folder_label
+
+    def _is_multi_folder_search_active(self) -> bool:
+        return (
+            self._search_scope.kind != SEARCH_SCOPE_FOLDER
+            and self._search_query is not None
+        )
+
+    def _is_multi_folder_scope(self) -> bool:
+        return self._search_scope.kind != SEARCH_SCOPE_FOLDER
 
     def _message_list_key(self, message: dict) -> str:
         row_key = message.get("_search_row_key")
@@ -1851,7 +1869,7 @@ class MainWindow(Adw.ApplicationWindow):
         return format_search_result_meta(account_label, folder_display, sender)
 
     def _update_search_scope_ui(self) -> None:
-        if self._is_all_mail_search_active():
+        if self._is_multi_folder_search_active():
             self._message_list_view.set_search_meta_label_resolver(
                 self._search_result_meta_label
             )
@@ -1864,7 +1882,7 @@ class MainWindow(Adw.ApplicationWindow):
                 )
 
     def _selected_message_source_matches_sidebar(self) -> bool:
-        if not self._is_all_mail_search_active():
+        if not self._is_multi_folder_search_active():
             return True
         selected = self._message_list_view.get_selected_uids()
         if len(selected) != 1:
@@ -1880,53 +1898,88 @@ class MainWindow(Adw.ApplicationWindow):
             and folder_name == self._current_folder
         )
 
-    def _enter_all_mail_sidebar_mode(self) -> None:
+    def _enter_multi_folder_sidebar_mode(self) -> None:
         if self._current_account and self._current_folder:
-            self._folder_before_all_mail = (
+            self._folder_before_multi_folder_search = (
                 self._current_account.uid,
                 self._current_folder,
             )
         self._sidebar.clear_folder_selection()
 
-    def _leave_all_mail_sidebar_mode(self) -> None:
-        saved = self._folder_before_all_mail
-        self._folder_before_all_mail = None
+    def _leave_multi_folder_sidebar_mode(self) -> None:
+        saved = self._folder_before_multi_folder_search
+        self._folder_before_multi_folder_search = None
         if saved is None:
             return
         account_uid, folder_name = saved
         if not self._sidebar.restore_folder_selection(account_uid, folder_name):
             self._sidebar.mark_folder_active(account_uid, folder_name)
 
-    def _sync_all_mail_sidebar_selection(self) -> None:
-        if self._search_all_mail:
-            self._enter_all_mail_sidebar_mode()
+    def _sync_multi_folder_sidebar_selection(self) -> None:
+        if self._is_multi_folder_scope():
+            self._enter_multi_folder_sidebar_mode()
         else:
-            self._leave_all_mail_sidebar_mode()
+            self._leave_multi_folder_sidebar_mode()
 
-    def _set_search_all_mail_switch_active(self, active: bool) -> None:
-        self._search_all_mail_switch_updating = True
+    def _set_search_scope_dropdown_selected(self, scope: SearchScope) -> None:
+        for index, item in enumerate(self._search_scope_items):
+            if item == scope:
+                self._search_scope_dropdown_updating = True
+                try:
+                    self._search_scope_dropdown.set_selected(index)
+                finally:
+                    self._search_scope_dropdown_updating = False
+                return
+        folder_scope = SearchScope(SEARCH_SCOPE_FOLDER)
+        for index, item in enumerate(self._search_scope_items):
+            if item == folder_scope:
+                self._search_scope_dropdown_updating = True
+                try:
+                    self._search_scope_dropdown.set_selected(index)
+                finally:
+                    self._search_scope_dropdown_updating = False
+                return
+
+    def _rebuild_search_scope_dropdown(self, account_uids: list[str]) -> None:
+        items: list[SearchScope] = [SearchScope(SEARCH_SCOPE_FOLDER)]
+        labels = ["Selected Folder"]
+        for account_uid in account_uids:
+            items.append(SearchScope(SEARCH_SCOPE_ACCOUNT, account_uid=account_uid))
+            labels.append(self._sidebar.account_display_label(account_uid))
+        items.append(SearchScope(SEARCH_SCOPE_ALL))
+        labels.append("All Mail")
+
+        scope = self._search_scope
+        if (
+            scope.kind == SEARCH_SCOPE_ACCOUNT
+            and scope.account_uid not in account_uids
+        ):
+            scope = SearchScope(SEARCH_SCOPE_FOLDER)
+            self._search_scope = scope
+            set_search_scope(scope)
+
+        self._search_scope_items = items
+        model = Gtk.StringList.new(labels)
+        self._search_scope_dropdown_updating = True
         try:
-            self._search_all_mail_switch.set_active(active)
+            self._search_scope_dropdown.set_model(model)
+            self._set_search_scope_dropdown_selected(scope)
         finally:
-            self._search_all_mail_switch_updating = False
+            self._search_scope_dropdown_updating = False
 
-    def _on_search_all_mail_switch_changed(
-        self, switch: Gtk.Switch, *_args
-    ) -> None:
-        if self._search_all_mail_switch_updating:
+    def _on_search_scope_changed(self, _dropdown: Gtk.DropDown, *_args) -> None:
+        if self._search_scope_dropdown_updating:
             return
-        active = switch.get_active()
-        self._search_all_mail = active
-        set_search_all_mail(active)
-        switch.set_tooltip_text(
-            "Search all Folders on all Accounts"
-            if active
-            else "Search only the Selected Folder"
-        )
-        self._sync_all_mail_sidebar_selection()
-        if active and self._parse_search_from_entry() is not None:
+        selected = _dropdown.get_selected()
+        if selected < 0 or selected >= len(self._search_scope_items):
+            return
+        scope = self._search_scope_items[selected]
+        self._search_scope = scope
+        set_search_scope(scope)
+        self._sync_multi_folder_sidebar_selection()
+        if self._is_multi_folder_scope() and self._parse_search_from_entry() is not None:
             self._apply_search_from_entry()
-        elif not active:
+        elif not self._is_multi_folder_scope():
             self._update_search_scope_ui()
 
     def _update_search_entry_state(self) -> None:
@@ -1936,17 +1989,18 @@ class MainWindow(Adw.ApplicationWindow):
             and not is_post_outbox_folder(self._current_folder)
         )
         self._header_search_entry.set_sensitive(enabled)
-        self._search_all_mail_switch.set_sensitive(enabled)
+        self._search_scope_dropdown.set_sensitive(enabled)
         if not enabled:
             self._search_entry_updating = True
             self._header_search_entry.set_text("")
             self._search_entry_updating = False
             self._search_query = None
-            if self._search_all_mail:
-                self._search_all_mail = False
-                set_search_all_mail(False)
-                self._set_search_all_mail_switch_active(False)
-            self._leave_all_mail_sidebar_mode()
+            if self._is_multi_folder_scope():
+                folder_scope = SearchScope(SEARCH_SCOPE_FOLDER)
+                self._search_scope = folder_scope
+                set_search_scope(folder_scope)
+                self._set_search_scope_dropdown_selected(folder_scope)
+            self._leave_multi_folder_sidebar_mode()
 
     def _parse_search_from_entry(self) -> MessageSearchQuery | None:
         raw = self._header_search_entry.get_text()
@@ -2044,8 +2098,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._preserve_pre_search_snapshot()
         self._search_query = query
         self._update_search_scope_ui()
-        if self._search_all_mail:
-            self._enter_all_mail_sidebar_mode()
+        if self._is_multi_folder_scope():
+            self._enter_multi_folder_sidebar_mode()
         search_trace(
             "search_apply",
             raw=raw,
@@ -2068,8 +2122,8 @@ class MainWindow(Adw.ApplicationWindow):
     def _exit_search_mode(self) -> None:
         self._search_query = None
         self._update_search_scope_ui()
-        if self._search_all_mail:
-            self._sync_all_mail_sidebar_selection()
+        if self._is_multi_folder_scope():
+            self._sync_multi_folder_sidebar_selection()
         self._search_entry_updating = True
         self._header_search_entry.set_text("")
         self._search_entry_updating = False
@@ -2509,10 +2563,7 @@ class MainWindow(Adw.ApplicationWindow):
         source: str,
     ) -> str:
         action = "Searching" if searching else "Loading"
-        if searching and self._search_all_mail:
-            target = "All Mail"
-        else:
-            target = display_folder
+        target = self._search_target_label(display_folder) if searching else display_folder
         if searching and not self._network_available:
             return f"Searching {target} · {OFFLINE_SEARCHING_LOCAL_CACHE}…"
         detail = self._load_source_label(source)
@@ -2806,8 +2857,16 @@ class MainWindow(Adw.ApplicationWindow):
                 )
                 return messages, unread, total, "outbox"
             if search_query is not None:
-                if self._search_all_mail:
+                scope = self._search_scope
+                if scope.kind == SEARCH_SCOPE_ALL:
                     messages, unread, total, source = self._mail.search_all_messages(
+                        search_query,
+                        on_progress=on_search_progress,
+                        on_matches=on_search_matches,
+                    )
+                elif scope.kind == SEARCH_SCOPE_ACCOUNT:
+                    messages, unread, total, source = self._mail.search_account_messages(
+                        scope.account_uid or account_uid,
                         search_query,
                         on_progress=on_search_progress,
                         on_matches=on_search_matches,
@@ -3204,6 +3263,7 @@ class MainWindow(Adw.ApplicationWindow):
                     and folder_index_has_cache(account_uid, folder_name)
                 ):
                     search_query = self._search_query
+                    search_scope = self._search_scope
 
                     def cache_worker() -> None:
                         if load_id != self._messages_load_generation:
@@ -3214,13 +3274,29 @@ class MainWindow(Adw.ApplicationWindow):
                         cached_source = "disk_cache"
                         try:
                             if search_query is not None:
-                                if self._search_all_mail:
+                                if search_scope.kind == SEARCH_SCOPE_ALL:
                                     (
                                         cached_messages,
                                         cached_unread,
                                         cached_total,
                                         cached_source,
                                     ) = self._mail.search_all_messages(
+                                        search_query,
+                                        on_progress=lambda progress: self._report_search_progress(
+                                            load_id, progress
+                                        ),
+                                        on_matches=lambda batch: self._report_search_matches(
+                                            load_id, batch
+                                        ),
+                                    )
+                                elif search_scope.kind == SEARCH_SCOPE_ACCOUNT:
+                                    (
+                                        cached_messages,
+                                        cached_unread,
+                                        cached_total,
+                                        cached_source,
+                                    ) = self._mail.search_account_messages(
+                                        search_scope.account_uid or account_uid,
                                         search_query,
                                         on_progress=lambda progress: self._report_search_progress(
                                             load_id, progress
