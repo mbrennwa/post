@@ -19,6 +19,7 @@ gi.require_version("Gdk", "4.0")
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
+from post.header_bar import add_end_window_controls
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.eds import MailAccount, MessageNotAvailableError
@@ -59,7 +60,8 @@ class ReaderWindow(Adw.ApplicationWindow):
         get_message_flags: GetMessageFlags,
         viewing_drafts: bool = False,
     ) -> None:
-        super().__init__(transient_for=parent, modal=False)
+        super().__init__()
+        self._parent_window = parent
         apply_window_icon(self)
         application = parent.get_application()
         if application is not None:
@@ -89,6 +91,7 @@ class ReaderWindow(Adw.ApplicationWindow):
         self.set_default_size(720, 560)
 
         header = Adw.HeaderBar()
+        add_end_window_controls(header)
         self._archive_btn = Gtk.Button(
             icon_name="mail-archive-symbolic",
             tooltip_text="Archive",
@@ -143,6 +146,10 @@ class ReaderWindow(Adw.ApplicationWindow):
     @property
     def folder_name(self) -> str:
         return self._folder_name
+
+    @property
+    def message_uid(self) -> str:
+        return self._message_uid
 
     def notify_flags_updated(self, uid: str, flags: dict[str, Any]) -> None:
         if uid != self._message_uid:
