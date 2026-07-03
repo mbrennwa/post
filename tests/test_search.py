@@ -467,13 +467,26 @@ class SearchScopeHelpersTests(unittest.TestCase):
             40,
             120,
             3,
+            account_label="Work",
             folder_label="Sent",
             folders_done=2,
             folders_total=5,
         )
         self.assertEqual(
             format_search_filter_progress(progress),
-            "Searching Sent…",
+            "Searching Work/Sent…",
+        )
+
+    def test_format_search_target_label_joins_account_and_folder(self) -> None:
+        from post.mail.search import format_search_target_label
+
+        self.assertEqual(
+            format_search_target_label(account_label="Work", folder_label="Inbox"),
+            "Work/Inbox",
+        )
+        self.assertEqual(
+            format_search_target_label(folder_label="Inbox"),
+            "Inbox",
         )
 
     def test_search_filter_progress_fraction_single_folder(self) -> None:

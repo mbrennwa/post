@@ -25,6 +25,7 @@ class SearchFilterProgress:
     scanned: int
     message_count: int
     matches: int
+    account_label: str | None = None
     folder_label: str | None = None
     folders_done: int | None = None
     folders_total: int | None = None
@@ -79,9 +80,27 @@ def format_search_result_meta(
     return " · ".join(parts)
 
 
+def format_search_target_label(
+    *,
+    account_label: str | None = None,
+    folder_label: str | None = None,
+) -> str | None:
+    if account_label and folder_label:
+        return f"{account_label}/{folder_label}"
+    if folder_label:
+        return folder_label
+    if account_label:
+        return account_label
+    return None
+
+
 def format_search_filter_progress(progress: SearchFilterProgress) -> str:
-    if progress.folder_label:
-        return f"Searching {progress.folder_label}…"
+    target = format_search_target_label(
+        account_label=progress.account_label,
+        folder_label=progress.folder_label,
+    )
+    if target:
+        return f"Searching {target}…"
     return "Searching…"
 
 

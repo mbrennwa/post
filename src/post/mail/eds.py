@@ -2581,6 +2581,7 @@ class MailService:
         def report_folder_progress(
             progress: SearchFilterProgress,
             *,
+            account_label: str,
             folder_label: str,
             folders_done: int,
             matched_before_folder: int,
@@ -2592,6 +2593,7 @@ class MailService:
                     progress.scanned,
                     progress.message_count,
                     matched_before_folder + progress.matches,
+                    account_label=account_label,
                     folder_label=folder_label,
                     folders_done=folders_done,
                     folders_total=folders_total,
@@ -2603,6 +2605,7 @@ class MailService:
         ):
             if cancellable.is_cancelled():
                 break
+            account_label = self.get_account(account_uid).display_label
             matched_before_folder = len(matched)
 
             def folder_on_matches(
@@ -2629,8 +2632,9 @@ class MailService:
                 folder_name,
                 query,
                 cancellable=cancellable,
-                on_progress=lambda progress, fl=folder_label, fd=folders_done, mbf=matched_before_folder: report_folder_progress(
+                on_progress=lambda progress, al=account_label, fl=folder_label, fd=folders_done, mbf=matched_before_folder: report_folder_progress(
                     progress,
+                    account_label=al,
                     folder_label=fl,
                     folders_done=fd,
                     matched_before_folder=mbf,
@@ -2714,6 +2718,7 @@ class MailService:
         def report_folder_progress(
             progress: SearchFilterProgress,
             *,
+            account_label: str,
             folder_label: str,
             folders_done: int,
             matched_before_folder: int,
@@ -2725,6 +2730,7 @@ class MailService:
                     progress.scanned,
                     progress.message_count,
                     matched_before_folder + progress.matches,
+                    account_label=account_label,
                     folder_label=folder_label,
                     folders_done=folders_done,
                     folders_total=folders_total,
@@ -2741,6 +2747,7 @@ class MailService:
                 return
 
             account_uid, folder_name, folder_label = folder_jobs[folder_index]
+            account_label = self.get_account(account_uid).display_label
             folders_done = folder_index + 1
             matched_before_folder = len(matched)
 
@@ -2804,8 +2811,9 @@ class MailService:
                 is_cancelled=cancellable.is_cancelled,
                 should_yield=get_mail_io_thread().has_interactive_work_pending,
                 cursor=cursor,
-                on_progress=lambda progress, fl=folder_label, fd=folders_done, mbf=matched_before_folder: report_folder_progress(
+                on_progress=lambda progress, al=account_label, fl=folder_label, fd=folders_done, mbf=matched_before_folder: report_folder_progress(
                     progress,
+                    account_label=al,
                     folder_label=fl,
                     folders_done=fd,
                     matched_before_folder=mbf,
