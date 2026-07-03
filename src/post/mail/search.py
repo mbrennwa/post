@@ -71,6 +71,24 @@ def format_search_filter_progress(progress: SearchFilterProgress) -> str:
         f" · {progress.matches:,} {match_word}"
     )
 
+
+def search_filter_progress_fraction(progress: SearchFilterProgress) -> float:
+    """Return 0.0–1.0 progress for search UI bars."""
+    if (
+        progress.folders_total is not None
+        and progress.folders_total > 0
+        and progress.folders_done is not None
+    ):
+        if progress.message_count > 0:
+            within_folder = progress.scanned / progress.message_count
+        else:
+            within_folder = 1.0
+        completed = progress.folders_done - 1 + within_folder
+        return min(1.0, completed / progress.folders_total)
+    if progress.message_count > 0:
+        return progress.scanned / progress.message_count
+    return 0.0
+
 # Optional whitespace after ":" so "subject: Auburn" works like "subject:Auburn".
 _QUERY_PATTERN = re.compile(
     r"""
