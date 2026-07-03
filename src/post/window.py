@@ -171,6 +171,9 @@ progressbar.search-progress {{
 .message-panel-search-progress {{
   padding: 8px 12px 4px 12px;
 }}
+.message-panel-search-progress label {{
+  min-width: 0;
+}}
 .message-panel-search-progress progressbar.search-progress {{
   margin-left: 0;
   margin-right: 0;
@@ -421,6 +424,8 @@ class MainWindow(Adw.ApplicationWindow):
             spacing=4,
         )
         self._message_search_progress_box.add_css_class("message-panel-search-progress")
+        self._message_search_progress_box.set_hexpand(True)
+        self._message_search_progress_box.set_halign(Gtk.Align.FILL)
         self._message_search_progress_box.set_visible(False)
         self._message_panel_search_spinner = Gtk.Spinner()
         self._message_panel_search_spinner.set_size_request(24, 24)
@@ -430,16 +435,19 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_panel_search_progress = Gtk.ProgressBar()
         self._message_panel_search_progress.set_show_text(False)
         self._message_panel_search_progress.add_css_class("search-progress")
+        self._message_panel_search_progress.set_hexpand(True)
+        self._message_panel_search_progress.set_halign(Gtk.Align.FILL)
         self._message_panel_search_progress.set_visible(False)
         self._message_search_progress_box.append(self._message_panel_search_progress)
         self._message_panel_search_label = Gtk.Label()
-        self._message_panel_search_label.set_wrap(True)
         self._message_panel_search_label.add_css_class("dim-label")
         self._message_panel_search_label.set_halign(Gtk.Align.START)
         self._message_search_progress_box.append(self._message_panel_search_label)
 
         message_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        message_panel.set_hexpand(True)
         message_panel.append(self._message_search_progress_box)
+        self._message_list_view.set_hexpand(True)
         message_panel.append(self._message_list_view)
 
         self._message_stack.add_named(message_panel, "list")
@@ -2678,7 +2686,8 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> None:
         self._message_stack.set_visible_child_name("list")
         self._message_search_progress_box.set_visible(True)
-        self._message_panel_search_label.set_label(label)
+        panel_label = "Loading Index…" if index_loading else "Searching…"
+        self._message_panel_search_label.set_label(panel_label)
         if index_loading:
             self._message_panel_search_spinner.start()
             self._message_panel_search_spinner.set_visible(True)
