@@ -22,6 +22,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 from post.compose_window import ComposeWindow, SavedDraftNotification
 from post.credentials import prompt_password_sync
 from post.gtk_schedule import schedule_on_gtk_main
+from post.header_bar import add_end_window_controls
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.eds import MailAccount, MessageNotAvailableError, OfflineSyncProgress
@@ -275,6 +276,7 @@ class MainWindow(Adw.ApplicationWindow):
         outer.set_vexpand(True)
 
         header = Adw.HeaderBar()
+        add_end_window_controls(header)
 
         self._header_search_entry = Gtk.SearchEntry()
         self._header_search_entry.set_placeholder_text(
@@ -320,7 +322,6 @@ class MainWindow(Adw.ApplicationWindow):
         settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
         settings_btn.set_tooltip_text("Settings")
         settings_btn.connect("clicked", self._on_settings_clicked)
-        header.pack_end(settings_btn)
 
         header_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         header_actions.set_margin_end(10)
@@ -342,6 +343,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._header_trash_btn.set_sensitive(False)
         self._header_trash_btn.connect("clicked", self._on_header_trash_clicked)
         header_actions.append(self._header_trash_btn)
+        header_actions.append(settings_btn)
 
         header.pack_end(header_actions)
 
@@ -801,8 +803,21 @@ class MainWindow(Adw.ApplicationWindow):
     def _destroy_after_close_cleanup(self) -> bool:
         self._abort_inflight_search()
         self._finish_close()
+        self._close_auxiliary_windows()
+        application = self.get_application()
         self.destroy()
+        if application is not None:
+            application.quit()
         return False
+
+    def _close_auxiliary_windows(self) -> None:
+        if self._settings_dialog is not None:
+            self._settings_dialog.destroy()
+            self._settings_dialog = None
+        for window in list(self._compose_windows):
+            window.force_close()
+        for window in list(self._reader_windows):
+            window.destroy()
 
     def _finish_close(self) -> bool:
         self._sync_watcher.stop()
@@ -4935,6 +4950,14 @@ class MainWindow(Adw.ApplicationWindow):
         if location is None:
             return
         account_uid, folder_name, message_uid = location
+        for window in self._reader_windows:
+            if (
+                window.account_uid == account_uid
+                and window.folder_name == folder_name
+                and window.message_uid == message_uid
+            ):
+                window.present()
+                return
         try:
             account = self._mail.get_account(account_uid)
         except ValueError:

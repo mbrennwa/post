@@ -20,6 +20,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, Gio, GLib, Gtk
 
+from post.header_bar import add_end_window_controls
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.compose import (
@@ -418,7 +419,8 @@ class ComposeWindow(Adw.Window):
         draft_message: dict[str, Any] | None = None,
         outbox_queue_id: str | None = None,
     ) -> None:
-        super().__init__(transient_for=parent, modal=False)
+        super().__init__()
+        self._parent_window = parent
         apply_window_icon(self)
         if parent is not None:
             application = parent.get_application()
@@ -442,6 +444,7 @@ class ComposeWindow(Adw.Window):
         self._unsaved_dialog: Adw.AlertDialog | None = None
         self._missing_attachment_dialog: Adw.AlertDialog | None = None
         self._user_edited = False
+        self._force_close = False
         self._tracking_edits = False
         self._tracked_signature: str | None = None
         self._previous_from_account_uid = account.uid
@@ -477,8 +480,8 @@ class ComposeWindow(Adw.Window):
         self.set_default_size(720, 560)
 
         header = Adw.HeaderBar()
-        header.set_show_end_title_buttons(True)
         header.set_show_title(False)
+        add_end_window_controls(header)
 
         self._save_draft_btn = Gtk.Button(label="Save Draft")
         self._save_draft_btn.connect("clicked", self._on_save_draft_clicked)
@@ -1337,6 +1340,11 @@ class ComposeWindow(Adw.Window):
     def is_dirty(self) -> bool:
         return self._user_edited
 
+    def force_close(self) -> None:
+        """Close immediately, e.g. when the application is quitting."""
+        self._force_close = True
+        self.destroy()
+
     def _dismiss(self) -> None:
         """Close the compose window without re-entering close-request."""
         self.destroy()
@@ -1355,6 +1363,8 @@ class ComposeWindow(Adw.Window):
 
     def _on_close_request(self, *_args) -> bool:
         """Window manager / header close: block while busy or when prompting."""
+        if self._force_close:
+            return False
         if self._saving_draft:
             return True
         if not self._user_edited:
@@ -1771,7 +1781,7 @@ class ComposeWindow(Adw.Window):
         in_reply_to: str | None,
         references: str | None,
     ) -> None:
-        parent = self.get_transient_for()
+        parent = self._parent_window
         request = OutboundSendRequest(
             account_uid=account.uid,
             to=to_addrs,
