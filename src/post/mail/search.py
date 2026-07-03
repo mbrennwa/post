@@ -57,19 +57,9 @@ def format_search_result_meta(
 
 
 def format_search_filter_progress(progress: SearchFilterProgress) -> str:
-    match_word = "match" if progress.matches == 1 else "matches"
-    if progress.folders_total is not None and progress.folders_done is not None:
-        folder_part = progress.folder_label or "folders"
-        prefix = (
-            f"Searching {folder_part}…"
-            f" ({progress.folders_done:,} / {progress.folders_total:,} folders)"
-        )
-    else:
-        prefix = "Searching…"
-    return (
-        f"{prefix} {progress.scanned:,} / {progress.message_count:,}"
-        f" · {progress.matches:,} {match_word}"
-    )
+    if progress.folder_label:
+        return f"Searching {progress.folder_label}…"
+    return "Searching…"
 
 
 def search_filter_progress_fraction(progress: SearchFilterProgress) -> float:
