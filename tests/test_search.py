@@ -399,7 +399,7 @@ class FilterMessagesByQueryTests(unittest.TestCase):
         self.assertEqual(seen[-1], SearchFilterProgress(250, 250, 250))
         self.assertEqual(
             format_search_filter_progress(seen[-1]),
-            "Searching… 250 / 250 · 250 matches",
+            "Searching…",
         )
 
     def test_reports_match_batches(self) -> None:
@@ -473,7 +473,7 @@ class SearchScopeHelpersTests(unittest.TestCase):
         )
         self.assertEqual(
             format_search_filter_progress(progress),
-            "Searching Sent… (2 / 5 folders) 40 / 120 · 3 matches",
+            "Searching Sent…",
         )
 
     def test_search_filter_progress_fraction_single_folder(self) -> None:

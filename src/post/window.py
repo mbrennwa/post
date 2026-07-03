@@ -2587,8 +2587,8 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> str:
         action = "Searching" if searching else "Loading"
         target = self._search_target_label(display_folder) if searching else display_folder
-        if searching and not self._network_available:
-            return f"Searching {target} · {OFFLINE_SEARCHING_LOCAL_CACHE}…"
+        if searching:
+            return f"Searching {target}…"
         detail = self._load_source_label(source)
         if detail:
             return f"{action} {target} {detail}…"
