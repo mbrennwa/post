@@ -60,27 +60,51 @@ class FolderTreeReadyTests(unittest.TestCase):
                 on_folder_tree_ready=self._on_folder_tree_ready,
             )
 
-    def test_ready_when_no_folder_loads_pending(self) -> None:
-        self.assertTrue(self.sidebar.folder_tree_ready)
+    def test_not_ready_before_first_folder_load_finishes(self) -> None:
+        # pending==0 before load() must not look "ready" (eager restore race).
+        self.assertEqual(self.sidebar._folder_loads_pending, 0)
+        self.assertFalse(self.sidebar.folder_tree_ready)
 
     def test_not_ready_while_folder_loads_pending(self) -> None:
         self.sidebar._folder_loads_pending = 2
         self.assertFalse(self.sidebar.folder_tree_ready)
 
+    def test_load_clears_ready_until_finish(self) -> None:
+        self.sidebar._folder_tree_ready = True
+        self.sidebar._mail.list_accounts.return_value = [_account("acct-1")]
+        with (
+            mock.patch.object(self.sidebar, "_start_folder_load"),
+            mock.patch.object(
+                self.sidebar,
+                "_make_account_section_loading",
+                return_value=Gtk.Box(),
+            ),
+        ):
+            self.sidebar.load()
+        self.assertFalse(self.sidebar.folder_tree_ready)
+        self.assertEqual(self.sidebar._folder_loads_pending, 1)
+
+        self.sidebar._folder_loads_pending = 0
+        self.sidebar._maybe_finish_initial_folder_load()
+        self.assertTrue(self.sidebar.folder_tree_ready)
+
     def test_folder_tree_ready_callback_fires_when_loads_complete(self) -> None:
         self.sidebar._folder_loads_pending = 1
         self.sidebar._maybe_finish_initial_folder_load()
         self._on_folder_tree_ready.assert_not_called()
+        self.assertFalse(self.sidebar.folder_tree_ready)
 
         self.sidebar._folder_loads_pending = 0
         self.sidebar._maybe_finish_initial_folder_load()
         self._on_folder_tree_ready.assert_called_once_with()
+        self.assertTrue(self.sidebar.folder_tree_ready)
 
     def test_folder_tree_ready_callback_fires_on_each_completion(self) -> None:
         self.sidebar._folder_loads_pending = 0
         self.sidebar._maybe_finish_initial_folder_load()
         self.sidebar._maybe_finish_initial_folder_load()
         self.assertEqual(self._on_folder_tree_ready.call_count, 2)
+        self.assertTrue(self.sidebar.folder_tree_ready)
 
 
 class SearchEntryStartupGatingTests(unittest.TestCase):
