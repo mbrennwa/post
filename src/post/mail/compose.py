@@ -299,16 +299,16 @@ def plain_to_simple_html(plain: str) -> str:
     return f'<div style="white-space:pre-wrap">{html.escape(text)}</div>'
 
 
-def plain_quoted_as_html(quoted_plain: str) -> str:
-    """Wrap edited plain-text quotes for the HTML body."""
-    text = quoted_plain.strip()
-    if not text:
-        return ""
-    return (
-        f'<blockquote class="post_quote">'
-        f'<div style="white-space:pre-wrap">{html.escape(text)}</div>'
-        f"</blockquote>"
-    )
+def is_plain_wrapper_html(body_html: str, body_plain: str) -> bool:
+    """Return True when HTML is only plain_to_simple_html of the plain body.
+
+    Such synthetic alternatives cause some recipients (e.g. Outlook read-as-plain)
+    to show the same text again as an ATT00001.htm attachment (#157).
+    """
+    html = (body_html or "").strip()
+    if not html:
+        return False
+    return html == plain_to_simple_html(body_plain)
 
 
 _REPLY_QUOTE_MARKER_RE = re.compile(r"\n\nOn .+ wrote:\n", re.DOTALL)
@@ -365,23 +365,26 @@ def build_outbound_html_for_compose(
     quoted_html_source: str | None,
     quoted_plain_expected: str,
 ) -> str | None:
-    """Build text/html for reply/forward using original MIME HTML when unchanged."""
+    """Build text/html for reply/forward using original MIME HTML when unchanged.
+
+    Returns None when there is no real HTML quote to preserve (edited quotes,
+    plain-only bodies). Synthetic plain wrappers alone must not become a
+    multipart/alternative HTML part (#157).
+    """
     if mode not in ("reply", "reply-all", "forward"):
         return None
     user_plain, quoted_plain = split_compose_body_at_quote(body_plain, mode)
-    quoted_html: str | None = None
-    if quoted_plain.strip():
-        if (
-            quoted_plain == quoted_plain_expected
-            and quoted_html_source
-            and reply_to is not None
-        ):
-            if mode == "forward":
-                quoted_html = quote_html_forward(reply_to, quoted_html_source)
-            else:
-                quoted_html = quote_html_reply(reply_to, quoted_html_source)
-        else:
-            quoted_html = plain_quoted_as_html(quoted_plain)
+    if not (
+        quoted_plain.strip()
+        and quoted_plain == quoted_plain_expected
+        and quoted_html_source
+        and reply_to is not None
+    ):
+        return None
+    if mode == "forward":
+        quoted_html = quote_html_forward(reply_to, quoted_html_source)
+    else:
+        quoted_html = quote_html_reply(reply_to, quoted_html_source)
     return build_outbound_html_body(user_plain=user_plain, quoted_html=quoted_html)
 
 
