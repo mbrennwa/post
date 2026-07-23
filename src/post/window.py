@@ -1156,6 +1156,10 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_folder_tree_ready(self) -> None:
         self._update_search_entry_state()
+        # Folder tree cache is now populated; refresh sync watch so inbox uses
+        # the real folder name instead of skipping while cache was empty (#153).
+        if self._sync_watcher.running:
+            self._sync_watcher.set_accounts(self._sidebar.account_uids())
 
     def _remote_sync_account_backends(self) -> frozenset[str]:
         return frozenset({"imap", "imapx", "ews", "microsoft365", "pop3"})
