@@ -17,6 +17,11 @@ jobs:
         run: ./scripts/install-deps.sh xvfb
 
       - name: Run checks
+        env:
+          # WebKitGTK sandbox needs unprivileged user namespaces; GitHub-hosted
+          # runners often deny bwrap uid maps (AppArmor), which aborts WebView tests.
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
+          GTK_A11Y: none
         run: |
           python3 -m venv .venv --system-site-packages
           xvfb-run -a ./scripts/check.sh

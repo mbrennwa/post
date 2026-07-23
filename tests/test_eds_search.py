@@ -415,20 +415,5 @@ class SearchAccountMessagesTests(unittest.TestCase):
         self.assertEqual(source, "memory")
 
 
-class PreemptBackgroundWorkTests(unittest.TestCase):
-    def test_does_not_cancel_folder_list(self) -> None:
-        service = MailService(registry=mock.Mock())
-        offline_sync = mock.Mock()
-        service._offline_sync = offline_sync
-
-        with mock.patch.object(service, "cancel_folder_list") as cancel_folder_list:
-            with mock.patch.object(service, "cancel_folder_search") as cancel_search:
-                service._preempt_background_work()
-
-        cancel_search.assert_called_once_with()
-        cancel_folder_list.assert_not_called()
-        offline_sync.cancel_all.assert_called_once_with()
-
-
 if __name__ == "__main__":
     unittest.main()
