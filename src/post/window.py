@@ -177,8 +177,6 @@ progressbar.status-search-progress progress {{
 }}
 progressbar.status-search-progress trough {{
   background-color: alpha(@window_fg_color, 0.1);
-  margin-top: auto;
-  margin-bottom: auto;
 }}
 progressbar.status-search-progress-indeterminate progress {{
   background-color: @accent_bg_color;
