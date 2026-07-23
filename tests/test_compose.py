@@ -17,6 +17,7 @@ from post.mail.compose import (
     build_forward_subject,
     build_reply_all_recipients,
     build_reply_references,
+    is_plain_wrapper_html,
     normalize_in_reply_to,
     normalize_references_header,
     parse_references_header,
@@ -28,6 +29,7 @@ from post.mail.compose import (
     normalize_email,
     parse_address_header,
     parse_address_list,
+    plain_to_simple_html,
     parse_draft_address_list,
     quote_html_forward,
     quote_plain_forward,
@@ -1583,7 +1585,7 @@ class HtmlForwardReplyTests(unittest.TestCase):
         self.assertIn(source, html)
         self.assertIn("My note", html)
 
-    def test_edited_plain_quote_falls_back_to_escaped_plain(self) -> None:
+    def test_edited_plain_quote_omits_html_alternative(self) -> None:
         original = {
             "from": "Alice <alice@example.com>",
             "to": "Bob <bob@example.com>",
@@ -1603,10 +1605,43 @@ class HtmlForwardReplyTests(unittest.TestCase):
             quoted_html_source=source,
             quoted_plain_expected=quoted_plain,
         )
-        self.assertIsNotNone(html)
-        assert html is not None
-        self.assertNotIn(source, html)
-        self.assertIn("edited quote", html)
+        self.assertIsNone(html)
+
+    def test_user_only_body_omits_html_alternative(self) -> None:
+        html = build_outbound_html_for_compose(
+            body_plain="hallo",
+            mode="reply",
+            reply_to={"from": "Alice <alice@example.com>"},
+            quoted_html_source="<p>Original</p>",
+            quoted_plain_expected="",
+        )
+        self.assertIsNone(html)
+
+    def test_is_plain_wrapper_html_matches_synthetic_wrapper(self) -> None:
+        plain = "hallo"
+        self.assertTrue(is_plain_wrapper_html(plain_to_simple_html(plain), plain))
+        self.assertFalse(is_plain_wrapper_html("<p>hallo</p>", plain))
+        self.assertFalse(is_plain_wrapper_html("", plain))
+        self.assertFalse(is_plain_wrapper_html(plain_to_simple_html("other"), plain))
+
+    def test_build_plain_mime_without_html_is_text_plain(self) -> None:
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hi",
+            body="hallo",
+            body_html=None,
+        )
+        content_type = message.get_content_type()
+        self.assertIsNotNone(content_type)
+        self.assertEqual(content_type.simple(), "text/plain")
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertNotIn(b"multipart/alternative", raw)
+        self.assertNotIn(b"white-space:pre-wrap", raw)
 
 
 class BodyMentionsAttachmentTests(unittest.TestCase):
