@@ -224,19 +224,66 @@ def draft_addresses_to_internet_address(addresses: list[str]) -> Any | None:
     return container if container.length() > 0 else None
 
 
+# Reply / forward subject prefixes (case-insensitive). Both lists are stripped
+# when normalizing so mixed stacks like "AW: Re: Fwd: topic" collapse cleanly.
+_REPLY_SUBJECT_PREFIXES = (
+    "re",
+    "aw",
+    "sv",
+    "antw",
+    "antwort",
+    "res",
+    "rif",
+    "rif.",
+    "odp",
+    "ynt",
+)
+_FORWARD_SUBJECT_PREFIXES = (
+    "fwd",
+    "fw",
+    "wg",
+    "vl",
+    "vs",
+    "tr",
+    "enc",
+    "rv",
+)
+_SUBJECT_PREFIXES = tuple(
+    sorted(
+        {*_REPLY_SUBJECT_PREFIXES, *_FORWARD_SUBJECT_PREFIXES},
+        key=len,
+        reverse=True,
+    )
+)
+
+
+def _strip_subject_prefixes(subject: str) -> str:
+    """Remove stacked reply/forward prefixes from the start of a subject."""
+    text = subject
+    while True:
+        stripped = text.lstrip()
+        lowered = stripped.lower()
+        matched = False
+        for prefix in _SUBJECT_PREFIXES:
+            token = f"{prefix}:"
+            if lowered.startswith(token):
+                text = stripped[len(token) :]
+                matched = True
+                break
+        if not matched:
+            return stripped
+
+
 def build_reply_subject(subject: str) -> str:
     subject = (subject or "").strip() or "(no subject)"
-    if subject.lower().startswith("re:"):
-        return subject
-    return f"Re: {subject}"
+    core = _strip_subject_prefixes(subject).strip() or "(no subject)"
+    return f"Re: {core}"
 
 
 def build_forward_subject(subject: str) -> str:
     subject = (subject or "").strip() or "(no subject)"
-    lowered = subject.lower()
-    if lowered.startswith("fwd:") or lowered.startswith("fw:"):
-        return subject
-    return f"Fwd: {subject}"
+    core = _strip_subject_prefixes(subject).strip() or "(no subject)"
+    return f"Fwd: {core}"
 
 
 def quote_plain_forward(original: dict[str, Any], body_plain: str | None) -> str:
