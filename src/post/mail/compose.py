@@ -19,6 +19,19 @@ from gi.repository import Gio
 
 _ADDRESS_SPLIT = re.compile(r",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)")
 _HEADER_NEWLINES = re.compile(r"[\r\n]+")
+# Line break not followed by WSP is header injection, not an RFC 5322 fold.
+_HEADER_INJECTION_BREAK = re.compile(r"\n(?![ \t])")
+
+
+def _reject_header_injection(value: str | None, *, field: str) -> None:
+    """Reject CR/LF that would start a new header line (not a folded continuation)."""
+    if value is None:
+        return
+    # Normalize CRLF/CR to LF so folds are detected as "\\n" + WSP.
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    if _HEADER_INJECTION_BREAK.search(normalized) or normalized.endswith("\n"):
+        raise ValueError(f"{field} must not contain line breaks.")
+
 
 
 def _sanitize_header_field(value: str, *, field: str) -> str:
@@ -955,11 +968,15 @@ def validate_compose_mime_fields(
     """Reject user-controlled header fields before outbox queue or MIME build."""
     _sanitize_optional_header_field(from_name, field="From name")
     _sanitize_header_field(subject or "", field="Subject")
-    _sanitize_optional_header_field(in_reply_to, field="In-Reply-To")
+    # Allow RFC 5322 folds; reject bare CR/LF injection; then normalize (#152).
+    _reject_header_injection(in_reply_to, field="In-Reply-To")
     _sanitize_optional_header_field(
         normalize_in_reply_to(in_reply_to), field="In-Reply-To"
     )
-    _sanitize_optional_header_field(references, field="References")
+    _reject_header_injection(references, field="References")
+    _sanitize_optional_header_field(
+        normalize_references_header(references), field="References"
+    )
     for field, group in (
         ("To", to),
         ("Cc", cc),
@@ -1054,11 +1071,14 @@ def _apply_compose_headers(
     if include_bcc_header and bcc_container is not None:
         message.set_recipients("Bcc", bcc_container)
 
-    _sanitize_optional_header_field(in_reply_to, field="In-Reply-To")
+    _reject_header_injection(in_reply_to, field="In-Reply-To")
     safe_in_reply_to = normalize_in_reply_to(in_reply_to)
+    _sanitize_optional_header_field(safe_in_reply_to, field="In-Reply-To")
     if safe_in_reply_to:
         message.set_header("In-Reply-To", safe_in_reply_to)
-    safe_references = _sanitize_optional_header_field(references, field="References")
+    _reject_header_injection(references, field="References")
+    safe_references = normalize_references_header(references)
+    _sanitize_optional_header_field(safe_references, field="References")
     if safe_references:
         message.set_header("References", safe_references)
 

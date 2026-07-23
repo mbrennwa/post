@@ -1170,6 +1170,30 @@ class ReferencesNormalizationTests(unittest.TestCase):
             references=normalized,
         )
 
+    def test_validate_accepts_raw_folded_references(self) -> None:
+        """Outbox enqueue must normalize before sanitize (#152)."""
+        folded = "<a@x.com> <b@x.com>\r\n <c@x.com>"
+        validate_compose_mime_fields(
+            from_name=None,
+            subject="Thread",
+            references=folded,
+        )
+
+    def test_validate_rejects_in_reply_to_bare_newline_injection(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_compose_mime_fields(
+                from_name=None,
+                subject="Thread",
+                in_reply_to="<orig@example.com>\r\nBcc: evil@example.com",
+            )
+
+    def test_validate_accepts_folded_in_reply_to(self) -> None:
+        validate_compose_mime_fields(
+            from_name=None,
+            subject="Thread",
+            in_reply_to="<parent@example.com>\r\n <ignored-fold>",
+        )
+
     def test_build_reply_references_cleans_folded_input(self) -> None:
         folded = "<a@x.com> <b@x.com>\r\n <c@x.com>"
         result = build_reply_references("<new@x.com>", folded)
@@ -1666,6 +1690,24 @@ class OutboundMimeParityTests(unittest.TestCase):
         self.assertIn(b"In-Reply-To: <parent@example.com>", raw)
         self.assertIn(b"References: <parent@example.com>", raw)
         self.assertNotIn(b"Bcc:", raw)
+
+    def test_build_plain_mime_message_normalizes_folded_references(self) -> None:
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Thread test",
+            body="Hello",
+            in_reply_to="<a@x.com>",
+            references="<a@x.com> <b@x.com>\r\n <c@x.com>",
+            include_bcc_header=False,
+        )
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertIn(b"References: <a@x.com> <b@x.com> <c@x.com>", raw)
+        self.assertNotIn(b"References: <a@x.com> <b@x.com>\r\n", raw)
 
     def test_build_plain_mime_message_normalizes_bare_in_reply_to(self) -> None:
         message = build_plain_mime_message(
