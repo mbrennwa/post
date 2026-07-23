@@ -129,6 +129,24 @@ class BuildReplySubjectTests(unittest.TestCase):
     def test_keeps_existing_re(self) -> None:
         self.assertEqual(build_reply_subject("Re: Hello"), "Re: Hello")
 
+    def test_collapses_stacked_re(self) -> None:
+        self.assertEqual(
+            build_reply_subject("Re: Re: Re: some subject"),
+            "Re: some subject",
+        )
+
+    def test_collapses_locale_and_re(self) -> None:
+        self.assertEqual(
+            build_reply_subject("AW: Re: some subject"),
+            "Re: some subject",
+        )
+
+    def test_normalizes_locale_reply_prefix(self) -> None:
+        self.assertEqual(build_reply_subject("aw: hello"), "Re: hello")
+
+    def test_strips_forward_prefix_when_replying(self) -> None:
+        self.assertEqual(build_reply_subject("Fwd: Hello"), "Re: Hello")
+
 
 class ExtractReplyAddressTests(unittest.TestCase):
     def test_from_named_address(self) -> None:
@@ -334,8 +352,20 @@ class BuildForwardSubjectTests(unittest.TestCase):
     def test_keeps_existing_fwd(self) -> None:
         self.assertEqual(build_forward_subject("Fwd: Hello"), "Fwd: Hello")
 
-    def test_keeps_existing_fw(self) -> None:
-        self.assertEqual(build_forward_subject("FW: Hello"), "FW: Hello")
+    def test_normalizes_fw_to_fwd(self) -> None:
+        self.assertEqual(build_forward_subject("FW: Hello"), "Fwd: Hello")
+
+    def test_collapses_stacked_fwd(self) -> None:
+        self.assertEqual(
+            build_forward_subject("Fwd: Fwd: Hello"),
+            "Fwd: Hello",
+        )
+
+    def test_normalizes_locale_forward_prefix(self) -> None:
+        self.assertEqual(build_forward_subject("WG: Hello"), "Fwd: Hello")
+
+    def test_strips_reply_prefix_when_forwarding(self) -> None:
+        self.assertEqual(build_forward_subject("Re: Hello"), "Fwd: Hello")
 
 
 class BuildDraftMimeMessageTests(unittest.TestCase):
