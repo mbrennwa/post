@@ -39,6 +39,7 @@ apt_depends = [
   "gir1.2-edataserver-1.2",
   "gir1.2-webkit-6.0",
   "evolution-data-server",
+  "evolution-ews",
   "librsvg2-bin",
   "desktop-file-utils",
 ]
