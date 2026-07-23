@@ -605,6 +605,7 @@ class MailService:
         run_on_mail_thread(self._set_network_available_unlocked, available)
 
     def _set_network_available_unlocked(self, available: bool) -> None:
+        stores_to_sync: list[tuple[str, Camel.Store, bool]] = []
         with self._lock:
             if self._network_available == available:
                 return
@@ -614,14 +615,16 @@ class MailService:
             for account_uid, store in self._stores.items():
                 if isinstance(store, Camel.OfflineStore):
                     effective = available and get_account_user_online(account_uid)
-                    try:
-                        store.set_online_sync(effective, None)
-                    except GLib.Error:
-                        log.debug(
-                            "Could not set store offline=%s",
-                            not effective,
-                            exc_info=True,
-                        )
+                    stores_to_sync.append((account_uid, store, effective))
+        for account_uid, store, effective in stores_to_sync:
+            try:
+                store.set_online_sync(effective, None)
+            except GLib.Error:
+                log.debug(
+                    "Could not set store offline=%s",
+                    not effective,
+                    exc_info=True,
+                )
         if available:
             self.offline_sync.schedule_all_accounts()
 
@@ -638,25 +641,30 @@ class MailService:
 
     def _apply_account_user_online_unlocked(self, account_uid: str) -> None:
         online = get_account_user_online(account_uid)
+        store: Camel.Store | None = None
+        effective = False
         with self._lock:
-            store = self._stores.get(account_uid)
-            if isinstance(store, Camel.OfflineStore):
+            candidate = self._stores.get(account_uid)
+            if isinstance(candidate, Camel.OfflineStore):
+                store = candidate
                 effective = self._network_available and online
-                try:
-                    store.set_online_sync(effective, None)
-                except GLib.Error:
-                    log.debug(
-                        "Could not set account %s online=%s",
-                        account_uid,
-                        effective,
-                        exc_info=True,
-                    )
+        if store is not None:
+            try:
+                store.set_online_sync(effective, None)
+            except GLib.Error:
+                log.debug(
+                    "Could not set account %s online=%s",
+                    account_uid,
+                    effective,
+                    exc_info=True,
+                )
         if online:
             self.schedule_offline_body_sync(account_uid)
         else:
             self.cancel_offline_body_sync(account_uid)
 
     def _go_online_sync_unlocked(self) -> None:
+        stores_to_online: list[Camel.Store] = []
         with self._lock:
             self._network_available = True
             if self._session is not None:
@@ -665,11 +673,13 @@ class MailService:
                 if not get_account_user_online(account_uid):
                     continue
                 if isinstance(store, Camel.OfflineStore):
-                    try:
-                        store.set_online_sync(True, None)
-                    except GLib.Error:
-                        log.exception("Failed to bring mail store online")
+                    stores_to_online.append(store)
             self._folder_indexes.clear()
+        for store in stores_to_online:
+            try:
+                store.set_online_sync(True, None)
+            except GLib.Error:
+                log.exception("Failed to bring mail store online")
         self.offline_sync.schedule_all_accounts()
 
     def reload_registry(self) -> None:
@@ -765,12 +775,30 @@ class MailService:
     def get_account(self, account_uid: str) -> MailAccount:
         with self._lock:
             account = self._accounts_by_uid.get(account_uid)
-            if account is not None:
-                return account
-            for candidate in self.list_accounts():
-                if candidate.uid == account_uid:
-                    return candidate
-            raise ValueError(f"Unknown mail account: {account_uid}")
+        if account is not None:
+            return account
+        for candidate in self.list_accounts():
+            if candidate.uid == account_uid:
+                return candidate
+        raise ValueError(f"Unknown mail account: {account_uid}")
+
+    def _call_without_service_lock(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        """Run ``func`` with ``_lock`` fully released (all re-entrant levels).
+
+        Camel connect / set_online can prompt for a password via the GTK main
+        loop. Holding ``_lock`` across that deadlocks when the UI also needs the
+        lock (for example ``get_account`` during startup).
+        """
+        depth = self._lock._recursion_count()
+        if depth <= 0:
+            return func(*args, **kwargs)
+        for _ in range(depth):
+            self._lock.release()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            for _ in range(depth):
+                self._lock.acquire()
 
     def _ensure_session(self) -> Camel.Session:
         if self._session is not None:
@@ -897,7 +925,11 @@ class MailService:
         if account_uid in self._stores:
             store = self._stores[account_uid]
             if store.get_connection_status() == Camel.ServiceConnectionStatus.CONNECTED:
-                self._sync_store_online_state_unlocked(store, cancellable=cancellable)
+                self._call_without_service_lock(
+                    self._sync_store_online_state_unlocked,
+                    store,
+                    cancellable=cancellable,
+                )
                 self._configure_store_settings_unlocked(store, account_uid)
                 return store
             del self._stores[account_uid]
@@ -906,7 +938,9 @@ class MailService:
         if source is None:
             raise ValueError(f"Unknown mail account: {account_uid}")
 
-        self._prepare_account_credentials_unlocked(account_uid)
+        self._call_without_service_lock(
+            self._prepare_account_credentials_unlocked, account_uid
+        )
         session = self._ensure_session()
         mail_ext = source.get_extension("Mail Account")
         service = session.add_service(
@@ -917,11 +951,15 @@ class MailService:
 
         source.camel_configure_service(service)
         store = service
+        self._stores[account_uid] = store
 
-        self._sync_store_online_state_unlocked(store, cancellable=cancellable)
+        self._call_without_service_lock(
+            self._sync_store_online_state_unlocked,
+            store,
+            cancellable=cancellable,
+        )
 
         self._configure_store_settings_unlocked(store, account_uid)
-        self._stores[account_uid] = store
         return store
 
     def _sync_store_online_state_unlocked(
@@ -930,6 +968,7 @@ class MailService:
         *,
         cancellable: Gio.Cancellable | None = None,
     ) -> None:
+        """Connect / set online. Must not run while ``_lock`` is held."""
         if isinstance(store, Camel.OfflineStore):
             store.set_online_sync(self._network_available, cancellable)
         elif self._network_available:
@@ -967,7 +1006,9 @@ class MailService:
                 return transport
             del self._transports[transport_uid]
 
-        self._prepare_account_credentials_unlocked(account_uid)
+        self._call_without_service_lock(
+            self._prepare_account_credentials_unlocked, account_uid
+        )
         session = self._ensure_session()
         backend = expected_backend
 
@@ -981,15 +1022,17 @@ class MailService:
 
         transport_source.camel_configure_service(service)
         transport = service
-
-        if hasattr(Camel, "OfflineTransport") and isinstance(
-            transport, Camel.OfflineTransport
-        ):
-            transport.set_online_sync(True, cancellable)
-        else:
-            transport.connect_sync(cancellable)
-
         self._transports[transport_uid] = transport
+
+        def _connect_transport() -> None:
+            if hasattr(Camel, "OfflineTransport") and isinstance(
+                transport, Camel.OfflineTransport
+            ):
+                transport.set_online_sync(True, cancellable)
+            else:
+                transport.connect_sync(cancellable)
+
+        self._call_without_service_lock(_connect_transport)
         return transport
 
     def flush_send_queue(self, *, force: bool = False) -> int:
