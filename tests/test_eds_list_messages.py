@@ -169,3 +169,24 @@ class FolderStatsOfflineFallbackTests(unittest.TestCase):
             unread, total = service._get_folder_stats_unlocked("acct-1", "INBOX")
 
         self.assertEqual((unread, total), (1, 3))
+
+
+class InboxFolderNameCachedTests(unittest.TestCase):
+    def test_returns_none_when_folder_tree_not_cached(self) -> None:
+        service = MailService(registry=mock.Mock())
+        self.assertIsNone(service.get_inbox_folder_name_cached("acct-1"))
+
+    def test_returns_guessed_inbox_from_cache(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._folder_tree_cache["acct-1"] = [
+            {"full_name": "Archive", "display_name": "Archive"},
+            {"full_name": "INBOX", "display_name": "Inbox"},
+        ]
+        self.assertEqual(service.get_inbox_folder_name_cached("acct-1"), "INBOX")
+
+    def test_guesses_inbox_by_display_name_when_full_name_differs(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._folder_tree_cache["acct-1"] = [
+            {"full_name": "AQMkAD...", "display_name": "Inbox"},
+        ]
+        self.assertEqual(service.get_inbox_folder_name_cached("acct-1"), "AQMkAD...")
