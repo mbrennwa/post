@@ -211,6 +211,10 @@ def _read_unflagged_uids(index: _FolderMessageIndex) -> list[str]:
     ]
 
 
+# Camel providers that authenticate via session OAuth (not IMAP password).
+_OAUTH_SERVICE_MECHANISMS = frozenset({"XOAUTH2", "Microsoft365"})
+
+
 class MailSession(Camel.Session):
     """Camel session: OAuth via ESource, password auth for IMAP."""
 
@@ -238,8 +242,8 @@ class MailSession(Camel.Session):
         return self._registry.ref_source(service.get_uid())
 
     def do_authenticate_sync(self, service, mechanism=None, cancellable=None):
-        """Password auth for IMAP; OAuth via do_get_oauth2_access_token_sync."""
-        if mechanism == "XOAUTH2":
+        """Password auth for IMAP; OAuth for XOAUTH2 / Microsoft 365 providers."""
+        if mechanism in _OAUTH_SERVICE_MECHANISMS:
             result = service.authenticate_sync(mechanism, cancellable)
             return result == Camel.AuthenticationResult.ACCEPTED
 
@@ -980,6 +984,28 @@ class MailService:
     ) -> None:
         apply_offline_settings_to_store(store, account_uid)
 
+    @staticmethod
+    def _apply_store_settings_to_transport(
+        store: Camel.Store, transport: Camel.Transport
+    ) -> None:
+        """Copy mailbox settings from the account store onto the transport.
+
+        GOA Microsoft 365 transport ESources are stubs (backend name only).
+        Without the store's ``user`` / OAuth settings, Camel probes Graph
+        ``mailFolders`` and fails with ResourceNotFound (#151).
+        """
+        try:
+            settings = store.get_property("settings")
+        except Exception:
+            log.debug(
+                "Could not read store settings for transport",
+                exc_info=True,
+            )
+            return
+        if settings is None:
+            return
+        transport.set_settings(settings)
+
     def _get_transport_unlocked(
         self,
         account_uid: str,
@@ -1023,6 +1049,10 @@ class MailService:
         transport_source.camel_configure_service(service)
         transport = service
         self._transports[transport_uid] = transport
+
+        if (backend or "").lower() == "microsoft365":
+            store = self._get_store_unlocked(account_uid, cancellable=cancellable)
+            self._apply_store_settings_to_transport(store, transport)
 
         def _connect_transport() -> None:
             if hasattr(Camel, "OfflineTransport") and isinstance(
