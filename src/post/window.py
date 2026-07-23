@@ -164,8 +164,8 @@ separator.header-divider {{
   color: @error_color;
 }}
 progressbar.status-search-progress {{
-  min-height: 0;
-  margin-top: 0;
+  min-height: 3px;
+  margin-top: 2px;
   margin-bottom: 0;
   padding-top: 0;
   padding-bottom: 0;
