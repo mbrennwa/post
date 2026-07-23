@@ -1404,7 +1404,7 @@ class ComposeWindow(Adw.Window):
         if self._close_while_saving_dialog is not None:
             return
         dialog = Adw.AlertDialog(
-            heading="Saving draft…",
+            heading="Saving Draft…",
             body="Draft save is still in progress.",
             close_response="wait",
         )
