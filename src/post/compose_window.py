@@ -439,6 +439,10 @@ class ComposeWindow(Adw.Window):
         self._draft_message = draft_message
         self._outbox_queue_id = outbox_queue_id
         self._saving_draft = False
+        self._draft_save_generation = 0
+        self._draft_save_cancellable: Gio.Cancellable | None = None
+        self._draft_save_timeout_id: int | None = None
+        self._close_while_saving_dialog: Adw.AlertDialog | None = None
         self._attachments: list[ComposeAttachment] = []
         self._close_when_saved = False
         self._unsaved_dialog: Adw.AlertDialog | None = None
@@ -615,7 +619,6 @@ class ComposeWindow(Adw.Window):
         self._update_save_draft_enabled()
         self.connect("close-request", self._on_close_request)
         GLib.idle_add(self._set_initial_focus)
-        GLib.idle_add(self._preflight_account_credentials)
         if self._mode in ("draft", "send-again"):
             GLib.idle_add(self._begin_load_draft_attachments)
 
@@ -775,17 +778,6 @@ class ComposeWindow(Adw.Window):
         if attachments:
             self._attachments = attachments
             self._refresh_attachments_ui()
-        return False
-
-    def _preflight_account_credentials(self) -> bool:
-        try:
-            self._mail.prepare_account_credentials(self._account.uid)
-        except Exception:
-            log.debug(
-                "Could not preflight credentials for %s",
-                self._account.uid,
-                exc_info=True,
-            )
         return False
 
     def _set_initial_focus(self) -> bool:
@@ -1342,12 +1334,29 @@ class ComposeWindow(Adw.Window):
 
     def force_close(self) -> None:
         """Close immediately, e.g. when the application is quitting."""
+        self._cancel_draft_save()
         self._force_close = True
         self.destroy()
 
     def _dismiss(self) -> None:
         """Close the compose window without re-entering close-request."""
+        self._cancel_draft_save()
         self.destroy()
+
+    def _cancel_draft_save(self) -> None:
+        cancellable = self._draft_save_cancellable
+        if cancellable is not None and not cancellable.is_cancelled():
+            cancellable.cancel()
+        self._clear_draft_save_timeout()
+        self._draft_save_generation += 1
+        self._saving_draft = False
+        self._close_when_saved = False
+
+    def _clear_draft_save_timeout(self) -> None:
+        timeout_id = self._draft_save_timeout_id
+        if timeout_id is not None:
+            GLib.source_remove(timeout_id)
+            self._draft_save_timeout_id = None
 
     def _set_compose_actions_sensitive(self, sensitive: bool) -> None:
         if not sensitive:
@@ -1366,11 +1375,35 @@ class ComposeWindow(Adw.Window):
         if self._force_close:
             return False
         if self._saving_draft:
+            self._prompt_close_while_saving()
             return True
         if not self._user_edited:
             return False
         self._prompt_save_before_close()
         return True
+
+    def _prompt_close_while_saving(self) -> None:
+        if self._close_while_saving_dialog is not None:
+            return
+        dialog = Adw.AlertDialog(
+            heading="Saving draft…",
+            body="Draft save is still in progress.",
+            close_response="wait",
+        )
+        dialog.add_response("wait", "Keep Waiting")
+        dialog.add_response("close", "Close Anyway")
+        dialog.set_response_appearance("close", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("wait")
+        self._close_while_saving_dialog = dialog
+        dialog.connect("response", self._on_close_while_saving_response)
+        dialog.present(self)
+
+    def _on_close_while_saving_response(
+        self, dialog: Adw.AlertDialog, response: str
+    ) -> None:
+        self._close_while_saving_dialog = None
+        if response == "close":
+            self._dismiss()
 
     def _prompt_save_before_close(self) -> None:
         if self._unsaved_dialog is not None:
@@ -1491,19 +1524,19 @@ class ComposeWindow(Adw.Window):
         account = self._selected_account()
 
         self._close_when_saved = close_when_done
-        try:
-            self._mail.prepare_account_credentials(account.uid)
-        except Exception:
-            log.debug(
-                "Could not preflight credentials for %s",
-                account.uid,
-                exc_info=True,
-            )
+        self._draft_save_generation += 1
+        generation = self._draft_save_generation
+        cancellable = Gio.Cancellable()
+        self._draft_save_cancellable = cancellable
         self._saving_draft = True
         self._set_compose_actions_sensitive(False)
         self._set_status("Saving draft…")
         self._pending_draft_body = body
         self._pending_draft_body_html = body_html
+        self._clear_draft_save_timeout()
+        self._draft_save_timeout_id = GLib.timeout_add_seconds(
+            30, self._on_draft_save_watchdog, generation
+        )
 
         account_uid = account.uid
         existing_uid = self._draft_message_uid if self._mode == "draft" else None
@@ -1515,6 +1548,8 @@ class ComposeWindow(Adw.Window):
 
         get_mail_io_thread().submit(
             self._run_save_draft_on_mail_thread,
+            generation=generation,
+            cancellable=cancellable,
             account_uid=account_uid,
             to_addrs=to_addrs,
             cc_addrs=cc_addrs,
@@ -1529,9 +1564,22 @@ class ComposeWindow(Adw.Window):
             attachments=attachments,
         )
 
+    def _on_draft_save_watchdog(self, generation: int) -> bool:
+        self._draft_save_timeout_id = None
+        if generation != self._draft_save_generation or not self._saving_draft:
+            return False
+        cancellable = self._draft_save_cancellable
+        if cancellable is not None and not cancellable.is_cancelled():
+            cancellable.cancel()
+        self._set_status("Draft save timed out — will retry from local queue if saved")
+        show_toast(self, "Draft save timed out")
+        return False
+
     def _run_save_draft_on_mail_thread(
         self,
         *,
+        generation: int,
+        cancellable: Gio.Cancellable,
         account_uid: str,
         to_addrs: list[str],
         cc_addrs: list[str],
@@ -1561,17 +1609,25 @@ class ComposeWindow(Adw.Window):
                 existing_uid=existing_uid,
                 drafts_folder_name=drafts_folder_name,
                 attachments=attachments or None,
+                cancellable=cancellable,
             )
         except Exception as exc:
             log.warning("Save draft failed: %s", exc)
             error = exc
-        GLib.idle_add(self._on_save_draft_finished, error, result)
+        GLib.idle_add(
+            self._on_save_draft_finished, generation, error, result
+        )
 
     def _on_save_draft_finished(
         self,
+        generation: int,
         error: Exception | None,
         result: tuple[str, str] | None,
     ) -> bool:
+        if generation != self._draft_save_generation:
+            return False
+        self._clear_draft_save_timeout()
+        self._draft_save_cancellable = None
         self._saving_draft = False
         self._set_compose_actions_sensitive(True)
         close_when_done = self._close_when_saved

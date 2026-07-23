@@ -147,3 +147,113 @@ class SaveDraftOfflineQueueTests(unittest.TestCase):
 
         queue_draft.assert_called_once()
         self.assertEqual(uid, "draft-queue-id")
+
+    def test_cancelled_append_queues_draft(self) -> None:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio
+
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        account = mock.Mock()
+        account.from_address = "user@example.com"
+        account.from_name = "User"
+        account.email = "user@example.com"
+        service.get_account = mock.Mock(return_value=account)
+        service._drafts_folder_name_unlocked = mock.Mock(return_value="Drafts")
+
+        cancellable = Gio.Cancellable()
+        cancellable.cancel()
+
+        def append_fail(*_args, **_kwargs):
+            raise RuntimeError("Could not save draft: Operation was cancelled")
+
+        service._append_draft_unlocked = mock.Mock(side_effect=append_fail)
+
+        with (
+            mock.patch(
+                "post.mail.eds.build_draft_mime_message",
+                return_value=mock.Mock(),
+            ),
+            mock.patch.object(
+                service,
+                "_queue_draft_unlocked",
+                return_value=("Drafts", "draft-queue-id"),
+            ) as queue_draft,
+            mock.patch("post.mail.eds.is_network_unavailable_error", return_value=True),
+        ):
+            folder_name, uid = service._save_draft_unlocked(
+                "acct-1",
+                to=None,
+                cc=None,
+                bcc=None,
+                subject="Hi",
+                body="Body",
+                body_html=None,
+                in_reply_to=None,
+                references=None,
+                existing_uid=None,
+                drafts_folder_name="Drafts",
+                cancellable=cancellable,
+            )
+
+        queue_draft.assert_called_once()
+        self.assertEqual((folder_name, uid), ("Drafts", "draft-queue-id"))
+
+
+class CorrespondentsCacheOnlyTests(unittest.TestCase):
+    def test_correspondents_without_folder_cache_are_empty(self) -> None:
+        service = MailService(registry=mock.Mock())
+        account = mock.Mock()
+        account.from_address = "me@example.com"
+        account.email = "me@example.com"
+        service.get_account = mock.Mock(return_value=account)
+        service._folder_tree_cache = {}
+        service._build_folder_index_unlocked = mock.Mock(
+            side_effect=AssertionError("must not open folders for correspondents")
+        )
+        service._get_store_unlocked = mock.Mock(
+            side_effect=AssertionError("must not connect for correspondents")
+        )
+
+        result = service._build_correspondents_index_unlocked("acct-1")
+        self.assertEqual(result, [])
+
+    def test_correspondents_use_memory_folder_index(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = MailService(registry=mock.Mock())
+        account = mock.Mock()
+        account.from_address = "me@example.com"
+        account.email = "me@example.com"
+        service.get_account = mock.Mock(return_value=account)
+        service._folder_tree_cache = {
+            "acct-1": [
+                {
+                    "full_name": "INBOX",
+                    "display_name": "Inbox",
+                    "flags": 1024,
+                }
+            ]
+        }
+        service._folder_indexes = {
+            ("acct-1", "INBOX"): _FolderMessageIndex(
+                messages=[
+                    {
+                        "uid": "1",
+                        "from": "Alice <alice@example.com>",
+                        "sort_date": 100,
+                    }
+                ],
+                unread=0,
+                total=1,
+            )
+        }
+        service._build_folder_index_unlocked = mock.Mock(
+            side_effect=AssertionError("must not open folders for correspondents")
+        )
+
+        result = service._build_correspondents_index_unlocked("acct-1")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].email, "alice@example.com")

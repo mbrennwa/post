@@ -29,6 +29,8 @@ _CREDENTIAL_PASSWORD = "password"
 
 _GOA_BUS = "org.gnome.OnlineAccounts"
 _GOA_IFACE = "org.gnome.OnlineAccounts.Account"
+# Finite wait: unbounded EnsureCredentials blocks the shared mail I/O thread (#156).
+_GOA_ENSURE_CREDENTIALS_TIMEOUT_MS = 15_000
 
 
 def _related_credential_sources(
@@ -87,7 +89,7 @@ def ensure_goa_credentials(
                 None,
                 GLib.VariantType.new("(i)"),
                 Gio.DBusCallFlags.NONE,
-                -1,
+                _GOA_ENSURE_CREDENTIALS_TIMEOUT_MS,
                 cancellable,
             )
         except GLib.Error as exc:
