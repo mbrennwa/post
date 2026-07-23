@@ -151,6 +151,7 @@ _MAX_CORRESPONDENTS = 500
 _SKIP_BACKENDS = frozenset({"rss", "vfolder"})
 DEFAULT_MESSAGE_PAGE_SIZE = 50
 _SEND_TIMEOUT_SECONDS = 30
+_DRAFT_TIMEOUT_SECONDS = 30
 # Stay below Camel IMAPx MAX_UIDSET_ITEMS (100) to avoid spurious uidset warnings
 # in evolution-data-server 3.56 when batching UID MOVE/COPY commands.
 _TRANSFER_MESSAGE_BATCH_SIZE = 50
@@ -349,6 +350,7 @@ class MailService:
 
     def _preempt_background_work(self) -> None:
         self.cancel_folder_search()
+        self.cancel_folder_list()
         self.offline_sync.cancel_all()
         if self._sync_setup_cancel is not None:
             self._sync_setup_cancel()
@@ -918,12 +920,16 @@ class MailService:
         if source.has_extension("GNOME Online Accounts"):
             ensure_goa_credentials(self.registry, source, None)
 
-    def _prepare_account_credentials_unlocked(self, account_uid: str) -> None:
+    def _prepare_account_credentials_unlocked(
+        self,
+        account_uid: str,
+        cancellable: Gio.Cancellable | None = None,
+    ) -> None:
         source = self.registry.ref_source(account_uid)
         if source is None:
             return
         if source.has_extension("GNOME Online Accounts"):
-            ensure_goa_credentials(self.registry, source, None)
+            ensure_goa_credentials(self.registry, source, cancellable)
 
     def _get_store_unlocked(
         self,
@@ -937,6 +943,7 @@ class MailService:
                 self._call_without_service_lock(
                     self._sync_store_online_state_unlocked,
                     store,
+                    account_uid,
                     cancellable=cancellable,
                 )
                 self._configure_store_settings_unlocked(store, account_uid)
@@ -948,7 +955,9 @@ class MailService:
             raise ValueError(f"Unknown mail account: {account_uid}")
 
         self._call_without_service_lock(
-            self._prepare_account_credentials_unlocked, account_uid
+            self._prepare_account_credentials_unlocked,
+            account_uid,
+            cancellable,
         )
         session = self._ensure_session()
         mail_ext = source.get_extension("Mail Account")
@@ -965,6 +974,7 @@ class MailService:
         self._call_without_service_lock(
             self._sync_store_online_state_unlocked,
             store,
+            account_uid,
             cancellable=cancellable,
         )
 
@@ -974,13 +984,15 @@ class MailService:
     def _sync_store_online_state_unlocked(
         self,
         store: Camel.Store,
+        account_uid: str,
         *,
         cancellable: Gio.Cancellable | None = None,
     ) -> None:
         """Connect / set online. Must not run while ``_lock`` is held."""
+        effective = self._network_available and get_account_user_online(account_uid)
         if isinstance(store, Camel.OfflineStore):
-            store.set_online_sync(self._network_available, cancellable)
-        elif self._network_available:
+            store.set_online_sync(effective, cancellable)
+        elif effective:
             store.connect_sync(cancellable)
 
     @staticmethod
@@ -1634,8 +1646,19 @@ class MailService:
             log.debug("Failed to refresh Sent folder after append", exc_info=True)
         self._invalidate_folder_index(account_uid, folder_name)
 
-    def _drafts_folder_name_unlocked(self, account_uid: str) -> str | None:
-        folders = self._list_folders_unlocked(account_uid)
+    def _drafts_folder_name_unlocked(
+        self,
+        account_uid: str,
+        *,
+        cancellable: Gio.Cancellable | None = None,
+    ) -> str | None:
+        with self._lock:
+            cached = self._folder_tree_cache.get(account_uid)
+        folders = (
+            cached
+            if cached is not None
+            else self._list_folders_unlocked(account_uid, cancellable=cancellable)
+        )
         drafts_info = find_folder_by_type(
             folders,
             Camel.FolderInfoFlags.TYPE_DRAFTS,
@@ -1672,14 +1695,18 @@ class MailService:
         account_uid: str,
         folder_name: str,
         message: Camel.MimeMessage,
+        *,
+        cancellable: Gio.Cancellable | None = None,
     ) -> str | None:
-        folder = self._open_folder_unlocked(account_uid, folder_name)
+        folder = self._open_folder_unlocked(
+            account_uid, folder_name, cancellable=cancellable
+        )
         if folder is None:
             raise RuntimeError(f"Drafts folder {folder_name!r} is not available")
 
         info = self._draft_message_info()
         try:
-            result = folder.append_message_sync(message, info, None)
+            result = folder.append_message_sync(message, info, cancellable)
             if isinstance(result, tuple):
                 ok, appended_uid = result
             else:
@@ -1692,7 +1719,7 @@ class MailService:
             raise RuntimeError("Could not append message to Drafts folder")
 
         try:
-            folder.refresh_info_sync(None)
+            folder.refresh_info_sync(cancellable)
         except GLib.Error:
             log.debug("Failed to refresh Drafts folder after append", exc_info=True)
         self._invalidate_folder_index(account_uid, folder_name)
@@ -1762,6 +1789,7 @@ class MailService:
         existing_uid: str | None = None,
         drafts_folder_name: str | None = None,
         attachments: Sequence[ComposeAttachment] | None = None,
+        cancellable: Gio.Cancellable | None = None,
     ) -> tuple[str, str]:
         """Save or update a draft. Returns (drafts_folder_name, message_uid)."""
         return run_on_mail_thread(
@@ -1778,6 +1806,7 @@ class MailService:
             existing_uid=existing_uid,
             drafts_folder_name=drafts_folder_name,
             attachments=attachments,
+            cancellable=cancellable,
         )
 
     def _save_draft_unlocked(
@@ -1795,6 +1824,7 @@ class MailService:
         existing_uid: str | None,
         drafts_folder_name: str | None,
         attachments: Sequence[ComposeAttachment] | None = None,
+        cancellable: Gio.Cancellable | None = None,
     ) -> tuple[str, str]:
         account = self.get_account(account_uid)
         from_address = account.from_address or account.email
@@ -1815,16 +1845,31 @@ class MailService:
             attachments=attachments,
         )
 
-        folder_name = drafts_folder_name or self._drafts_folder_name_unlocked(
-            account_uid
-        )
-        if not folder_name:
-            raise RuntimeError("No Drafts folder is configured for this account")
+        own_cancellable = cancellable is None
+        if cancellable is None:
+            cancellable = Gio.Cancellable()
+        timer = threading.Timer(_DRAFT_TIMEOUT_SECONDS, cancellable.cancel)
+        timer.start()
 
-        if not self._network_available and not self._flushing_draft_queue:
+        def _queue_local() -> tuple[str, str]:
+            folder = drafts_folder_name
+            if not folder:
+                with self._lock:
+                    cached_tree = self._folder_tree_cache.get(account_uid)
+                if cached_tree:
+                    drafts_info = find_folder_by_type(
+                        cached_tree,
+                        Camel.FolderInfoFlags.TYPE_DRAFTS,
+                        type_mask=Camel.FOLDER_TYPE_MASK,
+                        name_fallbacks=frozenset({"drafts", "draft"}),
+                    )
+                    if drafts_info is not None:
+                        folder = drafts_info.get("full_name")
+            if not folder:
+                folder = "Drafts"
             return self._queue_draft_unlocked(
                 account_uid,
-                folder_name,
+                folder,
                 to=to,
                 cc=cc,
                 bcc=bcc,
@@ -1837,25 +1882,82 @@ class MailService:
                 attachments=attachments,
             )
 
-        if existing_uid:
-            if is_queued_draft_id(existing_uid):
-                remove_queued_draft(existing_uid)
-            else:
-                self._delete_message_unlocked(account_uid, folder_name, existing_uid)
-
         try:
-            appended_uid = self._append_draft_unlocked(
-                account_uid, folder_name, message
+            folder_name = drafts_folder_name or self._drafts_folder_name_unlocked(
+                account_uid, cancellable=cancellable
             )
-        except RuntimeError as exc:
-            if self._flushing_draft_queue:
+            if not folder_name:
+                if cancellable.is_cancelled():
+                    if self._flushing_draft_queue:
+                        raise RuntimeError("Draft save timed out")
+                    return _queue_local()
+                raise RuntimeError("No Drafts folder is configured for this account")
+
+            if not self._network_available and not self._flushing_draft_queue:
+                return self._queue_draft_unlocked(
+                    account_uid,
+                    folder_name,
+                    to=to,
+                    cc=cc,
+                    bcc=bcc,
+                    subject=subject,
+                    body=body,
+                    body_html=body_html,
+                    in_reply_to=in_reply_to,
+                    references=references,
+                    existing_uid=existing_uid,
+                    attachments=attachments,
+                )
+
+            if existing_uid:
+                if is_queued_draft_id(existing_uid):
+                    remove_queued_draft(existing_uid)
+                else:
+                    self._delete_message_unlocked(
+                        account_uid, folder_name, existing_uid
+                    )
+
+            try:
+                appended_uid = self._append_draft_unlocked(
+                    account_uid,
+                    folder_name,
+                    message,
+                    cancellable=cancellable,
+                )
+            except RuntimeError as exc:
+                if self._flushing_draft_queue:
+                    raise
+                cause = exc.__cause__
+                offline = is_network_unavailable_error(exc) or (
+                    isinstance(cause, BaseException)
+                    and is_network_unavailable_error(cause)
+                )
+                cancelled = cancellable.is_cancelled()
+                if (
+                    offline
+                    or cancelled
+                    or "working online" in str(exc).lower()
+                    or "timed out" in str(exc).lower()
+                ):
+                    return self._queue_draft_unlocked(
+                        account_uid,
+                        folder_name,
+                        to=to,
+                        cc=cc,
+                        bcc=bcc,
+                        subject=subject,
+                        body=body,
+                        body_html=body_html,
+                        in_reply_to=in_reply_to,
+                        references=references,
+                        existing_uid=None,
+                        attachments=attachments,
+                    )
                 raise
-            cause = exc.__cause__
-            offline = is_network_unavailable_error(exc) or (
-                isinstance(cause, BaseException)
-                and is_network_unavailable_error(cause)
-            )
-            if offline or "working online" in str(exc).lower():
+
+            if cancellable.is_cancelled() and not appended_uid:
+                if self._flushing_draft_queue:
+                    raise RuntimeError("Draft save timed out")
                 return self._queue_draft_unlocked(
                     account_uid,
                     folder_name,
@@ -1870,11 +1972,24 @@ class MailService:
                     existing_uid=None,
                     attachments=attachments,
                 )
-            raise
 
-        if not appended_uid:
-            raise RuntimeError("Draft was saved but its UID could not be determined")
-        return folder_name, appended_uid
+            if not appended_uid:
+                raise RuntimeError("Draft was saved but its UID could not be determined")
+            return folder_name, appended_uid
+        except GLib.Error as exc:
+            if self._flushing_draft_queue:
+                raise
+            if cancellable.is_cancelled() or is_network_unavailable_error(exc):
+                return _queue_local()
+            raise
+        finally:
+            timer.cancel()
+            if own_cancellable and cancellable.is_cancelled():
+                log.debug(
+                    "Draft save cancelled or timed out after %ds account=%s",
+                    _DRAFT_TIMEOUT_SECONDS,
+                    account_uid,
+                )
 
     def delete_draft(
         self, account_uid: str, folder_name: str, message_uid: str
@@ -1911,7 +2026,11 @@ class MailService:
     def _folders_for_correspondents_unlocked(
         self, account_uid: str
     ) -> list[dict]:
-        folders = self._list_folders_unlocked(account_uid)
+        """Select Inbox/Sent from the cached folder tree only (no Camel connect)."""
+        with self._lock:
+            folders = self._folder_tree_cache.get(account_uid)
+        if not folders:
+            return []
         selected: list[dict] = []
         seen: set[str] = set()
         for folder_type, fallbacks in (
@@ -1951,6 +2070,7 @@ class MailService:
     def _build_correspondents_index_unlocked(
         self, account_uid: str
     ) -> list[Correspondent]:
+        """Build autocomplete from in-memory / disk folder indexes only (#156)."""
         account = self.get_account(account_uid)
         exclude_emails: set[str] = set()
         for raw in (account.from_address, account.email):
@@ -1963,8 +2083,15 @@ class MailService:
             full_name = folder.get("full_name")
             if not full_name:
                 continue
-            index = self._build_folder_index_unlocked(account_uid, full_name)
-            messages.extend(index.messages)
+            with self._lock:
+                index = self._folder_indexes.get((account_uid, full_name))
+            if index is not None:
+                messages.extend(index.messages)
+                continue
+            cached = folder_index_cache.load(account_uid, full_name)
+            if cached is not None:
+                cached_messages, _unread, _total = cached
+                messages.extend(cached_messages)
 
         messages.sort(key=lambda message: message.get("sort_date") or 0, reverse=True)
         correspondents = collect_correspondents(messages, exclude_emails=exclude_emails)
@@ -1992,7 +2119,7 @@ class MailService:
         """Build a folder tree from Camel's on-disk cache when the server is unreachable."""
         with self._lock:
             store = self._get_store_unlocked(account_uid)
-        self._sync_store_online_state_unlocked(store)
+        self._sync_store_online_state_unlocked(store, account_uid)
 
         folders: list[dict] = []
         try:
@@ -2073,9 +2200,12 @@ class MailService:
         cancellable: Gio.Cancellable | None = None,
     ) -> list[dict]:
         if cancellable is not None and cancellable.is_cancelled():
-            with self._lock:
-                cached = self._folder_tree_cache.get(account_uid)
-            return list(cached) if cached is not None else []
+            search_trace("folder_list_cancelled", account=account_uid)
+            raise GLib.Error.new_literal(
+                Gio.io_error_quark(),
+                "Operation was cancelled",
+                Gio.IOErrorEnum.CANCELLED,
+            )
 
         with self._lock:
             cached = self._folder_tree_cache.get(account_uid)
@@ -2091,15 +2221,38 @@ class MailService:
 
         try:
             with self._lock:
-                store = self._get_store_unlocked(account_uid)
+                store = self._get_store_unlocked(account_uid, cancellable=cancellable)
             root = store.get_folder_info_sync(
                 None,
                 Camel.StoreGetFolderInfoFlags.RECURSIVE,
                 cancellable,
             )
+            if cancellable is not None and cancellable.is_cancelled():
+                search_trace("folder_list_cancelled", account=account_uid)
+                raise GLib.Error.new_literal(
+                    Gio.io_error_quark(),
+                    "Operation was cancelled",
+                    Gio.IOErrorEnum.CANCELLED,
+                )
+            # Camel M365 can fail without setting GError (#156); do not cache [].
+            if root is None:
+                log.warning(
+                    "Folder list failed for account %s without GError; "
+                    "keeping prior cache if any",
+                    account_uid,
+                )
+                if cached is not None:
+                    return list(cached)
+                result = self._list_folders_from_local_store_unlocked(account_uid)
+                if result:
+                    with self._lock:
+                        self._folder_tree_cache[account_uid] = result
+                    return result
+                raise RuntimeError(
+                    "Could not list folders for this account"
+                )
             folders: list[dict] = []
-            if root is not None:
-                walk_folder_info(root, folders)
+            walk_folder_info(root, folders)
             result = [f for f in folders if f.get("full_name")]
             with self._lock:
                 self._folder_tree_cache[account_uid] = result
@@ -2109,7 +2262,7 @@ class MailService:
                 Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
             ):
                 search_trace("folder_list_cancelled", account=account_uid)
-                return list(cached) if cached is not None else []
+                raise
             if cached is not None and is_network_unavailable_error(exc):
                 log.debug(
                     "Using cached folder list for account %s while offline",
@@ -3271,11 +3424,15 @@ class MailService:
         return mime
 
     def _open_folder_unlocked(
-        self, account_uid: str, folder_name: str
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        cancellable: Gio.Cancellable | None = None,
     ) -> Camel.Folder | None:
-        store = self._get_store_unlocked(account_uid)
+        store = self._get_store_unlocked(account_uid, cancellable=cancellable)
         try:
-            return store.get_folder_sync(folder_name, 0, None)
+            return store.get_folder_sync(folder_name, 0, cancellable)
         except GLib.Error as exc:
             if self._is_missing_folder_error(exc):
                 log.debug(

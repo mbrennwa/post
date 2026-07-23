@@ -210,6 +210,56 @@ class ListFoldersOfflineBootstrapTests(unittest.TestCase):
         local_bootstrap.assert_called_once_with("acct-1")
         self.assertEqual(result, local_folders)
 
+    def test_null_folder_info_does_not_cache_empty(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        cached = [{"full_name": "Inbox", "display_name": "Inbox"}]
+        service._folder_tree_cache["acct-1"] = list(cached)
+        store = mock.Mock()
+        store.get_folder_info_sync.return_value = None
+
+        with mock.patch.object(service, "_get_store_unlocked", return_value=store):
+            result = service._list_folders_unlocked("acct-1")
+
+        self.assertEqual(result, cached)
+        self.assertEqual(service._folder_tree_cache["acct-1"], cached)
+
+    def test_null_folder_info_without_cache_raises(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        store = mock.Mock()
+        store.get_folder_info_sync.return_value = None
+
+        with (
+            mock.patch.object(service, "_get_store_unlocked", return_value=store),
+            mock.patch.object(
+                service,
+                "_list_folders_from_local_store_unlocked",
+                return_value=[],
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                service._list_folders_unlocked("acct-1")
+
+        self.assertNotIn("acct-1", service._folder_tree_cache)
+
+    def test_cancelled_folder_list_raises(self) -> None:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import Gio, GLib
+
+        service = MailService(registry=mock.Mock())
+        cancellable = Gio.Cancellable()
+        cancellable.cancel()
+
+        with self.assertRaises(GLib.Error) as ctx:
+            service._list_folders_unlocked("acct-1", cancellable=cancellable)
+        self.assertTrue(
+            ctx.exception.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED)
+        )
+
 
 class OfflineTransferQueueTests(unittest.TestCase):
     def test_transfer_queues_when_offline(self) -> None:

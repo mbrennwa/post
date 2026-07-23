@@ -51,7 +51,7 @@ class ServiceLockReleaseTests(unittest.TestCase):
 
         lock_held_during_sync: list[bool] = []
 
-        def fake_sync(_store, *, cancellable=None) -> None:
+        def fake_sync(_store, _account_uid=None, *, cancellable=None) -> None:
             lock_held_during_sync.append(service._lock._recursion_count() > 0)
 
         service._sync_store_online_state_unlocked = fake_sync
@@ -62,6 +62,40 @@ class ServiceLockReleaseTests(unittest.TestCase):
         self.assertIs(result, store)
         self.assertEqual(lock_held_during_sync, [False])
         self.assertIs(service._stores["acct-1"], store)
+
+    def test_preempt_background_work_cancels_folder_list(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service.cancel_folder_search = mock.Mock()
+        service.cancel_folder_list = mock.Mock()
+        service.offline_sync.cancel_all = mock.Mock()
+        service._sync_setup_cancel = None
+
+        service._preempt_background_work()
+
+        service.cancel_folder_search.assert_called_once()
+        service.cancel_folder_list.assert_called_once()
+        service.offline_sync.cancel_all.assert_called_once()
+
+    def test_sync_store_online_respects_user_offline(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        store = mock.Mock()
+        store.connect_sync = mock.Mock()
+        store.set_online_sync = mock.Mock()
+
+        with mock.patch(
+            "post.mail.eds.get_account_user_online", return_value=False
+        ):
+            # Non-OfflineStore: must not connect when the user took the account offline.
+            service._sync_store_online_state_unlocked(store, "acct-1")
+        store.connect_sync.assert_not_called()
+        store.set_online_sync.assert_not_called()
+
+        with mock.patch(
+            "post.mail.eds.get_account_user_online", return_value=True
+        ):
+            service._sync_store_online_state_unlocked(store, "acct-1")
+        store.connect_sync.assert_called_once()
 
     def test_get_account_does_not_hold_lock_across_list_accounts(self) -> None:
         service = MailService(registry=mock.Mock())
