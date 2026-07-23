@@ -133,6 +133,10 @@ class MailSidebar:
         self._account_inbox_folders: dict[str, str] = {}
         self._load_generation = 0
         self._folder_loads_pending = 0
+        # False until a folder-list load cycle has finished at least once.
+        # Pending==0 alone is not enough: before load() starts (and during the
+        # gap before pending is bumped), pending is also 0.
+        self._folder_tree_ready = False
         self._needs_initial_selection = False
         self._activated_folder: tuple[str, str] | None = None
         self._context_target: dict | None = None
@@ -155,7 +159,7 @@ class MailSidebar:
 
     @property
     def folder_tree_ready(self) -> bool:
-        return self._folder_loads_pending == 0
+        return self._folder_tree_ready
 
     def account_uids(self) -> list[str]:
         return [account.uid for account in self._accounts]
@@ -168,6 +172,7 @@ class MailSidebar:
         self._needs_initial_selection = True
         self._activated_folder = None
         self._folder_loads_pending = 0
+        self._folder_tree_ready = False
 
         try:
             self._accounts = self._mail.list_accounts()
@@ -1166,6 +1171,7 @@ class MailSidebar:
     def _maybe_finish_initial_folder_load(self) -> None:
         if self._folder_loads_pending > 0:
             return
+        self._folder_tree_ready = True
         callback = self._on_initial_folder_load_complete
         if callback is not None:
             self._on_initial_folder_load_complete = None
