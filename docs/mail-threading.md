@@ -20,11 +20,14 @@ Post runs blocking Camel / Evolution Data Server (EDS) work on a **single dedica
 1. **Never call `MailIoThread.run_sync()` from the GTK thread** — it blocks the UI. Use `submit()` + `idle_add` from UI code.
 2. **Never call `Camel.*_sync` directly from UI or ad-hoc worker threads** — go through `MailService` or `run_on_mail_thread()`.
 3. **One `MailSession` per process** — owned on the mail I/O thread (`MailService._session`, `_stores`, `_transports`). Do not reintroduce per-thread worker sessions.
-4. **Password / OAuth prompts** — use `GLib.idle_add` to show dialogs on the GTK thread; mail thread waits on the result.
-5. **Outbound send** — compose persists to outbox first, then delivers via Camel `transport.send_to_sync` on the mail I/O thread. No `smtplib` send path.
+4. **Password / OAuth prompts** — use `GLib.idle_add` to show dialogs on the GTK thread; mail thread waits on the result. Do **not** call GOA `EnsureCredentials` synchronously from the GTK thread (compose must not preflight on the UI thread; see #156).
+5. **Outbound send** — compose persists to outbox first, then delivers via Camel `transport.send_to_sync` on the mail I/O thread. No `smtplib` send path. Send and draft save use a **finite** cancellable timeout; draft failures/timeouts fall back to the local draft queue.
 6. **Offline body download** — `OfflineBodySyncCoordinator` runs `downsync_sync` on the mail I/O thread only. See [offline-body-cache.md](offline-body-cache.md).
-7. **Sync watcher setup** — `MailSyncWatcher` store/folder signal wiring runs as **background** mail-I/O work so folder search can preempt it.
+7. **Sync watcher setup** — `MailSyncWatcher` store/folder signal wiring runs as **background** mail-I/O work so folder search can preempt it. Preempt also cancels in-flight sidebar folder lists.
 8. **Search** — interactive mail-I/O work: filter the in-memory folder index (`filter_messages_by_query`), loading cached MIME for body terms. Cancellable; preempts offline downsync. See [offline-body-cache.md](offline-body-cache.md).
+9. **Correspondents / autocomplete** — build from cached folder tree + folder indexes only; never connect a store just for compose autocomplete (#156).
+10. **GOA EnsureCredentials** — D-Bus call uses a finite timeout (not `-1`) so a wedged Online Accounts account cannot pin `post-mail-io` forever.
+11. **Per-account Take offline** — first connect / `set_online_sync` must honor `get_account_user_online`, not only global network availability.
 
 ## Debugging
 
