@@ -504,16 +504,16 @@ class ComposeWindow(Adw.Window):
         send_actions.append(self._attach_files_btn)
         header.pack_start(send_actions)
 
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scrolled.set_vexpand(True)
+        self._form_scrolled = Gtk.ScrolledWindow()
+        self._form_scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._form_scrolled.set_vexpand(True)
 
         form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         form.set_margin_start(18)
         form.set_margin_end(18)
         form.set_margin_top(12)
         form.set_margin_bottom(12)
-        scrolled.set_child(form)
+        self._form_scrolled.set_child(form)
 
         from_labels = [from_account.from_label for from_account in self._from_accounts]
         self._from_dropdown = Gtk.DropDown.new_from_strings(from_labels)
@@ -605,7 +605,7 @@ class ComposeWindow(Adw.Window):
 
         toolbar_view = Adw.ToolbarView()
         toolbar_view.add_top_bar(header)
-        toolbar_view.set_content(scrolled)
+        toolbar_view.set_content(self._form_scrolled)
 
         self._toast_overlay = Adw.ToastOverlay()
         self._toast_overlay.set_child(toolbar_view)
@@ -784,20 +784,33 @@ class ComposeWindow(Adw.Window):
         if self._mode == "new":
             self._to_entry.grab_focus()
             return False
-        if self._mode == "draft":
-            self._body_view.grab_focus()
-            buffer = self._body_view.get_buffer()
-            buffer.place_cursor(buffer.get_start_iter())
-            return False
-        if self._mode == "send-again":
-            self._body_view.grab_focus()
-            buffer = self._body_view.get_buffer()
-            buffer.place_cursor(buffer.get_start_iter())
-            return False
-        if self._mode in ("reply", "reply-all"):
-            self._body_view.grab_focus()
-            buffer = self._body_view.get_buffer()
-            buffer.place_cursor(buffer.get_start_iter())
+        if self._mode in (
+            "draft",
+            "send-again",
+            "reply",
+            "reply-all",
+            "forward",
+            "outbox",
+        ):
+            # Place the caret first: grab_focus with insert at EOF scrolls the
+            # shared form ScrolledWindow to the bottom (#149).
+            self._focus_body_at_start()
+        return False
+
+    def _focus_body_at_start(self) -> None:
+        self._place_body_cursor_at_start()
+        self._body_view.grab_focus()
+        self._scroll_form_to_top()
+        # Focus may schedule a scroll-to-cursor after this handler returns.
+        GLib.idle_add(self._scroll_form_to_top_idle)
+
+    def _scroll_form_to_top(self) -> None:
+        adj = self._form_scrolled.get_vadjustment()
+        if adj is not None:
+            adj.set_value(adj.get_lower())
+
+    def _scroll_form_to_top_idle(self) -> bool:
+        self._scroll_form_to_top()
         return False
 
     def _setup_address_completion(self, entry: Gtk.Entry) -> None:
@@ -1210,6 +1223,7 @@ class ComposeWindow(Adw.Window):
                 signature=signature,
             )
             self._body_view.get_buffer().set_text(body)
+            self._place_body_cursor_at_start()
         elif self._mode == "forward" and self._reply_to is not None:
             self._subject_entry.set_text(
                 build_forward_subject(self._reply_to.get("subject") or "")
@@ -1226,6 +1240,7 @@ class ComposeWindow(Adw.Window):
                 signature=signature,
             )
             self._body_view.get_buffer().set_text(body)
+            self._place_body_cursor_at_start()
         elif self._mode == "draft" and self._draft_message is not None:
             msg = self._draft_message
             if msg.get("to"):
@@ -1240,6 +1255,7 @@ class ComposeWindow(Adw.Window):
             self._subject_entry.set_text(str(msg.get("subject") or ""))
             plain_body = str(msg.get("body_plain") or "")
             self._body_view.get_buffer().set_text(plain_body)
+            self._place_body_cursor_at_start()
             self._draft_body_html = (msg.get("body_html") or "").strip() or None
             self._draft_body_plain_snapshot = plain_body
             self._quoted_html_source = None
@@ -1258,6 +1274,7 @@ class ComposeWindow(Adw.Window):
             self._subject_entry.set_text(str(msg.get("subject") or ""))
             plain_body = str(msg.get("body_plain") or "")
             self._body_view.get_buffer().set_text(plain_body)
+            self._place_body_cursor_at_start()
             self._draft_body_html = (msg.get("body_html") or "").strip() or None
             self._draft_body_plain_snapshot = plain_body
             self._quoted_html_source = None
@@ -1275,6 +1292,7 @@ class ComposeWindow(Adw.Window):
                 self._bcc_toggle_btn.set_label("Hide Bcc")
             self._subject_entry.set_text(queued.subject)
             self._body_view.get_buffer().set_text(queued.body)
+            self._place_body_cursor_at_start()
             self._attachments = load_queued_attachments(
                 self._outbox_queue_id, queued
             )
