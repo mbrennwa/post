@@ -894,12 +894,17 @@ class MailService:
         return guess_inbox_name(self.list_folders(account_uid))
 
     def get_inbox_folder_name_cached(self, account_uid: str) -> str | None:
-        """Return INBOX from cache, or ``INBOX`` without a server folder list."""
+        """Return INBOX from the folder-tree cache, or None if not loaded yet.
+
+        Do not guess ``INBOX``: Microsoft 365 and other backends often use a
+        different Camel folder name, and a hardcoded fallback causes sync-watch
+        errors (#153).
+        """
         with self._lock:
             cached = self._folder_tree_cache.get(account_uid)
         if cached is not None:
             return guess_inbox_name(cached)
-        return "INBOX"
+        return None
 
     def prepare_account_credentials(self, account_uid: str) -> None:
         """Refresh GOA tokens before mail I/O (may show account sign-in UI)."""
