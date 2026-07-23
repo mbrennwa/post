@@ -46,7 +46,7 @@ from post.mail.compose import (
     normalize_email,
     parse_address_list,
     parse_draft_address_list,
-    plain_to_simple_html,
+    is_plain_wrapper_html,
     quote_plain_forward,
     quote_plain_reply,
     replace_new_message_signature,
@@ -1443,10 +1443,12 @@ class ComposeWindow(Adw.Window):
                 quoted_plain_expected=self._quoted_plain_expected,
             )
         if self._mode in ("draft", "send-again"):
-            if body_plain == self._draft_body_plain_snapshot and self._draft_body_html:
+            if (
+                body_plain == self._draft_body_plain_snapshot
+                and self._draft_body_html
+                and not is_plain_wrapper_html(self._draft_body_html, body_plain)
+            ):
                 return self._draft_body_html
-            if body_plain.strip():
-                return plain_to_simple_html(body_plain)
             return None
         return None
 
