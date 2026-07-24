@@ -135,6 +135,87 @@ class RelatedCredentialSourcesTests(unittest.TestCase):
         self.assertEqual(auth.password_prompt_reason_for_source(transport), "send_mail")
         self.assertEqual(auth.password_prompt_reason_for_source(store), "check_mail")
 
+    def test_authenticate_skips_prompt_when_cancelled(self) -> None:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import Gio, GLib
+
+        service = mock.Mock()
+        service.get_uid.return_value = "store-1"
+        service.get_password.return_value = None
+        source = _source(
+            uid="store-1",
+            display_name="info@example.com",
+            extensions={"Mail Account"},
+        )
+        registry = mock.Mock()
+        prompt = mock.Mock(return_value="should-not-be-called")
+        cancellable = Gio.Cancellable()
+        cancellable.cancel()
+
+        with mock.patch.object(auth, "ensure_goa_credentials"):
+            with self.assertRaises(GLib.Error) as ctx:
+                auth.authenticate_service_sync(
+                    service,
+                    source,
+                    registry,
+                    None,
+                    cancellable,
+                    prompt,
+                )
+        self.assertTrue(
+            ctx.exception.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED)
+        )
+        prompt.assert_not_called()
+
+    def test_authenticate_passes_service_uid_to_prompt(self) -> None:
+        service = mock.Mock()
+        service.get_uid.return_value = "store-1"
+        service.get_password.return_value = None
+        source = _source(
+            uid="store-1",
+            display_name="info@example.com",
+            extensions={"Mail Account"},
+        )
+        registry = mock.Mock()
+        seen: list[tuple] = []
+
+        def prompt(label, mechanism, reason, service_uid):
+            seen.append((label, mechanism, reason, service_uid))
+            return None
+
+        with mock.patch.object(auth, "ensure_goa_credentials"):
+            with mock.patch.object(auth, "lookup_stored_password", return_value=None):
+                ok = auth.authenticate_service_sync(
+                    service,
+                    source,
+                    registry,
+                    None,
+                    None,
+                    prompt,
+                )
+        self.assertFalse(ok)
+        self.assertEqual(
+            seen,
+            [("info@example.com", None, "check_mail", "store-1")],
+        )
+
+    def test_authentication_failed_error_is_cant_authenticate(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        exc = auth.authentication_failed_error("Authentication failed")
+        self.assertTrue(
+            exc.matches(
+                Camel.service_error_quark(),
+                int(Camel.ServiceError.CANT_AUTHENTICATE),
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
