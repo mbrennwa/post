@@ -86,6 +86,7 @@ from post.mail.helpers import (
     flag_menu_label,
     read_menu_items,
     read_menu_label,
+    should_offer_send_again,
     write_temp_attachment,
 )
 from post.message_list_activate import (
@@ -2761,6 +2762,11 @@ class MainWindow(Adw.ApplicationWindow):
             try:
                 messages, unread, total, _source = fetch_messages(True)
             except Exception as exc:
+                if isinstance(exc, GLib.Error) and exc.matches(
+                    Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
+                ):
+                    # Preempted by interactive folder load / search (#170 hang).
+                    return
                 if is_network_unavailable_error(exc):
                     GLib.idle_add(
                         self._on_messages_sync_finished,
@@ -2781,7 +2787,8 @@ class MainWindow(Adw.ApplicationWindow):
                 error,
             )
 
-        get_mail_io_thread().submit(worker_sync)
+        # Background so folder switches can preempt long refresh_info_sync calls.
+        get_mail_io_thread().submit_background(worker_sync)
 
     @staticmethod
     def _load_source_label(source: str) -> str:
@@ -3131,6 +3138,12 @@ class MainWindow(Adw.ApplicationWindow):
         self._messages_load_generation += 1
         load_id = self._messages_load_generation
         self._messages_load_expects_search = self._search_query is not None
+
+        # Abort background folder-info REFRESH / refresh_info_sync so the new
+        # folder load is not stuck behind Camel I/O (#170 hang on switch).
+        self._mail.cancel_folder_search()
+        self._mail.cancel_folder_list()
+        self._sidebar.cancel_folder_count_poll()
 
         display_folder = (
             "Outbox"
@@ -4026,12 +4039,15 @@ class MainWindow(Adw.ApplicationWindow):
                 menu.append("Reply", "win.message-reply")
                 menu.append("Reply All", "win.message-reply-all")
                 menu.append("Forward", "win.message-forward")
-                if (
-                    self._current_account is not None
-                    and self._current_folder is not None
-                    and self._sidebar.folder_is_sent(
-                        self._current_account.uid, self._current_folder
+                location = self._message_location_for_list_key(uids[0])
+                source_is_sent = False
+                if location is not None:
+                    account_uid, folder_name, _message_uid = location
+                    source_is_sent = self._sidebar.folder_is_sent(
+                        account_uid, folder_name
                     )
+                if should_offer_send_again(
+                    selection_count=count, source_is_sent=source_is_sent
                 ):
                     menu.append("Send Again", "win.message-send-again")
         if can_archive:
@@ -4116,12 +4132,19 @@ class MainWindow(Adw.ApplicationWindow):
         if not self._mail.list_sendable_accounts():
             self._set_status("No mail account configured for sending")
             return
-        if not self._current_account or not self._current_folder:
+        list_key = self._context_message_uids[0]
+        location = self._message_location_for_list_key(list_key)
+        if location is None:
             return
-        if not self._current_account.can_send:
+        account_uid, _folder_name, _message_uid = location
+        try:
+            account = self._mail.get_account(account_uid)
+        except ValueError:
+            return
+        if not account.can_send:
             self._set_status("Selected account has no mail transport configured")
             return
-        self._open_send_again(self._context_message_uids[0])
+        self._open_send_again(list_key)
 
     def _on_message_menu_outbox_edit(self, *_args) -> None:
         if len(self._context_message_uids) != 1 or not self._current_account:
@@ -4959,12 +4982,15 @@ class MainWindow(Adw.ApplicationWindow):
         )
         return False
 
-    def _open_send_again(self, uid: str) -> None:
-        if not self._current_account or not self._current_folder:
+    def _open_send_again(self, list_key: str) -> None:
+        location = self._message_location_for_list_key(list_key)
+        if location is None:
             return
-
-        account = self._current_account
-        folder_name = self._current_folder
+        account_uid, folder_name, message_uid = location
+        try:
+            account = self._mail.get_account(account_uid)
+        except ValueError:
+            return
 
         def worker() -> None:
             error: Exception | None = None
@@ -4973,13 +4999,13 @@ class MainWindow(Adw.ApplicationWindow):
                 msg = self._mail.read_message(
                     account.uid,
                     folder_name,
-                    uid,
+                    message_uid,
                     mark_seen=False,
                 )
             except MessageNotAvailableError as exc:
                 log.warning(
                     "Sent message %s no longer available in %r",
-                    uid,
+                    message_uid,
                     folder_name,
                 )
                 error = exc
@@ -4990,7 +5016,7 @@ class MainWindow(Adw.ApplicationWindow):
                 self._on_send_again_compose_loaded,
                 account,
                 folder_name,
-                uid,
+                message_uid,
                 msg,
                 error,
             )

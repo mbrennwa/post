@@ -9,6 +9,7 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import MagicMock
 
+from post.mail.folders import is_sent_folder_name
 from post.mail.helpers import (
     _decode_attachment_filename,
     _decode_header_value,
@@ -30,8 +31,10 @@ from post.mail.helpers import (
     read_menu_items,
     read_menu_label,
     reader_toggle_button_state,
+    should_offer_send_again,
     sort_messages_newest_first,
 )
+from post.mail.search import annotate_search_match
 
 
 @contextmanager
@@ -266,6 +269,52 @@ class MessageMenuItemsTests(unittest.TestCase):
     def test_flag_menu_labels_include_count(self) -> None:
         self.assertEqual(flag_menu_label("flag", 2), "Flag (2)")
         self.assertEqual(flag_menu_label("unflag", 1), "Unflag")
+
+    def test_send_again_single_sent(self) -> None:
+        self.assertTrue(
+            should_offer_send_again(selection_count=1, source_is_sent=True)
+        )
+
+    def test_send_again_single_not_sent(self) -> None:
+        self.assertFalse(
+            should_offer_send_again(selection_count=1, source_is_sent=False)
+        )
+
+    def test_send_again_multi_select_sent(self) -> None:
+        self.assertFalse(
+            should_offer_send_again(selection_count=2, source_is_sent=True)
+        )
+
+    def test_send_again_uses_annotated_search_folder_not_sidebar(self) -> None:
+        """Search hits carry their source folder; sidebar may still be Inbox."""
+        sent_match = annotate_search_match(
+            {"uid": "42", "subject": "hello"},
+            account_uid="acct-1",
+            folder_name="Sent",
+        )
+        inbox_match = annotate_search_match(
+            {"uid": "7", "subject": "other"},
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        # Location resolution prefers search annotations over current folder.
+        cases = (
+            (sent_match, True),
+            (inbox_match, False),
+        )
+        for message, expect_offer in cases:
+            folder_name = str(message["_search_folder"])
+            source_is_sent = is_sent_folder_name([], folder_name)
+            self.assertEqual(
+                should_offer_send_again(
+                    selection_count=1, source_is_sent=source_is_sent
+                ),
+                expect_offer,
+                msg=f"folder={folder_name!r}",
+            )
+        # Sent search hit must not depend on sidebar still being Inbox.
+        self.assertEqual(sent_match["_search_folder"], "Sent")
+        self.assertNotEqual(sent_match["_search_folder"], "INBOX")
 
 
 class ReaderToggleButtonStateTests(unittest.TestCase):
