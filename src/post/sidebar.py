@@ -22,6 +22,7 @@ from post.mail import MailService
 from post.mail.eds import MailAccount
 from post.mail.io_thread import get_mail_io_thread
 from post.folder_dialogs import confirm_action, prompt_folder_name, show_error
+from post.gtk_schedule import schedule_on_gtk_main
 from post.mail.dnd import (
     MESSAGE_TRANSFER_MIME,
     decode_message_transfer,
@@ -32,6 +33,7 @@ from post.mail.folders import (
     account_supports_folder_crud,
     filter_sidebar_folders,
     find_inbox_folder,
+    folder_names_for_count_refresh,
     format_folder_label,
     is_drafts_folder_name,
     is_sent_folder_name,
@@ -41,6 +43,7 @@ from post.mail.folders import (
     resolve_move_menu_state,
     resolve_sidebar_context_menu,
 )
+from post.mail.offline_settings import account_is_user_offline
 from post.mail.send_queue import (
     count_queued_for_account,
     format_folder_load_error,
@@ -149,6 +152,7 @@ class MailSidebar:
         self._context_actions: dict[str, Gio.SimpleAction] = {}
         self._context_popover: Gtk.PopoverMenu | None = None
         self._account_reload_callbacks: dict[str, AccountRefreshComplete] = {}
+        self._folder_count_poll_generation = 0
 
         self._sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
@@ -337,6 +341,129 @@ class MailSidebar:
             )
 
         get_mail_io_thread().submit(worker)
+
+    def refresh_all_folder_counts(self) -> None:
+        """Re-fetch unread/total for all sidebar message folders (badge-only).
+
+        Uses store-level folder-info REFRESH per account (STATUS-style), not
+        per-folder refresh_info_sync, so Camel Folder::changed is not stormed.
+        """
+        account_uids = [
+            account_uid
+            for account_uid in self._account_folders
+            if not account_is_user_offline(account_uid)
+            and folder_names_for_count_refresh(
+                self._account_folders.get(account_uid, [])
+            )
+        ]
+        if not account_uids:
+            return
+
+        self._folder_count_poll_generation += 1
+        generation = self._folder_count_poll_generation
+        self._poll_account_folder_counts_at(generation, account_uids, 0)
+
+    def cancel_folder_count_poll(self) -> None:
+        """Invalidate any in-flight background folder-count poll."""
+        self._folder_count_poll_generation += 1
+
+    def _poll_account_folder_counts_at(
+        self,
+        generation: int,
+        account_uids: list[str],
+        index: int,
+    ) -> None:
+        if generation != self._folder_count_poll_generation:
+            return
+        if index >= len(account_uids):
+            return
+
+        account_uid = account_uids[index]
+
+        def worker() -> None:
+            if generation != self._folder_count_poll_generation:
+                return
+            if get_mail_io_thread().has_interactive_work_pending():
+                schedule_on_gtk_main(
+                    self._defer_account_folder_count_poll,
+                    generation,
+                    account_uids,
+                    index,
+                )
+                return
+
+            stats: dict[str, tuple[int, int]] = {}
+            error: Exception | None = None
+            try:
+                stats = self._mail.get_account_folder_stats(account_uid)
+            except Exception as exc:
+                log_mail_error(
+                    log,
+                    f"Failed to refresh folder counts for {account_uid}",
+                    exc,
+                )
+                error = exc
+            schedule_on_gtk_main(
+                self._on_account_folder_counts_polled,
+                generation,
+                account_uids,
+                index,
+                account_uid,
+                stats,
+                error,
+            )
+
+        get_mail_io_thread().submit_background(worker)
+
+    def _defer_account_folder_count_poll(
+        self,
+        generation: int,
+        account_uids: list[str],
+        index: int,
+    ) -> None:
+        if generation != self._folder_count_poll_generation:
+            return
+        GLib.timeout_add(
+            250,
+            self._resume_account_folder_count_poll,
+            generation,
+            account_uids,
+            index,
+        )
+
+    def _resume_account_folder_count_poll(
+        self,
+        generation: int,
+        account_uids: list[str],
+        index: int,
+    ) -> bool:
+        self._poll_account_folder_counts_at(generation, account_uids, index)
+        return False
+
+    def _on_account_folder_counts_polled(
+        self,
+        generation: int,
+        account_uids: list[str],
+        index: int,
+        account_uid: str,
+        stats: dict[str, tuple[int, int]],
+        error: Exception | None,
+    ) -> None:
+        if generation != self._folder_count_poll_generation:
+            return
+        if error is None:
+            wanted = set(
+                folder_names_for_count_refresh(
+                    self._account_folders.get(account_uid, [])
+                )
+            )
+            for folder_name, (unread, total) in stats.items():
+                if folder_name not in wanted:
+                    continue
+                if unread < 0 and total < 0:
+                    continue
+                self.update_folder_row(account_uid, folder_name, unread, total)
+        self._poll_account_folder_counts_at(generation, account_uids, index + 1)
 
     def _inbox_folder_name(self, account_uid: str) -> str | None:
         inbox_name = self._account_inbox_folders.get(account_uid)
@@ -1257,6 +1384,8 @@ class MailSidebar:
 
         self._add_outbox_row(account_uid)
         self._add_inbox_row(account_uid, folders)
+        # Eager inbox only — full-folder STATUS at tree load saturates Camel/mail
+        # I/O and can make Post unresponsive (or OOM) on large accounts (#170).
         self.refresh_inbox_counts(account_uid)
         self._update_account_offline_marker(account_uid)
 
@@ -1299,6 +1428,7 @@ class MailSidebar:
 
     def _clear(self) -> None:
         self._hide_context_popover()
+        self._folder_count_poll_generation += 1
         while child := self._sidebar_box.get_first_child():
             self._sidebar_box.remove(child)
         self._folder_lists.clear()

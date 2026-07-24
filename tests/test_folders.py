@@ -14,6 +14,7 @@ from post.mail.folders import (
     find_trash_folder,
     folder_can_contain_messages,
     folder_name_from_uri,
+    folder_names_for_count_refresh,
     format_account_refresh_done,
     format_account_refresh_error,
     format_account_refresh_start,
@@ -72,6 +73,41 @@ class GuessInboxTests(unittest.TestCase):
 
     def test_empty(self) -> None:
         self.assertIsNone(guess_inbox_name([]))
+
+
+class FolderNamesForCountRefreshTests(unittest.TestCase):
+    def test_includes_message_folders(self) -> None:
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 0},
+            {"full_name": "Sent", "display_name": "Sent", "flags": 0},
+            {"full_name": "custom/work", "display_name": "work", "flags": 0},
+        ]
+        self.assertEqual(
+            folder_names_for_count_refresh(folders),
+            ["INBOX", "Sent", "custom/work"],
+        )
+
+    def test_skips_noselect_and_virtual(self) -> None:
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 0},
+            {"full_name": "[GoogleMail]", "display_name": "GoogleMail", "flags": 1},
+            {
+                "full_name": ".#evolution/Trash",
+                "display_name": "Trash",
+                "flags": 32,
+            },
+        ]
+        self.assertEqual(folder_names_for_count_refresh(folders), ["INBOX"])
+
+    def test_skips_post_local_and_missing_names(self) -> None:
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 0},
+            outbox_folder_dict(3),
+            {"full_name": "", "display_name": "Empty", "flags": 0},
+            {"display_name": "NoName", "flags": 0},
+        ]
+        self.assertEqual(folder_names_for_count_refresh(folders), ["INBOX"])
+        self.assertTrue(is_post_local_folder(POST_OUTBOX_FOLDER))
 
 
 class FolderCanContainMessagesTests(unittest.TestCase):
