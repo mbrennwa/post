@@ -381,7 +381,7 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
         )
         self.assertFalse(state["show_new_folder"])
 
-    def test_refresh_disabled_when_offline(self) -> None:
+    def test_refresh_hidden_when_network_offline(self) -> None:
         state = resolve_sidebar_context_menu(
             folders=self._folders(),
             folder_name="INBOX",
@@ -394,8 +394,126 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
             folder_crud_enabled=True,
             network_available=False,
         )
-        self.assertTrue(state["show_refresh"])
+        self.assertFalse(state["show_refresh"])
         self.assertFalse(state["enable_refresh"])
+
+    def test_refresh_hidden_when_account_user_offline(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=self._folders(),
+            folder_name=None,
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=2,
+            total=5,
+            outbox_count=0,
+            folder_crud_enabled=True,
+            network_available=True,
+            account_user_online=False,
+            account_offline_toggle_enabled=True,
+        )
+        self.assertFalse(state["show_refresh"])
+        self.assertTrue(state["show_take_online"])
+
+    def test_refresh_hidden_when_needs_sign_in(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=self._folders(),
+            folder_name=None,
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=2,
+            total=5,
+            outbox_count=0,
+            folder_crud_enabled=True,
+            network_available=True,
+            account_connect_health="needs_sign_in",
+            account_offline_toggle_enabled=True,
+        )
+        self.assertFalse(state["show_refresh"])
+        self.assertFalse(state["show_new_folder"])
+        self.assertFalse(state["show_take_offline"])
+        self.assertTrue(state["show_take_online"])
+
+    def test_unified_inbox_offline_shows_take_online(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=self._folders(),
+            folder_name="INBOX",
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=2,
+            total=5,
+            outbox_count=0,
+            folder_crud_enabled=True,
+            network_available=True,
+            account_connect_health="needs_sign_in",
+            account_offline_toggle_enabled=True,
+            is_unified_inbox=True,
+        )
+        self.assertTrue(state["show_take_online"])
+        self.assertFalse(state["show_take_offline"])
+        self.assertFalse(state["show_refresh"])
+
+    def test_unified_inbox_online_shows_take_offline(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=self._folders(),
+            folder_name="INBOX",
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=2,
+            total=5,
+            outbox_count=0,
+            folder_crud_enabled=True,
+            network_available=True,
+            account_user_online=True,
+            account_connect_health="ok",
+            account_offline_toggle_enabled=True,
+            is_unified_inbox=True,
+        )
+        self.assertTrue(state["show_take_offline"])
+        self.assertFalse(state["show_take_online"])
+
+    def test_take_offline_hidden_when_not_connected(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=self._folders(),
+            folder_name=None,
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=2,
+            total=5,
+            outbox_count=0,
+            folder_crud_enabled=True,
+            network_available=True,
+            account_user_online=True,
+            account_connect_health="not_connected",
+            account_offline_toggle_enabled=True,
+        )
+        self.assertFalse(state["show_take_offline"])
+        self.assertFalse(state["show_new_folder"])
+        self.assertTrue(state["show_take_online"])
+
+    def test_take_offline_shown_when_connected(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=self._folders(),
+            folder_name=None,
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=2,
+            total=5,
+            outbox_count=0,
+            folder_crud_enabled=True,
+            network_available=True,
+            account_user_online=True,
+            account_connect_health="ok",
+            account_offline_toggle_enabled=True,
+        )
+        self.assertTrue(state["show_take_offline"])
+        self.assertTrue(state["show_new_folder"])
+        self.assertTrue(state["show_refresh"])
 
     def test_refresh_enabled_when_online(self) -> None:
         state = resolve_sidebar_context_menu(
@@ -410,6 +528,7 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
             folder_crud_enabled=True,
             network_available=True,
         )
+        self.assertTrue(state["show_refresh"])
         self.assertTrue(state["enable_refresh"])
 
 

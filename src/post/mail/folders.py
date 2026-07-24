@@ -395,6 +395,8 @@ def resolve_sidebar_context_menu(
     network_available: bool = True,
     account_user_online: bool = True,
     account_offline_toggle_enabled: bool = False,
+    account_connect_health: str = "ok",
+    is_unified_inbox: bool = False,
 ) -> dict[str, bool]:
     """Return show/enabled flags for sidebar folder context menu actions."""
     is_account = folder_name is None
@@ -410,13 +412,19 @@ def resolve_sidebar_context_menu(
                 break
     read_count = read_message_count(unread, total)
 
-    show_new_folder = is_account and folder_crud_enabled
+    account_effectively_online = (
+        account_user_online
+        and network_available
+        and account_connect_health == "ok"
+    )
+    show_new_folder = is_account and folder_crud_enabled and account_effectively_online
     show_new_subfolder = (
         not is_account
         and not is_outbox
         and folder_crud_enabled
         and folder is not None
         and not is_virtual_folder(folder_name)
+        and account_effectively_online
     )
     show_rename = (
         not is_account
@@ -424,20 +432,24 @@ def resolve_sidebar_context_menu(
         and folder_crud_enabled
         and folder is not None
         and not protected
+        and account_effectively_online
     )
     show_delete = show_rename
-    show_archive_read = is_inbox and archive_name is not None
+    show_archive_read = (
+        is_inbox and archive_name is not None and account_effectively_online
+    )
     show_archive_read_unflagged = show_archive_read
     show_archive_all = show_archive_read
-    show_send_now = is_outbox
-    show_empty_trash = is_trash
-    show_refresh = True
-    show_take_offline = (
-        is_account and account_offline_toggle_enabled and account_user_online
+    show_send_now = is_outbox and account_effectively_online
+    show_empty_trash = is_trash and account_effectively_online
+    # Refresh only when the account can actually talk to the server.
+    show_refresh = account_effectively_online and not is_unified_inbox
+    # Account online toggle: account headers and unified Inboxes rows.
+    allow_online_toggle = account_offline_toggle_enabled and (
+        is_account or is_unified_inbox
     )
-    show_take_online = (
-        is_account and account_offline_toggle_enabled and not account_user_online
-    )
+    show_take_offline = allow_online_toggle and account_effectively_online
+    show_take_online = allow_online_toggle and not account_effectively_online
 
     return {
         "show_new_folder": show_new_folder,
@@ -459,7 +471,7 @@ def resolve_sidebar_context_menu(
         "show_empty_trash": show_empty_trash,
         "enable_empty_trash": show_empty_trash and total > 0,
         "show_refresh": show_refresh,
-        "enable_refresh": network_available or (is_account and not account_user_online),
+        "enable_refresh": show_refresh,
         "show_take_offline": show_take_offline,
         "enable_take_offline": show_take_offline,
         "show_take_online": show_take_online,
