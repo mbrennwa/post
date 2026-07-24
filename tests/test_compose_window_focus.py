@@ -1,7 +1,7 @@
 # Copyright (C) 2026 mbrennwa
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Regression tests for compose focus/scroll on open (#149)."""
+"""Regression tests for compose focus/scroll (#149, #167)."""
 
 from __future__ import annotations
 
@@ -144,21 +144,21 @@ class ComposeInitialFocusScrollTests(unittest.TestCase):
         insert = buffer.get_iter_at_mark(buffer.get_insert())
         self.assertEqual(insert.get_offset(), 0)
 
-    def _assert_form_scrolled_to_top(self, window: ComposeWindow) -> None:
-        adj = window._form_scrolled.get_vadjustment()
+    def _assert_body_scrolled_to_top(self, window: ComposeWindow) -> None:
+        adj = window._body_scrolled.get_vadjustment()
         self.assertIsNotNone(adj)
         assert adj is not None
         # Allow tiny floating-point / theme rounding.
         self.assertLessEqual(adj.get_value(), adj.get_lower() + 1.0)
 
-    def test_reply_initial_focus_keeps_form_at_top(self) -> None:
+    def test_reply_initial_focus_keeps_body_at_top(self) -> None:
         window = self._open_reply()
         buffer = window._body_view.get_buffer()
         self.assertGreater(buffer.get_char_count(), 100)
 
         # Simulate the old bug: insert at EOF, then scroll to show it.
         buffer.place_cursor(buffer.get_end_iter())
-        adj = window._form_scrolled.get_vadjustment()
+        adj = window._body_scrolled.get_vadjustment()
         self._pump()
         if adj.get_upper() > adj.get_page_size():
             adj.set_value(adj.get_upper() - adj.get_page_size())
@@ -166,26 +166,75 @@ class ComposeInitialFocusScrollTests(unittest.TestCase):
 
         self._run_captured_idles()
         self._assert_cursor_at_start(window)
-        self._assert_form_scrolled_to_top(window)
+        self._assert_body_scrolled_to_top(window)
 
-    def test_draft_initial_focus_keeps_form_at_top(self) -> None:
+    def test_draft_initial_focus_keeps_body_at_top(self) -> None:
         window = self._open_draft()
         buffer = window._body_view.get_buffer()
         self.assertGreater(buffer.get_char_count(), 100)
 
         buffer.place_cursor(buffer.get_end_iter())
-        adj = window._form_scrolled.get_vadjustment()
+        adj = window._body_scrolled.get_vadjustment()
         self._pump()
         if adj.get_upper() > adj.get_page_size():
             adj.set_value(adj.get_upper() - adj.get_page_size())
 
         self._run_captured_idles()
         self._assert_cursor_at_start(window)
-        self._assert_form_scrolled_to_top(window)
+        self._assert_body_scrolled_to_top(window)
 
     def test_prefill_places_cursor_at_start(self) -> None:
         window = self._open_reply()
         self._assert_cursor_at_start(window)
+
+    def test_body_textview_is_viewport_sized_not_full_content(self) -> None:
+        """Body TextView must not inflate to full content height (#167)."""
+        window = self._open_reply()
+        self._run_captured_idles()
+        self._pump()
+
+        tv_height = window._body_view.get_height()
+        win_height = window.get_height()
+        self.assertGreater(tv_height, 0)
+        self.assertGreater(win_height, 0)
+        # Slack for chrome; previously the TextView was ~tens of thousands of px.
+        self.assertLessEqual(tv_height, win_height + 50)
+
+        adj = window._body_scrolled.get_vadjustment()
+        self.assertGreater(adj.get_upper(), adj.get_page_size() + 1.0)
+
+    def test_header_then_body_focus_does_not_scroll_to_end(self) -> None:
+        """Clicking a header then the body must not jump to EOF (#167)."""
+        window = self._open_reply()
+        self._run_captured_idles()
+        self._pump()
+
+        buffer = window._body_view.get_buffer()
+        ok, near_top = buffer.get_iter_at_line(2)
+        self.assertTrue(ok)
+        buffer.place_cursor(near_top)
+        window._scroll_body_to_top()
+        self._pump()
+
+        adj = window._body_scrolled.get_vadjustment()
+        before = adj.get_value()
+        cursor_before = buffer.get_iter_at_mark(buffer.get_insert()).get_offset()
+
+        window._to_entry.grab_focus()
+        self._pump()
+        window._subject_entry.grab_focus()
+        self._pump()
+        window._body_view.grab_focus()
+        self._pump()
+
+        cursor_after = buffer.get_iter_at_mark(buffer.get_insert()).get_offset()
+        after = adj.get_value()
+        max_scroll = max(0.0, adj.get_upper() - adj.get_page_size())
+
+        self.assertEqual(cursor_after, cursor_before)
+        self.assertLessEqual(after, before + 1.0)
+        if max_scroll > 50:
+            self.assertLess(after, max_scroll * 0.5)
 
 
 if __name__ == "__main__":

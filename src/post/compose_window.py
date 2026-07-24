@@ -504,16 +504,15 @@ class ComposeWindow(Adw.Window):
         send_actions.append(self._attach_files_btn)
         header.pack_start(send_actions)
 
-        self._form_scrolled = Gtk.ScrolledWindow()
-        self._form_scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self._form_scrolled.set_vexpand(True)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
-        form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        form.set_margin_start(18)
-        form.set_margin_end(18)
-        form.set_margin_top(12)
-        form.set_margin_bottom(12)
-        self._form_scrolled.set_child(form)
+        # Headers stay outside the body scroller so focusing/editing the body
+        # cannot drag the whole form (#167 / #149).
+        headers = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        headers.set_margin_start(18)
+        headers.set_margin_end(18)
+        headers.set_margin_top(12)
+        headers.set_margin_bottom(12)
 
         from_labels = [from_account.from_label for from_account in self._from_accounts]
         self._from_dropdown = Gtk.DropDown.new_from_strings(from_labels)
@@ -525,7 +524,7 @@ class ComposeWindow(Adw.Window):
         if len(self._from_accounts) == 1:
             self._from_dropdown.set_sensitive(False)
         self._from_dropdown.connect("notify::selected", self._on_from_account_changed)
-        form.append(self._labeled_row("From", self._from_dropdown))
+        headers.append(self._labeled_row("From", self._from_dropdown))
 
         self._correspondents: list[Correspondent] = []
         self._correspondents_generation = 0
@@ -553,7 +552,7 @@ class ComposeWindow(Adw.Window):
         self._to_row.append(self._to_entry)
         self._to_row.append(self._cc_toggle_btn)
         self._to_row.append(self._bcc_toggle_btn)
-        form.append(self._to_row)
+        headers.append(self._to_row)
 
         self._cc_entry = Gtk.Entry()
         self._cc_entry.set_placeholder_text(_CC_PLACEHOLDER)
@@ -564,7 +563,7 @@ class ComposeWindow(Adw.Window):
         self._cc_row.append(self._field_label("Cc"))
         self._cc_row.append(self._cc_entry)
         self._cc_row.set_visible(False)
-        form.append(self._cc_row)
+        headers.append(self._cc_row)
         self._setup_address_completion(self._cc_entry)
 
         self._bcc_entry = Gtk.Entry()
@@ -576,7 +575,7 @@ class ComposeWindow(Adw.Window):
         self._bcc_row.append(self._field_label("Bcc"))
         self._bcc_row.append(self._bcc_entry)
         self._bcc_row.set_visible(False)
-        form.append(self._bcc_row)
+        headers.append(self._bcc_row)
         self._setup_address_completion(self._bcc_entry)
 
         self._subject_entry = Gtk.Entry()
@@ -586,26 +585,37 @@ class ComposeWindow(Adw.Window):
         subject_focus = Gtk.EventControllerFocus()
         subject_focus.connect("leave", self._on_subject_focus_leave)
         self._subject_entry.add_controller(subject_focus)
-        form.append(self._labeled_row("Subject", self._subject_entry))
+        headers.append(self._labeled_row("Subject", self._subject_entry))
 
         self._attachments_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self._attachments_box.set_visible(False)
-        form.append(self._attachments_box)
+        headers.append(self._attachments_box)
+
+        content.append(headers)
+
+        self._body_scrolled = Gtk.ScrolledWindow()
+        self._body_scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._body_scrolled.set_vexpand(True)
+        self._body_scrolled.set_propagate_natural_height(False)
 
         self._body_view = Gtk.TextView()
         self._body_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self._body_view.set_vexpand(True)
+        self._body_view.set_left_margin(18)
+        self._body_view.set_right_margin(18)
+        self._body_view.set_top_margin(0)
+        self._body_view.set_bottom_margin(12)
         self._body_view.get_buffer().connect("changed", self._on_body_buffer_changed)
         body_focus = Gtk.EventControllerFocus()
         body_focus.connect("enter", self._on_body_focus_in)
         self._body_view.add_controller(body_focus)
-        form.append(self._body_view)
+        self._body_scrolled.set_child(self._body_view)
+        content.append(self._body_scrolled)
 
         self._focus_body_at_start_on_enter = False
 
         toolbar_view = Adw.ToolbarView()
         toolbar_view.add_top_bar(header)
-        toolbar_view.set_content(self._form_scrolled)
+        toolbar_view.set_content(content)
 
         self._toast_overlay = Adw.ToastOverlay()
         self._toast_overlay.set_child(toolbar_view)
@@ -793,24 +803,24 @@ class ComposeWindow(Adw.Window):
             "outbox",
         ):
             # Place the caret first: grab_focus with insert at EOF scrolls the
-            # shared form ScrolledWindow to the bottom (#149).
+            # body ScrolledWindow to the bottom (#149).
             self._focus_body_at_start()
         return False
 
     def _focus_body_at_start(self) -> None:
         self._place_body_cursor_at_start()
         self._body_view.grab_focus()
-        self._scroll_form_to_top()
+        self._scroll_body_to_top()
         # Focus may schedule a scroll-to-cursor after this handler returns.
-        GLib.idle_add(self._scroll_form_to_top_idle)
+        GLib.idle_add(self._scroll_body_to_top_idle)
 
-    def _scroll_form_to_top(self) -> None:
-        adj = self._form_scrolled.get_vadjustment()
+    def _scroll_body_to_top(self) -> None:
+        adj = self._body_scrolled.get_vadjustment()
         if adj is not None:
             adj.set_value(adj.get_lower())
 
-    def _scroll_form_to_top_idle(self) -> bool:
-        self._scroll_form_to_top()
+    def _scroll_body_to_top_idle(self) -> bool:
+        self._scroll_body_to_top()
         return False
 
     def _setup_address_completion(self, entry: Gtk.Entry) -> None:
