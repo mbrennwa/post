@@ -99,13 +99,22 @@ from .send_queue import (
     is_network_unavailable_error,
     is_outbound_ready_to_send,
     is_queueable_network_error,
+    is_sign_in_required_error,
     list_queued_outbound_messages,
     load_queued_attachments,
     load_queued_outbound_message,
     remove_queued_outbound_message,
 )
 from post.preferences import get_show_evolution_local
-from .auth import PasswordPromptCallback, authenticate_service_sync, ensure_goa_credentials
+from .account_status import AccountConnectHealth
+from .auth import (
+    PasswordPromptCallback,
+    authenticate_service_sync,
+    authentication_failed_error,
+    ensure_goa_credentials,
+    open_gnome_online_accounts,
+    source_uses_goa,
+)
 from .compose import (
     ComposeAttachment,
     addresses_to_internet_address,
@@ -216,8 +225,11 @@ def _read_unflagged_uids(index: _FolderMessageIndex) -> list[str]:
 _OAUTH_SERVICE_MECHANISMS = frozenset({"XOAUTH2", "Microsoft365"})
 
 
+AuthOutcomeCallback = Callable[[str, bool], None]
+
+
 class MailSession(Camel.Session):
-    """Camel session: OAuth via ESource, password auth for IMAP."""
+    """Camel session: OAuth via ESource, password auth for IMAP/SMTP."""
 
     __gtype_name__ = "PostMailSession"
 
@@ -225,14 +237,21 @@ class MailSession(Camel.Session):
         self,
         registry: EDataServer.SourceRegistry,
         password_prompt: PasswordPromptCallback | None = None,
+        on_auth_outcome: AuthOutcomeCallback | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._registry = registry
         self._password_prompt = password_prompt
+        self._on_auth_outcome = on_auth_outcome
 
     def set_password_prompt(self, callback: PasswordPromptCallback | None) -> None:
         self._password_prompt = callback
+
+    def set_auth_outcome_callback(
+        self, callback: AuthOutcomeCallback | None
+    ) -> None:
+        self._on_auth_outcome = callback
 
     def do_get_filter_driver(self, type, for_folder=None):
         """Required when Camel parses MIME (e.g. reading messages)."""
@@ -242,24 +261,48 @@ class MailSession(Camel.Session):
         """Account ESource for a Camel service (matches Evolution's EMailSession)."""
         return self._registry.ref_source(service.get_uid())
 
+    def _report_auth_outcome(self, service_uid: str, success: bool) -> None:
+        if self._on_auth_outcome is not None:
+            self._on_auth_outcome(service_uid, success)
+
     def do_authenticate_sync(self, service, mechanism=None, cancellable=None):
-        """Password auth for IMAP; OAuth for XOAUTH2 / Microsoft 365 providers."""
+        """Password auth for IMAP/SMTP; OAuth for XOAUTH2 / Microsoft 365 providers."""
+        service_uid = service.get_uid()
         if mechanism in _OAUTH_SERVICE_MECHANISMS:
             result = service.authenticate_sync(mechanism, cancellable)
-            return result == Camel.AuthenticationResult.ACCEPTED
+            ok = result == Camel.AuthenticationResult.ACCEPTED
+            self._report_auth_outcome(service_uid, ok)
+            if ok:
+                return True
+            raise authentication_failed_error(
+                f"Authentication failed for {service_uid}"
+            )
 
         source = self._credential_source(service)
         if source is None:
-            return False
+            self._report_auth_outcome(service_uid, False)
+            raise authentication_failed_error(
+                f"No credential source for {service_uid}"
+            )
 
-        if authenticate_service_sync(
-            service,
-            source,
-            self._registry,
-            mechanism,
-            cancellable,
-            self._password_prompt,
-        ):
+        try:
+            accepted = authenticate_service_sync(
+                service,
+                source,
+                self._registry,
+                mechanism,
+                cancellable,
+                self._password_prompt,
+            )
+        except GLib.Error:
+            # Cancelled background loads must not be recorded as sign-in failure.
+            if cancellable is not None and cancellable.is_cancelled():
+                raise
+            self._report_auth_outcome(service_uid, False)
+            raise
+
+        if accepted:
+            self._report_auth_outcome(service_uid, True)
             return True
 
         log.warning(
@@ -267,7 +310,12 @@ class MailSession(Camel.Session):
             source.get_display_name(),
             mechanism,
         )
-        return False
+        self._report_auth_outcome(service_uid, False)
+        # Camel requires a GError when authenticate_sync fails; returning False
+        # alone leaves the store half-connected and skips our offline badge (#168).
+        raise authentication_failed_error(
+            f"Authentication failed for {source.get_display_name() or service_uid}"
+        )
 
     def do_get_oauth2_access_token_sync(self, service, cancellable):
         """OAuth2 for Gmail, Microsoft 365, etc. (via GOA / ESource)."""
@@ -281,6 +329,15 @@ class MailSession(Camel.Session):
         except Exception:
             log.exception("OAuth2 failed for %s", service.get_uid())
         return False, "", 0
+
+
+@dataclass
+class FlushSendQueueResult:
+    """Outcome of flushing the local Outbox queue."""
+
+    sent: int = 0
+    error_message: str | None = None
+    failed_account_uid: str | None = None
 
 
 @dataclass
@@ -302,6 +359,12 @@ class MailService:
     _network_available: bool = field(default=True, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _password_prompt: PasswordPromptCallback | None = field(default=None, init=False)
+    _account_connect_health: dict[str, AccountConnectHealth] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _account_health_changed: Callable[[str], None] | None = field(
+        default=None, init=False, repr=False
+    )
     _pending_mail_ops: int = field(default=0, init=False)
     _pending_mail_ops_cond: threading.Condition = field(
         default_factory=threading.Condition, init=False, repr=False
@@ -326,8 +389,10 @@ class MailService:
     _sync_setup_cancel: Callable[[], None] | None = field(
         default=None, init=False, repr=False
     )
-    _folder_list_cancellable: Gio.Cancellable | None = field(
-        default=None, init=False, repr=False
+    # Concurrent folder-list loads (one per account at startup) each register a
+    # cancellable. Preempt cancels the whole set; registering must not cancel siblings.
+    _folder_list_cancellables: set[Gio.Cancellable] = field(
+        default_factory=set, init=False, repr=False
     )
     _folder_list_state_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
@@ -357,27 +422,24 @@ class MailService:
 
     def cancel_folder_list(self) -> None:
         with self._folder_list_state_lock:
-            cancellable = self._folder_list_cancellable
-            self._folder_list_cancellable = None
-        if cancellable is not None:
-            search_trace("folder_list_cancel")
-            cancellable.cancel()
+            cancellables = list(self._folder_list_cancellables)
+            self._folder_list_cancellables.clear()
+        if cancellables:
+            search_trace("folder_list_cancel", count=len(cancellables))
+            for cancellable in cancellables:
+                cancellable.cancel()
 
     def _register_folder_list_cancellable(
         self, cancellable: Gio.Cancellable
     ) -> None:
         with self._folder_list_state_lock:
-            previous = self._folder_list_cancellable
-            self._folder_list_cancellable = cancellable
-        if previous is not None and previous is not cancellable:
-            previous.cancel()
+            self._folder_list_cancellables.add(cancellable)
 
     def _unregister_folder_list_cancellable(
         self, cancellable: Gio.Cancellable
     ) -> None:
         with self._folder_list_state_lock:
-            if self._folder_list_cancellable is cancellable:
-                self._folder_list_cancellable = None
+            self._folder_list_cancellables.discard(cancellable)
 
     def set_sync_setup_cancel_callback(
         self, callback: Callable[[], None] | None
@@ -606,6 +668,115 @@ class MailService:
         if isinstance(self._session, MailSession):
             self._session.set_password_prompt(callback)
 
+    def set_account_health_changed_callback(
+        self, callback: Callable[[str], None] | None
+    ) -> None:
+        """UI callback invoked on the GTK idle loop when connect health changes."""
+        self._account_health_changed = callback
+
+    def get_account_connect_health(self, account_uid: str) -> AccountConnectHealth:
+        with self._lock:
+            return self._account_connect_health.get(account_uid, "ok")
+
+    def account_uses_goa(self, account_uid: str) -> bool:
+        """Return True when this account authenticates via GNOME Online Accounts."""
+        source = self.registry.ref_source(account_uid)
+        if source is None:
+            return False
+        return source_uses_goa(self.registry, source)
+
+    def open_online_accounts_settings(self) -> bool:
+        """Open GNOME Settings → Online Accounts for re-authentication."""
+        return open_gnome_online_accounts()
+
+    def set_account_connect_health(
+        self, account_uid: str, health: AccountConnectHealth
+    ) -> None:
+        notify = False
+        with self._lock:
+            current = self._account_connect_health.get(account_uid, "ok")
+            if health == "ok":
+                if account_uid in self._account_connect_health:
+                    del self._account_connect_health[account_uid]
+                    notify = True
+            else:
+                if current != health:
+                    self._account_connect_health[account_uid] = health
+                # Always refresh UI for degraded state (sidebar icons may be rebuilt).
+                notify = True
+        if notify:
+            self._notify_account_health_changed(account_uid)
+
+    def _notify_account_health_changed(self, account_uid: str) -> None:
+        callback = self._account_health_changed
+        if callback is None:
+            return
+        GLib.idle_add(callback, account_uid)
+
+    def _account_uid_for_service(self, service_uid: str) -> str | None:
+        if not service_uid:
+            return None
+        with self._lock:
+            if service_uid in self._accounts_by_uid:
+                return service_uid
+            for account in self._accounts_by_uid.values():
+                if account.transport_uid == service_uid:
+                    return account.uid
+
+        source = self.registry.ref_source(service_uid)
+        if source is not None:
+            if source.has_extension("Mail Account"):
+                return service_uid
+            if source.has_extension("Mail Transport"):
+                parent_uid = source.get_parent()
+                name = source.get_display_name()
+                try:
+                    for account in self.list_accounts():
+                        if account.transport_uid == service_uid:
+                            return account.uid
+                        if name and account.name == name:
+                            return account.uid
+                        if parent_uid:
+                            account_source = self.registry.ref_source(account.uid)
+                            if (
+                                account_source is not None
+                                and account_source.get_parent() == parent_uid
+                            ):
+                                return account.uid
+                except Exception:
+                    log.debug(
+                        "Could not resolve transport %s to account",
+                        service_uid,
+                        exc_info=True,
+                    )
+        try:
+            for account in self.list_accounts():
+                if account.uid == service_uid or account.transport_uid == service_uid:
+                    return account.uid
+        except Exception:
+            log.debug(
+                "Could not resolve account for service %s", service_uid, exc_info=True
+            )
+        return None
+
+    def resolve_account_uid_for_service(self, service_uid: str) -> str | None:
+        """Map a Camel store/transport UID to its mail account UID."""
+        return self._account_uid_for_service(service_uid)
+
+    def _on_service_auth_outcome(self, service_uid: str, success: bool) -> None:
+        account_uid = self._account_uid_for_service(service_uid)
+        if account_uid is None:
+            log.warning(
+                "Auth outcome for unknown service %s (success=%s)",
+                service_uid,
+                success,
+            )
+            return
+        if success:
+            self.set_account_connect_health(account_uid, "ok")
+        else:
+            self.set_account_connect_health(account_uid, "needs_sign_in")
+
     def set_network_available(self, available: bool) -> None:
         """Update Camel session/store online state from Gio.NetworkMonitor."""
         run_on_mail_thread(self._set_network_available_unlocked, available)
@@ -639,11 +810,21 @@ class MailService:
         run_on_mail_thread(self._go_online_sync_unlocked)
 
     def set_account_user_online(self, account_uid: str, online: bool) -> None:
-        """Persist and apply per-account user online/offline state."""
+        """Persist and apply per-account user online/offline state.
+
+        Preference is saved immediately. Camel ``set_online_sync`` runs on the
+        mail I/O thread without blocking the GTK main loop (Take Offline from a
+        context menu must stay responsive).
+        """
         from post.preferences import set_account_user_online as save_pref
 
         save_pref(account_uid, online)
-        run_on_mail_thread(self._apply_account_user_online_unlocked, account_uid)
+        if is_mail_io_thread():
+            self._apply_account_user_online_unlocked(account_uid)
+            return
+        get_mail_io_thread().submit_front(
+            self._apply_account_user_online_unlocked, account_uid
+        )
 
     def _apply_account_user_online_unlocked(self, account_uid: str) -> None:
         online = get_account_user_online(account_uid)
@@ -819,6 +1000,7 @@ class MailService:
         self._session = MailSession(
             self.registry,
             password_prompt=self._password_prompt,
+            on_auth_outcome=self._on_service_auth_outcome,
             user_data_dir=user_data,
             user_cache_dir=user_cache,
             online=self._network_available,
@@ -890,6 +1072,53 @@ class MailService:
     def invalidate_correspondent_index(self, account_uid: str) -> None:
         with self._lock:
             self._correspondent_indexes.pop(account_uid, None)
+
+    def invalidate_account_connection(self, account_uid: str) -> None:
+        """Drop cached Camel store/transport so the next open uses fresh credentials."""
+        run_on_mail_thread(self._invalidate_account_connection_unlocked, account_uid)
+
+    def _invalidate_account_connection_unlocked(self, account_uid: str) -> None:
+        session: Camel.Session | None
+        transport_uid: str | None = None
+        with self._lock:
+            self._stores.pop(account_uid, None)
+            account = self._accounts_by_uid.get(account_uid)
+            if account is not None:
+                transport_uid = account.transport_uid
+            if not transport_uid:
+                try:
+                    looked_up = self.get_account(account_uid)
+                    transport_uid = looked_up.transport_uid
+                except Exception:
+                    transport_uid = None
+            if transport_uid:
+                self._transports.pop(transport_uid, None)
+            self._folder_tree_cache.pop(account_uid, None)
+            for key in list(self._folder_indexes):
+                if key[0] == account_uid:
+                    self._folder_indexes.pop(key, None)
+            self._correspondent_indexes.pop(account_uid, None)
+            session = self._session
+
+        if session is None:
+            return
+        for service_uid in (account_uid, transport_uid):
+            if not service_uid:
+                continue
+            try:
+                service = session.ref_service(service_uid)
+            except Exception:
+                service = None
+            if service is None:
+                continue
+            try:
+                session.remove_service(service)
+            except Exception:
+                log.debug(
+                    "Could not remove Camel service %s after credential change",
+                    service_uid,
+                    exc_info=True,
+                )
 
     def get_inbox_folder_name(self, account_uid: str) -> str | None:
         """Return INBOX folder name, using the cached folder tree when available."""
@@ -990,10 +1219,29 @@ class MailService:
     ) -> None:
         """Connect / set online. Must not run while ``_lock`` is held."""
         effective = self._network_available and get_account_user_online(account_uid)
-        if isinstance(store, Camel.OfflineStore):
-            store.set_online_sync(effective, cancellable)
-        elif effective:
-            store.connect_sync(cancellable)
+        try:
+            if isinstance(store, Camel.OfflineStore):
+                store.set_online_sync(effective, cancellable)
+            elif effective:
+                store.connect_sync(cancellable)
+        except GLib.Error as exc:
+            log.debug(
+                "Store connect/online failed for %s", account_uid, exc_info=True
+            )
+            if effective:
+                if is_sign_in_required_error(exc):
+                    self.set_account_connect_health(account_uid, "needs_sign_in")
+                elif self.get_account_connect_health(account_uid) != "needs_sign_in":
+                    self.set_account_connect_health(account_uid, "not_connected")
+            raise
+        if effective:
+            # Auth failures already set needs_sign_in via MailSession; keep that
+            # even when OfflineStore stays usable for cached folders.
+            if self.get_account_connect_health(account_uid) != "needs_sign_in":
+                self.set_account_connect_health(account_uid, "ok")
+        elif not get_account_user_online(account_uid):
+            # Intentional offline — clear runtime degraded so Take Offline wins.
+            self.set_account_connect_health(account_uid, "ok")
 
     @staticmethod
     def _configure_store_settings_unlocked(
@@ -1072,18 +1320,30 @@ class MailService:
             self._apply_store_settings_to_transport(store, transport)
 
         def _connect_transport() -> None:
-            if hasattr(Camel, "OfflineTransport") and isinstance(
-                transport, Camel.OfflineTransport
-            ):
-                transport.set_online_sync(True, cancellable)
-            else:
-                transport.connect_sync(cancellable)
+            try:
+                if hasattr(Camel, "OfflineTransport") and isinstance(
+                    transport, Camel.OfflineTransport
+                ):
+                    transport.set_online_sync(True, cancellable)
+                else:
+                    transport.connect_sync(cancellable)
+            except GLib.Error:
+                log.debug(
+                    "Transport connect failed for account %s",
+                    account_uid,
+                    exc_info=True,
+                )
+                if self.get_account_connect_health(account_uid) != "needs_sign_in":
+                    self.set_account_connect_health(account_uid, "not_connected")
+                raise
+            if self.get_account_connect_health(account_uid) != "needs_sign_in":
+                self.set_account_connect_health(account_uid, "ok")
 
         self._call_without_service_lock(_connect_transport)
         return transport
 
-    def flush_send_queue(self, *, force: bool = False) -> int:
-        """Try to send queued outbox messages. Returns count sent."""
+    def flush_send_queue(self, *, force: bool = False) -> FlushSendQueueResult:
+        """Try to send queued outbox messages."""
         if is_mail_io_thread():
             return self._flush_send_queue_unlocked(force=force)
         return get_mail_io_thread().run_sync(
@@ -1404,8 +1664,10 @@ class MailService:
             attachment_payloads=attachments,
         )
 
-    def _flush_send_queue_unlocked(self, *, force: bool = False) -> int:
+    def _flush_send_queue_unlocked(self, *, force: bool = False) -> FlushSendQueueResult:
         sent = 0
+        error_message: str | None = None
+        failed_account_uid: str | None = None
         for queue_id, queued in list_queued_outbound_messages():
             if not force and not is_outbound_ready_to_send(queued):
                 continue
@@ -1438,15 +1700,23 @@ class MailService:
                         queue_id,
                         exc.user_message,
                     )
+                    error_message = exc.user_message
+                    failed_account_uid = queued.account_uid
                     break
-                except Exception:
+                except Exception as exc:
                     log.exception("Failed to send queued message %s", queue_id)
+                    error_message = user_send_error_message(exc)
+                    failed_account_uid = queued.account_uid
                     break
                 else:
                     sent += 1
             finally:
                 self._end_outbound_send()
-        return sent
+        return FlushSendQueueResult(
+            sent=sent,
+            error_message=error_message,
+            failed_account_uid=failed_account_uid,
+        )
 
     def _flush_operation_queue_unlocked(self) -> int:
         flushed = 0

@@ -17,11 +17,13 @@ class EnsureGoaCredentialsTests(unittest.TestCase):
         source = mock.Mock()
         source.get_display_name.return_value = "M365"
         source.get_uid.return_value = "acct-1"
+        source.get_parent.return_value = ""
         source.has_extension.return_value = True
         goa = mock.Mock()
         goa.get_account_id.return_value = "goa-1"
         source.get_extension.return_value = goa
         registry.list_sources.return_value = [source]
+        registry.ref_source.return_value = None
 
         bus = mock.Mock()
         with mock.patch("post.mail.auth.Gio.bus_get_sync", return_value=bus):
@@ -32,6 +34,40 @@ class EnsureGoaCredentialsTests(unittest.TestCase):
         self.assertEqual(timeout_ms, auth._GOA_ENSURE_CREDENTIALS_TIMEOUT_MS)
         self.assertGreater(timeout_ms, 0)
         self.assertNotEqual(timeout_ms, -1)
+
+    def test_source_uses_goa(self) -> None:
+        registry = mock.Mock()
+        source = mock.Mock()
+        source.get_display_name.return_value = "M365"
+        source.get_uid.return_value = "acct-1"
+        source.get_parent.return_value = ""
+        source.has_extension.return_value = True
+        goa = mock.Mock()
+        goa.get_account_id.return_value = "goa-1"
+        source.get_extension.return_value = goa
+        registry.list_sources.return_value = [source]
+        registry.ref_source.return_value = None
+        self.assertTrue(auth.source_uses_goa(registry, source))
+
+    def test_open_gnome_online_accounts_falls_back_to_control_center(self) -> None:
+        with (
+            mock.patch(
+                "post.mail.auth.Gio.AppInfo.launch_default_for_uri",
+                side_effect=auth.GLib.Error.new_literal(
+                    auth.GLib.quark_from_string("g-io-error-quark"),
+                    "no handler",
+                    0,
+                ),
+            ),
+            mock.patch("post.mail.auth.Gio.Subprocess.new") as subproc,
+        ):
+            subproc.return_value = mock.Mock()
+            self.assertTrue(auth.open_gnome_online_accounts())
+            subproc.assert_called_once()
+            self.assertEqual(
+                list(subproc.call_args.args[0]),
+                ["gnome-control-center", "online-accounts"],
+            )
 
 
 if __name__ == "__main__":
