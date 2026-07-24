@@ -596,5 +596,58 @@ class FilterSearchMatchesForFolderTests(unittest.TestCase):
         self.assertEqual([message["uid"] for message in filtered], ["1"])
 
 
+class GroupListKeysByLocationTests(unittest.TestCase):
+    def test_groups_search_keys_by_folder(self) -> None:
+        from post.mail.search import (
+            annotate_search_match,
+            group_list_keys_by_location,
+            make_search_row_key,
+        )
+
+        inbox = annotate_search_match(
+            {"uid": "1"}, account_uid="acct-1", folder_name="INBOX"
+        )
+        sent = annotate_search_match(
+            {"uid": "2"}, account_uid="acct-1", folder_name="Sent"
+        )
+        inbox2 = annotate_search_match(
+            {"uid": "3"}, account_uid="acct-1", folder_name="INBOX"
+        )
+        locations = {
+            inbox["_search_row_key"]: ("acct-1", "INBOX", "1"),
+            sent["_search_row_key"]: ("acct-1", "Sent", "2"),
+            inbox2["_search_row_key"]: ("acct-1", "INBOX", "3"),
+        }
+
+        groups = group_list_keys_by_location(
+            [
+                inbox["_search_row_key"],
+                sent["_search_row_key"],
+                inbox2["_search_row_key"],
+                "missing",
+            ],
+            locations.get,
+        )
+        self.assertEqual(
+            groups[("acct-1", "INBOX")],
+            [
+                (make_search_row_key("acct-1", "INBOX", "1"), "1"),
+                (make_search_row_key("acct-1", "INBOX", "3"), "3"),
+            ],
+        )
+        self.assertEqual(
+            groups[("acct-1", "Sent")],
+            [(make_search_row_key("acct-1", "Sent", "2"), "2")],
+        )
+
+    def test_parse_search_row_key(self) -> None:
+        from post.mail.search import make_search_row_key, parse_search_row_key
+
+        key = make_search_row_key("acct", "Sent", "42")
+        self.assertEqual(parse_search_row_key(key), ("acct", "Sent", "42"))
+        self.assertIsNone(parse_search_row_key("plain-uid"))
+        self.assertIsNone(parse_search_row_key("a\0b"))
+
+
 if __name__ == "__main__":
     unittest.main()

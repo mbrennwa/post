@@ -42,6 +42,19 @@ def make_search_row_key(account_uid: str, folder_name: str, uid: str) -> str:
     return f"{account_uid}\0{folder_name}\0{uid}"
 
 
+def parse_search_row_key(list_key: str) -> tuple[str, str, str] | None:
+    """Return ``(account_uid, folder_name, message_uid)`` for a search row key."""
+    if "\0" not in list_key:
+        return None
+    parts = list_key.split("\0")
+    if len(parts) != 3:
+        return None
+    account_uid, folder_name, message_uid = parts
+    if not account_uid or not folder_name or not message_uid:
+        return None
+    return account_uid, folder_name, message_uid
+
+
 def annotate_search_match(
     message: dict,
     *,
@@ -54,6 +67,29 @@ def annotate_search_match(
     annotated["_search_folder"] = folder_name
     annotated["_search_row_key"] = make_search_row_key(account_uid, folder_name, uid)
     return annotated
+
+
+def group_list_keys_by_location(
+    list_keys: list[str],
+    resolve_location: Callable[[str], tuple[str, str, str] | None],
+) -> dict[tuple[str, str], list[tuple[str, str]]]:
+    """Group message-list keys by ``(account_uid, folder_name)``.
+
+    Each value is a list of ``(list_key, message_uid)`` pairs. List keys that
+    cannot be resolved are skipped.
+    """
+    groups: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for list_key in list_keys:
+        location = resolve_location(list_key)
+        if location is None:
+            continue
+        account_uid, folder_name, message_uid = location
+        if not message_uid:
+            continue
+        groups.setdefault((account_uid, folder_name), []).append(
+            (list_key, message_uid)
+        )
+    return groups
 
 
 def filter_search_matches_for_folder(
