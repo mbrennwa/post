@@ -73,6 +73,7 @@ OnFolderContentsChanged = Callable[[str, str], None]
 OnMoveStarted = Callable[[str, str], None]
 OnMoveUndoAvailable = Callable[[str, str, dict, str], None]
 OnAccountOnlineChanged = Callable[[str, bool], None]
+OnGoaReauthRequested = Callable[[str], None]
 OnMessagesDropped = Callable[[str, str, str, list[str]], None]
 FolderRefreshComplete = Callable[[int, int, Exception | None], None]
 AccountRefreshComplete = Callable[[int, Exception | None], None]
@@ -96,6 +97,7 @@ class MailSidebar:
         on_move_started: OnMoveStarted | None = None,
         on_move_undo_available: OnMoveUndoAvailable | None = None,
         on_account_online_changed: OnAccountOnlineChanged | None = None,
+        on_goa_reauth_requested: OnGoaReauthRequested | None = None,
         on_messages_dropped: OnMessagesDropped | None = None,
     ) -> None:
         self._mail = mail
@@ -112,6 +114,7 @@ class MailSidebar:
         self._on_move_started = on_move_started
         self._on_move_undo_available = on_move_undo_available
         self._on_account_online_changed = on_account_online_changed
+        self._on_goa_reauth_requested = on_goa_reauth_requested
         self._on_messages_dropped = on_messages_dropped
         self._network_available = True
         self._account_offline_icons: dict[str, Gtk.Image] = {}
@@ -621,9 +624,12 @@ class MailSidebar:
             self._on_refresh_folder(account_uid, folder_name)
 
     def _on_take_offline_activate(self, *_args) -> None:
+        # Dismiss before Camel work so the menu cannot stick if I/O is busy.
+        self._hide_context_popover()
         self._set_account_user_online(False)
 
     def _on_take_online_activate(self, *_args) -> None:
+        self._hide_context_popover()
         self._set_account_user_online(True)
 
     def _set_account_user_online(self, online: bool) -> None:
@@ -652,12 +658,15 @@ class MailSidebar:
                 # Expired M365/GOA tokens cannot be fixed by reconnect alone.
                 if self._mail.open_online_accounts_settings():
                     self._set_status(
-                        "Sign in again in Settings → Online Accounts"
+                        "Sign in again in Settings → Online Accounts, "
+                        "then return here to reconnect"
                     )
                 else:
                     self._set_status(
                         "Open Settings → Online Accounts to sign in again"
                     )
+                if self._on_goa_reauth_requested is not None:
+                    self._on_goa_reauth_requested(account_uid)
                 return
             if health != "ok" and self._on_refresh_account is not None:
                 # Password IMAP / other degraded: retry connect (may prompt).

@@ -96,6 +96,23 @@ class ServiceLockReleaseTests(unittest.TestCase):
         second.cancel.assert_called_once()
         self.assertEqual(service._folder_list_cancellables, set())
 
+    def test_set_account_user_online_does_not_block_caller(self) -> None:
+        service = MailService(registry=mock.Mock())
+        io = mock.Mock()
+        with (
+            mock.patch("post.mail.eds.is_mail_io_thread", return_value=False),
+            mock.patch("post.mail.eds.get_mail_io_thread", return_value=io),
+            mock.patch("post.preferences.set_account_user_online") as save_pref,
+        ):
+            service.set_account_user_online("acct-1", False)
+
+        save_pref.assert_called_once_with("acct-1", False)
+        io.submit_front.assert_called_once()
+        args = io.submit_front.call_args[0]
+        self.assertEqual(args[0], service._apply_account_user_online_unlocked)
+        self.assertEqual(args[1], "acct-1")
+        io.run_sync.assert_not_called()
+
     def test_sync_store_online_respects_user_offline(self) -> None:
         service = MailService(registry=mock.Mock())
         service._network_available = True

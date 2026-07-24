@@ -209,9 +209,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.connect("close-request", self._on_close_request)
         self.connect("notify::width", self._on_window_size_changed)
         self.connect("notify::height", self._on_window_size_changed)
+        self.connect("notify::is-active", self._on_is_active_changed)
         self._close_after_outbound_send = False
         self._delayed_send_close_dialog: Adw.AlertDialog | None = None
         self._is_closing = False
+        self._pending_goa_reauth: set[str] = set()
 
         self._mail = MailService.connect()
         self._send_delay_scheduler = OutboundSendDelayScheduler(
@@ -369,6 +371,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_move_started=self._on_sidebar_move_started,
             on_move_undo_available=self._on_sidebar_move_undo_available,
             on_account_online_changed=self._on_account_online_changed,
+            on_goa_reauth_requested=self._on_goa_reauth_requested,
             on_messages_dropped=self._on_messages_dropped,
         )
         sidebar_widget = self._sidebar.widget
@@ -1043,6 +1046,35 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _account_server_sync_enabled(self, account_uid: str) -> bool:
         return self._network_available and not account_is_user_offline(account_uid)
+
+    def _on_goa_reauth_requested(self, account_uid: str) -> None:
+        """Remember account to reconnect after Online Accounts re-auth."""
+        self._pending_goa_reauth.add(account_uid)
+
+    def _on_is_active_changed(self, *_args) -> None:
+        """After returning from GOA Settings, drop stale stores and reload."""
+        if not self.get_property("is-active"):
+            return
+        if not self._pending_goa_reauth:
+            return
+        pending = list(self._pending_goa_reauth)
+        self._pending_goa_reauth.clear()
+        for account_uid in pending:
+            self._reconnect_account_after_goa_reauth(account_uid)
+
+    def _reconnect_account_after_goa_reauth(self, account_uid: str) -> None:
+        label = self._sidebar.account_display_label(account_uid)
+        self._set_status(f"Reconnecting {label}…")
+
+        def work() -> None:
+            self._mail._invalidate_account_connection_unlocked(account_uid)
+            GLib.idle_add(self._finish_goa_reauth_reconnect, account_uid)
+
+        get_mail_io_thread().submit_front(work)
+
+    def _finish_goa_reauth_reconnect(self, account_uid: str) -> bool:
+        self._on_sidebar_refresh_account(account_uid)
+        return False
 
     def _on_sidebar_refresh_account(self, account_uid: str) -> None:
         if not self._network_available:
@@ -1831,6 +1863,7 @@ class MainWindow(Adw.ApplicationWindow):
         account_label: str,
         _mechanism: str | None,
         reason: str | None = None,
+        service_uid: str | None = None,
     ) -> str | None:
         from post.mail.auth import PasswordPromptReason
 
@@ -1843,10 +1876,21 @@ class MainWindow(Adw.ApplicationWindow):
             reason=prompt_reason,
         )
         if password is None:
-            # Cancel / empty sign-in: mark matching accounts as needing sign-in so
-            # the offline badge appears even when Camel continues with cache.
-            self._mark_accounts_need_sign_in(account_label)
+            # Cancel / empty sign-in: mark the account immediately so the offline
+            # badge appears even when Camel continues with a local cache.
+            self._mark_service_needs_sign_in(service_uid, account_label)
         return password
+
+    def _mark_service_needs_sign_in(
+        self, service_uid: str | None, account_label: str
+    ) -> None:
+        account_uid = None
+        if service_uid:
+            account_uid = self._mail.resolve_account_uid_for_service(service_uid)
+        if account_uid:
+            self._mail.set_account_connect_health(account_uid, "needs_sign_in")
+            return
+        self._mark_accounts_need_sign_in(account_label)
 
     def _mark_accounts_need_sign_in(self, account_label: str) -> None:
         label = (account_label or "").strip().casefold()

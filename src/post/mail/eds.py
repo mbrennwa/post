@@ -110,6 +110,7 @@ from .account_status import AccountConnectHealth
 from .auth import (
     PasswordPromptCallback,
     authenticate_service_sync,
+    authentication_failed_error,
     ensure_goa_credentials,
     open_gnome_online_accounts,
     source_uses_goa,
@@ -271,21 +272,36 @@ class MailSession(Camel.Session):
             result = service.authenticate_sync(mechanism, cancellable)
             ok = result == Camel.AuthenticationResult.ACCEPTED
             self._report_auth_outcome(service_uid, ok)
-            return ok
+            if ok:
+                return True
+            raise authentication_failed_error(
+                f"Authentication failed for {service_uid}"
+            )
 
         source = self._credential_source(service)
         if source is None:
             self._report_auth_outcome(service_uid, False)
-            return False
+            raise authentication_failed_error(
+                f"No credential source for {service_uid}"
+            )
 
-        if authenticate_service_sync(
-            service,
-            source,
-            self._registry,
-            mechanism,
-            cancellable,
-            self._password_prompt,
-        ):
+        try:
+            accepted = authenticate_service_sync(
+                service,
+                source,
+                self._registry,
+                mechanism,
+                cancellable,
+                self._password_prompt,
+            )
+        except GLib.Error:
+            # Cancelled background loads must not be recorded as sign-in failure.
+            if cancellable is not None and cancellable.is_cancelled():
+                raise
+            self._report_auth_outcome(service_uid, False)
+            raise
+
+        if accepted:
             self._report_auth_outcome(service_uid, True)
             return True
 
@@ -295,7 +311,11 @@ class MailSession(Camel.Session):
             mechanism,
         )
         self._report_auth_outcome(service_uid, False)
-        return False
+        # Camel requires a GError when authenticate_sync fails; returning False
+        # alone leaves the store half-connected and skips our offline badge (#168).
+        raise authentication_failed_error(
+            f"Authentication failed for {source.get_display_name() or service_uid}"
+        )
 
     def do_get_oauth2_access_token_sync(self, service, cancellable):
         """OAuth2 for Gmail, Microsoft 365, etc. (via GOA / ESource)."""
@@ -739,6 +759,10 @@ class MailService:
             )
         return None
 
+    def resolve_account_uid_for_service(self, service_uid: str) -> str | None:
+        """Map a Camel store/transport UID to its mail account UID."""
+        return self._account_uid_for_service(service_uid)
+
     def _on_service_auth_outcome(self, service_uid: str, success: bool) -> None:
         account_uid = self._account_uid_for_service(service_uid)
         if account_uid is None:
@@ -786,11 +810,21 @@ class MailService:
         run_on_mail_thread(self._go_online_sync_unlocked)
 
     def set_account_user_online(self, account_uid: str, online: bool) -> None:
-        """Persist and apply per-account user online/offline state."""
+        """Persist and apply per-account user online/offline state.
+
+        Preference is saved immediately. Camel ``set_online_sync`` runs on the
+        mail I/O thread without blocking the GTK main loop (Take Offline from a
+        context menu must stay responsive).
+        """
         from post.preferences import set_account_user_online as save_pref
 
         save_pref(account_uid, online)
-        run_on_mail_thread(self._apply_account_user_online_unlocked, account_uid)
+        if is_mail_io_thread():
+            self._apply_account_user_online_unlocked(account_uid)
+            return
+        get_mail_io_thread().submit_front(
+            self._apply_account_user_online_unlocked, account_uid
+        )
 
     def _apply_account_user_online_unlocked(self, account_uid: str) -> None:
         online = get_account_user_online(account_uid)
@@ -1038,6 +1072,53 @@ class MailService:
     def invalidate_correspondent_index(self, account_uid: str) -> None:
         with self._lock:
             self._correspondent_indexes.pop(account_uid, None)
+
+    def invalidate_account_connection(self, account_uid: str) -> None:
+        """Drop cached Camel store/transport so the next open uses fresh credentials."""
+        run_on_mail_thread(self._invalidate_account_connection_unlocked, account_uid)
+
+    def _invalidate_account_connection_unlocked(self, account_uid: str) -> None:
+        session: Camel.Session | None
+        transport_uid: str | None = None
+        with self._lock:
+            self._stores.pop(account_uid, None)
+            account = self._accounts_by_uid.get(account_uid)
+            if account is not None:
+                transport_uid = account.transport_uid
+            if not transport_uid:
+                try:
+                    looked_up = self.get_account(account_uid)
+                    transport_uid = looked_up.transport_uid
+                except Exception:
+                    transport_uid = None
+            if transport_uid:
+                self._transports.pop(transport_uid, None)
+            self._folder_tree_cache.pop(account_uid, None)
+            for key in list(self._folder_indexes):
+                if key[0] == account_uid:
+                    self._folder_indexes.pop(key, None)
+            self._correspondent_indexes.pop(account_uid, None)
+            session = self._session
+
+        if session is None:
+            return
+        for service_uid in (account_uid, transport_uid):
+            if not service_uid:
+                continue
+            try:
+                service = session.ref_service(service_uid)
+            except Exception:
+                service = None
+            if service is None:
+                continue
+            try:
+                session.remove_service(service)
+            except Exception:
+                log.debug(
+                    "Could not remove Camel service %s after credential change",
+                    service_uid,
+                    exc_info=True,
+                )
 
     def get_inbox_folder_name(self, account_uid: str) -> str | None:
         """Return INBOX folder name, using the cached folder tree when available."""

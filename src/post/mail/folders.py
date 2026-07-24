@@ -442,8 +442,13 @@ def resolve_sidebar_context_menu(
     show_archive_all = show_archive_read
     show_send_now = is_outbox and account_effectively_online
     show_empty_trash = is_trash and account_effectively_online
-    # Refresh only when the account can actually talk to the server.
-    show_refresh = account_effectively_online and not is_unified_inbox
+    # Refresh when the account can talk to the network. Allow retry while
+    # degraded (needs_sign_in / not_connected) so GOA re-auth + Refresh works.
+    show_refresh = (
+        not is_unified_inbox
+        and account_user_online
+        and network_available
+    )
     # Account online toggle: account headers and unified Inboxes rows.
     allow_online_toggle = account_offline_toggle_enabled and (
         is_account or is_unified_inbox

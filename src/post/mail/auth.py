@@ -24,8 +24,11 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 PasswordPromptReason = Literal["check_mail", "send_mail"]
-# (account_label, mechanism, reason)
-PasswordPromptCallback = Callable[[str, str | None, PasswordPromptReason | None], str | None]
+# (account_label, mechanism, reason, service_uid)
+PasswordPromptCallback = Callable[
+    [str, str | None, PasswordPromptReason | None, str | None],
+    str | None,
+]
 
 _CREDENTIAL_PASSWORD = "password"
 
@@ -175,7 +178,17 @@ def ensure_goa_credentials(
                 cancellable,
             )
         except GLib.Error as exc:
-            log.warning("GOA EnsureCredentials failed for %s: %s", account_id, exc.message)
+            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                log.debug(
+                    "GOA EnsureCredentials cancelled for %s",
+                    account_id,
+                )
+            else:
+                log.warning(
+                    "GOA EnsureCredentials failed for %s: %s",
+                    account_id,
+                    exc.message,
+                )
 
 
 def lookup_stored_password(
@@ -230,6 +243,15 @@ def store_stored_password(
         log.debug("Could not store password for %s", source.get_display_name())
 
 
+def _raise_if_cancelled(cancellable: Gio.Cancellable | None) -> None:
+    if cancellable is not None and cancellable.is_cancelled():
+        raise GLib.Error.new_literal(
+            Gio.io_error_quark(),
+            "Operation was cancelled",
+            Gio.IOErrorEnum.CANCELLED,
+        )
+
+
 def authenticate_service_sync(
     service: Camel.Service,
     source: EDataServer.Source,
@@ -243,20 +265,27 @@ def authenticate_service_sync(
         return False
 
     reason = password_prompt_reason_for_source(source)
+    service_uid = service.get_uid()
 
     for reprompt in (False, True):
+        _raise_if_cancelled(cancellable)
         password: str | None = None
         if not reprompt:
             ensure_goa_credentials(registry, source, cancellable)
+            # Folder-list preempt cancels EnsureCredentials; do not fall through to a
+            # password dialog for a cancelled background load (#168).
+            _raise_if_cancelled(cancellable)
             password = lookup_stored_password(registry, source, cancellable)
+            _raise_if_cancelled(cancellable)
             if not password:
                 password = service.get_password()
 
         if not password and password_prompt is not None:
             password = password_prompt(
-                source.get_display_name() or service.get_uid(),
+                source.get_display_name() or service_uid,
                 mechanism,
                 reason,
+                service_uid,
             )
 
         if not password:
@@ -288,3 +317,12 @@ def authenticate_service_sync(
         return False
 
     return False
+
+
+def authentication_failed_error(message: str = "Authentication failed") -> GLib.Error:
+    """GError Camel expects when Session.authenticate_sync fails."""
+    return GLib.Error.new_literal(
+        Camel.service_error_quark(),
+        message,
+        int(Camel.ServiceError.CANT_AUTHENTICATE),
+    )
