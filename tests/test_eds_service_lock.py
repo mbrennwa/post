@@ -76,6 +76,26 @@ class ServiceLockReleaseTests(unittest.TestCase):
         service.cancel_folder_list.assert_called_once()
         service.offline_sync.cancel_all.assert_called_once()
 
+    def test_folder_list_register_keeps_sibling_cancellables(self) -> None:
+        service = MailService(registry=mock.Mock())
+        first = mock.Mock()
+        second = mock.Mock()
+        first.cancel = mock.Mock()
+        second.cancel = mock.Mock()
+
+        service._register_folder_list_cancellable(first)
+        service._register_folder_list_cancellable(second)
+        first.cancel.assert_not_called()
+        second.cancel.assert_not_called()
+        self.assertEqual(service._folder_list_cancellables, {first, second})
+
+        service._unregister_folder_list_cancellable(first)
+        self.assertEqual(service._folder_list_cancellables, {second})
+
+        service.cancel_folder_list()
+        second.cancel.assert_called_once()
+        self.assertEqual(service._folder_list_cancellables, set())
+
     def test_sync_store_online_respects_user_offline(self) -> None:
         service = MailService(registry=mock.Mock())
         service._network_available = True

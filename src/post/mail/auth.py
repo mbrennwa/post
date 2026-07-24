@@ -1,13 +1,13 @@
 # Copyright (C) 2026 mbrennwa
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""EDS credential lookup and IMAP password authentication."""
+"""EDS credential lookup and IMAP/SMTP password authentication."""
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import gi
 
@@ -23,7 +23,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-PasswordPromptCallback = Callable[[str, str | None], str | None]
+PasswordPromptReason = Literal["check_mail", "send_mail"]
+# (account_label, mechanism, reason)
+PasswordPromptCallback = Callable[[str, str | None, PasswordPromptReason | None], str | None]
 
 _CREDENTIAL_PASSWORD = "password"
 
@@ -33,19 +35,71 @@ _GOA_IFACE = "org.gnome.OnlineAccounts.Account"
 _GOA_ENSURE_CREDENTIALS_TIMEOUT_MS = 15_000
 
 
+def password_prompt_reason_for_source(
+    source: EDataServer.Source,
+) -> PasswordPromptReason | None:
+    """Infer why Camel is asking for a password from the ESource type."""
+    if source.has_extension("Mail Transport"):
+        return "send_mail"
+    if source.has_extension("Mail Account"):
+        return "check_mail"
+    return None
+
+
+def _append_unique(
+    sources: list[EDataServer.Source],
+    seen: set[str],
+    candidate: EDataServer.Source | None,
+) -> None:
+    if candidate is None:
+        return
+    uid = candidate.get_uid()
+    if not uid or uid in seen:
+        return
+    seen.add(uid)
+    sources.append(candidate)
+
+
 def _related_credential_sources(
     registry: EDataServer.SourceRegistry, source: EDataServer.Source
 ) -> list[EDataServer.Source]:
-    """Mail source plus any GOA collection source for the same account."""
+    """Credential sources for an account: self, GOA collection, and siblings.
+
+    SMTP transports and IMAP stores are separate ESources. Looking up only the
+    transport UID misses a password already stored on the mail account or GOA
+    collection (#168).
+    """
     name = source.get_display_name()
-    sources = [source]
+    raw_parent = source.get_parent()
+    parent_uid = raw_parent if isinstance(raw_parent, str) and raw_parent else None
+    sources: list[EDataServer.Source] = []
+    seen: set[str] = set()
+    _append_unique(sources, seen, source)
+
+    if parent_uid:
+        _append_unique(sources, seen, registry.ref_source(parent_uid))
+
     for candidate in registry.list_sources():
-        if candidate.get_uid() == source.get_uid():
+        if candidate.get_uid() in seen:
             continue
-        if candidate.get_display_name() == name and candidate.has_extension(
-            "GNOME Online Accounts"
-        ):
-            sources.append(candidate)
+        same_name = bool(name) and candidate.get_display_name() == name
+        same_parent = bool(parent_uid) and candidate.get_parent() == parent_uid
+        if not (same_name or same_parent):
+            continue
+        if candidate.has_extension("GNOME Online Accounts"):
+            _append_unique(sources, seen, candidate)
+            continue
+        if candidate.has_extension("Mail Account"):
+            _append_unique(sources, seen, candidate)
+            continue
+        if candidate.has_extension("Mail Transport"):
+            _append_unique(sources, seen, candidate)
+            continue
+        if same_name and candidate.has_extension("Mail Identity"):
+            # Identity itself has no password; its parent collection may.
+            identity_parent = candidate.get_parent()
+            if isinstance(identity_parent, str) and identity_parent:
+                _append_unique(sources, seen, registry.ref_source(identity_parent))
     return sources
 
 
@@ -61,6 +115,34 @@ def _goa_account_ids(
         if account_id and account_id not in ids:
             ids.append(account_id)
     return ids
+
+
+def source_uses_goa(
+    registry: EDataServer.SourceRegistry, source: EDataServer.Source
+) -> bool:
+    """Return True when this mail source is backed by GNOME Online Accounts."""
+    return bool(_goa_account_ids(registry, source))
+
+
+def open_gnome_online_accounts() -> bool:
+    """Open GNOME Settings → Online Accounts. Return True if a launcher ran."""
+    # Preferred: GNOME Settings deep-link (GNOME 42+).
+    try:
+        Gio.AppInfo.launch_default_for_uri("settings://online-accounts", None)
+        return True
+    except GLib.Error:
+        log.debug("settings://online-accounts launch failed", exc_info=True)
+
+    # Fallback: gnome-control-center panel.
+    try:
+        launcher = Gio.Subprocess.new(
+            ["gnome-control-center", "online-accounts"],
+            Gio.SubprocessFlags.NONE,
+        )
+        return launcher is not None
+    except GLib.Error:
+        log.warning("Could not open GNOME Online Accounts settings", exc_info=True)
+        return False
 
 
 def ensure_goa_credentials(
@@ -106,6 +188,19 @@ def lookup_stored_password(
     for candidate in _related_credential_sources(registry, source):
         try:
             ok, creds = provider.lookup_sync(candidate, cancellable)
+        except GLib.Error as exc:
+            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                log.debug(
+                    "Credential lookup cancelled for %s",
+                    candidate.get_display_name(),
+                )
+            else:
+                log.warning(
+                    "Credential lookup failed for %s: %s",
+                    candidate.get_display_name(),
+                    exc.message,
+                )
+            continue
         except Exception:
             log.exception(
                 "Credential lookup failed for %s", candidate.get_display_name()
@@ -143,9 +238,11 @@ def authenticate_service_sync(
     cancellable: Gio.Cancellable | None,
     password_prompt: PasswordPromptCallback | None,
 ) -> bool:
-    """Authenticate an IMAP account using Camel's service-level SASL."""
+    """Authenticate a Camel store/transport using Camel's service-level SASL."""
     if mechanism == "XOAUTH2":
         return False
+
+    reason = password_prompt_reason_for_source(source)
 
     for reprompt in (False, True):
         password: str | None = None
@@ -157,7 +254,9 @@ def authenticate_service_sync(
 
         if not password and password_prompt is not None:
             password = password_prompt(
-                source.get_display_name() or service.get_uid(), mechanism
+                source.get_display_name() or service.get_uid(),
+                mechanism,
+                reason,
             )
 
         if not password:

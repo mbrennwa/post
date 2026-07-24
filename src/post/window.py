@@ -219,6 +219,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_outbox_changed=self._on_outbox_changed,
         )
         self._mail.set_password_prompt(self._prompt_account_password)
+        self._mail.set_account_health_changed_callback(self._on_account_health_changed)
         self._sync_watcher = MailSyncWatcher(
             self._mail,
             on_folder_changed=self._on_sync_folder_changed,
@@ -581,13 +582,11 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _flush_send_queue_worker(self, *, force: bool = False) -> None:
         try:
-            sent = self._mail.flush_send_queue(force=force)
+            result = self._mail.flush_send_queue(force=force)
         except Exception:
             log.exception("Failed to flush outbound send queue")
             return
-        if sent <= 0:
-            return
-        GLib.idle_add(self._on_send_queue_flushed, sent)
+        GLib.idle_add(self._on_send_queue_flushed, result)
 
     def _flush_operation_queue_idle(self) -> bool:
         get_mail_io_thread().submit(self._flush_operation_queue_worker)
@@ -637,14 +636,24 @@ class MainWindow(Adw.ApplicationWindow):
             self._set_status(f"Synced {flushed} queued drafts to Drafts")
         return False
 
-    def _on_send_queue_flushed(self, sent: int) -> bool:
+    def _on_send_queue_flushed(self, result) -> bool:
+        from post.mail.eds import FlushSendQueueResult
+
+        if not isinstance(result, FlushSendQueueResult):
+            result = FlushSendQueueResult(sent=int(result))
         self._on_outbox_changed()
-        if sent <= 0:
+        if result.failed_account_uid:
+            self._sidebar.refresh_account_online_marker(result.failed_account_uid)
+        if result.error_message:
+            show_error_toast(self, result.error_message)
+            self._set_status(result.error_message)
             return False
-        if sent == 1:
+        if result.sent <= 0:
+            return False
+        if result.sent == 1:
             self._set_status("Sent 1 queued message")
         else:
-            self._set_status(f"Sent {sent} queued messages")
+            self._set_status(f"Sent {result.sent} queued messages")
         return False
 
     def _on_outbox_changed(self) -> None:
@@ -1818,9 +1827,51 @@ class MainWindow(Adw.ApplicationWindow):
         return self
 
     def _prompt_account_password(
-        self, account_label: str, _mechanism: str | None
+        self,
+        account_label: str,
+        _mechanism: str | None,
+        reason: str | None = None,
     ) -> str | None:
-        return prompt_password_sync(self._interaction_parent_window(), account_label)
+        from post.mail.auth import PasswordPromptReason
+
+        prompt_reason: PasswordPromptReason | None = None
+        if reason in ("check_mail", "send_mail"):
+            prompt_reason = reason  # type: ignore[assignment]
+        password = prompt_password_sync(
+            self._interaction_parent_window(),
+            account_label,
+            reason=prompt_reason,
+        )
+        if password is None:
+            # Cancel / empty sign-in: mark matching accounts as needing sign-in so
+            # the offline badge appears even when Camel continues with cache.
+            self._mark_accounts_need_sign_in(account_label)
+        return password
+
+    def _mark_accounts_need_sign_in(self, account_label: str) -> None:
+        label = (account_label or "").strip().casefold()
+        if not label:
+            return
+        try:
+            accounts = self._mail.list_accounts()
+        except Exception:
+            log.exception("Could not list accounts after password cancel")
+            return
+        for account in accounts:
+            candidates = {
+                (account.display_label or "").strip().casefold(),
+                (account.name or "").strip().casefold(),
+                (account.email or "").strip().casefold(),
+                (account.from_address or "").strip().casefold(),
+            }
+            if label in candidates:
+                self._mail.set_account_connect_health(account.uid, "needs_sign_in")
+
+    def _on_account_health_changed(self, account_uid: str) -> bool:
+        sidebar = getattr(self, "_sidebar", None)
+        if sidebar is not None:
+            sidebar.refresh_account_online_marker(account_uid)
+        return False
 
     def _reload_sidebar(self) -> bool:
         self._sync_watcher.set_current_folder(None, None)
