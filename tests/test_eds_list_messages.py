@@ -120,6 +120,21 @@ class ReadPathDispatchTests(unittest.TestCase):
         )
         self.assertEqual(result, (3, 10))
 
+    @mock.patch("post.mail.eds.run_on_mail_thread")
+    def test_get_account_folder_stats_uses_mail_thread(
+        self, run_on_mail_thread
+    ) -> None:
+        run_on_mail_thread.return_value = {"INBOX": (1, 2)}
+        service = MailService(registry=mock.Mock())
+
+        result = service.get_account_folder_stats("acct-1")
+
+        run_on_mail_thread.assert_called_once_with(
+            service._get_account_folder_stats_unlocked,
+            "acct-1",
+        )
+        self.assertEqual(result, {"INBOX": (1, 2)})
+
 
 class FolderStatsOfflineFallbackTests(unittest.TestCase):
     def test_returns_memory_index_when_offline(self) -> None:

@@ -141,6 +141,21 @@ def folder_can_contain_messages(folder: dict) -> bool:
     return True
 
 
+def folder_names_for_count_refresh(folders: list[dict]) -> list[str]:
+    """Return full names of folders whose unread/total badges should be polled."""
+    names: list[str] = []
+    for folder in folders:
+        full_name = folder.get("full_name")
+        if not full_name:
+            continue
+        if is_post_local_folder(full_name):
+            continue
+        if not folder_can_contain_messages(folder):
+            continue
+        names.append(full_name)
+    return names
+
+
 def find_trash_folder(
     folders: list[dict],
     *,

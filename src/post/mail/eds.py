@@ -2555,6 +2555,18 @@ class MailService:
             self._get_folder_stats_unlocked, account_uid, folder_name
         )
 
+    def get_account_folder_stats(
+        self, account_uid: str
+    ) -> dict[str, tuple[int, int]]:
+        """Return unread/total for all folders via store folder-info REFRESH.
+
+        Uses IMAP STATUS-style folder info instead of opening each Camel.Folder
+        (avoids Folder::changed storms and heavy per-folder refresh_info_sync).
+        """
+        return run_on_mail_thread(
+            self._get_account_folder_stats_unlocked, account_uid
+        )
+
     def create_folder(
         self,
         account_uid: str,
@@ -2801,6 +2813,51 @@ class MailService:
                         return cached
                 raise
             return folder.get_unread_message_count(), folder.get_message_count()
+
+    def _get_account_folder_stats_unlocked(
+        self, account_uid: str
+    ) -> dict[str, tuple[int, int]]:
+        with self._lock:
+            store = self._get_store_unlocked(account_uid)
+        if not self._network_available:
+            cached = self._folder_tree_cache.get(account_uid) or []
+            return {
+                name: (int(folder.get("unread", -1)), int(folder.get("total", -1)))
+                for folder in cached
+                if (name := folder.get("full_name"))
+            }
+        flags = (
+            Camel.StoreGetFolderInfoFlags.RECURSIVE
+            | Camel.StoreGetFolderInfoFlags.REFRESH
+        )
+        try:
+            root = store.get_folder_info_sync(None, flags, None)
+        except GLib.Error as exc:
+            if is_network_unavailable_error(exc):
+                cached = self._folder_tree_cache.get(account_uid) or []
+                return {
+                    name: (
+                        int(folder.get("unread", -1)),
+                        int(folder.get("total", -1)),
+                    )
+                    for folder in cached
+                    if (name := folder.get("full_name"))
+                }
+            raise
+        if root is None:
+            return {}
+        folders: list[dict] = []
+        walk_folder_info(root, folders)
+        stats: dict[str, tuple[int, int]] = {}
+        for folder in folders:
+            full_name = folder.get("full_name")
+            if not full_name:
+                continue
+            stats[full_name] = (
+                int(folder.get("unread", -1)),
+                int(folder.get("total", -1)),
+            )
+        return stats
 
     @staticmethod
     def pick_default_account(accounts: list[MailAccount]) -> MailAccount | None:
