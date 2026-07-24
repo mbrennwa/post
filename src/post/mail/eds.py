@@ -391,6 +391,8 @@ class MailService:
     )
     # Concurrent folder-list loads (one per account at startup) each register a
     # cancellable. Preempt cancels the whole set; registering must not cancel siblings.
+    # Also used for other long Camel ops (folder-info REFRESH, refresh_info_sync)
+    # so interactive message loads can abort them.
     _folder_list_cancellables: set[Gio.Cancellable] = field(
         default_factory=set, init=False, repr=False
     )
@@ -2817,35 +2819,44 @@ class MailService:
     def _get_account_folder_stats_unlocked(
         self, account_uid: str
     ) -> dict[str, tuple[int, int]]:
-        with self._lock:
-            store = self._get_store_unlocked(account_uid)
-        if not self._network_available:
+        def _stats_from_cached_tree() -> dict[str, tuple[int, int]]:
             cached = self._folder_tree_cache.get(account_uid) or []
             return {
                 name: (int(folder.get("unread", -1)), int(folder.get("total", -1)))
                 for folder in cached
                 if (name := folder.get("full_name"))
             }
+
+        with self._lock:
+            store = self._get_store_unlocked(account_uid)
+        if not self._network_available:
+            return _stats_from_cached_tree()
         flags = (
             Camel.StoreGetFolderInfoFlags.RECURSIVE
             | Camel.StoreGetFolderInfoFlags.REFRESH
         )
+        cancellable = Gio.Cancellable()
+        self._register_folder_list_cancellable(cancellable)
         try:
-            root = store.get_folder_info_sync(None, flags, None)
+            if cancellable.is_cancelled():
+                return _stats_from_cached_tree()
+            root = store.get_folder_info_sync(None, flags, cancellable)
         except GLib.Error as exc:
+            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                return _stats_from_cached_tree()
             if is_network_unavailable_error(exc):
-                cached = self._folder_tree_cache.get(account_uid) or []
-                return {
-                    name: (
-                        int(folder.get("unread", -1)),
-                        int(folder.get("total", -1)),
-                    )
-                    for folder in cached
-                    if (name := folder.get("full_name"))
-                }
+                return _stats_from_cached_tree()
             raise
+        finally:
+            self._unregister_folder_list_cancellable(cancellable)
+        # Camel M365 can fail without setting GError (#156); keep prior counts.
         if root is None:
-            return {}
+            log.warning(
+                "Folder stats refresh failed for account %s without GError; "
+                "keeping prior cache if any",
+                account_uid,
+            )
+            return _stats_from_cached_tree()
         folders: list[dict] = []
         walk_folder_info(root, folders)
         stats: dict[str, tuple[int, int]] = {}
@@ -3822,7 +3833,18 @@ class MailService:
 
         try:
             if sync:
-                folder.refresh_info_sync(None)
+                cancellable = Gio.Cancellable()
+                self._register_folder_list_cancellable(cancellable)
+                try:
+                    if cancellable.is_cancelled():
+                        raise GLib.Error.new_literal(
+                            Gio.io_error_quark(),
+                            "Operation was cancelled",
+                            Gio.IOErrorEnum.CANCELLED,
+                        )
+                    folder.refresh_info_sync(cancellable)
+                finally:
+                    self._unregister_folder_list_cancellable(cancellable)
             unread = folder.get_unread_message_count()
             total = folder.get_message_count()
 
@@ -3851,6 +3873,8 @@ class MailService:
                 total=total,
             )
         except GLib.Error as exc:
+            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                raise
             if self._is_missing_folder_error(exc):
                 log.debug(
                     "Skipping unavailable folder %r for account %s",

@@ -303,6 +303,11 @@ def flag_menu_items(flagged_states: list[bool]) -> list[str]:
     return items
 
 
+def should_offer_send_again(*, selection_count: int, source_is_sent: bool) -> bool:
+    """Return True when the message context menu should offer Send Again."""
+    return selection_count == 1 and source_is_sent
+
+
 def reader_toggle_button_state(flags: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Return reader toolbar read/flag toggle presentation for *flags*.
 

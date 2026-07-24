@@ -135,6 +135,48 @@ class ReadPathDispatchTests(unittest.TestCase):
         )
         self.assertEqual(result, {"INBOX": (1, 2)})
 
+    def test_account_folder_stats_falls_back_when_refresh_returns_none(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        service._folder_tree_cache["acct-1"] = [
+            {"full_name": "INBOX", "unread": 4, "total": 9},
+            {"full_name": "Sent", "unread": 0, "total": 2},
+        ]
+        store = mock.Mock()
+        store.get_folder_info_sync.return_value = None
+
+        with mock.patch.object(service, "_get_store_unlocked", return_value=store):
+            stats = service._get_account_folder_stats_unlocked("acct-1")
+
+        self.assertEqual(stats, {"INBOX": (4, 9), "Sent": (0, 2)})
+        store.get_folder_info_sync.assert_called_once()
+        cancellable = store.get_folder_info_sync.call_args.args[2]
+        self.assertIsNotNone(cancellable)
+
+    def test_account_folder_stats_falls_back_when_refresh_cancelled(self) -> None:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import Gio, GLib
+
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        service._folder_tree_cache["acct-1"] = [
+            {"full_name": "INBOX", "unread": 1, "total": 3},
+        ]
+        store = mock.Mock()
+        store.get_folder_info_sync.side_effect = GLib.Error.new_literal(
+            Gio.io_error_quark(),
+            "Operation was cancelled",
+            Gio.IOErrorEnum.CANCELLED,
+        )
+
+        with mock.patch.object(service, "_get_store_unlocked", return_value=store):
+            stats = service._get_account_folder_stats_unlocked("acct-1")
+
+        self.assertEqual(stats, {"INBOX": (1, 3)})
+
 
 class FolderStatsOfflineFallbackTests(unittest.TestCase):
     def test_returns_memory_index_when_offline(self) -> None:
