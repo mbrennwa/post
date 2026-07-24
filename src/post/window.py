@@ -56,7 +56,9 @@ from post.mail.search import (
     format_search_filter_progress,
     format_search_result_meta,
     format_search_target_label,
+    group_list_keys_by_location,
     parse_search_query,
+    parse_search_row_key,
     query_requires_body_scan,
     search_filter_progress_fraction,
 )
@@ -1461,18 +1463,25 @@ class MainWindow(Adw.ApplicationWindow):
         self._present_compose_window(account, mode="new")
 
     def _open_compose_on_message(self, mode: str) -> None:
-        if (
-            not self._current_account
-            or not self._current_folder
-            or not self._current_message_uid
-        ):
+        if not self._current_message_uid:
             prompt = "Select a message to forward" if mode == "forward" else "Select a message to reply"
             self._set_status(prompt)
+            return
+        list_key = self._current_message_uid
+        location = self._message_location_for_list_key(list_key)
+        if location is None:
+            prompt = "Select a message to forward" if mode == "forward" else "Select a message to reply"
+            self._set_status(prompt)
+            return
+        account_uid, folder_name, message_uid = location
+        try:
+            account = self._mail.get_account(account_uid)
+        except ValueError:
+            self._set_status("Selected account is no longer available")
             return
         if not self._mail.list_sendable_accounts():
             self._set_status("No mail account configured for sending")
             return
-        account = self._current_account
         if not account.can_send:
             self._set_status("Selected account has no mail transport configured")
             return
@@ -1482,9 +1491,6 @@ class MainWindow(Adw.ApplicationWindow):
             )
             return
 
-        account_uid = account.uid
-        folder_name = self._current_folder
-        message_uid = self._current_message_uid
         preparing = "Preparing forward…" if mode == "forward" else "Preparing reply…"
         self._set_status(preparing)
 
@@ -2055,6 +2061,9 @@ class MainWindow(Adw.ApplicationWindow):
                             self._current_folder,
                             message_uid,
                         )
+        parsed = parse_search_row_key(list_key)
+        if parsed is not None:
+            return parsed
         if (
             self._current_account
             and self._current_folder
@@ -3992,15 +4001,39 @@ class MainWindow(Adw.ApplicationWindow):
         uids = self._uids_for_menu(uid)
         self._context_message_uids = uids
 
+        locations: list[tuple[str, str, str]] = []
+        for list_key in uids:
+            location = self._message_location_for_list_key(list_key)
+            if location is not None:
+                locations.append(location)
+
         can_archive = False
         can_trash = False
-        viewing_outbox = is_post_outbox_folder(self._current_folder or "")
-        if self._current_account and self._current_folder:
-            state = self._sidebar.get_move_menu_state(
-                self._current_account.uid, self._current_folder
+        viewing_outbox = False
+        if locations:
+            non_outbox = [
+                (account_uid, folder_name)
+                for account_uid, folder_name, _message_uid in locations
+                if not is_post_outbox_folder(folder_name)
+            ]
+            viewing_outbox = not non_outbox
+            can_archive = bool(non_outbox) and all(
+                bool(
+                    self._sidebar.get_move_menu_state(account_uid, folder_name).get(
+                        "can_archive"
+                    )
+                )
+                for account_uid, folder_name in non_outbox
             )
-            can_archive = bool(state.get("can_archive"))
-            can_trash = bool(state.get("can_trash"))
+            can_trash = all(
+                is_post_outbox_folder(folder_name)
+                or bool(
+                    self._sidebar.get_move_menu_state(account_uid, folder_name).get(
+                        "can_trash"
+                    )
+                )
+                for account_uid, folder_name, _message_uid in locations
+            )
 
         self._archive_action.set_enabled(can_archive)
         self._trash_action.set_enabled(can_trash)
@@ -4244,59 +4277,77 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> None:
         if not uids:
             return
-        if account_uid is None:
-            if not self._current_account:
-                return
-            account_uid = self._current_account.uid
-        if folder_name is None:
-            if not self._current_folder:
-                return
-            folder_name = self._current_folder
 
-        state = self._sidebar.get_move_menu_state(account_uid, folder_name)
-        if destination == "archive" and not state.get("can_archive"):
-            return
-        if destination == "trash" and not state.get("can_trash"):
-            return
-
-        uids = list(uids)
-        self._message_popover.popdown()
-
-        if is_post_outbox_folder(folder_name) and destination == "trash":
-            self._delete_queued_messages(uids)
-            return
-
-        self._clear_move_undo()
-        self._suppress_sync_list_reload = (account_uid, folder_name)
-
-        def worker() -> None:
-            error: Exception | None = None
-            result: dict | None = None
-            try:
-                if destination == "trash":
-                    result = self._mail.move_messages_to_trash(
-                        account_uid, folder_name, uids
-                    )
-                else:
-                    result = self._mail.archive_messages(
-                        account_uid, folder_name, uids
-                    )
-            except Exception as exc:
-                log.exception("Failed to move messages to %s", destination)
-                error = exc
-            GLib.idle_add(
-                self._on_messages_moved,
-                account_uid,
-                folder_name,
-                uids,
-                destination,
-                result,
-                error,
+        # Explicit location (reader window): *uids* are Camel message UIDs.
+        if account_uid is not None and folder_name is not None:
+            groups: dict[tuple[str, str], list[tuple[str, str]]] = {
+                (account_uid, folder_name): [(uid, uid) for uid in uids]
+            }
+        else:
+            # List/context selection: *uids* are list keys (plain or search).
+            groups = group_list_keys_by_location(
+                list(uids), self._message_location_for_list_key
             )
+        if not groups:
+            return
+
+        self._message_popover.popdown()
+        self._clear_move_undo()
 
         label = "Trash" if destination == "trash" else "Archive"
-        self._set_status(f"Moving {len(uids)} message(s) to {label}…")
-        get_mail_io_thread().submit(worker)
+        total_messages = sum(len(pairs) for pairs in groups.values())
+        self._set_status(f"Moving {total_messages} message(s) to {label}…")
+
+        for (group_account, group_folder), pairs in groups.items():
+            list_keys = [list_key for list_key, _message_uid in pairs]
+            message_uids = [message_uid for _list_key, message_uid in pairs]
+
+            state = self._sidebar.get_move_menu_state(group_account, group_folder)
+            if destination == "archive" and not state.get("can_archive"):
+                continue
+            if destination == "trash" and not (
+                state.get("can_trash") or is_post_outbox_folder(group_folder)
+            ):
+                continue
+
+            if is_post_outbox_folder(group_folder) and destination == "trash":
+                self._delete_queued_messages(message_uids)
+                continue
+
+            self._suppress_sync_list_reload = (group_account, group_folder)
+
+            def worker(
+                *,
+                account_uid: str = group_account,
+                folder_name: str = group_folder,
+                camel_uids: list[str] = list(message_uids),
+                ui_keys: list[str] = list(list_keys),
+            ) -> None:
+                error: Exception | None = None
+                result: dict | None = None
+                try:
+                    if destination == "trash":
+                        result = self._mail.move_messages_to_trash(
+                            account_uid, folder_name, camel_uids
+                        )
+                    else:
+                        result = self._mail.archive_messages(
+                            account_uid, folder_name, camel_uids
+                        )
+                except Exception as exc:
+                    log.exception("Failed to move messages to %s", destination)
+                    error = exc
+                GLib.idle_add(
+                    self._on_messages_moved,
+                    account_uid,
+                    folder_name,
+                    ui_keys,
+                    destination,
+                    result,
+                    error,
+                )
+
+            get_mail_io_thread().submit(worker)
 
     def _on_messages_dropped(
         self,
@@ -4616,11 +4667,11 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_total = max(0, self._message_total - count_delta)
 
         if removed_count > 0 and self._current_folder_messages:
-            moved_uids = set(uids)
+            moved_keys = set(uids)
             self._current_folder_messages = [
                 message
                 for message in self._current_folder_messages
-                if message.get("uid") not in moved_uids
+                if self._message_list_key(message) not in moved_keys
             ]
 
         if removed_count == 0 and moved_count > 0:
@@ -4667,98 +4718,109 @@ class MainWindow(Adw.ApplicationWindow):
         flagged: bool | None = None,
         uids: list[str] | None = None,
     ) -> None:
-        if uids is None:
-            uids = list(self._context_message_uids)
-        if not uids or not self._current_account or not self._current_folder:
+        list_keys = list(uids if uids is not None else self._context_message_uids)
+        if not list_keys:
             return
 
-        account_uid = self._current_account.uid
-        folder_name = self._current_folder
+        groups = group_list_keys_by_location(
+            list_keys, self._message_location_for_list_key
+        )
+        if not groups:
+            return
 
+        updates_by_list_key: dict[str, dict] = {}
+        folder_count_updates: list[tuple[str, str, int, int]] = []
+        any_queued = False
         error: Exception | None = None
-        result: dict | None = None
-        try:
-            if flag_name == "seen":
-                assert seen is not None
-                result = self._mail.set_messages_seen(
-                    account_uid, folder_name, uids, seen=seen
-                )
-            else:
-                assert flagged is not None
-                result = self._mail.set_messages_flagged(
-                    account_uid, folder_name, uids, flagged=flagged
-                )
-        except Exception as exc:
-            log.exception("Failed to update message %s", flag_name)
-            error = exc
-        self._on_messages_flag_toggled(uids, flag_name, result, error)
 
-    def _on_messages_flag_toggled(
+        for (account_uid, folder_name), pairs in groups.items():
+            message_uids = [message_uid for _list_key, message_uid in pairs]
+            list_key_by_uid = {
+                message_uid: list_key for list_key, message_uid in pairs
+            }
+            try:
+                if flag_name == "seen":
+                    assert seen is not None
+                    result = self._mail.set_messages_seen(
+                        account_uid, folder_name, message_uids, seen=seen
+                    )
+                else:
+                    assert flagged is not None
+                    result = self._mail.set_messages_flagged(
+                        account_uid, folder_name, message_uids, flagged=flagged
+                    )
+            except Exception as exc:
+                log.exception("Failed to update message %s", flag_name)
+                error = exc
+                break
+
+            for item in result.get("updates") or []:
+                camel_uid = item.get("uid")
+                list_key = list_key_by_uid.get(str(camel_uid)) if camel_uid else None
+                if list_key is None:
+                    continue
+                updates_by_list_key[list_key] = dict(item.get("flags") or {})
+            if result.get("queued"):
+                any_queued = True
+            if flag_name == "seen":
+                unread = result.get("folder_unread")
+                total = result.get("folder_total")
+                if unread is not None and total is not None:
+                    folder_count_updates.append(
+                        (account_uid, folder_name, int(unread), int(total))
+                    )
+
+        self._apply_message_flag_updates(
+            updates_by_list_key,
+            flag_name,
+            folder_count_updates=folder_count_updates,
+            queued=any_queued,
+            error=error,
+        )
+
+    def _apply_message_flag_updates(
         self,
-        uids: list[str],
+        updates_by_list_key: dict[str, dict],
         flag_name: str,
-        result: dict | None,
+        *,
+        folder_count_updates: list[tuple[str, str, int, int]],
+        queued: bool,
         error: Exception | None,
-    ) -> bool:
+    ) -> None:
         if error is not None:
             show_error_toast(self, f"Could not update messages: {error}")
-            return False
-        if result is None:
-            return False
+            return
+        if not updates_by_list_key and not folder_count_updates:
+            return
 
-        updates_by_uid = {
-            item["uid"]: item.get("flags") or {}
-            for item in result.get("updates") or []
-            if item.get("uid")
-        }
-        for uid in uids:
-            if uid not in updates_by_uid:
-                continue
-            flags = dict(updates_by_uid[uid])
-            self._message_list_view.update_message_flags(uid, flags)
-            self._update_message_flags_in_folder_cache(uid, flags)
-            if uid == self._current_message_uid and self._current_message is not None:
+        for list_key, flags in updates_by_list_key.items():
+            self._message_list_view.update_message_flags(list_key, flags)
+            self._update_message_flags_in_folder_cache(list_key, flags)
+            if list_key == self._current_message_uid and self._current_message is not None:
                 current_flags = dict(self._current_message.get("flags") or {})
                 current_flags.update(flags)
                 self._current_message["flags"] = current_flags
+                self._reader_pane.update_message_flags(dict(flags))
 
-        if self._current_message_uid in updates_by_uid:
-            self._reader_pane.update_message_flags(
-                dict(updates_by_uid[self._current_message_uid])
-            )
-
-        for uid, flags in updates_by_uid.items():
+            location = self._message_location_for_list_key(list_key)
+            reader_uid = location[2] if location is not None else list_key
             for window in self._reader_windows:
-                window.notify_flags_updated(uid, dict(flags))
+                window.notify_flags_updated(reader_uid, dict(flags))
 
-        if self._current_account and self._current_folder:
-            self._suppress_sync_list_reload = (
-                self._current_account.uid,
-                self._current_folder,
-            )
+        for account_uid, folder_name, unread, total in folder_count_updates:
+            self._suppress_sync_list_reload = (account_uid, folder_name)
+            self._sidebar.update_folder_row(account_uid, folder_name, unread, total)
 
-        if flag_name == "seen" and self._current_account and self._current_folder:
-            unread = result.get("folder_unread")
-            total = result.get("folder_total")
-            if unread is not None and total is not None:
-                self._sidebar.update_folder_row(
-                    self._current_account.uid,
-                    self._current_folder,
-                    unread,
-                    total,
-                )
-
-        count = len(updates_by_uid)
-        if result.get("queued"):
+        count = len(updates_by_list_key)
+        if queued:
             if count == 1:
                 self._set_status("Queued 1 action — will sync when online")
             elif count > 1:
                 self._set_status(f"Queued {count} actions — will sync when online")
             self._refresh_status_display()
-            return False
+            return
         if count > 1:
             self._set_status(f"Updated {count} messages")
-        return False
 
     def _on_message_list_selection_changed(self) -> None:
         GLib.idle_add(self._on_message_list_selection_changed_idle)
@@ -4824,16 +4886,38 @@ class MainWindow(Adw.ApplicationWindow):
         )
         self._set_message_actions_sensitive(can_use_reader_actions)
 
-        has_selection = bool(selected)
         can_archive = False
         can_trash = False
-        if has_selection and self._current_account and self._current_folder:
-            if self._selected_message_source_matches_sidebar():
-                state = self._sidebar.get_move_menu_state(
-                    self._current_account.uid, self._current_folder
+        if selected:
+            locations = [
+                location
+                for list_key in selected
+                if (location := self._message_location_for_list_key(list_key))
+                is not None
+            ]
+            if locations:
+                non_outbox = [
+                    (account_uid, folder_name)
+                    for account_uid, folder_name, _message_uid in locations
+                    if not is_post_outbox_folder(folder_name)
+                ]
+                can_archive = bool(non_outbox) and all(
+                    bool(
+                        self._sidebar.get_move_menu_state(
+                            account_uid, folder_name
+                        ).get("can_archive")
+                    )
+                    for account_uid, folder_name in non_outbox
                 )
-                can_archive = bool(state.get("can_archive"))
-                can_trash = bool(state.get("can_trash"))
+                can_trash = all(
+                    is_post_outbox_folder(folder_name)
+                    or bool(
+                        self._sidebar.get_move_menu_state(
+                            account_uid, folder_name
+                        ).get("can_trash")
+                    )
+                    for account_uid, folder_name, _message_uid in locations
+                )
 
         self._header_archive_btn.set_sensitive(can_archive)
         self._header_trash_btn.set_sensitive(can_trash)
@@ -5216,9 +5300,17 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
     def _on_reader_window_flags_updated(self, uid: str, flags: dict) -> None:
-        self._message_list_view.update_message_flags(uid, flags)
-        self._update_message_flags_in_folder_cache(uid, flags)
-        if uid == self._current_message_uid and self._current_message is not None:
+        # Reader windows report Camel message UIDs; map back to the list key
+        # used by the message list (plain uid or search row key).
+        list_key = uid
+        if self._current_folder_messages:
+            for message in self._current_folder_messages:
+                if str(message.get("uid") or "") == uid:
+                    list_key = self._message_list_key(message)
+                    break
+        self._message_list_view.update_message_flags(list_key, flags)
+        self._update_message_flags_in_folder_cache(list_key, flags)
+        if list_key == self._current_message_uid and self._current_message is not None:
             current_flags = dict(self._current_message.get("flags") or {})
             current_flags.update(flags)
             self._current_message["flags"] = current_flags
@@ -5253,9 +5345,11 @@ class MainWindow(Adw.ApplicationWindow):
             self._reader_pane.set_actions_sensitive(True)
 
     def _notify_reader_windows_message_moved(self, uids: list[str]) -> None:
-        for window in self._reader_windows:
-            for uid in uids:
-                window.notify_message_moved(uid)
+        for list_key in uids:
+            location = self._message_location_for_list_key(list_key)
+            message_uid = location[2] if location is not None else list_key
+            for window in self._reader_windows:
+                window.notify_message_moved(message_uid)
 
     def _open_uri_externally(self, uri: str) -> None:
         try:
