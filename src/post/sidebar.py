@@ -42,11 +42,13 @@ from post.mail.folders import (
     resolve_sidebar_context_menu,
 )
 from post.mail.send_queue import (
-    OFFLINE_FOLDER_MESSAGE,
     count_queued_for_account,
+    format_folder_load_error,
     is_network_unavailable_error,
+    is_sign_in_required_error,
     log_mail_error,
 )
+from post.mail.account_status import account_not_online_badge
 from post.preferences import (
     account_supports_user_offline,
     get_account_user_online,
@@ -71,6 +73,7 @@ OnFolderContentsChanged = Callable[[str, str], None]
 OnMoveStarted = Callable[[str, str], None]
 OnMoveUndoAvailable = Callable[[str, str, dict, str], None]
 OnAccountOnlineChanged = Callable[[str, bool], None]
+OnGoaReauthRequested = Callable[[str], None]
 OnMessagesDropped = Callable[[str, str, str, list[str]], None]
 FolderRefreshComplete = Callable[[int, int, Exception | None], None]
 AccountRefreshComplete = Callable[[int, Exception | None], None]
@@ -94,6 +97,7 @@ class MailSidebar:
         on_move_started: OnMoveStarted | None = None,
         on_move_undo_available: OnMoveUndoAvailable | None = None,
         on_account_online_changed: OnAccountOnlineChanged | None = None,
+        on_goa_reauth_requested: OnGoaReauthRequested | None = None,
         on_messages_dropped: OnMessagesDropped | None = None,
     ) -> None:
         self._mail = mail
@@ -110,9 +114,11 @@ class MailSidebar:
         self._on_move_started = on_move_started
         self._on_move_undo_available = on_move_undo_available
         self._on_account_online_changed = on_account_online_changed
+        self._on_goa_reauth_requested = on_goa_reauth_requested
         self._on_messages_dropped = on_messages_dropped
         self._network_available = True
         self._account_offline_icons: dict[str, Gtk.Image] = {}
+        self._inbox_offline_icons: dict[str, Gtk.Image] = {}
 
         self._accounts: list[MailAccount] = []
         self._accounts_by_uid: dict[str, MailAccount] = {}
@@ -195,6 +201,10 @@ class MailSidebar:
 
         if len(self._accounts) > 1:
             self._sidebar_box.append(self._make_inbox_section_loading())
+            # Seed Inboxes immediately so degraded accounts (expired GOA, etc.)
+            # stay visible even if folder-list fails or is cancelled/retried.
+            for account in self._accounts:
+                self._add_inbox_row_unavailable(account.uid)
 
         self._folder_loads_pending = len(self._accounts)
         for account in self._accounts:
@@ -215,11 +225,24 @@ class MailSidebar:
                 ):
                     row.unread = unread
                     row.total = total
-                    label = row.get_child()
-                    if isinstance(label, Gtk.Label):
+                    label = self._folder_row_label(row)
+                    if label is not None:
                         display = getattr(row, "display_name", folder_name)
                         label.set_label(format_folder_label(display, unread, total))
                 row = row.get_next_sibling()
+
+    @staticmethod
+    def _folder_row_label(row: Gtk.ListBoxRow) -> Gtk.Label | None:
+        child = row.get_child()
+        if isinstance(child, Gtk.Label):
+            return child
+        if isinstance(child, Gtk.Box):
+            widget = child.get_first_child()
+            while widget is not None:
+                if isinstance(widget, Gtk.Label):
+                    return widget
+                widget = widget.get_next_sibling()
+        return None
 
     def get_move_menu_state(self, account_uid: str, folder_name: str) -> dict:
         if is_post_outbox_folder(folder_name):
@@ -246,6 +269,7 @@ class MailSidebar:
 
     def set_network_available(self, available: bool) -> None:
         self._network_available = available
+        self.refresh_all_account_online_markers()
 
     def refresh_outbox_row(self, account_uid: str) -> None:
         count = count_queued_for_account(account_uid)
@@ -506,6 +530,7 @@ class MailSidebar:
         *,
         unread: int,
         total: int,
+        is_unified_inbox: bool = False,
     ) -> dict[str, bool]:
         import gi
 
@@ -537,6 +562,8 @@ class MailSidebar:
             network_available=self._network_available,
             account_user_online=get_account_user_online(account_uid),
             account_offline_toggle_enabled=account_supports_user_offline(backend),
+            account_connect_health=self._mail.get_account_connect_health(account_uid),
+            is_unified_inbox=is_unified_inbox,
         )
 
     def _build_context_menu_model(self, state: dict[str, bool]) -> Gio.Menu:
@@ -597,34 +624,88 @@ class MailSidebar:
             self._on_refresh_folder(account_uid, folder_name)
 
     def _on_take_offline_activate(self, *_args) -> None:
+        # Dismiss before Camel work so the menu cannot stick if I/O is busy.
+        self._hide_context_popover()
         self._set_account_user_online(False)
 
     def _on_take_online_activate(self, *_args) -> None:
+        self._hide_context_popover()
         self._set_account_user_online(True)
 
     def _set_account_user_online(self, online: bool) -> None:
         if self._context_target is None:
             return
         account_uid = self._context_target["account_uid"]
-        if self._context_target.get("folder_name") is not None:
+        folder_name = self._context_target.get("folder_name")
+        is_unified_inbox = bool(self._context_target.get("is_unified_inbox"))
+        # Account headers (folder_name is None) or unified Inboxes rows.
+        if folder_name is not None and not is_unified_inbox:
             return
         account = self._accounts_by_uid.get(account_uid)
         if account is None or not account_supports_user_offline(account.backend):
             return
-        if get_account_user_online(account_uid) == online:
+        if online:
+            health = self._mail.get_account_connect_health(account_uid)
+            needs_goa_sign_in = (
+                health == "needs_sign_in" and self._mail.account_uses_goa(account_uid)
+            )
+            if not get_account_user_online(account_uid):
+                self._mail.set_account_user_online(account_uid, True)
+                self._update_account_offline_marker(account_uid)
+                if self._on_account_online_changed is not None:
+                    self._on_account_online_changed(account_uid, True)
+            if needs_goa_sign_in:
+                # Expired M365/GOA tokens cannot be fixed by reconnect alone.
+                if self._mail.open_online_accounts_settings():
+                    self._set_status(
+                        "Sign in again in Settings → Online Accounts, "
+                        "then return here to reconnect"
+                    )
+                else:
+                    self._set_status(
+                        "Open Settings → Online Accounts to sign in again"
+                    )
+                if self._on_goa_reauth_requested is not None:
+                    self._on_goa_reauth_requested(account_uid)
+                return
+            if health != "ok" and self._on_refresh_account is not None:
+                # Password IMAP / other degraded: retry connect (may prompt).
+                self._on_refresh_account(account_uid)
             return
-        self._mail.set_account_user_online(account_uid, online)
-        self._update_account_offline_marker(account_uid)
-        if self._on_account_online_changed is not None:
-            self._on_account_online_changed(account_uid, online)
+        if get_account_user_online(account_uid):
+            self._mail.set_account_user_online(account_uid, False)
+            self._update_account_offline_marker(account_uid)
+            if self._on_account_online_changed is not None:
+                self._on_account_online_changed(account_uid, False)
 
     def _update_account_offline_marker(self, account_uid: str) -> None:
-        icon = self._account_offline_icons.get(account_uid)
-        if icon is not None:
-            icon.set_visible(not get_account_user_online(account_uid))
+        account = self._accounts_by_uid.get(account_uid)
+        remote = account_supports_user_offline(
+            account.backend if account is not None else None
+        )
+        show, tooltip = account_not_online_badge(
+            user_online=get_account_user_online(account_uid),
+            connect_health=self._mail.get_account_connect_health(account_uid),
+            network_available=self._network_available,
+            remote_account=remote,
+        )
+        for icon in (
+            self._account_offline_icons.get(account_uid),
+            self._inbox_offline_icons.get(account_uid),
+        ):
+            if icon is None:
+                continue
+            icon.set_visible(show)
+            if tooltip:
+                icon.set_tooltip_text(tooltip)
 
     def refresh_account_online_marker(self, account_uid: str) -> None:
         self._update_account_offline_marker(account_uid)
+
+    def refresh_all_account_online_markers(self) -> None:
+        uids = set(self._account_offline_icons) | set(self._inbox_offline_icons)
+        for account_uid in uids:
+            self._update_account_offline_marker(account_uid)
 
     def _on_new_folder_activate(self, *_args) -> None:
         self._prompt_and_create_folder(parent_folder_name=None)
@@ -966,6 +1047,7 @@ class MailSidebar:
         *,
         account_uid: str,
         folder_name: str | None,
+        is_unified_inbox: bool = False,
     ) -> None:
         gesture = Gtk.GestureClick()
         gesture.set_button(0)
@@ -975,6 +1057,7 @@ class MailSidebar:
             self._on_sidebar_context_pressed,
             account_uid,
             folder_name,
+            is_unified_inbox,
         )
         widget.add_controller(gesture)
 
@@ -986,6 +1069,7 @@ class MailSidebar:
         y: float,
         account_uid: str,
         folder_name: str | None,
+        is_unified_inbox: bool = False,
         *,
         unread: int = -1,
         total: int = -1,
@@ -1006,6 +1090,8 @@ class MailSidebar:
             unread = int(getattr(row, "unread", unread))
             total = int(getattr(row, "total", total))
             display_name = getattr(row, "display_name", display_name)
+            if getattr(row, "is_unified_inbox", False):
+                is_unified_inbox = True
 
         if is_post_outbox_folder(folder_name):
             total = count_queued_for_account(account_uid)
@@ -1016,6 +1102,7 @@ class MailSidebar:
             folder_name,
             unread=unread,
             total=total,
+            is_unified_inbox=is_unified_inbox,
         )
         self._context_target = {
             "account_uid": account_uid,
@@ -1024,9 +1111,12 @@ class MailSidebar:
             "unread": unread,
             "total": total,
             "read_count": state.get("read_count", 0),
+            "is_unified_inbox": is_unified_inbox,
         }
 
         menu = self._build_context_menu_model(state)
+        if menu.get_n_items() == 0:
+            return
         self._hide_context_popover()
         self._context_popover = Gtk.PopoverMenu.new_from_model(menu)
         self._context_popover.set_has_arrow(False)
@@ -1129,11 +1219,7 @@ class MailSidebar:
         self._clear_listbox(folder_list)
 
         if error is not None:
-            label_text = (
-                OFFLINE_FOLDER_MESSAGE
-                if is_network_unavailable_error(error)
-                else f"Could not load folders: {error}"
-            )
+            label_text = format_folder_load_error(error)
             error_label = Gtk.Label(
                 label=label_text,
                 xalign=0,
@@ -1145,6 +1231,18 @@ class MailSidebar:
             error_label.set_margin_bottom(8)
             folder_list.append(self._wrap_list_row(error_label))
             self._add_outbox_row(account_uid)
+            health = self._mail.get_account_connect_health(account_uid)
+            if health == "ok":
+                if is_network_unavailable_error(error):
+                    new_health = "not_connected"
+                elif is_sign_in_required_error(error):
+                    new_health = "needs_sign_in"
+                else:
+                    new_health = "not_connected"
+                self._mail.set_account_connect_health(account_uid, new_health)
+            # Keep offline/degraded accounts visible in the unified Inboxes list.
+            self._add_inbox_row_unavailable(account_uid)
+            self._update_account_offline_marker(account_uid)
             self._folder_loads_pending -= 1
             self._maybe_apply_initial_selection()
             self._finish_account_reload(account_uid, 0, error)
@@ -1160,6 +1258,7 @@ class MailSidebar:
         self._add_outbox_row(account_uid)
         self._add_inbox_row(account_uid, folders)
         self.refresh_inbox_counts(account_uid)
+        self._update_account_offline_marker(account_uid)
 
         self._folder_loads_pending -= 1
         self._maybe_apply_initial_selection()
@@ -1205,6 +1304,8 @@ class MailSidebar:
         self._folder_lists.clear()
         self._account_folders.clear()
         self._account_inbox_folders.clear()
+        self._account_offline_icons.clear()
+        self._inbox_offline_icons.clear()
         self._inbox_expander = None
         self._inbox_list = None
 
@@ -1291,8 +1392,6 @@ class MailSidebar:
         self._inbox_list = inbox_list
         self._inbox_expander = expander
 
-        inbox_list.append(self._make_loading_row("Loading Inboxes…"))
-
         expander.set_child(inbox_list)
         return expander
 
@@ -1308,27 +1407,51 @@ class MailSidebar:
         if inbox_folder is None:
             return
 
+        self._replace_inbox_row(account_uid, inbox_folder)
+
+    def _add_inbox_row_unavailable(self, account_uid: str) -> None:
+        """Show a degraded/offline account in Inboxes even when folder list failed."""
+        if self._inbox_list is None:
+            return
+        cached_name = self._account_inbox_folders.get(account_uid)
+        if not cached_name:
+            cached_name = self._mail.get_inbox_folder_name_cached(account_uid)
+        inbox_name = cached_name or "INBOX"
+        inbox_folder = {
+            "full_name": inbox_name,
+            "display_name": "Inbox",
+            "unread": -1,
+            "total": -1,
+            "flags": 0,
+        }
+        self._replace_inbox_row(account_uid, inbox_folder)
+
+    def _replace_inbox_row(self, account_uid: str, inbox_folder: dict) -> None:
+        if self._inbox_list is None:
+            return
+
         row = self._inbox_list.get_first_child()
         while row is not None:
             next_row = row.get_next_sibling()
-            if getattr(row, "account_uid", None) == account_uid or (
-                getattr(row, "folder_name", None) is None
-            ):
+            if getattr(row, "account_uid", None) == account_uid:
                 self._inbox_list.remove(row)
             row = next_row
 
         account = self._accounts_by_uid.get(account_uid)
         display = account.display_label if account else account_uid
         full_name = inbox_folder.get("full_name")
-        if full_name:
+        if isinstance(full_name, str) and full_name:
             self._account_inbox_folders[account_uid] = full_name
         self._inbox_list.append(
-            self._make_folder_row(account_uid, inbox_folder, display=display)
+            self._make_folder_row(
+                account_uid, inbox_folder, display=display, show_offline_badge=True
+            )
         )
         row = self._inbox_list.get_last_child()
         if isinstance(row, Gtk.ListBoxRow):
             self._setup_inbox_row_drag(row)
         self._sort_inbox_list()
+        self._update_account_offline_marker(account_uid)
 
     def _current_inbox_order_from_list(self) -> list[str]:
         if self._inbox_list is None:
@@ -1471,8 +1594,8 @@ class MailSidebar:
         offline_icon = Gtk.Image.new_from_icon_name("network-offline-symbolic")
         offline_icon.set_tooltip_text("Account Offline")
         offline_icon.add_css_class("dim-label")
-        offline_icon.set_visible(not get_account_user_online(account.uid))
         self._account_offline_icons[account.uid] = offline_icon
+        self._update_account_offline_marker(account.uid)
         box.append(label)
         box.append(offline_icon)
         self._attach_refresh_menu(box, account_uid=account.uid, folder_name=None)
@@ -1501,6 +1624,7 @@ class MailSidebar:
         folder: dict,
         *,
         display: str | None = None,
+        show_offline_badge: bool = False,
     ) -> Gtk.ListBoxRow:
         if display is None:
             display = folder.get("display_name") or folder.get("full_name") or "?"
@@ -1508,19 +1632,35 @@ class MailSidebar:
         total = folder.get("total", -1)
         label_text = format_folder_label(display, unread, total)
 
-        label = Gtk.Label(label=label_text, xalign=0, margin_start=12, margin_end=12)
+        label = Gtk.Label(label=label_text, xalign=0, hexpand=True)
+        label.set_margin_start(12)
+        label.set_margin_end(6 if show_offline_badge else 12)
         row = Gtk.ListBoxRow()
-        row.set_child(label)
+        if show_offline_badge:
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            offline_icon = Gtk.Image.new_from_icon_name("network-offline-symbolic")
+            offline_icon.add_css_class("dim-label")
+            offline_icon.set_margin_end(12)
+            offline_icon.set_visible(False)
+            self._inbox_offline_icons[account_uid] = offline_icon
+            box.append(label)
+            box.append(offline_icon)
+            row.set_child(box)
+            self._update_account_offline_marker(account_uid)
+        else:
+            row.set_child(label)
         row.account_uid = account_uid
         row.folder_name = folder.get("full_name")
         row.display_name = display
         row.unread = unread
         row.total = total
+        row.is_unified_inbox = show_offline_badge
         if row.folder_name:
             self._attach_refresh_menu(
                 row,
                 account_uid=account_uid,
                 folder_name=row.folder_name,
+                is_unified_inbox=show_offline_badge,
             )
             self._setup_folder_row_drop(row)
         return row

@@ -209,9 +209,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.connect("close-request", self._on_close_request)
         self.connect("notify::width", self._on_window_size_changed)
         self.connect("notify::height", self._on_window_size_changed)
+        self.connect("notify::is-active", self._on_is_active_changed)
         self._close_after_outbound_send = False
         self._delayed_send_close_dialog: Adw.AlertDialog | None = None
         self._is_closing = False
+        self._pending_goa_reauth: set[str] = set()
 
         self._mail = MailService.connect()
         self._send_delay_scheduler = OutboundSendDelayScheduler(
@@ -219,6 +221,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_outbox_changed=self._on_outbox_changed,
         )
         self._mail.set_password_prompt(self._prompt_account_password)
+        self._mail.set_account_health_changed_callback(self._on_account_health_changed)
         self._sync_watcher = MailSyncWatcher(
             self._mail,
             on_folder_changed=self._on_sync_folder_changed,
@@ -368,6 +371,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_move_started=self._on_sidebar_move_started,
             on_move_undo_available=self._on_sidebar_move_undo_available,
             on_account_online_changed=self._on_account_online_changed,
+            on_goa_reauth_requested=self._on_goa_reauth_requested,
             on_messages_dropped=self._on_messages_dropped,
         )
         sidebar_widget = self._sidebar.widget
@@ -581,13 +585,11 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _flush_send_queue_worker(self, *, force: bool = False) -> None:
         try:
-            sent = self._mail.flush_send_queue(force=force)
+            result = self._mail.flush_send_queue(force=force)
         except Exception:
             log.exception("Failed to flush outbound send queue")
             return
-        if sent <= 0:
-            return
-        GLib.idle_add(self._on_send_queue_flushed, sent)
+        GLib.idle_add(self._on_send_queue_flushed, result)
 
     def _flush_operation_queue_idle(self) -> bool:
         get_mail_io_thread().submit(self._flush_operation_queue_worker)
@@ -637,14 +639,24 @@ class MainWindow(Adw.ApplicationWindow):
             self._set_status(f"Synced {flushed} queued drafts to Drafts")
         return False
 
-    def _on_send_queue_flushed(self, sent: int) -> bool:
+    def _on_send_queue_flushed(self, result) -> bool:
+        from post.mail.eds import FlushSendQueueResult
+
+        if not isinstance(result, FlushSendQueueResult):
+            result = FlushSendQueueResult(sent=int(result))
         self._on_outbox_changed()
-        if sent <= 0:
+        if result.failed_account_uid:
+            self._sidebar.refresh_account_online_marker(result.failed_account_uid)
+        if result.error_message:
+            show_error_toast(self, result.error_message)
+            self._set_status(result.error_message)
             return False
-        if sent == 1:
+        if result.sent <= 0:
+            return False
+        if result.sent == 1:
             self._set_status("Sent 1 queued message")
         else:
-            self._set_status(f"Sent {sent} queued messages")
+            self._set_status(f"Sent {result.sent} queued messages")
         return False
 
     def _on_outbox_changed(self) -> None:
@@ -1034,6 +1046,35 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _account_server_sync_enabled(self, account_uid: str) -> bool:
         return self._network_available and not account_is_user_offline(account_uid)
+
+    def _on_goa_reauth_requested(self, account_uid: str) -> None:
+        """Remember account to reconnect after Online Accounts re-auth."""
+        self._pending_goa_reauth.add(account_uid)
+
+    def _on_is_active_changed(self, *_args) -> None:
+        """After returning from GOA Settings, drop stale stores and reload."""
+        if not self.get_property("is-active"):
+            return
+        if not self._pending_goa_reauth:
+            return
+        pending = list(self._pending_goa_reauth)
+        self._pending_goa_reauth.clear()
+        for account_uid in pending:
+            self._reconnect_account_after_goa_reauth(account_uid)
+
+    def _reconnect_account_after_goa_reauth(self, account_uid: str) -> None:
+        label = self._sidebar.account_display_label(account_uid)
+        self._set_status(f"Reconnecting {label}…")
+
+        def work() -> None:
+            self._mail._invalidate_account_connection_unlocked(account_uid)
+            GLib.idle_add(self._finish_goa_reauth_reconnect, account_uid)
+
+        get_mail_io_thread().submit_front(work)
+
+    def _finish_goa_reauth_reconnect(self, account_uid: str) -> bool:
+        self._on_sidebar_refresh_account(account_uid)
+        return False
 
     def _on_sidebar_refresh_account(self, account_uid: str) -> None:
         if not self._network_available:
@@ -1818,9 +1859,63 @@ class MainWindow(Adw.ApplicationWindow):
         return self
 
     def _prompt_account_password(
-        self, account_label: str, _mechanism: str | None
+        self,
+        account_label: str,
+        _mechanism: str | None,
+        reason: str | None = None,
+        service_uid: str | None = None,
     ) -> str | None:
-        return prompt_password_sync(self._interaction_parent_window(), account_label)
+        from post.mail.auth import PasswordPromptReason
+
+        prompt_reason: PasswordPromptReason | None = None
+        if reason in ("check_mail", "send_mail"):
+            prompt_reason = reason  # type: ignore[assignment]
+        password = prompt_password_sync(
+            self._interaction_parent_window(),
+            account_label,
+            reason=prompt_reason,
+        )
+        if password is None:
+            # Cancel / empty sign-in: mark the account immediately so the offline
+            # badge appears even when Camel continues with a local cache.
+            self._mark_service_needs_sign_in(service_uid, account_label)
+        return password
+
+    def _mark_service_needs_sign_in(
+        self, service_uid: str | None, account_label: str
+    ) -> None:
+        account_uid = None
+        if service_uid:
+            account_uid = self._mail.resolve_account_uid_for_service(service_uid)
+        if account_uid:
+            self._mail.set_account_connect_health(account_uid, "needs_sign_in")
+            return
+        self._mark_accounts_need_sign_in(account_label)
+
+    def _mark_accounts_need_sign_in(self, account_label: str) -> None:
+        label = (account_label or "").strip().casefold()
+        if not label:
+            return
+        try:
+            accounts = self._mail.list_accounts()
+        except Exception:
+            log.exception("Could not list accounts after password cancel")
+            return
+        for account in accounts:
+            candidates = {
+                (account.display_label or "").strip().casefold(),
+                (account.name or "").strip().casefold(),
+                (account.email or "").strip().casefold(),
+                (account.from_address or "").strip().casefold(),
+            }
+            if label in candidates:
+                self._mail.set_account_connect_health(account.uid, "needs_sign_in")
+
+    def _on_account_health_changed(self, account_uid: str) -> bool:
+        sidebar = getattr(self, "_sidebar", None)
+        if sidebar is not None:
+            sidebar.refresh_account_online_marker(account_uid)
+        return False
 
     def _reload_sidebar(self) -> bool:
         self._sync_watcher.set_current_folder(None, None)
