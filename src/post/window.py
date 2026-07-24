@@ -228,6 +228,8 @@ class MainWindow(Adw.ApplicationWindow):
             on_folder_tree_changed=self._on_sync_folder_tree_changed,
         )
         self._mail.set_sync_setup_cancel_callback(self._sync_watcher.cancel_setup)
+        self._folder_count_poll_timer_id: int | None = None
+        self._folder_count_poll_deferred_id: int | None = None
         self._current_account: MailAccount | None = None
         self._current_folder: str | None = None
         self._current_message_uid: str | None = None
@@ -826,7 +828,7 @@ class MainWindow(Adw.ApplicationWindow):
             window.destroy()
 
     def _finish_close(self) -> bool:
-        self._sync_watcher.stop()
+        self._stop_sync_watcher()
         try:
             self._mail.shutdown_sync()
         except Exception:
@@ -1185,10 +1187,9 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_accounts_loaded(self, account_uids: list[str]) -> None:
         self._sync_watcher.set_accounts(account_uids)
         if any(not account_is_user_offline(uid) for uid in account_uids):
-            if not self._sync_watcher.running:
-                self._sync_watcher.start()
-        elif self._sync_watcher.running:
-            self._sync_watcher.stop()
+            self._start_sync_watcher()
+        else:
+            self._stop_sync_watcher()
         self._rebuild_search_scope_dropdown(account_uids)
         self._maybe_show_offline_body_sync_prompt(account_uids)
 
@@ -1201,6 +1202,18 @@ class MainWindow(Adw.ApplicationWindow):
         # the real folder name instead of skipping while cache was empty (#153).
         if self._sync_watcher.running:
             self._sync_watcher.set_accounts(self._sidebar.account_uids())
+        # Defer the first all-folder count poll until after message list I/O
+        # has had a chance to run (#170).
+        if self._sync_watcher.running and self._folder_count_poll_deferred_id is None:
+            self._folder_count_poll_deferred_id = GLib.timeout_add_seconds(
+                5, self._on_deferred_folder_count_poll
+            )
+
+    def _on_deferred_folder_count_poll(self) -> bool:
+        self._folder_count_poll_deferred_id = None
+        if self._sync_watcher.running:
+            self._sidebar.refresh_all_folder_counts()
+        return False
 
     def _remote_sync_account_backends(self) -> frozenset[str]:
         return frozenset({"imap", "imapx", "ews", "microsoft365", "pop3"})
@@ -1286,8 +1299,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._sidebar.refresh_account_online_marker(account_uid)
         self._sync_watcher.set_accounts(self._sidebar.account_uids())
         if online:
-            if not self._sync_watcher.running:
-                self._sync_watcher.start()
+            self._start_sync_watcher()
             if (
                 self._current_account
                 and self._current_account.uid == account_uid
@@ -1300,7 +1312,7 @@ class MainWindow(Adw.ApplicationWindow):
                 not account_is_user_offline(uid)
                 for uid in self._sidebar.account_uids()
             ):
-                self._sync_watcher.stop()
+                self._stop_sync_watcher()
             if (
                 self._current_account
                 and self._current_account.uid == account_uid
@@ -1312,6 +1324,42 @@ class MainWindow(Adw.ApplicationWindow):
             self._set_status(f"{label} is online")
         else:
             self._set_status(f"{label} is offline")
+
+    def _start_sync_watcher(self) -> None:
+        if not self._sync_watcher.running:
+            self._sync_watcher.start()
+        self._start_folder_count_poll()
+
+    def _stop_sync_watcher(self) -> None:
+        self._stop_folder_count_poll()
+        if self._sync_watcher.running:
+            self._sync_watcher.stop()
+
+    def _start_folder_count_poll(self) -> None:
+        if self._folder_count_poll_timer_id is not None:
+            return
+        self._folder_count_poll_timer_id = GLib.timeout_add_seconds(
+            60, self._on_folder_count_poll_tick
+        )
+
+    def _stop_folder_count_poll(self) -> None:
+        timer_id = self._folder_count_poll_timer_id
+        if timer_id is not None:
+            GLib.source_remove(timer_id)
+            self._folder_count_poll_timer_id = None
+        deferred_id = self._folder_count_poll_deferred_id
+        if deferred_id is not None:
+            GLib.source_remove(deferred_id)
+            self._folder_count_poll_deferred_id = None
+        # Cancel any in-flight one-folder poll chain.
+        self._sidebar.cancel_folder_count_poll()
+
+    def _on_folder_count_poll_tick(self) -> bool:
+        if not self._sync_watcher.running:
+            self._folder_count_poll_timer_id = None
+            return False
+        self._sidebar.refresh_all_folder_counts()
+        return True
 
     def _on_sync_folder_changed(self, account_uid: str, folder_name: str) -> None:
         self._mail.invalidate_folder_index(account_uid, folder_name)
