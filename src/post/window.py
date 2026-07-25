@@ -46,7 +46,8 @@ from post.mail.folder_index_cache import (
 )
 from post.mail.message_list_state import (
     MESSAGE_LIST_UI_BATCH_SIZE,
-    message_list_fingerprint,
+    MESSAGE_LIST_UI_BIND_CAP,
+    message_lists_equivalent_for_ui,
     prepended_message_count,
 )
 from post.mail.search import (
@@ -1603,8 +1604,11 @@ class MainWindow(Adw.ApplicationWindow):
         if time.time() < self._local_draft_sync_suppress_until.get(key, 0):
             return True
         self._local_draft_sync_suppress_until.pop(key, None)
+        # Keep suppress for the whole in-flight move/archive — not one-shot.
+        # Graph fires multiple folder-changed events while Camel is still in
+        # transfer_messages_to_sync; clearing early queues a reload storm
+        # behind the hung mail I/O thread (#189).
         if self._suppress_sync_list_reload == key:
-            self._suppress_sync_list_reload = None
             return True
         return False
 
@@ -2697,15 +2701,19 @@ class MainWindow(Adw.ApplicationWindow):
         load_id: int,
         on_complete: Callable[[], None] | None = None,
     ) -> None:
+        # Keep full ``messages`` in ``_current_folder_messages``; only bind a
+        # capped prefix into Gtk.ListView so huge folders (M365 Archive) do not
+        # freeze the main thread creating thousands of GObjects.
+        bind_messages = messages[:MESSAGE_LIST_UI_BIND_CAP]
         batch_size = MESSAGE_LIST_UI_BATCH_SIZE
-        if len(messages) <= batch_size:
-            self._apply_folder_messages(messages, folder_name, account=account)
+        if len(bind_messages) <= batch_size:
+            self._apply_folder_messages(bind_messages, folder_name, account=account)
             if on_complete is not None:
                 on_complete()
             return
 
         self._message_list_populating = True
-        first_batch = messages[:batch_size]
+        first_batch = bind_messages[:batch_size]
         self._apply_folder_messages(first_batch, folder_name, account=account)
 
         def append_batches(offset: int) -> bool:
@@ -2713,10 +2721,10 @@ class MainWindow(Adw.ApplicationWindow):
                 self._message_list_populating = False
                 return False
             next_offset = offset + batch_size
-            batch = messages[offset:next_offset]
+            batch = bind_messages[offset:next_offset]
             if batch:
                 self._message_list_view.append_messages(batch, folder_name=folder_name)
-            if next_offset < len(messages):
+            if next_offset < len(bind_messages):
                 GLib.idle_add(append_batches, next_offset)
                 return False
             self._message_list_populating = False
@@ -2979,7 +2987,7 @@ class MainWindow(Adw.ApplicationWindow):
         if self._is_closing:
             return
         if snapshot is None:
-            self._mail.cancel_folder_list()
+            self._mail.cancel_folder_refresh()
             get_mail_io_thread().submit_front(fallback_worker)
             return
         search_query = self._search_query
@@ -3164,8 +3172,10 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Abort background folder-info REFRESH / refresh_info_sync so the new
         # folder load is not stuck behind Camel I/O (#170 hang on switch).
+        # Do not cancel sidebar tree list_folders — that thrash-cancels M365
+        # into permanent "Loading folders…".
         self._mail.cancel_folder_search()
-        self._mail.cancel_folder_list()
+        self._mail.cancel_folder_refresh()
         self._sidebar.cancel_folder_count_poll()
 
         display_folder = (
@@ -3321,6 +3331,25 @@ class MainWindow(Adw.ApplicationWindow):
         sync_after_send = use_background_sync and send_pending
 
         def schedule_background_sync() -> None:
+            # Full server re-index of multi-thousand folders (M365 Archive)
+            # blocks mail I/O and rebound the UI uncapped → lockup/OOM (#189).
+            if (
+                use_background_sync
+                and has_disk_cache
+                and folder_index_has_cache(account_uid, folder_name)
+            ):
+                snapshot = self._mail.get_folder_index_snapshot(
+                    account_uid, folder_name
+                )
+                cached_len = len(snapshot[0]) if snapshot is not None else 0
+                if cached_len > MESSAGE_LIST_UI_BIND_CAP:
+                    log.debug(
+                        "Skipping background sync for large folder %s/%s (%d msgs)",
+                        account_uid,
+                        folder_name,
+                        cached_len,
+                    )
+                    return
             if use_background_sync and not send_pending:
                 self._start_background_message_sync(
                     load_id,
@@ -3472,7 +3501,7 @@ class MainWindow(Adw.ApplicationWindow):
                 get_mail_io_thread().submit_front(worker_load_cached_header_index)
                 return
             if search_query is not None:
-                self._mail.cancel_folder_list()
+                self._mail.cancel_folder_refresh()
             search_trace("search_worker_submit_front", load_id=load_id)
             get_mail_io_thread().submit_front(worker_initial)
 
@@ -3855,9 +3884,11 @@ class MainWindow(Adw.ApplicationWindow):
                 self._sidebar.update_folder_row(account_uid, folder_name, unread, total)
 
         current = self._current_folder_messages or []
-        if (
-            message_list_fingerprint(messages) == message_list_fingerprint(current)
-            and self._message_total == total
+        if message_lists_equivalent_for_ui(
+            current,
+            messages,
+            current_total=self._message_total,
+            refreshed_total=total,
         ):
             GLib.idle_add(self._on_messages_sync_finished, load_id, False)
             return False
@@ -3867,6 +3898,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_list_source = "server"
         self._message_sync_in_progress = False
         self._messages_load_generation += 1
+        apply_load_id = self._messages_load_generation
         self._set_status(f"Refreshing {folder_name} From Server…")
 
         if not messages:
@@ -3888,14 +3920,27 @@ class MainWindow(Adw.ApplicationWindow):
         prepended = prepended_message_count(current, messages)
         if prepended > 0:
             self._apply_prepended_folder_messages(
-                messages[:prepended],
+                messages[: min(prepended, MESSAGE_LIST_UI_BIND_CAP)],
                 folder_name,
                 account=account,
             )
-        else:
-            self._apply_folder_messages(messages, folder_name, account=account)
-        if self._search_query is None:
-            self._try_restore_selected_message(account.uid, folder_name)
+            if self._search_query is None:
+                self._try_restore_selected_message(account.uid, folder_name)
+            return False
+
+        def after_refresh_list() -> None:
+            if self._search_query is None:
+                self._try_restore_selected_message(account.uid, folder_name)
+
+        # Must go through the bind-capped path — applying all messages here
+        # previously rebound 9k+ Archive rows and OOM-killed the process.
+        self._apply_messages_to_list(
+            messages,
+            folder_name,
+            account=account,
+            load_id=apply_load_id,
+            on_complete=after_refresh_list,
+        )
         return False
 
     def _try_restore_selected_message(self, account_uid: str, folder_name: str) -> None:
@@ -4328,6 +4373,17 @@ class MainWindow(Adw.ApplicationWindow):
 
             self._suppress_sync_list_reload = (group_account, group_folder)
 
+            # Optimistic UI: remove rows immediately so Archive doesn't look
+            # stuck while Camel transfer_messages_to_sync blocks (M365).
+            self._message_list_view.remove_uids(list_keys)
+            cleared_current = any(
+                key == self._current_message_uid for key in list_keys
+            )
+            if cleared_current:
+                self._clear_reader()
+                set_active_message_uid(None)
+                self._restore_message_folder = None
+
             def worker(
                 *,
                 account_uid: str = group_account,
@@ -4612,7 +4668,7 @@ class MainWindow(Adw.ApplicationWindow):
         *,
         status_label: str | None = None,
     ) -> None:
-        moved_count = len(result.get("moved_uids") or uids)
+        moved_count = len(result.get("moved_uids") or [])
         if status_label is None:
             status_label = self._move_status_label(destination, moved_count)
 
@@ -4659,6 +4715,14 @@ class MainWindow(Adw.ApplicationWindow):
             if self._suppress_sync_list_reload == suppress_key:
                 self._suppress_sync_list_reload = None
             show_error_toast(self, f"Could not move messages: {error}")
+            # Restore optimistic list removals.
+            if (
+                self._current_account
+                and self._current_folder
+                and self._current_account.uid == account_uid
+                and self._current_folder == folder_name
+            ):
+                self._load_messages(account_uid, folder_name, sync=False)
             return False
         if result is None:
             if self._suppress_sync_list_reload == suppress_key:
@@ -4673,28 +4737,24 @@ class MainWindow(Adw.ApplicationWindow):
             set_active_message_uid(None)
             self._restore_message_folder = None
 
-        moved_count = len(result.get("moved_uids") or uids)
+        moved_count = len(result.get("moved_uids") or [])
+        # Optimistic remove already dropped rows; still count them for totals.
         count_delta = removed_count if removed_count > 0 else moved_count
         if self._message_total >= 0:
             self._message_total = max(0, self._message_total - count_delta)
 
-        if removed_count > 0 and self._current_folder_messages:
-            moved_keys = set(uids)
+        moved_keys = set(uids)
+        if self._current_folder_messages is not None:
             self._current_folder_messages = [
                 message
                 for message in self._current_folder_messages
                 if self._message_list_key(message) not in moved_keys
             ]
 
-        if removed_count == 0 and moved_count > 0:
-            if (
-                self._current_account
-                and self._current_folder
-                and self._current_account.uid == account_uid
-                and self._current_folder == folder_name
-            ):
-                self._load_messages(account_uid, folder_name, sync=False)
-        elif self._message_list_view.item_count() == 0 and folder_name:
+        # Do not _load_messages on success: disk cache can still contain the
+        # moved UIDs and a reload resurrects them (Archive Trash looked like a
+        # no-op). Rows are already removed above / via optimistic UI.
+        if self._message_list_view.item_count() == 0 and folder_name:
             self._message_empty_label.set_label(
                 f"No Messages in {folder_name}"
             )
