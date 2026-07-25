@@ -702,6 +702,53 @@ class EnrichMessageDictFromMimeTests(unittest.TestCase):
         enrich_message_dict_from_mime(result, mime)
         self.assertEqual(result["reply_to"], "Author <author@example.com>")
 
+    def test_fills_unsubscribe_one_click(self) -> None:
+        result: dict = {}
+        mime = MagicMock()
+        mime.get_recipients.return_value = None
+        mime.get_header.side_effect = lambda name: {
+            "To": None,
+            "Cc": None,
+            "Bcc": None,
+            "List-Unsubscribe": (
+                "<mailto:off@example.com>, <https://example.com/unsub>"
+            ),
+            "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+        }.get(name)
+        enrich_message_dict_from_mime(result, mime)
+        self.assertEqual(
+            result["unsubscribe"],
+            {"kind": "post", "url": "https://example.com/unsub"},
+        )
+
+    def test_fills_unsubscribe_open_https(self) -> None:
+        result: dict = {}
+        mime = MagicMock()
+        mime.get_recipients.return_value = None
+        mime.get_header.side_effect = lambda name: {
+            "To": None,
+            "Cc": None,
+            "Bcc": None,
+            "List-Unsubscribe": "<https://example.com/leave>",
+        }.get(name)
+        enrich_message_dict_from_mime(result, mime)
+        self.assertEqual(
+            result["unsubscribe"],
+            {"kind": "open", "url": "https://example.com/leave"},
+        )
+
+    def test_omits_unsubscribe_without_headers(self) -> None:
+        result: dict = {}
+        mime = MagicMock()
+        mime.get_recipients.return_value = None
+        mime.get_header.side_effect = lambda name: {
+            "To": None,
+            "Cc": None,
+            "Bcc": None,
+        }.get(name)
+        enrich_message_dict_from_mime(result, mime)
+        self.assertNotIn("unsubscribe", result)
+
 
 if __name__ == "__main__":
     unittest.main()
