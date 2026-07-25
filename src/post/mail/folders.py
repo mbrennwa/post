@@ -61,6 +61,15 @@ def format_account_refresh_error(display_label: str) -> str:
     return f"Could not refresh folders for {display_label}"
 
 
+def format_startup_loading_accounts() -> str:
+    return "Loading accounts…"
+
+
+def format_startup_loading_folders(done: int, total: int) -> str:
+    noun = "account" if total == 1 else "accounts"
+    return f"Loading folders for {done} of {total} {noun}…"
+
+
 def guess_inbox_name(folders: list[dict]) -> str | None:
     for folder in folders:
         name = (folder.get("full_name") or "").upper()

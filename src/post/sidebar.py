@@ -35,6 +35,7 @@ from post.mail.folders import (
     find_inbox_folder,
     folder_names_for_count_refresh,
     format_folder_label,
+    format_startup_loading_folders,
     is_drafts_folder_name,
     is_sent_folder_name,
     is_post_outbox_folder,
@@ -142,6 +143,7 @@ class MailSidebar:
         self._account_inbox_folders: dict[str, str] = {}
         self._load_generation = 0
         self._folder_loads_pending = 0
+        self._startup_folder_total = 0
         # False until a folder-list load cycle has finished at least once.
         # Pending==0 alone is not enough: before load() starts (and during the
         # gap before pending is bumped), pending is also 0.
@@ -182,6 +184,7 @@ class MailSidebar:
         self._needs_initial_selection = True
         self._activated_folder = None
         self._folder_loads_pending = 0
+        self._startup_folder_total = 0
         self._folder_tree_ready = False
 
         try:
@@ -211,11 +214,14 @@ class MailSidebar:
                 self._add_inbox_row_unavailable(account.uid)
 
         self._folder_loads_pending = len(self._accounts)
+        self._startup_folder_total = len(self._accounts)
         for account in self._accounts:
             self._sidebar_box.append(self._make_account_section_loading(account))
             self._start_folder_load(load_id, account)
 
-        self._set_status(f"{len(self._accounts)} account(s)")
+        self._set_status(
+            format_startup_loading_folders(0, self._startup_folder_total)
+        )
 
     def update_folder_row(
         self, account_uid: str, folder_name: str, unread: int, total: int
@@ -1325,7 +1331,16 @@ class MailSidebar:
 
     def _release_folder_load_slot(self) -> None:
         self._folder_loads_pending = max(0, self._folder_loads_pending - 1)
+        self._update_startup_folder_load_status()
         self._maybe_finish_initial_folder_load()
+
+    def _update_startup_folder_load_status(self) -> None:
+        if self._folder_tree_ready or self._startup_folder_total <= 0:
+            return
+        done = self._startup_folder_total - self._folder_loads_pending
+        self._set_status(
+            format_startup_loading_folders(done, self._startup_folder_total)
+        )
 
     def _on_folders_loaded(
         self,
@@ -1373,6 +1388,7 @@ class MailSidebar:
             self._folder_loads_pending -= 1
             self._maybe_apply_initial_selection()
             self._finish_account_reload(account_uid, 0, error)
+            self._update_startup_folder_load_status()
             self._maybe_finish_initial_folder_load()
             return False
 
@@ -1392,6 +1408,7 @@ class MailSidebar:
         self._folder_loads_pending -= 1
         self._maybe_apply_initial_selection()
         self._finish_account_reload(account_uid, len(folders), None)
+        self._update_startup_folder_load_status()
         self._maybe_finish_initial_folder_load()
 
         return False
@@ -1400,6 +1417,9 @@ class MailSidebar:
         if self._folder_loads_pending > 0:
             return
         self._folder_tree_ready = True
+        if self._startup_folder_total > 0:
+            self._set_status(f"{len(self._accounts)} account(s)")
+            self._startup_folder_total = 0
         callback = self._on_initial_folder_load_complete
         if callback is not None:
             self._on_initial_folder_load_complete = None

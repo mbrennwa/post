@@ -88,6 +88,42 @@ class FolderTreeReadyTests(unittest.TestCase):
         self.sidebar._maybe_finish_initial_folder_load()
         self.assertTrue(self.sidebar.folder_tree_ready)
 
+    def test_load_reports_startup_folder_status_progress(self) -> None:
+        set_status = self.sidebar._set_status
+        self.sidebar._mail.list_accounts.return_value = [
+            _account("acct-1"),
+            _account("acct-2"),
+        ]
+        with (
+            mock.patch.object(self.sidebar, "_start_folder_load"),
+            mock.patch.object(
+                self.sidebar,
+                "_make_account_section_loading",
+                side_effect=lambda *_a, **_k: Gtk.Box(),
+            ),
+            mock.patch.object(
+                self.sidebar,
+                "_make_inbox_section_loading",
+                side_effect=lambda *_a, **_k: Gtk.Box(),
+            ),
+            mock.patch.object(self.sidebar, "_add_inbox_row_unavailable"),
+        ):
+            self.sidebar.load()
+
+        set_status.assert_called_with("Loading folders for 0 of 2 accounts…")
+        self.assertEqual(self.sidebar._startup_folder_total, 2)
+        self.assertEqual(self.sidebar._folder_loads_pending, 2)
+
+        self.sidebar._folder_loads_pending = 1
+        self.sidebar._update_startup_folder_load_status()
+        set_status.assert_called_with("Loading folders for 1 of 2 accounts…")
+
+        self.sidebar._folder_loads_pending = 0
+        self.sidebar._maybe_finish_initial_folder_load()
+        set_status.assert_called_with("2 account(s)")
+        self.assertEqual(self.sidebar._startup_folder_total, 0)
+        self.assertTrue(self.sidebar.folder_tree_ready)
+
     def test_folder_tree_ready_callback_fires_when_loads_complete(self) -> None:
         self.sidebar._folder_loads_pending = 1
         self.sidebar._maybe_finish_initial_folder_load()
