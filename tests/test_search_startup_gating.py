@@ -13,7 +13,13 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
 
 from post.mail.eds import MailAccount
-from post.preferences import SEARCH_SCOPE_ALL, SEARCH_SCOPE_FOLDER, SearchScope
+from post.mail.search import parse_search_query
+from post.preferences import (
+    SEARCH_SCOPE_ACCOUNT,
+    SEARCH_SCOPE_ALL,
+    SEARCH_SCOPE_FOLDER,
+    SearchScope,
+)
 from post.sidebar import MailSidebar
 from post.window import MainWindow
 
@@ -204,6 +210,55 @@ class SearchEntryStartupGatingTests(unittest.TestCase):
         set_search_scope.assert_not_called()
         self.window._set_search_scope_dropdown_selected.assert_not_called()
         self.window._leave_multi_folder_sidebar_mode.assert_not_called()
+
+
+class CachedHeaderSearchGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.window = mock.Mock()
+        self.window._search_scope = SearchScope(SEARCH_SCOPE_FOLDER)
+
+    def test_folder_scope_header_query_uses_cache_when_present(self) -> None:
+        query = parse_search_query("from:rebecca")
+        with mock.patch(
+            "post.window.folder_index_has_cache", return_value=True
+        ) as has_cache:
+            self.assertTrue(
+                MainWindow._should_use_cached_header_search(
+                    self.window, query, "acct-1", "INBOX"
+                )
+            )
+        has_cache.assert_called_once_with("acct-1", "INBOX")
+
+    def test_all_mail_header_query_skips_cache_fast_path(self) -> None:
+        self.window._search_scope = SearchScope(SEARCH_SCOPE_ALL)
+        query = parse_search_query("from:rebecca")
+        with mock.patch("post.window.folder_index_has_cache", return_value=True):
+            self.assertFalse(
+                MainWindow._should_use_cached_header_search(
+                    self.window, query, "acct-1", "INBOX"
+                )
+            )
+
+    def test_account_scope_header_query_skips_cache_fast_path(self) -> None:
+        self.window._search_scope = SearchScope(
+            SEARCH_SCOPE_ACCOUNT, account_uid="acct-other"
+        )
+        query = parse_search_query("from:rebecca")
+        with mock.patch("post.window.folder_index_has_cache", return_value=True):
+            self.assertFalse(
+                MainWindow._should_use_cached_header_search(
+                    self.window, query, "acct-1", "INBOX"
+                )
+            )
+
+    def test_folder_scope_text_query_skips_cache_fast_path(self) -> None:
+        query = parse_search_query("rebecca")
+        with mock.patch("post.window.folder_index_has_cache", return_value=True):
+            self.assertFalse(
+                MainWindow._should_use_cached_header_search(
+                    self.window, query, "acct-1", "INBOX"
+                )
+            )
 
 
 if __name__ == "__main__":

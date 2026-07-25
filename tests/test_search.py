@@ -10,6 +10,7 @@ from post.mail.search import (
     SearchTerm,
     filter_messages_by_query,
     parse_search_query,
+    query_requires_body_scan,
     query_to_sexp,
 )
 
@@ -178,7 +179,43 @@ class QueryToSexpTests(unittest.TestCase):
         )
 
 
+class QueryRequiresBodyScanTests(unittest.TestCase):
+    def test_header_and_boolean_terms_skip_body_scan(self) -> None:
+        for raw in ("from:rebecca", "to:bob", "subject:hi", "cc:alice", "is:read"):
+            with self.subTest(raw=raw):
+                query = parse_search_query(raw)
+                assert query is not None
+                self.assertFalse(query_requires_body_scan(query))
+
+    def test_text_and_body_terms_require_body_scan(self) -> None:
+        for raw in ("rebecca", "body:invoice", "invoice from:alice"):
+            with self.subTest(raw=raw):
+                query = parse_search_query(raw)
+                assert query is not None
+                self.assertTrue(query_requires_body_scan(query))
+
+
 class FilterMessagesByQueryTests(unittest.TestCase):
+    def test_from_prefix_matches_sender(self) -> None:
+        query = parse_search_query("from:rebecca")
+        assert query is not None
+        messages = [
+            {
+                "uid": "1",
+                "subject": "hello",
+                "from": "Rebecca Smith <rebecca@example.com>",
+                "flags": {"seen": True},
+            },
+            {
+                "uid": "2",
+                "subject": "rebecca in subject only",
+                "from": "Other <other@example.com>",
+                "flags": {"seen": True},
+            },
+        ]
+        matched = filter_messages_by_query(messages, query)
+        self.assertEqual([message["uid"] for message in matched], ["1"])
+
     def test_text_matches_headers(self) -> None:
         query = parse_search_query("klotz")
         assert query is not None
