@@ -317,6 +317,107 @@ class MessageMenuItemsTests(unittest.TestCase):
         self.assertNotEqual(sent_match["_search_folder"], "INBOX")
 
 
+class FetchAttachmentSearchLocationTests(unittest.TestCase):
+    """#180: attachment fetch must use search-hit location, not sidebar."""
+
+    def _window_for_search_hit(self, message: dict, *, sidebar_folder: str):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        account = SimpleNamespace(uid="acct-1")
+        window = SimpleNamespace(
+            _current_account=account,
+            _current_folder=sidebar_folder,
+            _current_folder_messages=[message],
+            _current_message_uid=str(message["_search_row_key"]),
+            _mail=mock.Mock(),
+        )
+        window._message_list_key = lambda msg: MainWindow._message_list_key(
+            window, msg
+        )
+        window._message_location_for_list_key = (
+            lambda list_key: MainWindow._message_location_for_list_key(
+                window, list_key
+            )
+        )
+        window._on_attachment_fetched = (
+            lambda filename, data, error, on_ready: MainWindow._on_attachment_fetched(
+                window, filename, data, error, on_ready
+            )
+        )
+        return window
+
+    def test_location_prefers_annotated_folder_over_sidebar(self) -> None:
+        from post.window import MainWindow
+
+        sent_match = annotate_search_match(
+            {"uid": "42", "subject": "with pdf"},
+            account_uid="acct-1",
+            folder_name="Sent",
+        )
+        window = self._window_for_search_hit(sent_match, sidebar_folder="INBOX")
+        location = MainWindow._message_location_for_list_key(
+            window, window._current_message_uid
+        )
+        self.assertEqual(location, ("acct-1", "Sent", "42"))
+        self.assertNotEqual(location[1], window._current_folder)
+        self.assertNotIn("\0", location[2])
+
+    def test_location_same_folder_search_still_uses_plain_uid(self) -> None:
+        from post.window import MainWindow
+
+        inbox_match = annotate_search_match(
+            {"uid": "7", "subject": "inbox hit"},
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        window = self._window_for_search_hit(inbox_match, sidebar_folder="INBOX")
+        location = MainWindow._message_location_for_list_key(
+            window, window._current_message_uid
+        )
+        self.assertEqual(location, ("acct-1", "INBOX", "7"))
+        self.assertEqual(window._current_message_uid, inbox_match["_search_row_key"])
+        self.assertNotEqual(location[2], window._current_message_uid)
+
+    def test_fetch_attachment_passes_resolved_location_not_list_key(self) -> None:
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        sent_match = annotate_search_match(
+            {"uid": "42", "subject": "with pdf"},
+            account_uid="acct-1",
+            folder_name="Sent",
+        )
+        window = self._window_for_search_hit(sent_match, sidebar_folder="INBOX")
+        window._mail.read_attachment_data.return_value = ("file.pdf", b"%PDF")
+
+        class _ImmediateMailIoThread:
+            def submit(self, func, /, *args, **kwargs) -> None:
+                func(*args, **kwargs)
+
+        def _run_idle_add(func, *args):
+            func(*args)
+            return False
+
+        on_ready = mock.Mock()
+        with (
+            mock.patch(
+                "post.window.get_mail_io_thread",
+                return_value=_ImmediateMailIoThread(),
+            ),
+            mock.patch("post.window.GLib.idle_add", side_effect=_run_idle_add),
+        ):
+            MainWindow._fetch_attachment(window, 0, on_ready)
+
+        window._mail.read_attachment_data.assert_called_once_with(
+            "acct-1", "Sent", "42", 0
+        )
+        on_ready.assert_called_once_with("file.pdf", b"%PDF", None)
+
+
 class ReaderToggleButtonStateTests(unittest.TestCase):
     def test_read_flagged_shows_unread_and_unflag_actions(self) -> None:
         state = reader_toggle_button_state({"seen": True, "flagged": True})
