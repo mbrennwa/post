@@ -453,7 +453,8 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
         self.assertFalse(state["show_refresh"])
         self.assertTrue(state["show_take_online"])
 
-    def test_refresh_hidden_when_needs_sign_in(self) -> None:
+    def test_refresh_shown_when_needs_sign_in(self) -> None:
+        # Refresh stays available while auth is degraded so GOA re-auth can retry.
         state = resolve_sidebar_context_menu(
             folders=self._folders(),
             folder_name=None,
@@ -468,7 +469,7 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
             account_connect_health="needs_sign_in",
             account_offline_toggle_enabled=True,
         )
-        self.assertFalse(state["show_refresh"])
+        self.assertTrue(state["show_refresh"])
         self.assertFalse(state["show_new_folder"])
         self.assertFalse(state["show_take_offline"])
         self.assertTrue(state["show_take_online"])
@@ -532,6 +533,7 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
         self.assertFalse(state["show_take_offline"])
         self.assertFalse(state["show_new_folder"])
         self.assertTrue(state["show_take_online"])
+        self.assertTrue(state["show_refresh"])
 
     def test_take_offline_shown_when_connected(self) -> None:
         state = resolve_sidebar_context_menu(
