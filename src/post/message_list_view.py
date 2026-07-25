@@ -215,6 +215,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         at_top = self._is_scrolled_to_top()
         self._folder_name = folder_name
         self._store.splice(0, 0, items)
+        # Prepend shifts every index; full rebuild is simplest and uncommon.
         self._rebuild_list_key_positions()
         if at_top:
             self._scroll_to_top_after_layout()
@@ -231,7 +232,11 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self._folder_name = folder_name
         position = self._store.get_n_items()
         self._store.splice(position, 0, items)
-        self._rebuild_list_key_positions()
+        # O(batch) — avoid full O(n) rebuild on every UI batch for large folders.
+        for item in items:
+            if item.list_key:
+                self._list_key_positions[item.list_key] = position
+            position += 1
 
     def remove_uids(self, uids: Iterable[str]) -> int:
         uid_set = set(uids)

@@ -955,6 +955,7 @@ class MailSidebar:
         status_label = f"Archived {read_count} read {noun}"
         if self._on_move_started is not None:
             self._on_move_started(account_uid, folder_name)
+        self._set_status(f"Archiving {read_count} read {noun}…")
         self._run_folder_operation(
             lambda: self._mail.archive_read_messages(account_uid, folder_name),
             success_status=status_label,
@@ -1001,6 +1002,9 @@ class MailSidebar:
         status_label = f"Archived {read_unflagged_count} read and unflagged {noun}"
         if self._on_move_started is not None:
             self._on_move_started(account_uid, folder_name)
+        self._set_status(
+            f"Archiving {read_unflagged_count} read and unflagged {noun}…"
+        )
         self._run_folder_operation(
             lambda: self._mail.archive_read_unflagged_messages(
                 account_uid, folder_name
@@ -1034,6 +1038,7 @@ class MailSidebar:
         status_label = f"Archived {total} {noun}"
         if self._on_move_started is not None:
             self._on_move_started(account_uid, folder_name)
+        self._set_status(f"Archiving {total} {noun}…")
         self._run_folder_operation(
             lambda: self._mail.archive_all_messages(account_uid, folder_name),
             success_status=status_label,
@@ -1168,7 +1173,10 @@ class MailSidebar:
             return
         archived_count = int(result.get("archived_count") or 0)
         if archived_count <= 0:
+            # Overwrite the premature success flash from _on_folder_operation_finished.
+            self._set_status("No messages were archived")
             return
+        self._set_status(status_label)
         if self._on_move_undo_available is not None:
             self._on_move_undo_available(
                 account_uid, folder_name, result, status_label
