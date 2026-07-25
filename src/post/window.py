@@ -21,6 +21,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from post.compose_window import ComposeWindow, SavedDraftNotification
 from post.credentials import prompt_password_sync
+from post.folder_dialogs import confirm_action
 from post.gtk_schedule import schedule_on_gtk_main
 from post.header_bar import add_end_window_controls
 from post.icon_utils import apply_window_icon
@@ -29,6 +30,7 @@ from post.mail.eds import MailAccount, MessageNotAvailableError, OfflineSyncProg
 from post.mail.io_thread import get_mail_io_thread
 from post.mail.sync_watcher import MailSyncWatcher
 from post.message_list_view import VirtualMessageList
+from post.open_uri import open_uri_externally
 from post.mail.folders import (
     POST_OUTBOX_FOLDER,
     format_account_refresh_done,
@@ -89,6 +91,7 @@ from post.settings_window import SettingsWindow
 from post.mail.helpers import (
     flag_menu_items,
     flag_menu_label,
+    perform_one_click_unsubscribe,
     read_menu_items,
     read_menu_label,
     should_offer_send_again,
@@ -481,6 +484,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_reply=self._on_reply_clicked,
             on_reply_all=self._on_reply_all_clicked,
             on_forward=self._on_forward_clicked,
+            on_unsubscribe=self._on_unsubscribe_clicked,
             on_attachment_clicked=self._on_reader_attachment_clicked,
             on_attachment_context_menu=self._on_reader_attachment_context_menu,
             on_open_uri=self._open_uri_externally,
@@ -1477,6 +1481,122 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_forward_clicked(self, *_args) -> None:
         self._open_compose_on_message("forward")
 
+    @staticmethod
+    def _unsubscribe_action_from_message(msg: dict | None) -> dict[str, str] | None:
+        if msg is None:
+            return None
+        action = msg.get("unsubscribe")
+        if not isinstance(action, dict):
+            return None
+        kind = action.get("kind")
+        url = action.get("url")
+        if kind in ("post", "open") and isinstance(url, str) and url:
+            return {"kind": kind, "url": url}
+        return None
+
+    def _unsubscribe_action_for_list_key(self, list_key: str) -> dict[str, str] | None:
+        if list_key == self._current_message_uid:
+            action = self._unsubscribe_action_from_message(self._current_message)
+            if action is not None:
+                return action
+        location = self._message_location_for_list_key(list_key)
+        if location is None:
+            return None
+        account_uid, folder_name, message_uid = location
+        for window in self._reader_windows:
+            if (
+                window.account_uid == account_uid
+                and window.folder_name == folder_name
+                and window.message_uid == message_uid
+            ):
+                return self._unsubscribe_action_from_message(window.current_message)
+        return None
+
+    def _on_unsubscribe_clicked(self, action: dict[str, str]) -> None:
+        self._run_unsubscribe_action(action, list_key=self._current_message_uid)
+
+    def _can_archive_list_key(self, list_key: str | None) -> bool:
+        if not list_key:
+            return False
+        location = self._message_location_for_list_key(list_key)
+        if location is None:
+            return False
+        account_uid, folder_name, _message_uid = location
+        return bool(
+            self._sidebar.get_move_menu_state(account_uid, folder_name).get(
+                "can_archive"
+            )
+        )
+
+    def _archive_after_unsubscribe(self, list_key: str | None) -> None:
+        if not list_key or not self._can_archive_list_key(list_key):
+            return
+        self._move_messages("archive", [list_key])
+
+    def _run_unsubscribe_action(
+        self,
+        action: dict[str, str],
+        *,
+        list_key: str | None = None,
+    ) -> None:
+        kind = action["kind"]
+        url = action["url"]
+        if kind == "open":
+            # Launch first so the click gesture still counts for focus activation.
+            self._open_uri_externally(url)
+            if url.lower().startswith("mailto:"):
+                show_toast(
+                    self,
+                    "Opening unsubscribe email…",
+                    priority=Adw.ToastPriority.HIGH,
+                )
+            else:
+                show_toast(
+                    self,
+                    "Opening unsubscribe page in your browser…",
+                    priority=Adw.ToastPriority.HIGH,
+                )
+            self._archive_after_unsubscribe(list_key)
+            return
+        if kind != "post":
+            return
+        will_archive = self._can_archive_list_key(list_key)
+        body = (
+            "Send a one-click unsubscribe request and archive this message?"
+            if will_archive
+            else "Send a one-click unsubscribe request for this mailing list?"
+        )
+        if not confirm_action(
+            self,
+            heading="Unsubscribe?",
+            body=body,
+            confirm_label="Unsubscribe",
+        ):
+            return
+
+        def worker() -> None:
+            error: Exception | None = None
+            try:
+                perform_one_click_unsubscribe(url)
+            except Exception as exc:
+                log.exception("One-click unsubscribe failed")
+                error = exc
+            GLib.idle_add(self._on_one_click_unsubscribe_done, error, list_key)
+
+        get_mail_io_thread().submit(worker)
+
+    def _on_one_click_unsubscribe_done(
+        self,
+        error: Exception | None,
+        list_key: str | None = None,
+    ) -> bool:
+        if error is not None:
+            show_error_toast(self, f"Unsubscribe failed: {error}")
+        else:
+            show_toast(self, "Unsubscribe request sent")
+            self._archive_after_unsubscribe(list_key)
+        return False
+
     def _compose_account(self) -> MailAccount | None:
         if self._current_account is not None:
             return self._current_account
@@ -1796,6 +1916,10 @@ class MainWindow(Adw.ApplicationWindow):
         send_again_action = Gio.SimpleAction.new("message-send-again", None)
         send_again_action.connect("activate", self._on_message_menu_send_again)
         self.add_action(send_again_action)
+
+        unsubscribe_action = Gio.SimpleAction.new("message-unsubscribe", None)
+        unsubscribe_action.connect("activate", self._on_message_menu_unsubscribe)
+        self.add_action(unsubscribe_action)
 
         self._outbox_edit_action = Gio.SimpleAction.new("message-outbox-edit", None)
         self._outbox_edit_action.connect("activate", self._on_message_menu_outbox_edit)
@@ -4168,6 +4292,8 @@ class MainWindow(Adw.ApplicationWindow):
                 menu.append("Reply", "win.message-reply")
                 menu.append("Reply All", "win.message-reply-all")
                 menu.append("Forward", "win.message-forward")
+                if self._unsubscribe_action_for_list_key(uids[0]) is not None:
+                    menu.append("Unsubscribe…", "win.message-unsubscribe")
                 location = self._message_location_for_list_key(uids[0])
                 source_is_sent = False
                 if location is not None:
@@ -4254,6 +4380,14 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_message_menu_forward(self, *_args) -> None:
         self._open_compose_on_message("forward")
+
+    def _on_message_menu_unsubscribe(self, *_args) -> None:
+        if len(self._context_message_uids) != 1:
+            return
+        list_key = self._context_message_uids[0]
+        action = self._unsubscribe_action_for_list_key(list_key)
+        if action is not None:
+            self._run_unsubscribe_action(action, list_key=list_key)
 
     def _on_message_menu_send_again(self, *_args) -> None:
         if len(self._context_message_uids) != 1:
@@ -5488,7 +5622,8 @@ class MainWindow(Adw.ApplicationWindow):
                 window.notify_message_moved(message_uid)
 
     def _open_uri_externally(self, uri: str) -> None:
-        try:
-            Gio.AppInfo.launch_default_for_uri(uri, None)
-        except GLib.Error as exc:
-            show_error_toast(self, f"Could not open link: {exc.message}")
+        open_uri_externally(
+            self,
+            uri,
+            on_error=lambda message: show_error_toast(self, message),
+        )

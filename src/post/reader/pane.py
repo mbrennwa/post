@@ -42,6 +42,7 @@ class MessageReaderPane(Gtk.Box):
         on_reply: Callable[[], None],
         on_reply_all: Callable[[], None],
         on_forward: Callable[[], None],
+        on_unsubscribe: Callable[[dict[str, str]], None],
         on_attachment_clicked: Callable[[int], None],
         on_attachment_context_menu: Callable[
             [Gtk.Widget, float, float, int, str | None, str], None
@@ -54,6 +55,7 @@ class MessageReaderPane(Gtk.Box):
         self._on_reply = on_reply
         self._on_reply_all = on_reply_all
         self._on_forward = on_forward
+        self._on_unsubscribe = on_unsubscribe
         self._on_attachment_clicked = on_attachment_clicked
         self._on_attachment_context_menu = on_attachment_context_menu
         self._on_open_uri = on_open_uri
@@ -135,6 +137,14 @@ class MessageReaderPane(Gtk.Box):
     def _build_message_action_buttons(self) -> Gtk.Widget:
         outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
 
+        self._unsubscribe_btn = self._make_message_action_button(
+            "list-remove-symbolic",
+            "Unsubscribe",
+            self._emit_unsubscribe,
+        )
+        self._unsubscribe_btn.set_visible(False)
+        outer.append(self._unsubscribe_btn)
+
         flag_group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         flag_group.add_css_class("linked")
 
@@ -190,6 +200,7 @@ class MessageReaderPane(Gtk.Box):
         return button
 
     def set_actions_sensitive(self, sensitive: bool) -> None:
+        self._unsubscribe_btn.set_sensitive(sensitive)
         self._read_toggle_btn.set_sensitive(sensitive)
         self._flag_toggle_btn.set_sensitive(sensitive)
         self._reply_btn.set_sensitive(sensitive)
@@ -197,6 +208,23 @@ class MessageReaderPane(Gtk.Box):
         self._forward_btn.set_sensitive(sensitive)
         if sensitive:
             self._refresh_toggle_buttons()
+
+    def _update_unsubscribe_button(self, msg: dict[str, Any] | None) -> None:
+        has_action = bool(msg and msg.get("unsubscribe"))
+        self._unsubscribe_btn.set_visible(has_action)
+
+    def _emit_unsubscribe(self) -> None:
+        msg = self._current_message
+        if msg is None:
+            return
+        action = msg.get("unsubscribe")
+        if not isinstance(action, dict):
+            return
+        kind = action.get("kind")
+        url = action.get("url")
+        if kind not in ("post", "open") or not isinstance(url, str) or not url:
+            return
+        self._on_unsubscribe({"kind": kind, "url": url})
 
     def update_toggle_buttons(self, flags: dict[str, Any]) -> None:
         toggles = reader_toggle_button_state(flags)
@@ -222,6 +250,7 @@ class MessageReaderPane(Gtk.Box):
         self._reader_subject.set_visible(True)
         self._reader_meta.set_label("")
         self._clear_attachments()
+        self._update_unsubscribe_button(None)
         self._message_actions.set_visible(False)
         self.set_actions_sensitive(False)
         self._reader_body_stack.set_visible_child_name("empty")
@@ -244,6 +273,7 @@ class MessageReaderPane(Gtk.Box):
         self._reader_subject.set_visible(True)
         self._reader_meta.set_label(format_reader_header(msg))
         self._show_attachments(msg.get("attachments") or [])
+        self._update_unsubscribe_button(msg)
         self._message_actions.set_visible(True)
         self.set_actions_sensitive(True)
         self._show_reader_document()
@@ -255,6 +285,7 @@ class MessageReaderPane(Gtk.Box):
         self._reader_subject.set_visible(False)
         self._reader_meta.set_label("")
         self._clear_attachments()
+        self._update_unsubscribe_button(None)
         self._message_actions.set_visible(False)
         self.set_actions_sensitive(False)
         self._reader_body_stack.set_visible_child_name("empty")
@@ -267,6 +298,7 @@ class MessageReaderPane(Gtk.Box):
         self._reader_subject.set_visible(True)
         self._reader_meta.set_label(message)
         self._clear_attachments()
+        self._update_unsubscribe_button(None)
         self._message_actions.set_visible(False)
         self.set_actions_sensitive(False)
         self._load_error_html(message)
@@ -279,6 +311,7 @@ class MessageReaderPane(Gtk.Box):
         self._reader_subject.set_visible(True)
         self._reader_meta.set_label(str(error))
         self._clear_attachments()
+        self._update_unsubscribe_button(None)
         self._message_actions.set_visible(False)
         self.set_actions_sensitive(False)
         self._load_error_html("This message could not be loaded.")
