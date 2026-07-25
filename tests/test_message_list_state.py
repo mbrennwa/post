@@ -154,6 +154,15 @@ class MessageBatchRangesTests(unittest.TestCase):
 
         self.assertEqual(MESSAGE_LIST_UI_BIND_CAP, 500)
 
+    def test_heavy_folder_name(self) -> None:
+        from post.mail.message_list_state import is_heavy_folder_name
+
+        self.assertTrue(is_heavy_folder_name("Archive"))
+        self.assertTrue(is_heavy_folder_name("INBOX/Archive"))
+        self.assertTrue(is_heavy_folder_name("[Google Mail]/All Mail"))
+        self.assertFalse(is_heavy_folder_name("Inbox"))
+        self.assertFalse(is_heavy_folder_name("Sent Items"))
+
     def test_lists_equivalent_samples_large_lists(self) -> None:
         from post.mail.message_list_state import message_lists_equivalent_for_ui
 

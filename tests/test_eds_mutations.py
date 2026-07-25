@@ -349,9 +349,10 @@ class TransferFinalizeTests(unittest.TestCase):
         service._transfer_uids_in_folder = mock.Mock(return_value=["opaque-1"])
         service._message_dicts_for_uids_unlocked = mock.Mock(return_value=[])
         service._remove_messages_from_cache = mock.Mock()
-        service._invalidate_folder_index = mock.Mock()
+        service._merge_moved_messages_into_dest_cache_unlocked = mock.Mock(return_value=(-1, -1))
         service._update_cached_folder_counts = mock.Mock()
         service._finalize_folder_transfer_unlocked = mock.Mock()
+        service._prune_folder_summary_uids_unlocked = mock.Mock()
 
         result = service._transfer_messages_unlocked(
             "acct-1",
@@ -364,6 +365,9 @@ class TransferFinalizeTests(unittest.TestCase):
         self.assertEqual(result["moved_uids"], ["opaque-1"])
         self.assertEqual(result["destination_folder"], "Archive")
         service._finalize_folder_transfer_unlocked.assert_called_once()
+        service._prune_folder_summary_uids_unlocked.assert_called_once_with(
+            source, ["opaque-1"]
+        )
 
     def test_finalize_skips_sync_and_refresh_for_microsoft365(self) -> None:
         service = MailService(registry=mock.Mock())
@@ -430,9 +434,10 @@ class TransferFinalizeTests(unittest.TestCase):
         service._transfer_uids_in_folder = mock.Mock(return_value=["opaque-1"])
         service._message_dicts_for_uids_unlocked = mock.Mock(return_value=[])
         service._remove_messages_from_cache = mock.Mock()
-        service._invalidate_folder_index = mock.Mock()
+        service._merge_moved_messages_into_dest_cache_unlocked = mock.Mock(return_value=(-1, -1))
         service._update_cached_folder_counts = mock.Mock()
         service._finalize_folder_transfer_unlocked = mock.Mock()
+        service._prune_folder_summary_uids_unlocked = mock.Mock()
 
         service._transfer_messages_unlocked(
             "acct-1",
@@ -446,6 +451,7 @@ class TransferFinalizeTests(unittest.TestCase):
         dest.freeze.assert_called_once()
         source.thaw.assert_called_once()
         dest.thaw.assert_called_once()
+        service._prune_folder_summary_uids_unlocked.assert_called_once()
 
     def test_transfer_timeout_soft_succeeds_when_source_uids_gone(self) -> None:
         import gi
@@ -480,8 +486,9 @@ class TransferFinalizeTests(unittest.TestCase):
         )
         service._finalize_folder_transfer_unlocked = mock.Mock()
         service._remove_messages_from_cache = mock.Mock()
-        service._invalidate_folder_index = mock.Mock()
+        service._merge_moved_messages_into_dest_cache_unlocked = mock.Mock(return_value=(-1, -1))
         service._update_cached_folder_counts = mock.Mock()
+        service._prune_folder_summary_uids_unlocked = mock.Mock()
 
         result = service._transfer_messages_unlocked(
             "acct-1",
@@ -494,6 +501,9 @@ class TransferFinalizeTests(unittest.TestCase):
         self.assertEqual(result["moved_uids"], ["opaque-1"])
         service._finalize_folder_transfer_unlocked.assert_called_once()
         service._remove_messages_from_cache.assert_called_once()
+        service._prune_folder_summary_uids_unlocked.assert_called_once_with(
+            source, ["opaque-1"]
+        )
 
     def test_transfer_timeout_raises_when_uids_still_present(self) -> None:
         import gi
@@ -531,7 +541,218 @@ class TransferFinalizeTests(unittest.TestCase):
             )
 
 
+class FolderSummaryPruneTests(unittest.TestCase):
+    def test_prune_removes_uids_touches_and_emits_changed(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        folder = mock.Mock()
+        summary = mock.Mock()
+        summary.remove_uids.return_value = True
+        folder.get_folder_summary.return_value = summary
+        changes = mock.Mock()
+        with mock.patch.object(Camel.FolderChangeInfo, "new", return_value=changes):
+            MailService._prune_folder_summary_uids_unlocked(
+                folder, ["opaque-1", "opaque-2"]
+            )
+
+        summary.remove_uids.assert_called_once_with(["opaque-1", "opaque-2"])
+        summary.touch.assert_called_once()
+        summary.save.assert_called_once()
+        self.assertEqual(changes.remove_uid.call_count, 2)
+        folder.changed.assert_called_once_with(changes)
+
+    def test_prune_falls_back_to_remove_uid(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        folder = mock.Mock()
+        summary = mock.Mock()
+        summary.remove_uids.side_effect = RuntimeError("batch unsupported")
+        summary.remove_uid.return_value = True
+        folder.get_folder_summary.return_value = summary
+        changes = mock.Mock()
+        with mock.patch.object(Camel.FolderChangeInfo, "new", return_value=changes):
+            MailService._prune_folder_summary_uids_unlocked(folder, ["uid-1"])
+
+        summary.remove_uid.assert_called_once_with("uid-1")
+        summary.touch.assert_called_once()
+        summary.save.assert_called_once()
+
+    def test_prune_failure_does_not_raise(self) -> None:
+        folder = mock.Mock()
+        folder.get_folder_summary.side_effect = RuntimeError("no summary")
+        MailService._prune_folder_summary_uids_unlocked(folder, ["uid-1"])
+
+
+class TransferBusyStateTests(unittest.TestCase):
+    def test_transfer_clears_busy_state_on_success(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        dest = mock.Mock()
+        dest.get_full_name.return_value = "Archive"
+        dest.get_unread_message_count.return_value = 0
+        dest.get_message_count.return_value = 1
+        source = mock.Mock()
+        source.transfer_messages_to_sync.return_value = (True, ["dest-1"])
+        source.get_unread_message_count.return_value = 0
+        source.get_message_count.return_value = 0
+        service._open_folder_unlocked = mock.Mock(return_value=source)
+        service._transfer_uids_in_folder = mock.Mock(return_value=["opaque-1"])
+        service._message_dicts_for_uids_unlocked = mock.Mock(return_value=[])
+        service._remove_messages_from_cache = mock.Mock()
+        service._merge_moved_messages_into_dest_cache_unlocked = mock.Mock(return_value=(-1, -1))
+        service._update_cached_folder_counts = mock.Mock()
+        service._finalize_folder_transfer_unlocked = mock.Mock()
+        service._prune_folder_summary_uids_unlocked = mock.Mock()
+
+        service._transfer_messages_unlocked(
+            "acct-1",
+            "Inbox",
+            ["opaque-1"],
+            dest,
+            op_type="archive",
+        )
+
+        self.assertEqual(service.get_account_transfer_state("acct-1"), "idle")
+
+    def test_m365_transfer_fails_fast_while_busy(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        service._accounts_by_uid["acct-1"] = mock.Mock(backend="microsoft365")
+        service.set_account_transfer_state("acct-1", "busy")
+        dest = mock.Mock()
+        dest.get_full_name.return_value = "Archive"
+        source = mock.Mock()
+        service._open_folder_unlocked = mock.Mock(return_value=source)
+        service._transfer_uids_in_folder = mock.Mock(return_value=["opaque-1"])
+
+        with self.assertRaises(RuntimeError) as ctx:
+            service._transfer_messages_unlocked(
+                "acct-1",
+                "Inbox",
+                ["opaque-1"],
+                dest,
+                op_type="archive",
+            )
+        self.assertIn("still in progress", str(ctx.exception))
+        source.transfer_messages_to_sync.assert_not_called()
+
+    def test_timeout_escalates_to_not_responding_then_clears(self) -> None:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import Gio, GLib
+
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        service._accounts_by_uid["acct-1"] = mock.Mock(backend="microsoft365")
+        dest = mock.Mock()
+        dest.get_full_name.return_value = "Archive"
+        source = mock.Mock()
+        states: list[str] = []
+
+        def timed_out_transfer(*_args, **_kwargs):
+            states.append(service.get_account_transfer_state("acct-1"))
+            # Simulate the watchdog timer firing while Camel is blocked.
+            service.set_account_transfer_state("acct-1", "not_responding")
+            states.append(service.get_account_transfer_state("acct-1"))
+            raise GLib.Error.new_literal(
+                Gio.io_error_quark(),
+                "Operation was cancelled",
+                Gio.IOErrorEnum.CANCELLED,
+            )
+
+        source.transfer_messages_to_sync.side_effect = timed_out_transfer
+        service._open_folder_unlocked = mock.Mock(return_value=source)
+        service._transfer_uids_in_folder = mock.Mock(return_value=["opaque-1"])
+        service._message_dicts_for_uids_unlocked = mock.Mock(return_value=[])
+        service._uids_missing_from_folder_unlocked = mock.Mock(
+            return_value=["opaque-1"]
+        )
+        service._finalize_folder_transfer_unlocked = mock.Mock()
+        service._prune_folder_summary_uids_unlocked = mock.Mock()
+        service._remove_messages_from_cache = mock.Mock()
+        service._merge_moved_messages_into_dest_cache_unlocked = mock.Mock(return_value=(-1, -1))
+        service._update_cached_folder_counts = mock.Mock()
+
+        result = service._transfer_messages_unlocked(
+            "acct-1",
+            "Inbox",
+            ["opaque-1"],
+            dest,
+            op_type="archive",
+        )
+
+        self.assertEqual(result["moved_uids"], ["opaque-1"])
+        self.assertIn("busy", states)
+        self.assertIn("not_responding", states)
+        self.assertEqual(service.get_account_transfer_state("acct-1"), "idle")
+
+
 class RemoveMessagesFromCacheTests(unittest.TestCase):
+    def test_merge_dest_cache_preserves_existing_rows_without_dest_uids(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = MailService(registry=mock.Mock())
+        service._folder_indexes[("acct-1", "Archive")] = _FolderMessageIndex(
+            messages=[{"uid": f"old-{i}", "flags": {"seen": True}} for i in range(20)],
+            unread=0,
+            total=20,
+        )
+        with mock.patch("post.mail.eds.folder_index_cache.save") as save:
+            unread, total = service._merge_moved_messages_into_dest_cache_unlocked(
+                "acct-1",
+                "Archive",
+                source_messages=[
+                    {
+                        "uid": "src-1",
+                        "subject": "test3",
+                        "flags": {"seen": True},
+                    }
+                ],
+                destination_uids=[],
+                moved_count=1,
+            )
+        self.assertEqual(total, 21)
+        self.assertEqual(unread, 0)
+        index = service._folder_indexes[("acct-1", "Archive")]
+        self.assertEqual(len(index.messages), 21)
+        self.assertEqual(index.messages[0]["uid"], "src-1")
+        self.assertTrue(index.messages[0].get("moved_provisional"))
+        self.assertEqual(index.messages[0]["subject"], "test3")
+        save.assert_called_once()
+
+    def test_merge_dest_cache_prepends_when_dest_uids_known(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = MailService(registry=mock.Mock())
+        service._folder_indexes[("acct-1", "Archive")] = _FolderMessageIndex(
+            messages=[{"uid": "old-1", "flags": {"seen": True}}],
+            unread=0,
+            total=1,
+        )
+        with mock.patch("post.mail.eds.folder_index_cache.save"):
+            unread, total = service._merge_moved_messages_into_dest_cache_unlocked(
+                "acct-1",
+                "Archive",
+                source_messages=[
+                    {"uid": "src-1", "subject": "Hi", "flags": {"seen": False}}
+                ],
+                destination_uids=["dest-1"],
+                moved_count=1,
+            )
+        index = service._folder_indexes[("acct-1", "Archive")]
+        self.assertEqual(index.messages[0]["uid"], "dest-1")
+        self.assertEqual(index.messages[0]["subject"], "Hi")
+        self.assertEqual(total, 2)
+        self.assertEqual(unread, 1)
+
     def test_remove_persists_updated_index_to_disk(self) -> None:
         from post.mail.eds import _FolderMessageIndex
 

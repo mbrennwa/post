@@ -159,5 +159,29 @@ class OutboundSendTrackingTests(unittest.TestCase):
         callback.assert_called_once()
 
 
+class FolderTransferTrackingTests(unittest.TestCase):
+    def test_wait_for_folder_transfers_blocks_until_complete(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service.begin_folder_transfer()
+        done = threading.Event()
+
+        def release() -> None:
+            service.end_folder_transfer()
+            done.set()
+
+        threading.Timer(0.05, release).start()
+        service.wait_for_folder_transfers(timeout=1.0)
+        self.assertTrue(done.is_set())
+        self.assertFalse(service.folder_transfers_pending())
+
+    def test_wait_for_folder_transfers_times_out_and_resets_counter(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service.begin_folder_transfer()
+        completed = service.wait_for_folder_transfers(timeout=0.05)
+        self.assertFalse(completed)
+        service._reset_folder_transfer_counter_after_timeout()
+        self.assertFalse(service.folder_transfers_pending())
+
+
 if __name__ == "__main__":
     unittest.main()
