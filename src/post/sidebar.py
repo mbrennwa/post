@@ -552,8 +552,12 @@ class MailSidebar:
         if on_complete is not None:
             self._account_reload_callbacks[account_uid] = on_complete
 
-        self._clear_listbox(folder_list)
-        folder_list.append(self._make_loading_row("Loading Folders…"))
+        self._sidebar_selecting = True
+        try:
+            self._clear_listbox(folder_list)
+            folder_list.append(self._make_loading_row("Loading Folders…"))
+        finally:
+            self._sidebar_selecting = False
         self._start_folder_load(self._load_generation, account)
 
     def refresh_folder_row(
@@ -821,6 +825,7 @@ class MailSidebar:
             connect_health=self._mail.get_account_connect_health(account_uid),
             network_available=self._network_available,
             remote_account=remote,
+            transfer_state=self._mail.get_account_transfer_state(account_uid),
         )
         for icon in (
             self._account_offline_icons.get(account_uid),
@@ -963,6 +968,7 @@ class MailSidebar:
                 account_uid, folder_name, result, status_label
             ),
             error_heading="Could not archive messages",
+            folder_transfer=True,
         )
 
     def _on_archive_read_unflagged_activate(self, *_args) -> None:
@@ -1014,6 +1020,7 @@ class MailSidebar:
                 account_uid, folder_name, result, status_label
             ),
             error_heading="Could not archive messages",
+            folder_transfer=True,
         )
 
     def _on_archive_all_activate(self, *_args) -> None:
@@ -1046,6 +1053,7 @@ class MailSidebar:
                 account_uid, folder_name, result, status_label
             ),
             error_heading="Could not archive messages",
+            folder_transfer=True,
         )
 
     def _on_send_now_activate(self, *_args) -> None:
@@ -1088,6 +1096,7 @@ class MailSidebar:
         success_status: str,
         on_success: Callable[[object], None],
         error_heading: str,
+        folder_transfer: bool = False,
     ) -> None:
         def worker() -> None:
             error: Exception | None = None
@@ -1097,6 +1106,9 @@ class MailSidebar:
             except Exception as exc:
                 log_mail_error(log, error_heading, exc)
                 error = exc
+            finally:
+                if folder_transfer:
+                    self._mail.end_folder_transfer()
             GLib.idle_add(
                 self._on_folder_operation_finished,
                 result,
@@ -1106,6 +1118,8 @@ class MailSidebar:
                 error_heading,
             )
 
+        if folder_transfer:
+            self._mail.begin_folder_transfer()
         get_mail_io_thread().submit(worker)
 
     def _on_folder_operation_finished(
@@ -1366,48 +1380,61 @@ class MailSidebar:
             self._release_folder_load_slot()
             return False
 
-        self._clear_listbox(folder_list)
+        # Block row-selected → activate while rebuilding. Gtk.ListBox SINGLE
+        # selection fires row-selected on each append; re-entering activate /
+        # unselect_all from inside append corrupts the list sequence (segfault).
+        self._sidebar_selecting = True
+        load_error = error
+        folder_count = 0
+        try:
+            self._clear_listbox(folder_list)
 
-        if error is not None:
-            label_text = format_folder_load_error(error)
-            error_label = Gtk.Label(
-                label=label_text,
-                xalign=0,
-                wrap=True,
-            )
-            error_label.add_css_class("dim-label")
-            error_label.set_margin_start(12)
-            error_label.set_margin_end(12)
-            error_label.set_margin_bottom(8)
-            folder_list.append(self._wrap_list_row(error_label))
-            self._add_outbox_row(account_uid)
-            health = self._mail.get_account_connect_health(account_uid)
-            if health == "ok":
-                if is_network_unavailable_error(error):
-                    new_health = "not_connected"
-                elif is_sign_in_required_error(error):
-                    new_health = "needs_sign_in"
-                else:
-                    new_health = "not_connected"
-                self._mail.set_account_connect_health(account_uid, new_health)
-            # Keep offline/degraded accounts visible in the unified Inboxes list.
-            self._add_inbox_row_unavailable(account_uid)
-            self._update_account_offline_marker(account_uid)
+            if load_error is not None:
+                label_text = format_folder_load_error(load_error)
+                error_label = Gtk.Label(
+                    label=label_text,
+                    xalign=0,
+                    wrap=True,
+                )
+                error_label.add_css_class("dim-label")
+                error_label.set_margin_start(12)
+                error_label.set_margin_end(12)
+                error_label.set_margin_bottom(8)
+                folder_list.append(self._wrap_list_row(error_label))
+                self._add_outbox_row(account_uid)
+                health = self._mail.get_account_connect_health(account_uid)
+                if health == "ok":
+                    if is_network_unavailable_error(load_error):
+                        new_health = "not_connected"
+                    elif is_sign_in_required_error(load_error):
+                        new_health = "needs_sign_in"
+                    else:
+                        new_health = "not_connected"
+                    self._mail.set_account_connect_health(account_uid, new_health)
+                # Keep offline/degraded accounts visible in the unified Inboxes list.
+                self._add_inbox_row_unavailable(account_uid)
+                self._update_account_offline_marker(account_uid)
+            else:
+                assert folders is not None
+                folders = filter_sidebar_folders(folders)
+                self._account_folders[account_uid] = folders
+                folder_count = len(folders)
+                for folder in folders:
+                    folder_list.append(self._make_folder_row(account_uid, folder))
+
+                self._add_outbox_row(account_uid)
+                self._add_inbox_row(account_uid, folders)
+        finally:
+            self._sidebar_selecting = False
+
+        if load_error is not None:
             self._folder_loads_pending -= 1
-            self._maybe_apply_initial_selection()
-            self._finish_account_reload(account_uid, 0, error)
+            self._finish_account_reload(account_uid, 0, load_error)
             self._update_startup_folder_load_status()
             self._maybe_finish_initial_folder_load()
+            self._maybe_apply_initial_selection()
             return False
 
-        assert folders is not None
-        folders = filter_sidebar_folders(folders)
-        self._account_folders[account_uid] = folders
-        for folder in folders:
-            folder_list.append(self._make_folder_row(account_uid, folder))
-
-        self._add_outbox_row(account_uid)
-        self._add_inbox_row(account_uid, folders)
         # Eager inbox only — full-folder STATUS at tree load saturates Camel/mail
         # I/O and can make Post unresponsive (or OOM) on large accounts (#170).
         self.refresh_inbox_counts(account_uid)
@@ -1415,7 +1442,7 @@ class MailSidebar:
 
         self._folder_loads_pending -= 1
         self._maybe_apply_initial_selection()
-        self._finish_account_reload(account_uid, len(folders), None)
+        self._finish_account_reload(account_uid, folder_count, None)
         self._update_startup_folder_load_status()
         self._maybe_finish_initial_folder_load()
 

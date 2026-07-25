@@ -47,6 +47,7 @@ from post.mail.folder_index_cache import (
 from post.mail.message_list_state import (
     MESSAGE_LIST_UI_BATCH_SIZE,
     MESSAGE_LIST_UI_BIND_CAP,
+    is_heavy_folder_name,
     message_lists_equivalent_for_ui,
     prepended_message_count,
 )
@@ -216,6 +217,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.connect("notify::height", self._on_window_size_changed)
         self.connect("notify::is-active", self._on_is_active_changed)
         self._close_after_outbound_send = False
+        self._close_after_folder_transfer = False
         self._delayed_send_close_dialog: Adw.AlertDialog | None = None
         self._is_closing = False
         self._pending_goa_reauth: set[str] = set()
@@ -728,6 +730,25 @@ class MainWindow(Adw.ApplicationWindow):
         if self._close_after_outbound_send:
             return True
 
+        if self._mail.folder_transfers_pending():
+            self._set_status(
+                "Moving messages… Post will close when the move finishes."
+            )
+            show_toast(
+                self,
+                "A move is still in progress. Post will close when it finishes.",
+                timeout=8,
+            )
+            if not self._close_after_folder_transfer:
+                self._close_after_folder_transfer = True
+                self._mail.when_folder_transfers_complete(
+                    self._continue_close_after_folder_transfer
+                )
+            return True
+
+        if self._close_after_folder_transfer:
+            return True
+
         pending_delayed = list_pending_delayed_outbound_messages()
         if pending_delayed and self._delayed_send_close_dialog is None:
             self._prompt_send_delayed_before_close(pending_delayed)
@@ -808,6 +829,17 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _continue_close_after_outbound_send(self) -> None:
         self._close_after_outbound_send = False
+        # A move may have started while we waited for send.
+        if self._mail.folder_transfers_pending():
+            self._on_close_request()
+            return
+        GLib.idle_add(self._destroy_after_close_cleanup)
+
+    def _continue_close_after_folder_transfer(self) -> None:
+        self._close_after_folder_transfer = False
+        if self._mail.outbound_sends_pending():
+            self._on_close_request()
+            return
         GLib.idle_add(self._destroy_after_close_cleanup)
 
     def _destroy_after_close_cleanup(self) -> bool:
@@ -3333,6 +3365,13 @@ class MainWindow(Adw.ApplicationWindow):
         def schedule_background_sync() -> None:
             # Full server re-index of multi-thousand folders (M365 Archive)
             # blocks mail I/O and rebound the UI uncapped → lockup/OOM (#189).
+            if use_background_sync and is_heavy_folder_name(folder_name):
+                log.debug(
+                    "Skipping background sync for heavy folder %s/%s",
+                    account_uid,
+                    folder_name,
+                )
+                return
             if (
                 use_background_sync
                 and has_disk_cache
@@ -4371,6 +4410,14 @@ class MainWindow(Adw.ApplicationWindow):
                 self._delete_queued_messages(message_uids)
                 continue
 
+            if self._mail.get_account_transfer_state(group_account) != "idle":
+                show_error_toast(
+                    self,
+                    "A previous move is still in progress or the server is not "
+                    "responding; try again in a moment",
+                )
+                continue
+
             self._suppress_sync_list_reload = (group_account, group_folder)
 
             # Optimistic UI: remove rows immediately so Archive doesn't look
@@ -4405,6 +4452,8 @@ class MainWindow(Adw.ApplicationWindow):
                 except Exception as exc:
                     log.exception("Failed to move messages to %s", destination)
                     error = exc
+                finally:
+                    self._mail.end_folder_transfer()
                 GLib.idle_add(
                     self._on_messages_moved,
                     account_uid,
@@ -4415,6 +4464,7 @@ class MainWindow(Adw.ApplicationWindow):
                     error,
                 )
 
+            self._mail.begin_folder_transfer()
             get_mail_io_thread().submit(worker)
 
     def _on_messages_dropped(
@@ -4438,6 +4488,14 @@ class MainWindow(Adw.ApplicationWindow):
         if not uids or source_folder == dest_folder:
             return
 
+        if self._mail.get_account_transfer_state(account_uid) != "idle":
+            show_error_toast(
+                self,
+                "A previous move is still in progress or the server is not "
+                "responding; try again in a moment",
+            )
+            return
+
         uids = list(uids)
         self._clear_move_undo()
         self._suppress_sync_list_reload = (account_uid, source_folder)
@@ -4454,6 +4512,8 @@ class MainWindow(Adw.ApplicationWindow):
                     "Failed to move messages to folder %r", dest_folder
                 )
                 error = exc
+            finally:
+                self._mail.end_folder_transfer()
             GLib.idle_add(
                 self._on_folder_messages_moved,
                 account_uid,
@@ -4469,6 +4529,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._set_status(f"Moving message to {display}…")
         else:
             self._set_status(f"Moving {len(uids)} messages to {display}…")
+        self._mail.begin_folder_transfer()
         get_mail_io_thread().submit(worker)
 
     def _on_folder_messages_moved(
@@ -4561,9 +4622,12 @@ class MainWindow(Adw.ApplicationWindow):
             except Exception as exc:
                 log.exception("Failed to undo message move")
                 error = exc
+            finally:
+                self._mail.end_folder_transfer()
             GLib.idle_add(self._on_move_undo_finished, undo, result, error)
 
         self._set_status("Restoring messages…")
+        self._mail.begin_folder_transfer()
         get_mail_io_thread().submit(worker)
 
     def _on_move_undo_finished(
