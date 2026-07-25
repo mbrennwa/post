@@ -106,7 +106,7 @@ from .send_queue import (
     remove_queued_outbound_message,
 )
 from post.preferences import get_show_evolution_local
-from .account_status import AccountConnectHealth
+from .account_status import AccountConnectHealth, AccountTransferState
 from .auth import (
     PasswordPromptCallback,
     authenticate_service_sync,
@@ -368,6 +368,10 @@ class MailService:
     _account_connect_health: dict[str, AccountConnectHealth] = field(
         default_factory=dict, init=False, repr=False
     )
+    # In-flight / timed-out move state for sidebar badge + fail-fast (#189).
+    _account_transfer_state: dict[str, AccountTransferState] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _account_health_changed: Callable[[str], None] | None = field(
         default=None, init=False, repr=False
     )
@@ -377,6 +381,11 @@ class MailService:
     )
     _outbound_sends_in_progress: int = field(default=0, init=False)
     _outbound_sends_cond: threading.Condition = field(
+        default_factory=threading.Condition, init=False, repr=False
+    )
+    # Archive/move/trash transfers submitted from the UI (#189 quit safety).
+    _folder_transfers_in_progress: int = field(default=0, init=False)
+    _folder_transfers_cond: threading.Condition = field(
         default_factory=threading.Condition, init=False, repr=False
     )
     _active_outbound_deliveries: set[str] = field(default_factory=set, init=False)
@@ -648,6 +657,68 @@ class MailService:
 
         threading.Thread(target=worker, daemon=True, name="post-send-wait").start()
 
+    def begin_folder_transfer(self) -> None:
+        """Mark an Archive/move/trash worker as in flight (call before submit)."""
+        with self._folder_transfers_cond:
+            self._folder_transfers_in_progress += 1
+
+    def end_folder_transfer(self) -> None:
+        with self._folder_transfers_cond:
+            if self._folder_transfers_in_progress > 0:
+                self._folder_transfers_in_progress -= 1
+            if self._folder_transfers_in_progress == 0:
+                self._folder_transfers_cond.notify_all()
+
+    def folder_transfers_pending(self) -> bool:
+        with self._folder_transfers_cond:
+            return self._folder_transfers_in_progress > 0
+
+    def wait_for_folder_transfers(
+        self,
+        timeout: float = _TRANSFER_TIMEOUT_SECONDS + 15.0,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._folder_transfers_cond:
+            while self._folder_transfers_in_progress > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.warning(
+                        "Timed out waiting for %d folder transfer(s)",
+                        self._folder_transfers_in_progress,
+                    )
+                    return False
+                self._folder_transfers_cond.wait(timeout=remaining)
+        return True
+
+    def _reset_folder_transfer_counter_after_timeout(self) -> None:
+        with self._folder_transfers_cond:
+            if self._folder_transfers_in_progress <= 0:
+                return
+            log.warning(
+                "Resetting stuck folder transfer counter (%d) after wait timeout",
+                self._folder_transfers_in_progress,
+            )
+            self._folder_transfers_in_progress = 0
+            self._folder_transfers_cond.notify_all()
+
+    def when_folder_transfers_complete(
+        self,
+        callback: Callable[[], None],
+        *,
+        timeout: float = _TRANSFER_TIMEOUT_SECONDS + 15.0,
+    ) -> None:
+        """Run callback on the GTK thread after Archive/move/trash workers finish."""
+
+        def worker() -> None:
+            completed = self.wait_for_folder_transfers(timeout=timeout)
+            if not completed:
+                self._reset_folder_transfer_counter_after_timeout()
+            GLib.idle_add(_run_on_gtk_thread, callback)
+
+        threading.Thread(
+            target=worker, daemon=True, name="post-transfer-wait"
+        ).start()
+
     def wait_for_pending_mail_ops(self, timeout: float = 10.0) -> None:
         deadline = time.monotonic() + timeout
         with self._pending_mail_ops_cond:
@@ -664,6 +735,8 @@ class MailService:
     def shutdown_sync(self) -> None:
         """Best-effort store flush before exit; never wait for offline body download."""
         self.wait_for_outbound_sends()
+        # Finish in-flight Archive/move/trash before tearing down Camel (#189).
+        self.wait_for_folder_transfers()
         self.cancel_folder_search()
         offline_sync_active = self.offline_sync.is_active()
         self.offline_sync.cancel_all()
@@ -717,6 +790,27 @@ class MailService:
     def get_account_connect_health(self, account_uid: str) -> AccountConnectHealth:
         with self._lock:
             return self._account_connect_health.get(account_uid, "ok")
+
+    def get_account_transfer_state(self, account_uid: str) -> AccountTransferState:
+        with self._lock:
+            return self._account_transfer_state.get(account_uid, "idle")
+
+    def set_account_transfer_state(
+        self, account_uid: str, state: AccountTransferState
+    ) -> None:
+        """Update move/busy badge state and notify the sidebar (#189)."""
+        notify = False
+        with self._lock:
+            current = self._account_transfer_state.get(account_uid, "idle")
+            if state == "idle":
+                if account_uid in self._account_transfer_state:
+                    del self._account_transfer_state[account_uid]
+                    notify = True
+            elif current != state:
+                self._account_transfer_state[account_uid] = state
+                notify = True
+        if notify:
+            self._notify_account_health_changed(account_uid)
 
     def account_uses_goa(self, account_uid: str) -> bool:
         """Return True when this account authenticates via GNOME Online Accounts."""
@@ -3739,6 +3833,26 @@ class MailService:
         self._folder_indexes[key] = index
         if index.messages or index.total:
             if _folder_index_is_cacheable(index):
+                existing = folder_index_cache.load(account_uid, folder_name)
+                # Never replace a larger on-disk index with a partial Camel
+                # summary (common for M365 Archive before refresh_info) (#189).
+                if existing is not None and len(existing[0]) > len(index.messages):
+                    log.debug(
+                        "Keeping larger disk cache for %s/%s "
+                        "(disk=%d, camel=%d)",
+                        account_uid,
+                        folder_name,
+                        len(existing[0]),
+                        len(index.messages),
+                    )
+                    messages, unread, total = existing
+                    index = _FolderMessageIndex(
+                        messages=messages,
+                        unread=unread,
+                        total=total,
+                    )
+                    self._folder_indexes[key] = index
+                    return index, "disk_cache"
                 folder_index_cache.save(
                     account_uid,
                     folder_name,
@@ -4710,6 +4824,18 @@ class MailService:
                 destination_folder=dest_name,
             )
 
+        account = self._accounts_by_uid.get(account_uid)
+        backend = (account.backend or "").lower() if account is not None else ""
+        # Fail-fast while a previous Graph move is still pinning the mail thread
+        # or the UI already marked the account not-responding (#189).
+        if backend in {"microsoft365", "ews"}:
+            transfer_state = self.get_account_transfer_state(account_uid)
+            if transfer_state != "idle":
+                raise RuntimeError(
+                    "A previous move is still in progress or the server is not "
+                    "responding; try again in a moment"
+                )
+
         source_messages = self._message_dicts_for_uids_unlocked(
             source_folder, transfer_uids
         )
@@ -4717,7 +4843,15 @@ class MailService:
         destination_uids: list[str] = []
         moved_uids = list(transfer_uids)
         cancellable = Gio.Cancellable()
-        timer = threading.Timer(_TRANSFER_TIMEOUT_SECONDS, cancellable.cancel)
+
+        def _on_transfer_timeout() -> None:
+            cancellable.cancel()
+            # Escalate badge even if Camel has not returned yet (#189).
+            if self.get_account_transfer_state(account_uid) == "busy":
+                self.set_account_transfer_state(account_uid, "not_responding")
+
+        timer = threading.Timer(_TRANSFER_TIMEOUT_SECONDS, _on_transfer_timeout)
+        self.set_account_transfer_state(account_uid, "busy")
         timer.start()
         transfer_start = time.monotonic()
         # O365 transfer_messages_to_sync refreshes the destination unless it is
@@ -4726,103 +4860,110 @@ class MailService:
         source_folder.freeze()
         destination_folder.freeze()
         try:
-            log.debug(
-                "transfer_messages_to_sync start account=%s %s → %s uids=%d",
-                account_uid,
-                source_folder_name,
-                dest_name,
-                len(transfer_uids),
-            )
-            for offset in range(0, len(transfer_uids), _TRANSFER_MESSAGE_BATCH_SIZE):
-                batch = transfer_uids[offset : offset + _TRANSFER_MESSAGE_BATCH_SIZE]
-                ok, transferred = source_folder.transfer_messages_to_sync(
-                    batch, destination_folder, True, cancellable
-                )
-                if not ok:
-                    raise RuntimeError("Could not move messages")
-                destination_uids.extend(camel_uid_list(transferred))
-            log.debug(
-                "transfer_messages_to_sync done account=%s in %.2fs",
-                account_uid,
-                time.monotonic() - transfer_start,
-            )
-        except Exception as exc:
-            timed_out = cancellable.is_cancelled() or (
-                isinstance(exc, GLib.Error)
-                and exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED)
-            )
-            if timed_out:
-                gone = self._uids_missing_from_folder_unlocked(
-                    source_folder, transfer_uids
-                )
-                if gone:
-                    log.warning(
-                        "Transfer timed out after %.1fs for %s (%s → %s) but "
-                        "%d/%d message(s) left the source; treating as moved",
-                        time.monotonic() - transfer_start,
-                        account_uid,
-                        source_folder_name,
-                        dest_name,
-                        len(gone),
-                        len(transfer_uids),
-                    )
-                    moved_uids = gone
-                    destination_uids = []
-                else:
-                    log.warning(
-                        "Transfer timed out after %.1fs for %s (%s → %s); "
-                        "messages still in source",
-                        time.monotonic() - transfer_start,
-                        account_uid,
-                        source_folder_name,
-                        dest_name,
-                    )
-                    raise TimeoutError(
-                        f"Move timed out after {_TRANSFER_TIMEOUT_SECONDS}s"
-                    ) from exc
-            elif is_queueable_network_error(exc) and not self._flushing_operation_queue:
-                return self._queue_transfer_operation_unlocked(
+            try:
+                log.debug(
+                    "transfer_messages_to_sync start account=%s %s → %s uids=%d",
                     account_uid,
                     source_folder_name,
-                    transfer_uids,
-                    op_type=op_type,
-                    destination_folder=dest_name,
+                    dest_name,
+                    len(transfer_uids),
                 )
-            else:
-                raise
-        finally:
-            timer.cancel()
-            try:
-                destination_folder.thaw()
-            except Exception:
-                log.debug("destination thaw failed", exc_info=True)
-            try:
-                source_folder.thaw()
-            except Exception:
-                log.debug("source thaw failed", exc_info=True)
+                for offset in range(0, len(transfer_uids), _TRANSFER_MESSAGE_BATCH_SIZE):
+                    batch = transfer_uids[offset : offset + _TRANSFER_MESSAGE_BATCH_SIZE]
+                    ok, transferred = source_folder.transfer_messages_to_sync(
+                        batch, destination_folder, True, cancellable
+                    )
+                    if not ok:
+                        raise RuntimeError("Could not move messages")
+                    destination_uids.extend(camel_uid_list(transferred))
+                log.debug(
+                    "transfer_messages_to_sync done account=%s in %.2fs",
+                    account_uid,
+                    time.monotonic() - transfer_start,
+                )
+            except Exception as exc:
+                timed_out = cancellable.is_cancelled() or (
+                    isinstance(exc, GLib.Error)
+                    and exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED)
+                )
+                if timed_out:
+                    gone = self._uids_missing_from_folder_unlocked(
+                        source_folder, transfer_uids
+                    )
+                    if gone:
+                        log.warning(
+                            "Transfer timed out after %.1fs for %s (%s → %s) but "
+                            "%d/%d message(s) left the source; treating as moved",
+                            time.monotonic() - transfer_start,
+                            account_uid,
+                            source_folder_name,
+                            dest_name,
+                            len(gone),
+                            len(transfer_uids),
+                        )
+                        moved_uids = gone
+                        destination_uids = []
+                    else:
+                        log.warning(
+                            "Transfer timed out after %.1fs for %s (%s → %s); "
+                            "messages still in source",
+                            time.monotonic() - transfer_start,
+                            account_uid,
+                            source_folder_name,
+                            dest_name,
+                        )
+                        raise TimeoutError(
+                            f"Move timed out after {_TRANSFER_TIMEOUT_SECONDS}s"
+                        ) from exc
+                elif (
+                    is_queueable_network_error(exc)
+                    and not self._flushing_operation_queue
+                ):
+                    return self._queue_transfer_operation_unlocked(
+                        account_uid,
+                        source_folder_name,
+                        transfer_uids,
+                        op_type=op_type,
+                        destination_folder=dest_name,
+                    )
+                else:
+                    raise
+            finally:
+                timer.cancel()
+                try:
+                    destination_folder.thaw()
+                except Exception:
+                    log.debug("destination thaw failed", exc_info=True)
+                try:
+                    source_folder.thaw()
+                except Exception:
+                    log.debug("source thaw failed", exc_info=True)
 
-        # Commit + refresh can hang indefinitely on M365 after a successful
-        # Graph move. Bound them so the UI can complete; cache is updated below.
-        self._finalize_folder_transfer_unlocked(
-            account_uid,
-            source_folder,
-            destination_folder,
-            source_folder_name=source_folder_name,
-            dest_name=dest_name,
-        )
-
-        if not destination_uids:
-            # Fingerprint scan of Archive (often thousands of UIDs) is too costly
-            # and can re-enter hung Camel I/O; skip when the provider gave no
-            # transferred UIDs (common on Graph). Undo simply won't be offered.
-            account = self._accounts_by_uid.get(account_uid)
-            backend = (
-                (account.backend or "").lower() if account is not None else ""
+            # Commit + refresh can hang indefinitely on M365 after a successful
+            # Graph move. Bound them so the UI can complete; cache is updated below.
+            self._finalize_folder_transfer_unlocked(
+                account_uid,
+                source_folder,
+                destination_folder,
+                source_folder_name=source_folder_name,
+                dest_name=dest_name,
             )
-            if backend not in {"microsoft365", "ews"}:
+
+            # Evolution-style: drop moved UIDs from Camel's local summary so the
+            # folder matches Post's cache without a hung Graph refresh (#189).
+            self._prune_folder_summary_uids_unlocked(source_folder, moved_uids)
+
+            if not destination_uids:
+                # Full Archive fingerprint scans are costly / can hang on Graph.
+                # Still try a capped newest-UID match so Archive cache can show
+                # the moved message with a real destination UID (#189).
                 try:
                     destination_uids = self._find_moved_uids_in_folder_unlocked(
-                        destination_folder, source_messages
+                        destination_folder,
+                        source_messages,
+                        uid_limit=(
+                            500 if backend in {"microsoft365", "ews"} else None
+                        ),
                     )
                 except Exception:
                     log.debug(
@@ -4831,30 +4972,89 @@ class MailService:
                     )
                     destination_uids = []
 
-        source_unread = source_folder.get_unread_message_count()
-        source_total = source_folder.get_message_count()
-        self._remove_messages_from_cache(
-            account_uid, source_folder_name, moved_uids, source_unread, source_total
-        )
-        self._invalidate_folder_index(account_uid, dest_name)
-
-        dest_unread = destination_folder.get_unread_message_count()
-        dest_total = destination_folder.get_message_count()
-        if dest_name:
-            self._update_cached_folder_counts(
-                account_uid, dest_name, dest_unread, dest_total
+            source_unread = source_folder.get_unread_message_count()
+            source_total = source_folder.get_message_count()
+            self._remove_messages_from_cache(
+                account_uid, source_folder_name, moved_uids, source_unread, source_total
+            )
+            # Never wipe the destination disk index after a move. Invalidating
+            # Archive then rebuilding from an incomplete Camel summary was saving
+            # ~50 messages as the full folder and OOMing on the next startup
+            # background reindex (#189).
+            dest_unread, dest_total = self._merge_moved_messages_into_dest_cache_unlocked(
+                account_uid,
+                dest_name,
+                source_messages=source_messages,
+                destination_uids=destination_uids,
+                moved_count=len(moved_uids),
             )
 
-        return {
-            "moved_uids": moved_uids,
-            "destination_uids": destination_uids,
-            "source_folder": source_folder_name,
-            "source_folder_unread": source_unread,
-            "source_folder_total": source_total,
-            "destination_folder": dest_name,
-            "destination_folder_unread": dest_unread,
-            "destination_folder_total": dest_total,
-        }
+            return {
+                "moved_uids": moved_uids,
+                "destination_uids": destination_uids,
+                "source_folder": source_folder_name,
+                "source_folder_unread": source_unread,
+                "source_folder_total": source_total,
+                "destination_folder": dest_name,
+                "destination_folder_unread": dest_unread,
+                "destination_folder_total": dest_total,
+            }
+        finally:
+            self.set_account_transfer_state(account_uid, "idle")
+
+    @staticmethod
+    def _prune_folder_summary_uids_unlocked(
+        folder: Camel.Folder,
+        message_uids: list[str],
+    ) -> None:
+        """Remove UIDs from Camel's local FolderSummary (Evolution-style, #189).
+
+        Best-effort: never fails the move if summary mutation is unavailable.
+        """
+        if not message_uids:
+            return
+        try:
+            summary = folder.get_folder_summary()
+        except Exception:
+            log.debug("Could not get folder summary for prune", exc_info=True)
+            return
+        if summary is None:
+            return
+
+        api_uids = [camel_uid_to_api(uid) for uid in message_uids]
+        try:
+            removed = False
+            remove_uids = getattr(summary, "remove_uids", None)
+            if callable(remove_uids):
+                try:
+                    removed = bool(remove_uids(api_uids))
+                except Exception:
+                    log.debug("summary.remove_uids failed; falling back", exc_info=True)
+            if not removed:
+                for uid in api_uids:
+                    try:
+                        if summary.remove_uid(uid):
+                            removed = True
+                    except Exception:
+                        log.debug(
+                            "summary.remove_uid failed for %r",
+                            uid,
+                            exc_info=True,
+                        )
+            if removed:
+                summary.touch()
+                summary.save()
+        except Exception:
+            log.debug("Folder summary prune failed", exc_info=True)
+            return
+
+        try:
+            changes = Camel.FolderChangeInfo.new()
+            for uid in api_uids:
+                changes.remove_uid(uid)
+            folder.changed(changes)
+        except Exception:
+            log.debug("folder.changed after summary prune failed", exc_info=True)
 
     @staticmethod
     def _uids_missing_from_folder_unlocked(
@@ -5048,7 +5248,11 @@ class MailService:
         return messages
 
     def _find_moved_uids_in_folder_unlocked(
-        self, folder: Camel.Folder, source_messages: list[dict[str, Any]]
+        self,
+        folder: Camel.Folder,
+        source_messages: list[dict[str, Any]],
+        *,
+        uid_limit: int | None = None,
     ) -> list[str]:
         if not source_messages:
             return []
@@ -5065,9 +5269,11 @@ class MailService:
         uids = folder_get_uids(folder)
         if not uids:
             return []
+        if uid_limit is not None and uid_limit >= 0:
+            uids = uids[:uid_limit]
 
         for uid in uids:
-            info = folder_get_message_info(folder,uid)
+            info = folder_get_message_info(folder, uid)
             if info is None:
                 continue
             message = message_info_to_dict(info, uid=uid)
@@ -5078,6 +5284,8 @@ class MailService:
             )
             if fingerprint in fingerprints:
                 found.append(str(uid))
+                if len(found) >= len(fingerprints):
+                    break
         return found
 
     def _apply_message_flags_unlocked(
@@ -5138,6 +5346,134 @@ class MailService:
         if index is not None:
             index.unread = unread
             index.total = total
+
+    def _merge_moved_messages_into_dest_cache_unlocked(
+        self,
+        account_uid: str,
+        dest_name: str | None,
+        *,
+        source_messages: list[dict],
+        destination_uids: list[str],
+        moved_count: int,
+    ) -> tuple[int, int]:
+        """Update destination folder cache after a move without wiping it.
+
+        Returns ``(unread, total)`` for sidebar badges. Always prepend moved
+        message rows so Archive shows them immediately — even when Graph gives
+        no destination UIDs (provisional source UIDs) (#189).
+        """
+        if not dest_name:
+            return -1, -1
+
+        key = (account_uid, dest_name)
+        index = self._folder_indexes.get(key)
+        if index is None:
+            cached = folder_index_cache.load(account_uid, dest_name)
+            if cached is not None:
+                messages, unread, total = cached
+                index = _FolderMessageIndex(
+                    messages=list(messages),
+                    unread=unread,
+                    total=total,
+                )
+                self._folder_indexes[key] = index
+
+        if index is None:
+            # No prior cache — seed from the moved messages only (do not pull a
+            # partial Camel Archive summary that would poison disk cache).
+            if not source_messages and not destination_uids:
+                return -1, -1
+            index = _FolderMessageIndex(messages=[], unread=0, total=0)
+            self._folder_indexes[key] = index
+
+        by_order = list(source_messages)
+        new_messages: list[dict] = []
+        if destination_uids:
+            for offset, dest_uid in enumerate(destination_uids):
+                base = dict(by_order[offset]) if offset < len(by_order) else {}
+                base["uid"] = dest_uid
+                base.pop("moved_provisional", None)
+                new_messages.append(base)
+        else:
+            # Graph often returns no dest UIDs. Keep headers visible in Archive
+            # using source UIDs until a later resolve/refresh.
+            for message in by_order:
+                base = dict(message)
+                if not base.get("uid"):
+                    continue
+                base["moved_provisional"] = True
+                new_messages.append(base)
+
+        if not new_messages:
+            if moved_count > 0 and index.total >= 0:
+                index.total += max(0, moved_count)
+                folder_index_cache.save(
+                    account_uid,
+                    dest_name,
+                    index.messages,
+                    index.unread,
+                    index.total,
+                )
+            return index.unread, index.total
+
+        def _fingerprint(message: dict) -> tuple[str, str, int | float]:
+            return (
+                message.get("subject") or "",
+                message.get("from") or "",
+                message.get("sort_date") or 0,
+            )
+
+        existing_uids = {
+            message.get("uid") for message in index.messages if message.get("uid")
+        }
+        prepend: list[dict] = []
+        added_unread = 0
+        for message in new_messages:
+            uid = message.get("uid")
+            fingerprint = _fingerprint(message)
+            if uid and uid in existing_uids:
+                continue
+
+            replaced = False
+            if fingerprint != ("", "", 0):
+                for offset, existing in enumerate(index.messages):
+                    if _fingerprint(existing) != fingerprint:
+                        continue
+                    if existing.get("moved_provisional") and not message.get(
+                        "moved_provisional"
+                    ):
+                        index.messages[offset] = message
+                        existing_uids.add(uid)
+                        replaced = True
+                    else:
+                        replaced = True
+                    break
+            if replaced:
+                continue
+
+            prepend.append(message)
+            if uid:
+                existing_uids.add(uid)
+            if not (message.get("flags") or {}).get("seen", False):
+                added_unread += 1
+
+        if prepend:
+            index.messages = prepend + index.messages
+            if index.unread >= 0:
+                index.unread += added_unread
+            if index.total >= 0:
+                index.total += len(prepend)
+            else:
+                index.total = len(index.messages)
+
+        folder_index_cache.save(
+            account_uid,
+            dest_name,
+            index.messages,
+            index.unread,
+            index.total,
+        )
+        return index.unread, index.total
 
     def _remove_messages_from_cache(
         self,
