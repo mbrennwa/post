@@ -295,9 +295,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._header_search_entry.connect("search-changed", self._on_search_changed)
         self._header_search_entry.connect("activate", self._on_search_activate)
         self._header_search_entry.connect("stop-search", self._on_search_stopped)
-        search_overlay = Gtk.Overlay()
-        search_overlay.set_hexpand(True)
-        search_overlay.set_child(self._header_search_entry)
 
         self._search_scope_dropdown = Gtk.DropDown()
         self._search_scope_dropdown.set_sensitive(False)
@@ -305,16 +302,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._search_scope_dropdown.connect(
             "notify::selected", self._on_search_scope_changed
         )
-        search_scope = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        search_scope.set_valign(Gtk.Align.CENTER)
-        search_scope.append(self._search_scope_dropdown)
 
-        search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        search_row.add_css_class("linked")
         search_row.set_halign(Gtk.Align.CENTER)
         search_row.set_hexpand(True)
         search_row.set_valign(Gtk.Align.CENTER)
-        search_row.append(search_overlay)
-        search_row.append(search_scope)
+        search_row.append(self._header_search_entry)
+        search_row.append(self._search_scope_dropdown)
 
         search_title = Gtk.Box()
         search_title.set_halign(Gtk.Align.CENTER)
