@@ -22,6 +22,8 @@ from post.mail.folders import (
     format_folder_refresh_error,
     format_folder_refresh_start,
     format_folder_label,
+    format_startup_loading_accounts,
+    format_startup_loading_folders,
     guess_inbox_name,
     is_post_outbox_folder,
     is_post_local_folder,
@@ -804,6 +806,25 @@ class FolderRefreshStatusTests(unittest.TestCase):
         self.assertEqual(
             format_account_refresh_error("Work"),
             "Could not refresh folders for Work",
+        )
+
+    def test_format_startup_loading_messages(self) -> None:
+        self.assertEqual(format_startup_loading_accounts(), "Loading accounts…")
+        self.assertEqual(
+            format_startup_loading_folders(0, 5),
+            "Loading folders for 0 of 5 accounts…",
+        )
+        self.assertEqual(
+            format_startup_loading_folders(2, 5),
+            "Loading folders for 2 of 5 accounts…",
+        )
+        self.assertEqual(
+            format_startup_loading_folders(5, 5),
+            "Loading folders for 5 of 5 accounts…",
+        )
+        self.assertEqual(
+            format_startup_loading_folders(0, 1),
+            "Loading folders for 0 of 1 account…",
         )
 
 
