@@ -45,6 +45,7 @@ class MessageReaderPaneTests(unittest.TestCase):
             on_reply=_noop,
             on_reply_all=_noop,
             on_forward=_noop,
+            on_unsubscribe=_noop,
             on_attachment_clicked=_noop,
             on_attachment_context_menu=_noop,
             on_open_uri=_noop,
@@ -60,6 +61,64 @@ class MessageReaderPaneTests(unittest.TestCase):
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
         self.assertIs(self.pane.current_message, msg)
+
+    def test_unsubscribe_button_hidden_by_default(self) -> None:
+        self.pane.show_message(
+            _sample_message(),
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertFalse(self.pane._unsubscribe_btn.get_visible())
+
+    def test_unsubscribe_button_visible_when_action_present(self) -> None:
+        clicked: list[dict[str, str]] = []
+
+        def on_unsubscribe(action: dict[str, str]) -> None:
+            clicked.append(action)
+
+        pane = MessageReaderPane(
+            on_read_toggle=_noop,
+            on_flag_toggle=_noop,
+            on_reply=_noop,
+            on_reply_all=_noop,
+            on_forward=_noop,
+            on_unsubscribe=on_unsubscribe,
+            on_attachment_clicked=_noop,
+            on_attachment_context_menu=_noop,
+            on_open_uri=_noop,
+        )
+        msg = _sample_message()
+        msg["unsubscribe"] = {
+            "kind": "open",
+            "url": "https://example.com/unsub",
+        }
+        pane.show_message(
+            msg,
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertTrue(pane._unsubscribe_btn.get_visible())
+        pane._unsubscribe_btn.emit("clicked")
+        self.assertEqual(
+            clicked,
+            [{"kind": "open", "url": "https://example.com/unsub"}],
+        )
+
+    def test_unsubscribe_button_is_left_of_read(self) -> None:
+        outer = self.pane._message_actions
+        children: list[Gtk.Widget] = []
+        child = outer.get_first_child()
+        while child is not None:
+            children.append(child)
+            child = child.get_next_sibling()
+        self.assertGreaterEqual(len(children), 2)
+        self.assertIs(children[0], self.pane._unsubscribe_btn)
+        flag_group = children[1]
+        self.assertIs(flag_group.get_first_child(), self.pane._read_toggle_btn)
 
     def test_clear_resets_current_message(self) -> None:
         self.pane.show_message(

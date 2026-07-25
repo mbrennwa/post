@@ -19,12 +19,14 @@ gi.require_version("Gdk", "4.0")
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
+from post.folder_dialogs import confirm_action
 from post.header_bar import add_end_window_controls
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.eds import MailAccount, MessageNotAvailableError
-from post.mail.helpers import write_temp_attachment
+from post.mail.helpers import perform_one_click_unsubscribe, write_temp_attachment
 from post.mail.io_thread import get_mail_io_thread
+from post.open_uri import open_uri_externally
 from post.preferences import get_load_remote_content, get_message_appearance
 from post.reader.pane import MessageReaderPane
 from post.toast import show_error_toast, show_toast
@@ -114,6 +116,7 @@ class ReaderWindow(Adw.ApplicationWindow):
             on_reply=self._on_reply,
             on_reply_all=self._on_reply_all,
             on_forward=self._on_forward,
+            on_unsubscribe=self._on_unsubscribe,
             on_attachment_clicked=self._on_attachment_clicked,
             on_attachment_context_menu=self._on_attachment_context_menu,
             on_open_uri=self._open_uri_externally,
@@ -150,6 +153,10 @@ class ReaderWindow(Adw.ApplicationWindow):
     @property
     def message_uid(self) -> str:
         return self._message_uid
+
+    @property
+    def current_message(self) -> dict[str, Any] | None:
+        return self._current_message
 
     def notify_flags_updated(self, uid: str, flags: dict[str, Any]) -> None:
         if uid != self._message_uid:
@@ -359,6 +366,70 @@ class ReaderWindow(Adw.ApplicationWindow):
     def _on_forward(self, *_args) -> None:
         self._open_compose("forward")
 
+    def _on_unsubscribe(self, action: dict[str, str]) -> None:
+        kind = action.get("kind")
+        url = action.get("url")
+        if kind not in ("post", "open") or not isinstance(url, str) or not url:
+            return
+        if kind == "open":
+            self._open_uri_externally(url)
+            if url.lower().startswith("mailto:"):
+                show_toast(
+                    self,
+                    "Opening unsubscribe email…",
+                    priority=Adw.ToastPriority.HIGH,
+                )
+            else:
+                show_toast(
+                    self,
+                    "Opening unsubscribe page in your browser…",
+                    priority=Adw.ToastPriority.HIGH,
+                )
+            self._archive_after_unsubscribe()
+            return
+        will_archive = bool(self._get_move_state().get("can_archive"))
+        body = (
+            "Send a one-click unsubscribe request and archive this message?"
+            if will_archive
+            else "Send a one-click unsubscribe request for this mailing list?"
+        )
+        if not confirm_action(
+            self,
+            heading="Unsubscribe?",
+            body=body,
+            confirm_label="Unsubscribe",
+        ):
+            return
+
+        def worker() -> None:
+            error: Exception | None = None
+            try:
+                perform_one_click_unsubscribe(url)
+            except Exception as exc:
+                log.exception("One-click unsubscribe failed")
+                error = exc
+            GLib.idle_add(self._on_one_click_unsubscribe_done, error)
+
+        get_mail_io_thread().submit(worker)
+
+    def _archive_after_unsubscribe(self) -> None:
+        if not self._get_move_state().get("can_archive"):
+            return
+        self._on_request_move(
+            "archive",
+            self._message_uid,
+            self._account.uid,
+            self._folder_name,
+        )
+
+    def _on_one_click_unsubscribe_done(self, error: Exception | None) -> bool:
+        if error is not None:
+            show_error_toast(self, f"Unsubscribe failed: {error}")
+        else:
+            show_toast(self, "Unsubscribe request sent")
+            self._archive_after_unsubscribe()
+        return False
+
     def _open_compose(self, mode: str) -> None:
         if self._current_message is None:
             return
@@ -546,7 +617,8 @@ class ReaderWindow(Adw.ApplicationWindow):
         dialog.present()
 
     def _open_uri_externally(self, uri: str) -> None:
-        try:
-            Gio.AppInfo.launch_default_for_uri(uri, None)
-        except GLib.Error as exc:
-            show_error_toast(self, f"Could not open link: {exc.message}")
+        open_uri_externally(
+            self,
+            uri,
+            on_error=lambda message: show_error_toast(self, message),
+        )
