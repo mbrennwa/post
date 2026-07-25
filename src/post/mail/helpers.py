@@ -183,6 +183,94 @@ def _recipient_field_from_mime(mime: Any, field: str) -> str:
     return ""
 
 
+_LIST_UNSUBSCRIBE_ANGLE_RE = re.compile(r"<([^>]+)>")
+_ONE_CLICK_POST_TOKEN = "list-unsubscribe=one-click"
+
+
+def parse_list_unsubscribe_uris(header: str | None) -> list[str]:
+    """Extract http(s)/mailto URIs from a List-Unsubscribe header value."""
+    if not header:
+        return []
+    raw = header.strip()
+    if not raw:
+        return []
+    candidates: list[str] = []
+    for match in _LIST_UNSUBSCRIBE_ANGLE_RE.finditer(raw):
+        uri = match.group(1).strip()
+        if uri:
+            candidates.append(uri)
+    if not candidates:
+        for part in raw.split(","):
+            uri = part.strip().strip("<>").strip()
+            if uri:
+                candidates.append(uri)
+    return [uri for uri in candidates if _is_allowed_unsubscribe_uri(uri)]
+
+
+def _is_allowed_unsubscribe_uri(uri: str) -> bool:
+    lower = uri.lower()
+    return lower.startswith(("https://", "http://", "mailto:"))
+
+
+def has_one_click_unsubscribe_post(header: str | None) -> bool:
+    """True when List-Unsubscribe-Post advertises RFC 8058 one-click."""
+    if not header:
+        return False
+    normalized = " ".join(str(header).split()).lower()
+    return _ONE_CLICK_POST_TOKEN in normalized
+
+
+def unsubscribe_action_from_headers(
+    list_unsubscribe: str | None,
+    list_unsubscribe_post: str | None = None,
+) -> dict[str, str] | None:
+    """Resolve a usable unsubscribe action from list headers.
+
+    Returns ``{"kind": "post"|"open", "url": "..."}`` or ``None``.
+    One-click POST is only offered for https URLs when List-Unsubscribe-Post
+    indicates One-Click.
+    """
+    uris = parse_list_unsubscribe_uris(list_unsubscribe)
+    if not uris:
+        return None
+    https = [uri for uri in uris if uri.lower().startswith("https://")]
+    http = [uri for uri in uris if uri.lower().startswith("http://")]
+    mailto = [uri for uri in uris if uri.lower().startswith("mailto:")]
+    if has_one_click_unsubscribe_post(list_unsubscribe_post) and https:
+        return {"kind": "post", "url": https[0]}
+    if https:
+        return {"kind": "open", "url": https[0]}
+    if http:
+        return {"kind": "open", "url": http[0]}
+    if mailto:
+        return {"kind": "open", "url": mailto[0]}
+    return None
+
+
+def perform_one_click_unsubscribe(url: str, *, timeout: float = 30.0) -> None:
+    """POST List-Unsubscribe=One-Click to an https unsubscribe URL (RFC 8058)."""
+    import urllib.error
+    import urllib.request
+
+    if not url.lower().startswith("https://"):
+        raise ValueError("One-click unsubscribe requires an https URL")
+    request = urllib.request.Request(
+        url,
+        data=b"List-Unsubscribe=One-Click",
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = getattr(response, "status", None)
+            if status is not None and int(status) >= 400:
+                raise OSError(f"Unsubscribe failed with HTTP {status}")
+    except urllib.error.HTTPError as exc:
+        raise OSError(f"Unsubscribe failed with HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise OSError(f"Unsubscribe request failed: {exc.reason}") from exc
+
+
 def enrich_message_dict_from_mime(result: dict[str, Any], mime: Any) -> None:
     """Prefer full To/Cc/Bcc from MIME over Camel MessageInfo summaries."""
     for field in ("to", "cc", "bcc"):
@@ -195,6 +283,15 @@ def enrich_message_dict_from_mime(result: dict[str, Any], mime: Any) -> None:
             stripped = format_recipient_header(reply_to_header)
             if stripped:
                 result["reply_to"] = stripped
+        list_unsubscribe = _decode_header_value(mime.get_header("List-Unsubscribe"))
+        list_unsubscribe_post = _decode_header_value(
+            mime.get_header("List-Unsubscribe-Post")
+        )
+        action = unsubscribe_action_from_headers(
+            list_unsubscribe, list_unsubscribe_post
+        )
+        if action is not None:
+            result["unsubscribe"] = action
 
 
 def _valid_unix_timestamp(unix_time: float | int | None) -> float | None:
