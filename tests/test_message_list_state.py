@@ -147,7 +147,36 @@ class LruCacheTests(unittest.TestCase):
 
 class MessageBatchRangesTests(unittest.TestCase):
     def test_batch_size_constant(self) -> None:
-        self.assertEqual(MESSAGE_LIST_UI_BATCH_SIZE, 500)
+        self.assertEqual(MESSAGE_LIST_UI_BATCH_SIZE, 100)
+
+    def test_bind_cap_constant(self) -> None:
+        from post.mail.message_list_state import MESSAGE_LIST_UI_BIND_CAP
+
+        self.assertEqual(MESSAGE_LIST_UI_BIND_CAP, 500)
+
+    def test_lists_equivalent_samples_large_lists(self) -> None:
+        from post.mail.message_list_state import message_lists_equivalent_for_ui
+
+        current = [{"uid": str(i), "subject": f"s{i}"} for i in range(200)]
+        refreshed = [dict(m) for m in current]
+        self.assertTrue(
+            message_lists_equivalent_for_ui(
+                current,
+                refreshed,
+                current_total=200,
+                refreshed_total=200,
+            )
+        )
+        refreshed[0]["subject"] = "changed"
+        self.assertFalse(
+            message_lists_equivalent_for_ui(
+                current,
+                refreshed,
+                current_total=200,
+                refreshed_total=200,
+            )
+        )
+
 
     def test_empty(self) -> None:
         self.assertEqual(message_batch_ranges(0), [])

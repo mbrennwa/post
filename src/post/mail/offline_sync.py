@@ -177,6 +177,18 @@ class OfflineBodySyncCoordinator:
             folder_index += 1
             if not isinstance(folder, Camel.OfflineFolder):
                 continue
+            # Archive/Trash/Junk are often huge (M365 Archive ≈ 10k+). Downsyncing
+            # bodies for them OOMs the process; skip for offline backfill.
+            try:
+                flags = int(folder.get_flags())
+            except Exception:
+                flags = 0
+            if flags & (
+                Camel.FolderInfoFlags.TYPE_ARCHIVE
+                | Camel.FolderInfoFlags.TYPE_TRASH
+                | Camel.FolderInfoFlags.TYPE_JUNK
+            ):
+                continue
             apply_offline_sync_to_folder(folder, mode)
             if not folder.can_downsync():
                 continue

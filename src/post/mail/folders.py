@@ -172,7 +172,15 @@ def find_trash_folder(
     type_mask: int,
 ) -> dict | None:
     """Return the best trash folder, preferring real IMAP folders over virtual ones."""
-    name_fallbacks = frozenset({"trash", "deleted", "bin"})
+    name_fallbacks = frozenset(
+        {
+            "trash",
+            "deleted",
+            "bin",
+            "deleted items",
+            "deleted messages",
+        }
+    )
     real: list[dict] = []
     virtual: list[dict] = []
 

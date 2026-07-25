@@ -256,10 +256,21 @@ def folder_search_uids(
 
 
 def normalize_camel_uid(value: Any) -> str | None:
-    """Return a non-zero numeric Camel/IMAP UID string, or None if invalid."""
+    """Return a stripped Camel UID string, or None if empty/invalid.
+
+    Accepts IMAP numeric UIDs, ``uidb64:…`` binary UIDs, and opaque
+    non-numeric Camel/Graph UIDs (e.g. Microsoft 365). Rejects empty,
+    whitespace-only, and ``"0"``.
+    """
     uid = str(value).strip()
-    if not uid or not uid.isdigit() or uid == "0":
+    if not uid or uid == "0":
         return None
+    if uid.startswith(_UID_B64_PREFIX):
+        try:
+            camel_uid_to_bytes(uid)
+        except (ValueError, UnicodeError):
+            return None
+        return uid
     return uid
 
 

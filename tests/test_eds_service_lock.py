@@ -67,12 +67,14 @@ class ServiceLockReleaseTests(unittest.TestCase):
         service = MailService(registry=mock.Mock())
         service.cancel_folder_search = mock.Mock()
         service.cancel_folder_list = mock.Mock()
+        service.cancel_folder_refresh = mock.Mock()
         service.offline_sync.cancel_all = mock.Mock()
         service._sync_setup_cancel = None
 
         service._preempt_background_work()
 
         service.cancel_folder_search.assert_called_once()
+        service.cancel_folder_refresh.assert_called_once()
         service.cancel_folder_list.assert_called_once()
         service.offline_sync.cancel_all.assert_called_once()
 
@@ -95,6 +97,22 @@ class ServiceLockReleaseTests(unittest.TestCase):
         service.cancel_folder_list()
         second.cancel.assert_called_once()
         self.assertEqual(service._folder_list_cancellables, set())
+
+    def test_cancel_folder_refresh_does_not_cancel_tree_list(self) -> None:
+        service = MailService(registry=mock.Mock())
+        tree = mock.Mock()
+        refresh = mock.Mock()
+        tree.cancel = mock.Mock()
+        refresh.cancel = mock.Mock()
+
+        service._register_folder_list_cancellable(tree)
+        service._register_folder_refresh_cancellable(refresh)
+
+        service.cancel_folder_refresh()
+        refresh.cancel.assert_called_once()
+        tree.cancel.assert_not_called()
+        self.assertEqual(service._folder_list_cancellables, {tree})
+        self.assertEqual(service._folder_refresh_cancellables, set())
 
     def test_set_account_user_online_does_not_block_caller(self) -> None:
         service = MailService(registry=mock.Mock())

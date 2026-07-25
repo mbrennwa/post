@@ -49,18 +49,30 @@ class FolderGetUidsTests(unittest.TestCase):
 
 
 class NormalizeCamelUidTests(unittest.TestCase):
-    def test_valid(self) -> None:
+    def test_valid_numeric(self) -> None:
         self.assertEqual(normalize_camel_uid("42"), "42")
         self.assertEqual(normalize_camel_uid("  7  "), "7")
+
+    def test_accepts_opaque_and_uidb64(self) -> None:
+        self.assertEqual(normalize_camel_uid("abc"), "abc")
+        self.assertEqual(normalize_camel_uid("12a"), "12a")
+        self.assertEqual(
+            normalize_camel_uid("AQMkADAwATM0MDAAMS0"),
+            "AQMkADAwATM0MDAAMS0",
+        )
+        self.assertEqual(normalize_camel_uid("uidb64:ov8="), "uidb64:ov8=")
+        self.assertEqual(
+            normalize_camel_uid("  uidb64:ov8=  "),
+            "uidb64:ov8=",
+        )
 
     def test_rejects_empty_and_zero(self) -> None:
         self.assertIsNone(normalize_camel_uid(""))
         self.assertIsNone(normalize_camel_uid("0"))
         self.assertIsNone(normalize_camel_uid("  "))
 
-    def test_rejects_non_numeric(self) -> None:
-        self.assertIsNone(normalize_camel_uid("abc"))
-        self.assertIsNone(normalize_camel_uid("12a"))
+    def test_rejects_invalid_uidb64(self) -> None:
+        self.assertIsNone(normalize_camel_uid("uidb64:!!!"))
 
 
 class SpoolTrashTests(unittest.TestCase):

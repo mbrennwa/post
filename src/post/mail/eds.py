@@ -161,6 +161,12 @@ _SKIP_BACKENDS = frozenset({"rss", "vfolder"})
 DEFAULT_MESSAGE_PAGE_SIZE = 50
 _SEND_TIMEOUT_SECONDS = 30
 _DRAFT_TIMEOUT_SECONDS = 30
+# Camel transfer_messages_to_sync can hang on M365 after Graph already moved
+# the message. Bound the call and soft-succeed when source UIDs are gone.
+_TRANSFER_TIMEOUT_SECONDS = 45
+# Post-transfer synchronize/refresh must not pin the mail I/O thread forever
+# after Camel has already moved messages (M365 Graph can hang here).
+_TRANSFER_POST_TIMEOUT_SECONDS = 30
 # Stay below Camel IMAPx MAX_UIDSET_ITEMS (100) to avoid spurious uidset warnings
 # in evolution-data-server 3.56 when batching UID MOVE/COPY commands.
 _TRANSFER_MESSAGE_BATCH_SIZE = 50
@@ -389,11 +395,17 @@ class MailService:
     _sync_setup_cancel: Callable[[], None] | None = field(
         default=None, init=False, repr=False
     )
-    # Concurrent folder-list loads (one per account at startup) each register a
-    # cancellable. Preempt cancels the whole set; registering must not cancel siblings.
-    # Also used for other long Camel ops (folder-info REFRESH, refresh_info_sync)
-    # so interactive message loads can abort them.
+    # Concurrent sidebar folder-tree loads (one per account at startup).
+    # Preempt may cancel these so interactive mail work can run; registering
+    # must not cancel siblings. Do not share with refresh ops — message loads
+    # cancel refresh only so tree loads are not thrash-cancelled into
+    # permanent "Loading folders…".
     _folder_list_cancellables: set[Gio.Cancellable] = field(
+        default_factory=set, init=False, repr=False
+    )
+    # Folder-info REFRESH / refresh_info_sync for counts and index sync.
+    # Cancelled by message loads and preempt without aborting sidebar tree loads.
+    _folder_refresh_cancellables: set[Gio.Cancellable] = field(
         default_factory=set, init=False, repr=False
     )
     _folder_list_state_lock: threading.Lock = field(
@@ -417,6 +429,10 @@ class MailService:
 
     def _preempt_background_work(self) -> None:
         self.cancel_folder_search()
+        self.cancel_folder_refresh()
+        # Cancel in-flight sidebar tree loads so interactive work is not stuck
+        # behind a slow M365 get_folder_info_sync; list_folders falls back to
+        # cache when available.
         self.cancel_folder_list()
         self.offline_sync.cancel_all()
         if self._sync_setup_cancel is not None:
@@ -431,6 +447,16 @@ class MailService:
             for cancellable in cancellables:
                 cancellable.cancel()
 
+    def cancel_folder_refresh(self) -> None:
+        """Abort folder-info REFRESH / refresh_info_sync (not sidebar tree loads)."""
+        with self._folder_list_state_lock:
+            cancellables = list(self._folder_refresh_cancellables)
+            self._folder_refresh_cancellables.clear()
+        if cancellables:
+            search_trace("folder_refresh_cancel", count=len(cancellables))
+            for cancellable in cancellables:
+                cancellable.cancel()
+
     def _register_folder_list_cancellable(
         self, cancellable: Gio.Cancellable
     ) -> None:
@@ -442,6 +468,18 @@ class MailService:
     ) -> None:
         with self._folder_list_state_lock:
             self._folder_list_cancellables.discard(cancellable)
+
+    def _register_folder_refresh_cancellable(
+        self, cancellable: Gio.Cancellable
+    ) -> None:
+        with self._folder_list_state_lock:
+            self._folder_refresh_cancellables.add(cancellable)
+
+    def _unregister_folder_refresh_cancellable(
+        self, cancellable: Gio.Cancellable
+    ) -> None:
+        with self._folder_list_state_lock:
+            self._folder_refresh_cancellables.discard(cancellable)
 
     def set_sync_setup_cancel_callback(
         self, callback: Callable[[], None] | None
@@ -2473,6 +2511,13 @@ class MailService:
     ) -> list[dict]:
         if cancellable is not None and cancellable.is_cancelled():
             search_trace("folder_list_cancelled", account=account_uid)
+            with self._lock:
+                cached_early = self._folder_tree_cache.get(account_uid)
+            if cached_early is not None:
+                search_trace(
+                    "folder_list_cancelled_using_cache", account=account_uid
+                )
+                return list(cached_early)
             raise GLib.Error.new_literal(
                 Gio.io_error_quark(),
                 "Operation was cancelled",
@@ -2501,6 +2546,11 @@ class MailService:
             )
             if cancellable is not None and cancellable.is_cancelled():
                 search_trace("folder_list_cancelled", account=account_uid)
+                if cached is not None:
+                    search_trace(
+                        "folder_list_cancelled_using_cache", account=account_uid
+                    )
+                    return list(cached)
                 raise GLib.Error.new_literal(
                     Gio.io_error_quark(),
                     "Operation was cancelled",
@@ -2534,6 +2584,11 @@ class MailService:
                 Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
             ):
                 search_trace("folder_list_cancelled", account=account_uid)
+                if cached is not None:
+                    search_trace(
+                        "folder_list_cancelled_using_cache", account=account_uid
+                    )
+                    return list(cached)
                 raise
             if cached is not None and is_network_unavailable_error(exc):
                 log.debug(
@@ -2721,7 +2776,7 @@ class MailService:
         result = self._archive_messages_unlocked(
             account_uid, folder_name, read_uids
         )
-        result["archived_count"] = len(read_uids)
+        result["archived_count"] = len(result.get("moved_uids") or [])
         return result
 
     def _count_read_unflagged_messages_unlocked(
@@ -2742,7 +2797,7 @@ class MailService:
                 "source_folder_total": index.total,
             }
         result = self._archive_messages_unlocked(account_uid, folder_name, uids)
-        result["archived_count"] = len(uids)
+        result["archived_count"] = len(result.get("moved_uids") or [])
         return result
 
     def _archive_all_messages_unlocked(
@@ -2763,7 +2818,7 @@ class MailService:
         result = self._archive_messages_unlocked(
             account_uid, folder_name, all_uids
         )
-        result["archived_count"] = len(all_uids)
+        result["archived_count"] = len(result.get("moved_uids") or [])
         return result
 
     def _invalidate_account_folder_tree(
@@ -2836,7 +2891,7 @@ class MailService:
             | Camel.StoreGetFolderInfoFlags.REFRESH
         )
         cancellable = Gio.Cancellable()
-        self._register_folder_list_cancellable(cancellable)
+        self._register_folder_refresh_cancellable(cancellable)
         try:
             if cancellable.is_cancelled():
                 return _stats_from_cached_tree()
@@ -2848,7 +2903,7 @@ class MailService:
                 return _stats_from_cached_tree()
             raise
         finally:
-            self._unregister_folder_list_cancellable(cancellable)
+            self._unregister_folder_refresh_cancellable(cancellable)
         # Camel M365 can fail without setting GError (#156); keep prior counts.
         if root is None:
             log.warning(
@@ -3834,7 +3889,7 @@ class MailService:
         try:
             if sync:
                 cancellable = Gio.Cancellable()
-                self._register_folder_list_cancellable(cancellable)
+                self._register_folder_refresh_cancellable(cancellable)
                 try:
                     if cancellable.is_cancelled():
                         raise GLib.Error.new_literal(
@@ -3844,7 +3899,7 @@ class MailService:
                         )
                     folder.refresh_info_sync(cancellable)
                 finally:
-                    self._unregister_folder_list_cancellable(cancellable)
+                    self._unregister_folder_refresh_cancellable(cancellable)
             unread = folder.get_unread_message_count()
             total = folder.get_message_count()
 
@@ -4498,7 +4553,10 @@ class MailService:
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
         store = self._get_store_unlocked(account_uid)
-        folders = self._list_folders_unlocked(account_uid)
+        with self._lock:
+            folders = self._folder_tree_cache.get(account_uid)
+        if folders is None:
+            folders = self._list_folders_unlocked(account_uid)
         archive_info = find_folder_by_type(
             folders,
             Camel.FolderInfoFlags.TYPE_ARCHIVE,
@@ -4641,7 +4699,7 @@ class MailService:
 
         transfer_uids = self._transfer_uids_in_folder(source_folder, message_uids)
         if not transfer_uids:
-            return {"moved_uids": []}
+            raise ValueError("No matching messages to move")
 
         if not self._network_available and not self._flushing_operation_queue:
             return self._queue_transfer_operation_unlocked(
@@ -4657,19 +4715,72 @@ class MailService:
         )
 
         destination_uids: list[str] = []
+        moved_uids = list(transfer_uids)
+        cancellable = Gio.Cancellable()
+        timer = threading.Timer(_TRANSFER_TIMEOUT_SECONDS, cancellable.cancel)
+        timer.start()
+        transfer_start = time.monotonic()
+        # O365 transfer_messages_to_sync refreshes the destination unless it is
+        # frozen — that refresh often hangs after Graph already moved the mail.
+        # Evolution freezes folders around bulk transfers for the same reason.
+        source_folder.freeze()
+        destination_folder.freeze()
         try:
+            log.debug(
+                "transfer_messages_to_sync start account=%s %s → %s uids=%d",
+                account_uid,
+                source_folder_name,
+                dest_name,
+                len(transfer_uids),
+            )
             for offset in range(0, len(transfer_uids), _TRANSFER_MESSAGE_BATCH_SIZE):
                 batch = transfer_uids[offset : offset + _TRANSFER_MESSAGE_BATCH_SIZE]
                 ok, transferred = source_folder.transfer_messages_to_sync(
-                    batch, destination_folder, True, None
+                    batch, destination_folder, True, cancellable
                 )
                 if not ok:
                     raise RuntimeError("Could not move messages")
                 destination_uids.extend(camel_uid_list(transferred))
-
-            self._commit_folder_transfer_unlocked(source_folder, destination_folder)
+            log.debug(
+                "transfer_messages_to_sync done account=%s in %.2fs",
+                account_uid,
+                time.monotonic() - transfer_start,
+            )
         except Exception as exc:
-            if is_queueable_network_error(exc) and not self._flushing_operation_queue:
+            timed_out = cancellable.is_cancelled() or (
+                isinstance(exc, GLib.Error)
+                and exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED)
+            )
+            if timed_out:
+                gone = self._uids_missing_from_folder_unlocked(
+                    source_folder, transfer_uids
+                )
+                if gone:
+                    log.warning(
+                        "Transfer timed out after %.1fs for %s (%s → %s) but "
+                        "%d/%d message(s) left the source; treating as moved",
+                        time.monotonic() - transfer_start,
+                        account_uid,
+                        source_folder_name,
+                        dest_name,
+                        len(gone),
+                        len(transfer_uids),
+                    )
+                    moved_uids = gone
+                    destination_uids = []
+                else:
+                    log.warning(
+                        "Transfer timed out after %.1fs for %s (%s → %s); "
+                        "messages still in source",
+                        time.monotonic() - transfer_start,
+                        account_uid,
+                        source_folder_name,
+                        dest_name,
+                    )
+                    raise TimeoutError(
+                        f"Move timed out after {_TRANSFER_TIMEOUT_SECONDS}s"
+                    ) from exc
+            elif is_queueable_network_error(exc) and not self._flushing_operation_queue:
                 return self._queue_transfer_operation_unlocked(
                     account_uid,
                     source_folder_name,
@@ -4677,21 +4788,48 @@ class MailService:
                     op_type=op_type,
                     destination_folder=dest_name,
                 )
-            raise
-
-        # Camel returns destination UIDs; the UI and cache use source UIDs.
-        moved_uids = list(transfer_uids)
-        try:
-            source_folder.refresh_info_sync(None)
-            destination_folder.refresh_info_sync(None)
-        except GLib.Error as exc:
-            if not is_network_unavailable_error(exc):
+            else:
                 raise
+        finally:
+            timer.cancel()
+            try:
+                destination_folder.thaw()
+            except Exception:
+                log.debug("destination thaw failed", exc_info=True)
+            try:
+                source_folder.thaw()
+            except Exception:
+                log.debug("source thaw failed", exc_info=True)
+
+        # Commit + refresh can hang indefinitely on M365 after a successful
+        # Graph move. Bound them so the UI can complete; cache is updated below.
+        self._finalize_folder_transfer_unlocked(
+            account_uid,
+            source_folder,
+            destination_folder,
+            source_folder_name=source_folder_name,
+            dest_name=dest_name,
+        )
 
         if not destination_uids:
-            destination_uids = self._find_moved_uids_in_folder_unlocked(
-                destination_folder, source_messages
+            # Fingerprint scan of Archive (often thousands of UIDs) is too costly
+            # and can re-enter hung Camel I/O; skip when the provider gave no
+            # transferred UIDs (common on Graph). Undo simply won't be offered.
+            account = self._accounts_by_uid.get(account_uid)
+            backend = (
+                (account.backend or "").lower() if account is not None else ""
             )
+            if backend not in {"microsoft365", "ews"}:
+                try:
+                    destination_uids = self._find_moved_uids_in_folder_unlocked(
+                        destination_folder, source_messages
+                    )
+                except Exception:
+                    log.debug(
+                        "Could not resolve destination UIDs after move",
+                        exc_info=True,
+                    )
+                    destination_uids = []
 
         source_unread = source_folder.get_unread_message_count()
         source_total = source_folder.get_message_count()
@@ -4717,6 +4855,25 @@ class MailService:
             "destination_folder_unread": dest_unread,
             "destination_folder_total": dest_total,
         }
+
+    @staticmethod
+    def _uids_missing_from_folder_unlocked(
+        folder: Camel.Folder, message_uids: list[str]
+    ) -> list[str]:
+        """Return UIDs that are no longer present in ``folder``."""
+        missing: list[str] = []
+        for uid in message_uids:
+            try:
+                if folder_get_message_info(folder, uid) is None:
+                    missing.append(uid)
+            except Exception:
+                # Treat lookup failures as still-present; caller may time out.
+                log.debug(
+                    "Could not probe UID %r after transfer timeout",
+                    uid,
+                    exc_info=True,
+                )
+        return missing
 
     def _persist_message_flag_changes_unlocked(
         self,
@@ -4784,11 +4941,101 @@ class MailService:
     def _commit_folder_transfer_unlocked(
         source_folder: Camel.Folder,
         destination_folder: Camel.Folder,
+        cancellable: Gio.Cancellable | None = None,
     ) -> None:
         """Push a folder transfer to the mail store (required for IMAP)."""
-        if not source_folder.synchronize_sync(True, None):
+        if not source_folder.synchronize_sync(True, cancellable):
             raise RuntimeError("Could not synchronize source folder after move")
-        destination_folder.synchronize_sync(False, None)
+        destination_folder.synchronize_sync(False, cancellable)
+
+    def _finalize_folder_transfer_unlocked(
+        self,
+        account_uid: str,
+        source_folder: Camel.Folder,
+        destination_folder: Camel.Folder,
+        *,
+        source_folder_name: str,
+        dest_name: str | None,
+    ) -> None:
+        """Best-effort post-move sync/refresh with a hard timeout.
+
+        Graph/M365 often completes ``transfer_messages_to_sync`` then hangs in
+        synchronize/refresh. The move already succeeded; do not block the UI.
+        """
+        account = self._accounts_by_uid.get(account_uid)
+        backend = (account.backend or "").lower() if account is not None else ""
+        # Graph/EWS already applied the move server-side. Local summary is
+        # updated via cache; synchronize/refresh_info often hang (#189).
+        if backend in {"microsoft365", "ews"}:
+            log.debug(
+                "Skipping post-transfer sync/refresh for %s backend=%s (%s → %s)",
+                account_uid,
+                backend,
+                source_folder_name,
+                dest_name,
+            )
+            return
+
+        cancellable = Gio.Cancellable()
+        timer = threading.Timer(
+            _TRANSFER_POST_TIMEOUT_SECONDS, cancellable.cancel
+        )
+        timer.start()
+        try:
+            self._commit_folder_transfer_unlocked(
+                source_folder, destination_folder, cancellable
+            )
+            if cancellable.is_cancelled():
+                log.warning(
+                    "Post-transfer sync timed out for %s (%s → %s)",
+                    account_uid,
+                    source_folder_name,
+                    dest_name,
+                )
+                return
+            source_folder.refresh_info_sync(cancellable)
+            if cancellable.is_cancelled():
+                log.warning(
+                    "Post-transfer source refresh timed out for %s/%s",
+                    account_uid,
+                    source_folder_name,
+                )
+                return
+            destination_folder.refresh_info_sync(cancellable)
+            if cancellable.is_cancelled():
+                log.warning(
+                    "Post-transfer destination refresh timed out for %s/%s",
+                    account_uid,
+                    dest_name,
+                )
+        except GLib.Error as exc:
+            if (
+                cancellable.is_cancelled()
+                or exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED)
+                or is_network_unavailable_error(exc)
+            ):
+                log.warning(
+                    "Post-transfer sync/refresh incomplete for %s (%s → %s): %s",
+                    account_uid,
+                    source_folder_name,
+                    dest_name,
+                    exc.message,
+                )
+                return
+            raise
+        except RuntimeError as exc:
+            if cancellable.is_cancelled():
+                log.warning(
+                    "Post-transfer sync incomplete for %s (%s → %s): %s",
+                    account_uid,
+                    source_folder_name,
+                    dest_name,
+                    exc,
+                )
+                return
+            raise
+        finally:
+            timer.cancel()
 
     def _message_dicts_for_uids_unlocked(
         self, folder: Camel.Folder, message_uids: list[str]
@@ -4903,6 +5150,19 @@ class MailService:
         uid_set = set(message_uids)
         index = self._folder_indexes.get((account_uid, folder_name))
         if index is None:
+            # Still drop from disk so a later cache seed cannot resurrect UIDs.
+            cached = folder_index_cache.load(account_uid, folder_name)
+            if cached is None:
+                return
+            messages, _cached_unread, _cached_total = cached
+            messages = [
+                message
+                for message in messages
+                if message.get("uid") not in uid_set
+            ]
+            folder_index_cache.save(
+                account_uid, folder_name, messages, unread, total
+            )
             return
         index.messages = [
             message
@@ -4911,6 +5171,13 @@ class MailService:
         ]
         index.unread = unread
         index.total = total
+        folder_index_cache.save(
+            account_uid,
+            folder_name,
+            index.messages,
+            index.unread,
+            index.total,
+        )
 
     def _invalidate_folder_index(
         self, account_uid: str, folder_name: str | None

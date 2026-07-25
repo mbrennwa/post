@@ -14,7 +14,10 @@ _K = TypeVar("_K", bound=Hashable)
 _V = TypeVar("_V")
 
 DEFAULT_FOLDER_LIST_CACHE_SIZE = 2
-MESSAGE_LIST_UI_BATCH_SIZE = 500
+MESSAGE_LIST_UI_BATCH_SIZE = 100
+# Hard cap for rows bound into Gtk.ListView on one folder open. Binding tens of
+# thousands of GObjects (e.g. M365 Archive) freezes the UI / OOMs on startup.
+MESSAGE_LIST_UI_BIND_CAP = 500
 
 
 def message_batch_ranges(
@@ -35,6 +38,35 @@ def message_list_fingerprint(messages: list[dict[str, Any]]) -> tuple[str, ...]:
         f"{message.get('uid')}:{message.get('subject') or ''}"
         for message in messages
     )
+
+
+def message_lists_equivalent_for_ui(
+    current: list[dict[str, Any]],
+    refreshed: list[dict[str, Any]],
+    *,
+    current_total: int,
+    refreshed_total: int,
+    sample: int = 32,
+) -> bool:
+    """Cheap equality for deciding whether to rebind the message list.
+
+    Full fingerprints of multi-thousand folders stall the GTK main thread.
+    """
+    if current_total != refreshed_total:
+        return False
+    if len(current) != len(refreshed):
+        return False
+    if not refreshed:
+        return True
+    if len(refreshed) <= sample * 2:
+        return message_list_fingerprint(current) == message_list_fingerprint(
+            refreshed
+        )
+    return message_list_fingerprint(
+        current[:sample]
+    ) == message_list_fingerprint(refreshed[:sample]) and message_list_fingerprint(
+        current[-sample:]
+    ) == message_list_fingerprint(refreshed[-sample:])
 
 
 def prepended_message_count(
