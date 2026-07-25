@@ -20,6 +20,19 @@ MESSAGE_LIST_UI_BATCH_SIZE = 100
 MESSAGE_LIST_UI_BIND_CAP = 500
 
 
+def is_heavy_folder_name(folder_name: str | None) -> bool:
+    """Return True for folders where a full Camel reindex often OOMs (#189)."""
+    if not folder_name:
+        return False
+    lower = folder_name.strip().lower().replace("\\", "/")
+    leaf = lower.rsplit("/", 1)[-1]
+    if leaf in {"archive", "archives", "all mail", "allmail"}:
+        return True
+    if "[google mail]/all mail" in lower or "[gmail]/all mail" in lower:
+        return True
+    return False
+
+
 def message_batch_ranges(
     count: int,
     batch_size: int = MESSAGE_LIST_UI_BATCH_SIZE,

@@ -13,6 +13,8 @@ from post.mail.account_status import (
     TOOLTIP_NEEDS_SIGN_IN,
     TOOLTIP_NETWORK_OFFLINE,
     TOOLTIP_NOT_CONNECTED,
+    TOOLTIP_TRANSFER_BUSY,
+    TOOLTIP_TRANSFER_NOT_RESPONDING,
     account_not_online_badge,
 )
 from post.mail.eds import FlushSendQueueResult, MailService
@@ -76,6 +78,39 @@ class AccountNotOnlineBadgeTests(unittest.TestCase):
         )
         self.assertFalse(show)
         self.assertEqual(tip, "")
+
+    def test_transfer_busy_shows_badge(self) -> None:
+        show, tip = account_not_online_badge(
+            user_online=True,
+            connect_health="ok",
+            network_available=True,
+            remote_account=True,
+            transfer_state="busy",
+        )
+        self.assertTrue(show)
+        self.assertEqual(tip, TOOLTIP_TRANSFER_BUSY)
+
+    def test_transfer_not_responding_shows_badge(self) -> None:
+        show, tip = account_not_online_badge(
+            user_online=True,
+            connect_health="ok",
+            network_available=True,
+            remote_account=True,
+            transfer_state="not_responding",
+        )
+        self.assertTrue(show)
+        self.assertEqual(tip, TOOLTIP_TRANSFER_NOT_RESPONDING)
+
+    def test_needs_sign_in_beats_transfer_busy(self) -> None:
+        show, tip = account_not_online_badge(
+            user_online=True,
+            connect_health="needs_sign_in",
+            network_available=True,
+            remote_account=True,
+            transfer_state="busy",
+        )
+        self.assertTrue(show)
+        self.assertEqual(tip, TOOLTIP_NEEDS_SIGN_IN)
 
 
 class FolderLoadErrorFormatTests(unittest.TestCase):
