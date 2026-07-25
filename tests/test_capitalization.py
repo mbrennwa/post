@@ -156,6 +156,8 @@ _STATUS_MESSAGE_FUNCTIONS: dict[str, frozenset[str]] = {
             "format_account_refresh_start",
             "format_account_refresh_done",
             "format_account_refresh_error",
+            "format_startup_loading_accounts",
+            "format_startup_loading_folders",
         }
     ),
     "mail/send_queue.py": frozenset(
@@ -484,6 +486,8 @@ def _runtime_status_message_samples() -> list[str]:
         format_folder_refresh_done,
         format_folder_refresh_error,
         format_folder_refresh_start,
+        format_startup_loading_accounts,
+        format_startup_loading_folders,
     )
     from post.mail.operation_queue import offline_queue_status_text
     from post.mail.send_queue import offline_cache_status_text, offline_status_text
@@ -497,6 +501,9 @@ def _runtime_status_message_samples() -> list[str]:
         format_account_refresh_done("Work", 1),
         format_account_refresh_done("Work", 4),
         format_account_refresh_error("Work"),
+        format_startup_loading_accounts(),
+        format_startup_loading_folders(0, 3),
+        format_startup_loading_folders(2, 3),
         offline_status_text(queued_count=0),
         offline_status_text(queued_count=1),
         offline_status_text(queued_count=3),

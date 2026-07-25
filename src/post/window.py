@@ -37,6 +37,7 @@ from post.mail.folders import (
     format_folder_refresh_done,
     format_folder_refresh_error,
     format_folder_refresh_start,
+    format_startup_loading_accounts,
     is_post_outbox_folder,
 )
 from post.mail.folder_index_cache import (
@@ -1815,6 +1816,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def begin_load(self) -> None:
         """Load accounts and folders after the window is on screen."""
+        self._set_status(format_startup_loading_accounts())
         GLib.idle_add(self._begin_startup_load)
 
     def _begin_startup_load(self) -> bool:
