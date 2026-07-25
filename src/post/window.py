@@ -2487,16 +2487,13 @@ class MainWindow(Adw.ApplicationWindow):
         attachment_index: int,
         on_ready: Callable[[str, bytes | None, Exception | None], None],
     ) -> None:
-        if (
-            not self._current_account
-            or not self._current_folder
-            or not self._current_message_uid
-        ):
+        list_key = self._current_message_uid
+        if not list_key:
             return
-
-        account_uid = self._current_account.uid
-        folder_name = self._current_folder
-        message_uid = self._current_message_uid
+        location = self._message_location_for_list_key(list_key)
+        if location is None:
+            return
+        account_uid, folder_name, message_uid = location
 
         def worker() -> None:
             error: Exception | None = None
