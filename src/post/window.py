@@ -2947,6 +2947,24 @@ class MainWindow(Adw.ApplicationWindow):
         self._current_folder_messages.extend(batch)
         return False
 
+    def _should_use_cached_header_search(
+        self,
+        search_query: MessageSearchQuery | None,
+        account_uid: str,
+        folder_name: str,
+    ) -> bool:
+        """True when header-only search can use the current folder disk index.
+
+        Account / All Mail scopes must use ``_start_mail_search`` so the
+        selected scope is respected (#173).
+        """
+        return (
+            search_query is not None
+            and self._search_scope.kind == SEARCH_SCOPE_FOLDER
+            and folder_index_has_cache(account_uid, folder_name)
+            and not query_requires_body_scan(search_query)
+        )
+
     def _begin_chunked_cached_header_search(
         self,
         load_id: int,
@@ -3403,10 +3421,8 @@ class MainWindow(Adw.ApplicationWindow):
             )
 
         def start_initial_worker() -> None:
-            if (
-                search_query is not None
-                and folder_index_has_cache(account_uid, folder_name)
-                and not query_requires_body_scan(search_query)
+            if self._should_use_cached_header_search(
+                search_query, account_uid, folder_name
             ):
                 def worker_load_cached_header_index() -> None:
                     if load_id != self._messages_load_generation:
