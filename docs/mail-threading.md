@@ -22,13 +22,14 @@ Post runs blocking Camel / Evolution Data Server (EDS) work on a **single dedica
 3. **One `MailSession` per process** — owned on the mail I/O thread (`MailService._session`, `_stores`, `_transports`). Do not reintroduce per-thread worker sessions.
 4. **Password / OAuth prompts** — use `GLib.idle_add` to show dialogs on the GTK thread; mail thread waits on the result. Do **not** call GOA `EnsureCredentials` synchronously from the GTK thread (compose must not preflight on the UI thread; see #156).
 5. **Outbound send** — compose persists to outbox first, then delivers via Camel `transport.send_to_sync` on the mail I/O thread. No `smtplib` send path. Send and draft save use a **finite** cancellable timeout; draft failures/timeouts fall back to the local draft queue.
-6. **Offline body download** — `OfflineBodySyncCoordinator` runs `downsync_sync` on the mail I/O thread only. See [offline-body-cache.md](offline-body-cache.md).
+6. **Offline body download** — `OfflineBodySyncCoordinator` runs `downsync_sync` on the mail I/O thread only. Each folder downsync is bound by a **30s** `Gio.Cancellable` timeout so one slow folder cannot pin `post-mail-io` for minutes (#197). Interactive work preempts offline sync via `cancel_all()` and between-folder yield. See [offline-body-cache.md](offline-body-cache.md).
 7. **Sync watcher setup** — `MailSyncWatcher` store/folder signal wiring runs as **background** mail-I/O work so folder search can preempt it. Preempt also cancels in-flight sidebar folder lists.
 8. **Search** — interactive mail-I/O work: filter the in-memory folder index (`filter_messages_by_query`), loading cached MIME for body terms. Cancellable; preempts offline downsync. See [offline-body-cache.md](offline-body-cache.md).
 9. **Correspondents / autocomplete** — build from cached folder tree + folder indexes only; never connect a store just for compose autocomplete (#156).
 10. **GOA EnsureCredentials** — D-Bus call uses a finite timeout (not `-1`) so a wedged Online Accounts account cannot pin `post-mail-io` forever.
 11. **Per-account Take offline** — first connect / `set_online_sync` must honor `get_account_user_online`, not only global network availability.
 12. **Folder transfer / Archive (#189)** — `transfer_messages_to_sync` uses a finite `Gio.Cancellable` timeout; soft-succeed when source UIDs are already gone. After move (including soft-succeed), prune Camel `FolderSummary` UIDs locally (Evolution-style) and update Post’s folder-index cache — do **not** block UI completion on Graph `refresh_info_sync`. For `microsoft365` / `ews`, skip post-transfer `synchronize_sync` / `refresh_info_sync`. Account transfer-busy / not-responding badges escalate on timeout; refuse new moves for that account while busy. **Quit waits** for in-flight Archive/move/trash (same pattern as outbound send) so a mid-move exit does not drop work. **Residual:** if the Graph provider ignores cancel, `post-mail-io` stays pinned until the native call returns or the wait times out; true kill-isolation needs a helper process (follow-up), not a second in-process Camel session.
+13. **Folder stats / count refresh (#197)** — per-folder `refresh_info_sync` uses a registered refresh cancellable with a **15s** timeout and falls back to cached unread/total on cancel. Folder switches call `cancel_folder_refresh()` so interactive loads are not stuck behind sidebar count polls.
 
 ## Debugging
 
@@ -39,6 +40,8 @@ POST_LOG_LEVEL=DEBUG PYTHONPATH=src python3 -m post.main
 # or
 POST_LOG_LEVEL=DEBUG ./run.sh
 ```
+
+Mail I/O tasks that run longer than **10s** also emit **WARNING** lines (`still running` / `slow finish`) with `func=` and elapsed time — useful for soft hangs where the UI sits on “Loading …” behind a Camel call (#197).
 
 For folder search diagnostics (#120), also set `POST_DEBUG_SEARCH=1` (or use `POST_LOG_LEVEL=DEBUG`):
 

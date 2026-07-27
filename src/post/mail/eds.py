@@ -167,6 +167,8 @@ _TRANSFER_TIMEOUT_SECONDS = 45
 # Post-transfer synchronize/refresh must not pin the mail I/O thread forever
 # after Camel has already moved messages (M365 Graph can hang here).
 _TRANSFER_POST_TIMEOUT_SECONDS = 30
+# Per-folder refresh_info_sync for sidebar counts must not pin post-mail-io (#197).
+_FOLDER_STATS_TIMEOUT_SECONDS = 15
 # Stay below Camel IMAPx MAX_UIDSET_ITEMS (100) to avoid spurious uidset warnings
 # in evolution-data-server 3.56 when batching UID MOVE/COPY commands.
 _TRANSFER_MESSAGE_BATCH_SIZE = 50
@@ -2946,24 +2948,51 @@ class MailService:
     ) -> tuple[int, int]:
         with self._lock:
             store = self._get_store_unlocked(account_uid)
-            folder = store.get_folder_sync(folder_name, 0, None)
-            if folder is None:
-                raise ValueError(f"Folder not found: {folder_name}")
             if not self._network_available:
                 cached = self._cached_folder_stats_unlocked(account_uid, folder_name)
                 if cached is not None:
                     return cached
+            cancellable = Gio.Cancellable()
+            self._register_folder_refresh_cancellable(cancellable)
+            timer = threading.Timer(
+                _FOLDER_STATS_TIMEOUT_SECONDS, cancellable.cancel
+            )
+            timer.start()
             try:
-                folder.refresh_info_sync(None)
-            except GLib.Error as exc:
-                if is_network_unavailable_error(exc):
+                if cancellable.is_cancelled():
                     cached = self._cached_folder_stats_unlocked(
                         account_uid, folder_name
                     )
                     if cached is not None:
                         return cached
-                raise
-            return folder.get_unread_message_count(), folder.get_message_count()
+                    raise GLib.Error.new_literal(
+                        Gio.io_error_quark(),
+                        "Operation was cancelled",
+                        Gio.IOErrorEnum.CANCELLED,
+                    )
+                folder = store.get_folder_sync(folder_name, 0, cancellable)
+                if folder is None:
+                    raise ValueError(f"Folder not found: {folder_name}")
+                try:
+                    folder.refresh_info_sync(cancellable)
+                except GLib.Error as exc:
+                    if exc.matches(
+                        Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
+                    ) or is_network_unavailable_error(exc):
+                        cached = self._cached_folder_stats_unlocked(
+                            account_uid, folder_name
+                        )
+                        if cached is not None:
+                            return cached
+                        if exc.matches(
+                            Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
+                        ):
+                            return (-1, -1)
+                    raise
+                return folder.get_unread_message_count(), folder.get_message_count()
+            finally:
+                timer.cancel()
+                self._unregister_folder_refresh_cancellable(cancellable)
 
     def _get_account_folder_stats_unlocked(
         self, account_uid: str
