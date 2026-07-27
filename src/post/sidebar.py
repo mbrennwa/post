@@ -558,6 +558,12 @@ class MailSidebar:
             folder_list.append(self._make_loading_row("Loading Folders…"))
         finally:
             self._sidebar_selecting = False
+        # Count this load against pending so a mid-startup reload cannot make
+        # folder_tree_ready flip early and leave search stuck disabled (#196).
+        self._folder_loads_pending += 1
+        if not self._folder_tree_ready and self._startup_folder_total > 0:
+            self._startup_folder_total += 1
+            self._update_startup_folder_load_status()
         self._start_folder_load(self._load_generation, account)
 
     def refresh_folder_row(
@@ -1330,8 +1336,10 @@ class MailSidebar:
         get_mail_io_thread().submit_background(worker)
 
     def _on_folder_load_cancelled(self, load_id: int, account_uid: str) -> bool:
+        # Stale generations must not touch the current pending counter — that
+        # races with sidebar.reload()/load() and can mark the tree ready before
+        # rows exist, leaving search disabled (#196).
         if load_id != self._load_generation:
-            self._release_folder_load_slot()
             return False
         account = self._accounts_by_uid.get(account_uid)
         if account is None:
@@ -1342,7 +1350,6 @@ class MailSidebar:
 
     def _retry_folder_load(self, load_id: int, account_uid: str) -> bool:
         if load_id != self._load_generation:
-            self._release_folder_load_slot()
             return False
         account = self._accounts_by_uid.get(account_uid)
         if account is None:
@@ -1372,7 +1379,6 @@ class MailSidebar:
         error: Exception | None,
     ) -> bool:
         if load_id != self._load_generation:
-            self._release_folder_load_slot()
             return False
 
         folder_list = self._folder_lists.get(account_uid)
@@ -1428,12 +1434,13 @@ class MailSidebar:
             self._sidebar_selecting = False
 
         if load_error is not None:
-            self._folder_loads_pending -= 1
+            self._folder_loads_pending = max(0, self._folder_loads_pending - 1)
             self._finish_account_reload(account_uid, 0, load_error)
             self._update_startup_folder_load_status()
             # Select before marking ready so search can enable in the same turn (#196).
             self._maybe_apply_initial_selection()
             self._maybe_finish_initial_folder_load()
+            self._maybe_recover_search_folder_selection()
             return False
 
         # Eager inbox only — full-folder STATUS at tree load saturates Camel/mail
@@ -1441,11 +1448,12 @@ class MailSidebar:
         self.refresh_inbox_counts(account_uid)
         self._update_account_offline_marker(account_uid)
 
-        self._folder_loads_pending -= 1
+        self._folder_loads_pending = max(0, self._folder_loads_pending - 1)
         self._maybe_apply_initial_selection()
         self._finish_account_reload(account_uid, folder_count, None)
         self._update_startup_folder_load_status()
         self._maybe_finish_initial_folder_load()
+        self._maybe_recover_search_folder_selection()
 
         return False
 
@@ -1533,6 +1541,21 @@ class MailSidebar:
                     return
         self._needs_initial_selection = True
         self._maybe_apply_initial_selection()
+
+    def _maybe_recover_search_folder_selection(self) -> None:
+        """If the tree is already ready but no folder is active, select one (#196).
+
+        Covers the case where folder_tree_ready flipped before rows existed
+        (stale load completions / reload races); later row builds must still
+        drive a selection so search can enable.
+        """
+        if not self._folder_tree_ready:
+            return
+        if self._activated_folder is not None:
+            account_uid, folder_name = self._activated_folder
+            if not is_post_outbox_folder(folder_name):
+                return
+        self.ensure_folder_selection()
 
     def _find_initial_folder(self) -> tuple[Gtk.ListBox | None, Gtk.ListBoxRow | None]:
         saved = self._saved_active_folder
