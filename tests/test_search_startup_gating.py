@@ -296,13 +296,10 @@ class SearchEntryStartupGatingTests(unittest.TestCase):
         self.window._is_multi_folder_scope = mock.Mock(return_value=False)
         self.window._leave_multi_folder_sidebar_mode = mock.Mock()
 
-    def test_search_entry_enabled_while_folder_tree_loading_once_folder_selected(
-        self,
-    ) -> None:
-        """Entry can accept input before the tree is ready; apply stays gated (#196)."""
+    def test_search_entry_disabled_while_folder_tree_loading(self) -> None:
         MainWindow._update_search_entry_state(self.window)
-        self.assertTrue(self.window._header_search_entry.get_sensitive())
-        self.assertTrue(self.window._search_scope_dropdown.get_sensitive())
+        self.assertFalse(self.window._header_search_entry.get_sensitive())
+        self.assertFalse(self.window._search_scope_dropdown.get_sensitive())
 
     def test_search_entry_disabled_without_folder_even_when_tree_ready(self) -> None:
         self.window._current_account = None
@@ -330,7 +327,6 @@ class SearchEntryStartupGatingTests(unittest.TestCase):
         self.window._update_search_entry_state = (
             lambda: MainWindow._update_search_entry_state(self.window)
         )
-        self.window._apply_search_from_entry = mock.Mock()
 
         MainWindow._on_folder_tree_ready(self.window)
 
@@ -354,28 +350,11 @@ class SearchEntryStartupGatingTests(unittest.TestCase):
         self.window._update_search_entry_state = (
             lambda: MainWindow._update_search_entry_state(self.window)
         )
-        self.window._apply_search_from_entry = mock.Mock()
 
         MainWindow._on_folder_tree_ready(self.window)
 
         self.window._sidebar.ensure_folder_selection.assert_called_once_with()
         self.assertTrue(self.window._header_search_entry.get_sensitive())
-
-    def test_folder_tree_ready_applies_pending_search_text(self) -> None:
-        self.window._sidebar.folder_tree_ready = True
-        self.window._header_search_entry.set_text("from:ada")
-        self.window._sidebar.ensure_folder_selection = mock.Mock()
-        self.window._sync_watcher = mock.Mock()
-        self.window._sync_watcher.running = False
-        self.window._folder_count_poll_deferred_id = None
-        self.window._update_search_entry_state = (
-            lambda: MainWindow._update_search_entry_state(self.window)
-        )
-        self.window._apply_search_from_entry = mock.Mock()
-
-        MainWindow._on_folder_tree_ready(self.window)
-
-        self.window._apply_search_from_entry.assert_called_once_with()
 
     def test_reselecting_current_folder_refreshes_search_without_reload(self) -> None:
         self.window._sidebar.folder_tree_ready = True
