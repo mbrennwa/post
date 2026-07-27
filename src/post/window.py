@@ -2543,6 +2543,11 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_folder_selected(self, account: MailAccount, folder_name: str) -> None:
         query = self._parse_search_from_entry()
         narrowing = self._is_multi_folder_scope() and query is not None
+        already_current = (
+            self._current_account is not None
+            and self._current_account.uid == account.uid
+            and self._current_folder == folder_name
+        )
         seed_source = (
             list(self._current_folder_messages or []) if narrowing else []
         )
@@ -2559,6 +2564,10 @@ class MainWindow(Adw.ApplicationWindow):
                 query,
                 seed_matches=seed_matches,
             )
+            return
+        # Eager restore / re-select of the active row only needs search state
+        # refreshed — avoid kicking off a duplicate message load (#196).
+        if already_current:
             return
         self._search_query = query
         self._load_messages(account.uid, folder_name)
