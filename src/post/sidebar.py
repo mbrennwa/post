@@ -1431,8 +1431,9 @@ class MailSidebar:
             self._folder_loads_pending -= 1
             self._finish_account_reload(account_uid, 0, load_error)
             self._update_startup_folder_load_status()
-            self._maybe_finish_initial_folder_load()
+            # Select before marking ready so search can enable in the same turn (#196).
             self._maybe_apply_initial_selection()
+            self._maybe_finish_initial_folder_load()
             return False
 
         # Eager inbox only — full-folder STATUS at tree load saturates Camel/mail
@@ -1455,12 +1456,17 @@ class MailSidebar:
         if self._startup_folder_total > 0:
             self._set_status(f"{len(self._accounts)} account(s)")
             self._startup_folder_total = 0
+        # Enable search before offline-sync kickoff: list_accounts() there can
+        # throw and would otherwise leave the search bar stuck disabled (#196).
+        if self._on_folder_tree_ready is not None:
+            self._on_folder_tree_ready()
         callback = self._on_initial_folder_load_complete
         if callback is not None:
             self._on_initial_folder_load_complete = None
-            callback()
-        if self._on_folder_tree_ready is not None:
-            self._on_folder_tree_ready()
+            try:
+                callback()
+            except Exception:
+                log.exception("Initial folder-load complete callback failed")
 
     def _save_expanded_state(self) -> None:
         if self._inbox_expander is not None:
@@ -1512,6 +1518,22 @@ class MailSidebar:
         self._activate_folder_row(initial_list, initial_row)
         self._needs_initial_selection = False
 
+    def ensure_folder_selection(self) -> None:
+        """Select a searchable folder if none is active yet (#196).
+
+        Called when the folder tree becomes ready so the header search bar can
+        enable without waiting for a manual sidebar click.
+        """
+        if self._activated_folder is not None:
+            account_uid, folder_name = self._activated_folder
+            if not is_post_outbox_folder(folder_name):
+                account = self._accounts_by_uid.get(account_uid)
+                if account is not None:
+                    self._on_folder_selected(account, folder_name)
+                    return
+        self._needs_initial_selection = True
+        self._maybe_apply_initial_selection()
+
     def _find_initial_folder(self) -> tuple[Gtk.ListBox | None, Gtk.ListBoxRow | None]:
         saved = self._saved_active_folder
         if saved is not None:
@@ -1539,7 +1561,8 @@ class MailSidebar:
         if self._inbox_list is not None:
             row = self._inbox_list.get_first_child()
             while row is not None:
-                if getattr(row, "folder_name", None):
+                folder_name = getattr(row, "folder_name", None)
+                if folder_name and not is_post_outbox_folder(folder_name):
                     return self._inbox_list, row
                 row = row.get_next_sibling()
 
@@ -1548,7 +1571,7 @@ class MailSidebar:
             row = listbox.get_first_child()
             while row is not None:
                 folder_name = getattr(row, "folder_name", None)
-                if folder_name:
+                if folder_name and not is_post_outbox_folder(folder_name):
                     if first[1] is None:
                         first = (listbox, row)
                     if folder_name.upper() in ("INBOX", "INBOX/"):
@@ -1995,13 +2018,17 @@ class MailSidebar:
             return
 
         selection = (account_uid, folder_name)
+        account = self._accounts_by_uid.get(account_uid)
         if selection == self._activated_folder:
             self._sync_folder_row_selection(listbox, row)
+            # Still notify so header search can enable after folder-tree ready
+            # even when the row was only marked active (eager restore) (#196).
+            if account is not None:
+                self._on_folder_selected(account, folder_name)
             return
 
         self._sync_folder_row_selection(listbox, row)
 
-        account = self._accounts_by_uid.get(account_uid)
         if account is None:
             return
 

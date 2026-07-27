@@ -148,6 +148,132 @@ class FolderTreeReadyTests(unittest.TestCase):
         self.assertEqual(self._on_folder_tree_ready.call_count, 2)
         self.assertTrue(self.sidebar.folder_tree_ready)
 
+    def test_folder_tree_ready_runs_before_initial_load_complete(self) -> None:
+        order: list[str] = []
+        self.sidebar._on_folder_tree_ready = lambda: order.append("ready")
+        self.sidebar._on_initial_folder_load_complete = lambda: order.append(
+            "offline"
+        )
+        self.sidebar._folder_loads_pending = 0
+        self.sidebar._maybe_finish_initial_folder_load()
+        self.assertEqual(order, ["ready", "offline"])
+
+    def test_folder_tree_ready_still_runs_if_initial_load_complete_raises(self) -> None:
+        ready = mock.Mock()
+
+        def boom() -> None:
+            raise RuntimeError("offline sync setup failed")
+
+        self.sidebar._on_folder_tree_ready = ready
+        self.sidebar._on_initial_folder_load_complete = boom
+        self.sidebar._folder_loads_pending = 0
+        self.sidebar._maybe_finish_initial_folder_load()
+        ready.assert_called_once_with()
+        self.assertTrue(self.sidebar.folder_tree_ready)
+        self.assertIsNone(self.sidebar._on_initial_folder_load_complete)
+
+    def test_error_path_selects_before_marking_folder_tree_ready(self) -> None:
+        order: list[str] = []
+        self.sidebar._folder_loads_pending = 1
+        self.sidebar._needs_initial_selection = True
+        self.sidebar._accounts_by_uid["acct-1"] = _account("acct-1")
+        self.sidebar._folder_lists["acct-1"] = Gtk.ListBox()
+        self.sidebar._on_folder_tree_ready = lambda: order.append("ready")
+
+        def apply_selection() -> None:
+            order.append("select")
+            self.sidebar._needs_initial_selection = False
+
+        with (
+            mock.patch.object(
+                self.sidebar,
+                "_maybe_apply_initial_selection",
+                side_effect=apply_selection,
+            ),
+            mock.patch.object(self.sidebar, "_finish_account_reload"),
+            mock.patch.object(self.sidebar, "_update_startup_folder_load_status"),
+            mock.patch.object(self.sidebar, "_clear_listbox"),
+            mock.patch.object(
+                self.sidebar, "_add_outbox_row"
+            ),
+            mock.patch.object(
+                self.sidebar, "_add_inbox_row_unavailable"
+            ),
+            mock.patch.object(
+                self.sidebar, "_update_account_offline_marker"
+            ),
+            mock.patch.object(
+                self.sidebar, "_wrap_list_row", return_value=Gtk.ListBoxRow()
+            ),
+            mock.patch(
+                "post.sidebar.format_folder_load_error",
+                return_value="failed",
+            ),
+            mock.patch(
+                "post.sidebar.is_network_unavailable_error",
+                return_value=False,
+            ),
+            mock.patch(
+                "post.sidebar.is_sign_in_required_error",
+                return_value=False,
+            ),
+        ):
+            self.sidebar._on_folders_loaded(
+                self.sidebar._load_generation,
+                "acct-1",
+                None,
+                RuntimeError("boom"),
+            )
+
+        self.assertEqual(order, ["select", "ready"])
+        self.assertTrue(self.sidebar.folder_tree_ready)
+
+    def test_ensure_folder_selection_notifies_existing_active_folder(self) -> None:
+        account = _account("acct-1")
+        self.sidebar._accounts_by_uid["acct-1"] = account
+        self.sidebar.mark_folder_active("acct-1", "INBOX")
+        on_selected = mock.Mock()
+        self.sidebar._on_folder_selected = on_selected
+
+        self.sidebar.ensure_folder_selection()
+
+        on_selected.assert_called_once_with(account, "INBOX")
+
+    def test_ensure_folder_selection_picks_default_when_none_active(self) -> None:
+        account = _account("acct-1")
+        self.sidebar._accounts_by_uid["acct-1"] = account
+        self.sidebar._needs_initial_selection = False
+        self.sidebar._activated_folder = None
+        listbox = Gtk.ListBox()
+        row = Gtk.ListBoxRow()
+        row.account_uid = "acct-1"  # type: ignore[attr-defined]
+        row.folder_name = "INBOX"  # type: ignore[attr-defined]
+        listbox.append(row)
+        self.sidebar._folder_lists["acct-1"] = listbox
+        on_selected = mock.Mock()
+        self.sidebar._on_folder_selected = on_selected
+
+        self.sidebar.ensure_folder_selection()
+
+        on_selected.assert_called_once_with(account, "INBOX")
+        self.assertEqual(self.sidebar._activated_folder, ("acct-1", "INBOX"))
+
+    def test_default_initial_folder_skips_outbox(self) -> None:
+        listbox = Gtk.ListBox()
+        outbox = Gtk.ListBoxRow()
+        outbox.account_uid = "acct-1"  # type: ignore[attr-defined]
+        outbox.folder_name = ".post/Outbox"  # type: ignore[attr-defined]
+        inbox = Gtk.ListBoxRow()
+        inbox.account_uid = "acct-1"  # type: ignore[attr-defined]
+        inbox.folder_name = "INBOX"  # type: ignore[attr-defined]
+        listbox.append(outbox)
+        listbox.append(inbox)
+        self.sidebar._folder_lists["acct-1"] = listbox
+
+        found_list, found_row = self.sidebar._default_initial_folder()
+        self.assertIs(found_list, listbox)
+        self.assertIs(found_row, inbox)
+
 
 class SearchEntryStartupGatingTests(unittest.TestCase):
     @classmethod
@@ -175,11 +301,88 @@ class SearchEntryStartupGatingTests(unittest.TestCase):
         self.assertFalse(self.window._header_search_entry.get_sensitive())
         self.assertFalse(self.window._search_scope_dropdown.get_sensitive())
 
+    def test_search_entry_disabled_without_folder_even_when_tree_ready(self) -> None:
+        self.window._current_account = None
+        self.window._current_folder = None
+        self.window._sidebar.folder_tree_ready = True
+        MainWindow._update_search_entry_state(self.window)
+        self.assertFalse(self.window._header_search_entry.get_sensitive())
+        self.assertFalse(self.window._search_scope_dropdown.get_sensitive())
+
     def test_search_entry_enabled_when_folder_tree_ready(self) -> None:
         self.window._sidebar.folder_tree_ready = True
         MainWindow._update_search_entry_state(self.window)
         self.assertTrue(self.window._header_search_entry.get_sensitive())
         self.assertTrue(self.window._search_scope_dropdown.get_sensitive())
+
+    def test_folder_tree_ready_enables_search_without_user_click(self) -> None:
+        """Eager-restored folder + tree ready must enable search automatically (#196)."""
+        self.window._header_search_entry.set_sensitive(False)
+        self.window._search_scope_dropdown.set_sensitive(False)
+        self.window._sidebar.folder_tree_ready = True
+        self.window._sidebar.ensure_folder_selection = mock.Mock()
+        self.window._sync_watcher = mock.Mock()
+        self.window._sync_watcher.running = False
+        self.window._folder_count_poll_deferred_id = None
+        self.window._update_search_entry_state = (
+            lambda: MainWindow._update_search_entry_state(self.window)
+        )
+
+        MainWindow._on_folder_tree_ready(self.window)
+
+        self.window._sidebar.ensure_folder_selection.assert_not_called()
+        self.assertTrue(self.window._header_search_entry.get_sensitive())
+        self.assertTrue(self.window._search_scope_dropdown.get_sensitive())
+
+    def test_folder_tree_ready_selects_folder_when_none_current(self) -> None:
+        self.window._current_account = None
+        self.window._current_folder = None
+        self.window._sidebar.folder_tree_ready = True
+
+        def ensure() -> None:
+            self.window._current_account = _account("acct-1")
+            self.window._current_folder = "INBOX"
+
+        self.window._sidebar.ensure_folder_selection = mock.Mock(side_effect=ensure)
+        self.window._sync_watcher = mock.Mock()
+        self.window._sync_watcher.running = False
+        self.window._folder_count_poll_deferred_id = None
+        self.window._update_search_entry_state = (
+            lambda: MainWindow._update_search_entry_state(self.window)
+        )
+
+        MainWindow._on_folder_tree_ready(self.window)
+
+        self.window._sidebar.ensure_folder_selection.assert_called_once_with()
+        self.assertTrue(self.window._header_search_entry.get_sensitive())
+
+    def test_reselecting_current_folder_refreshes_search_without_reload(self) -> None:
+        self.window._sidebar.folder_tree_ready = True
+        self.window._parse_search_from_entry = mock.Mock(return_value=None)
+        self.window._prepare_folder_selection = mock.Mock()
+        self.window._load_messages = mock.Mock()
+        self.window._current_folder_messages = []
+
+        MainWindow._on_folder_selected(
+            self.window, self.window._current_account, "INBOX"
+        )
+
+        self.window._prepare_folder_selection.assert_called_once_with(
+            self.window._current_account, "INBOX"
+        )
+        self.window._load_messages.assert_not_called()
+
+    def test_selecting_new_folder_loads_messages(self) -> None:
+        other = _account("acct-2")
+        self.window._parse_search_from_entry = mock.Mock(return_value=None)
+        self.window._prepare_folder_selection = mock.Mock()
+        self.window._load_messages = mock.Mock()
+        self.window._current_folder_messages = []
+
+        MainWindow._on_folder_selected(self.window, other, "INBOX")
+
+        self.window._prepare_folder_selection.assert_called_once_with(other, "INBOX")
+        self.window._load_messages.assert_called_once_with(other.uid, "INBOX")
 
     def test_apply_search_skips_while_folder_tree_loading(self) -> None:
         self.window._header_search_entry.set_text("hello")

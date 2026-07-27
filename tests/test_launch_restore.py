@@ -113,7 +113,7 @@ class MarkFolderActiveTests(unittest.TestCase):
         self.assertEqual(self.sidebar._activated_folder, ("acct-1", "INBOX"))
         self._on_folder_selected.assert_not_called()
 
-    def test_activate_folder_row_skips_callback_when_already_active(self) -> None:
+    def test_activate_folder_row_notifies_when_already_active(self) -> None:
         self.sidebar.mark_folder_active("acct-1", "INBOX")
         self.sidebar._accounts_by_uid["acct-1"] = MailAccount(
             uid="acct-1",
@@ -134,7 +134,10 @@ class MarkFolderActiveTests(unittest.TestCase):
 
         self.sidebar._activate_folder_row(listbox, row)
 
-        self._on_folder_selected.assert_not_called()
+        self._on_folder_selected.assert_called_once()
+        account, folder_name = self._on_folder_selected.call_args.args
+        self.assertEqual(account.uid, "acct-1")
+        self.assertEqual(folder_name, "INBOX")
 
 
 if __name__ == "__main__":
