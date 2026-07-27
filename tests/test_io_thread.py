@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import threading
+import time
 import unittest
+from unittest import mock
 
 from post.mail.io_thread import get_mail_io_thread, is_mail_io_thread, run_on_mail_thread
 
@@ -170,3 +172,42 @@ class MailIoThreadTests(unittest.TestCase):
         self.assertTrue(preempted.wait(timeout=5.0))
         self._io.run_sync(lambda: None)
         self.assertEqual(results, ["background", "interactive"])
+
+
+class MailIoThreadWatchdogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._io = get_mail_io_thread()
+
+    def test_slow_task_logs_still_running_and_slow_finish(self) -> None:
+        import post.mail.io_thread as io_thread_mod
+
+        gate = threading.Event()
+        started = threading.Event()
+
+        def slow_task() -> None:
+            started.set()
+            gate.wait(timeout=5.0)
+
+        with mock.patch.object(io_thread_mod, "_LONG_TASK_WARN_SECONDS", 0.05):
+            with mock.patch.object(io_thread_mod.log, "warning") as warn:
+                self._io.submit(slow_task)
+                self.assertTrue(started.wait(timeout=5.0))
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if any(
+                        "still running" in str(call)
+                        for call in warn.call_args_list
+                    ):
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail("expected still-running warning")
+                gate.set()
+                self._io.run_sync(lambda: None)
+                self.assertTrue(
+                    any(
+                        "slow finish" in str(call)
+                        for call in warn.call_args_list
+                    )
+                )

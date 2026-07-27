@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, TYPE_CHECKING
 
@@ -32,6 +34,9 @@ if TYPE_CHECKING:
     from post.mail.eds import MailService
 
 log = logging.getLogger(__name__)
+
+# Bound downsync_sync so one folder cannot pin post-mail-io for minutes (#197).
+_OFFLINE_DOWNSYNC_TIMEOUT_SECONDS = 30
 
 OfflineSyncProgressCallback = Callable[["OfflineSyncProgress"], None]
 
@@ -266,13 +271,34 @@ class OfflineBodySyncCoordinator:
     ) -> None:
         if cancellable.is_cancelled():
             return
+        folder_name = folder.get_full_name() or ""
+        timer = threading.Timer(
+            _OFFLINE_DOWNSYNC_TIMEOUT_SECONDS, cancellable.cancel
+        )
+        started = time.monotonic()
+        timer.start()
         try:
             folder.downsync_sync(expression, cancellable)
         except GLib.Error as exc:
             if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                elapsed = time.monotonic() - started
+                if elapsed >= _OFFLINE_DOWNSYNC_TIMEOUT_SECONDS * 0.9:
+                    log.warning(
+                        "Offline downsync timed out after %.1fs for folder %r",
+                        elapsed,
+                        folder_name,
+                    )
+                else:
+                    log.debug(
+                        "Offline downsync cancelled for folder %r after %.1fs",
+                        folder_name,
+                        elapsed,
+                    )
                 return
             log.debug(
                 "Offline downsync failed for folder %r",
-                folder.get_full_name(),
+                folder_name,
                 exc_info=True,
             )
+        finally:
+            timer.cancel()
