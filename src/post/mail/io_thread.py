@@ -46,6 +46,9 @@ _instance: MailIoThread | None = None
 _instance_lock = threading.Lock()
 _camel_initialized = False
 
+# Warn when a mail-I/O task runs this long (soft-hang diagnosis, #197).
+_LONG_TASK_WARN_SECONDS = 10.0
+
 
 def is_mail_io_thread() -> bool:
     return _io_thread_id is not None and threading.get_ident() == _io_thread_id
@@ -103,6 +106,7 @@ class MailIoThread:
         self._lock = threading.Lock()
         self._work_available = threading.Condition(self._lock)
         self._current_is_background = False
+        self._current_task_id = 0
         self._background_preempted = False
         self._on_background_preempt: Callable[[], None] | None = None
         self._on_background_resume: Callable[[], None] | None = None
@@ -233,21 +237,63 @@ class MailIoThread:
             )
             with self._work_available:
                 self._current_is_background = task.priority is _TaskPriority.BACKGROUND
+                self._current_task_id += 1
+                current_task_id = self._current_task_id
             task_start = GLib.get_monotonic_time()
+            warn_seconds = _LONG_TASK_WARN_SECONDS
+            thread_name = threading.current_thread().name
+
+            def _warn_still_running(task_id: int = current_task_id) -> None:
+                with self._work_available:
+                    if self._current_task_id != task_id:
+                        return
+                elapsed_ms = (GLib.get_monotonic_time() - task_start) / 1000
+                log.warning(
+                    "Mail I/O task still running thread=%s func=%s priority=%s "
+                    "elapsed=%.1fms",
+                    thread_name,
+                    func_name,
+                    task.priority.name,
+                    elapsed_ms,
+                )
+
+            watchdog: threading.Timer | None = None
+            if warn_seconds > 0:
+                watchdog = threading.Timer(warn_seconds, _warn_still_running)
+                watchdog.daemon = True
+                watchdog.start()
             try:
                 task.result["value"] = task.func(*task.args, **task.kwargs)
             except BaseException as exc:
                 task.result["error"] = exc
                 log.debug("Mail I/O task failed func=%s", func_name, exc_info=True)
+                elapsed_ms = (GLib.get_monotonic_time() - task_start) / 1000
+                if warn_seconds > 0 and elapsed_ms >= warn_seconds * 1000:
+                    log.warning(
+                        "Mail I/O task failed slowly thread=%s func=%s "
+                        "elapsed=%.1fms",
+                        thread_name,
+                        func_name,
+                        elapsed_ms,
+                    )
             else:
                 elapsed_ms = (GLib.get_monotonic_time() - task_start) / 1000
                 log.debug(
                     "Mail I/O task finish thread=%s func=%s elapsed=%.1fms",
-                    threading.current_thread().name,
+                    thread_name,
                     func_name,
                     elapsed_ms,
                 )
+                if warn_seconds > 0 and elapsed_ms >= warn_seconds * 1000:
+                    log.warning(
+                        "Mail I/O task slow finish thread=%s func=%s elapsed=%.1fms",
+                        thread_name,
+                        func_name,
+                        elapsed_ms,
+                    )
             finally:
+                if watchdog is not None:
+                    watchdog.cancel()
                 with self._work_available:
                     self._current_is_background = False
                 if task.done is not None:

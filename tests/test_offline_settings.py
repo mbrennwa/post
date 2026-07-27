@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import time
 import unittest
 from unittest import mock
 
@@ -158,6 +159,46 @@ class OfflineSyncYieldTests(unittest.TestCase):
 
         self.assertFalse(complete)
         io_thread.submit_background.assert_called_once()
+
+
+class OfflineDownsyncTimeoutTests(unittest.TestCase):
+    def test_downsync_folder_sync_cancels_on_timeout(self) -> None:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import Gio, GLib
+
+        from post.mail import offline_sync
+        from post.mail.offline_sync import OfflineBodySyncCoordinator
+
+        mail = mock.Mock()
+        coordinator = OfflineBodySyncCoordinator(mail)
+        cancellable = Gio.Cancellable()
+        folder = mock.Mock()
+        folder.get_full_name.return_value = "INBOX"
+
+        def blocking_downsync(_expression: str, cancel: Gio.Cancellable) -> None:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if cancel.is_cancelled():
+                    raise GLib.Error.new_literal(
+                        Gio.io_error_quark(),
+                        "Operation was cancelled",
+                        Gio.IOErrorEnum.CANCELLED,
+                    )
+                time.sleep(0.02)
+            raise AssertionError("downsync was not cancelled by timeout")
+
+        folder.downsync_sync.side_effect = blocking_downsync
+
+        with mock.patch.object(offline_sync, "_OFFLINE_DOWNSYNC_TIMEOUT_SECONDS", 0.1):
+            started = time.monotonic()
+            coordinator._downsync_folder_sync(folder, "(match-all)", cancellable)
+            elapsed = time.monotonic() - started
+
+        self.assertTrue(cancellable.is_cancelled())
+        self.assertLess(elapsed, 1.0)
 
 
 class ShutdownSyncTests(unittest.TestCase):
