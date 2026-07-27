@@ -20,7 +20,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, Gio, GLib, Gtk
 
-from post.header_bar import add_end_window_controls
+from post.header_bar import add_end_window_controls, apply_header_corner_inset
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.compose import (
@@ -486,6 +486,7 @@ class ComposeWindow(Adw.Window):
         header = Adw.HeaderBar()
         header.set_show_title(False)
         add_end_window_controls(header)
+        apply_header_corner_inset(header)
 
         self._save_draft_btn = Gtk.Button(label="Save Draft")
         self._save_draft_btn.connect("clicked", self._on_save_draft_clicked)
@@ -600,10 +601,10 @@ class ComposeWindow(Adw.Window):
 
         self._body_view = Gtk.TextView()
         self._body_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self._body_view.set_left_margin(18)
-        self._body_view.set_right_margin(18)
-        self._body_view.set_top_margin(0)
-        self._body_view.set_bottom_margin(12)
+        self._body_view.set_left_margin(10)
+        self._body_view.set_right_margin(10)
+        self._body_view.set_top_margin(10)
+        self._body_view.set_bottom_margin(10)
         self._body_view.get_buffer().connect("changed", self._on_body_buffer_changed)
         body_focus = Gtk.EventControllerFocus()
         body_focus.connect("enter", self._on_body_focus_in)
