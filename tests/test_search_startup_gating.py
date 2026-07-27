@@ -183,6 +183,7 @@ class FolderTreeReadyTests(unittest.TestCase):
         def apply_selection() -> None:
             order.append("select")
             self.sidebar._needs_initial_selection = False
+            self.sidebar._activated_folder = ("acct-1", "INBOX")
 
         with (
             mock.patch.object(
@@ -273,6 +274,63 @@ class FolderTreeReadyTests(unittest.TestCase):
         found_list, found_row = self.sidebar._default_initial_folder()
         self.assertIs(found_list, listbox)
         self.assertIs(found_row, inbox)
+
+    def test_stale_folder_load_completion_does_not_release_current_pending(
+        self,
+    ) -> None:
+        self.sidebar._load_generation = 2
+        self.sidebar._folder_loads_pending = 2
+        self.sidebar._folder_tree_ready = False
+        ready = mock.Mock()
+        self.sidebar._on_folder_tree_ready = ready
+
+        # Old generation completions must be ignored (sidebar reload race).
+        self.sidebar._on_folder_load_cancelled(1, "acct-1")
+        self.sidebar._on_folders_loaded(1, "acct-1", [], None)
+        self.sidebar._retry_folder_load(1, "acct-1")
+
+        self.assertEqual(self.sidebar._folder_loads_pending, 2)
+        self.assertFalse(self.sidebar.folder_tree_ready)
+        ready.assert_not_called()
+
+    def test_reload_account_increments_pending_during_startup(self) -> None:
+        account = _account("acct-1")
+        self.sidebar._accounts_by_uid["acct-1"] = account
+        self.sidebar._folder_lists["acct-1"] = Gtk.ListBox()
+        self.sidebar._folder_loads_pending = 2
+        self.sidebar._startup_folder_total = 2
+        self.sidebar._folder_tree_ready = False
+
+        with mock.patch.object(self.sidebar, "_start_folder_load") as start:
+            self.sidebar.reload_account("acct-1")
+
+        self.assertEqual(self.sidebar._folder_loads_pending, 3)
+        self.assertEqual(self.sidebar._startup_folder_total, 3)
+        start.assert_called_once()
+
+    def test_recover_selects_folder_when_ready_before_rows_existed(self) -> None:
+        """Early ready + late row build must still select so search can enable."""
+        account = _account("acct-1")
+        self.sidebar._accounts_by_uid["acct-1"] = account
+        self.sidebar._folder_tree_ready = True
+        self.sidebar._folder_loads_pending = 0
+        self.sidebar._needs_initial_selection = False
+        self.sidebar._activated_folder = None
+        on_selected = mock.Mock()
+        self.sidebar._on_folder_selected = on_selected
+
+        # Simulate rows appearing after an early ready flip.
+        listbox = Gtk.ListBox()
+        row = Gtk.ListBoxRow()
+        row.account_uid = "acct-1"  # type: ignore[attr-defined]
+        row.folder_name = "INBOX"  # type: ignore[attr-defined]
+        listbox.append(row)
+        self.sidebar._folder_lists["acct-1"] = listbox
+
+        self.sidebar._maybe_recover_search_folder_selection()
+
+        on_selected.assert_called_once_with(account, "INBOX")
+        self.assertEqual(self.sidebar._activated_folder, ("acct-1", "INBOX"))
 
 
 class SearchEntryStartupGatingTests(unittest.TestCase):
