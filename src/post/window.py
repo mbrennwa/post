@@ -1235,6 +1235,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._mail.schedule_offline_body_sync()
 
     def _on_folder_tree_ready(self) -> None:
+        # Folder tree is up; make sure a searchable folder is selected so the
+        # header search bar can enable without waiting for a click (#196).
+        if (
+            self._current_account is None
+            or self._current_folder is None
+            or is_post_outbox_folder(self._current_folder)
+        ):
+            self._sidebar.ensure_folder_selection()
         self._update_search_entry_state()
         # Folder tree cache is now populated; refresh sync watch so inbox uses
         # the real folder name instead of skipping while cache was empty (#153).
@@ -2366,6 +2374,8 @@ class MainWindow(Adw.ApplicationWindow):
             and self._current_folder is not None
             and not is_post_outbox_folder(self._current_folder)
         )
+        # Keep the bar disabled until the folder tree has finished loading so
+        # search cannot preempt sidebar assembly (#144 / #196).
         enabled = folder_selected and self._sidebar.folder_tree_ready
         self._header_search_entry.set_sensitive(enabled)
         self._search_scope_dropdown.set_sensitive(enabled)
@@ -2543,6 +2553,11 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_folder_selected(self, account: MailAccount, folder_name: str) -> None:
         query = self._parse_search_from_entry()
         narrowing = self._is_multi_folder_scope() and query is not None
+        already_current = (
+            self._current_account is not None
+            and self._current_account.uid == account.uid
+            and self._current_folder == folder_name
+        )
         seed_source = (
             list(self._current_folder_messages or []) if narrowing else []
         )
@@ -2559,6 +2574,10 @@ class MainWindow(Adw.ApplicationWindow):
                 query,
                 seed_matches=seed_matches,
             )
+            return
+        # Eager restore / re-select of the active row only needs search state
+        # refreshed — avoid kicking off a duplicate message load (#196).
+        if already_current:
             return
         self._search_query = query
         self._load_messages(account.uid, folder_name)
