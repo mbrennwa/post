@@ -1518,6 +1518,22 @@ class MailSidebar:
         self._activate_folder_row(initial_list, initial_row)
         self._needs_initial_selection = False
 
+    def ensure_folder_selection(self) -> None:
+        """Select a searchable folder if none is active yet (#196).
+
+        Called when the folder tree becomes ready so the header search bar can
+        enable without waiting for a manual sidebar click.
+        """
+        if self._activated_folder is not None:
+            account_uid, folder_name = self._activated_folder
+            if not is_post_outbox_folder(folder_name):
+                account = self._accounts_by_uid.get(account_uid)
+                if account is not None:
+                    self._on_folder_selected(account, folder_name)
+                    return
+        self._needs_initial_selection = True
+        self._maybe_apply_initial_selection()
+
     def _find_initial_folder(self) -> tuple[Gtk.ListBox | None, Gtk.ListBoxRow | None]:
         saved = self._saved_active_folder
         if saved is not None:
@@ -1545,7 +1561,8 @@ class MailSidebar:
         if self._inbox_list is not None:
             row = self._inbox_list.get_first_child()
             while row is not None:
-                if getattr(row, "folder_name", None):
+                folder_name = getattr(row, "folder_name", None)
+                if folder_name and not is_post_outbox_folder(folder_name):
                     return self._inbox_list, row
                 row = row.get_next_sibling()
 
@@ -1554,7 +1571,7 @@ class MailSidebar:
             row = listbox.get_first_child()
             while row is not None:
                 folder_name = getattr(row, "folder_name", None)
-                if folder_name:
+                if folder_name and not is_post_outbox_folder(folder_name):
                     if first[1] is None:
                         first = (listbox, row)
                     if folder_name.upper() in ("INBOX", "INBOX/"):
