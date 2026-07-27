@@ -1244,9 +1244,6 @@ class MainWindow(Adw.ApplicationWindow):
         ):
             self._sidebar.ensure_folder_selection()
         self._update_search_entry_state()
-        # Pick up text typed while the tree was still loading (#144 / #196).
-        if self._header_search_entry.get_text().strip():
-            self._apply_search_from_entry()
         # Folder tree cache is now populated; refresh sync watch so inbox uses
         # the real folder name instead of skipping while cache was empty (#153).
         if self._sync_watcher.running:
@@ -2377,9 +2374,9 @@ class MainWindow(Adw.ApplicationWindow):
             and self._current_folder is not None
             and not is_post_outbox_folder(self._current_folder)
         )
-        # Sensitivity follows folder selection only. Search *execution* stays
-        # gated on folder_tree_ready in _apply_search_from_entry (#144 / #196).
-        enabled = folder_selected
+        # Keep the bar disabled until the folder tree has finished loading so
+        # search cannot preempt sidebar assembly (#144 / #196).
+        enabled = folder_selected and self._sidebar.folder_tree_ready
         self._header_search_entry.set_sensitive(enabled)
         self._search_scope_dropdown.set_sensitive(enabled)
         if not enabled:
