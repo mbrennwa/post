@@ -19,6 +19,7 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Adw, GLib, Gio, Gtk
 
 from post import _ISSUE_TRACKER_URL, _PROJECT_HOMEPAGE, get_app_description, get_version
+from post.logging_setup import log_file_path, open_log_file_uri
 
 from post.mail import MailService
 from post.mail.accounts import (
@@ -457,7 +458,8 @@ class SettingsDialog(Adw.PreferencesWindow):
         issues_row = Adw.ActionRow(title="Issue Tracker")
         issues_row.set_subtitle(
             "Report bugs on GitHub. Include the Post version, your OS or distro, "
-            "and steps to reproduce. Crash logs and screenshots help when relevant."
+            "steps to reproduce, and attach post.log when relevant. "
+            "Screenshots help too."
         )
         issues_row.set_activatable(True)
         issues_row.connect(
@@ -465,8 +467,28 @@ class SettingsDialog(Adw.PreferencesWindow):
             lambda *_args: self._open_uri_externally(_ISSUE_TRACKER_URL),
         )
         bugs_group.add(issues_row)
+
+        log_row = Adw.ActionRow(title="Open Log File")
+        log_row.set_subtitle(str(log_file_path()))
+        log_row.set_activatable(True)
+        log_row.connect("activated", lambda *_args: self._open_log_file())
+        bugs_group.add(log_row)
         page.add(bugs_group)
         return page
+
+    def _open_log_file(self) -> None:
+        path = log_file_path()
+        try:
+            if path.is_file():
+                uri = open_log_file_uri()
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                uri = path.parent.resolve().as_uri()
+            Gio.AppInfo.launch_default_for_uri(uri, None)
+        except GLib.Error as exc:
+            log.warning("Could not open log file %s: %s", path, exc.message)
+        except OSError as exc:
+            log.warning("Could not open log file %s: %s", path, exc)
 
     @staticmethod
     def _open_uri_externally(uri: str) -> None:
