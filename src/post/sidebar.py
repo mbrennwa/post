@@ -64,6 +64,30 @@ from post.preferences import (
 
 log = logging.getLogger(__name__)
 
+
+def _flush_log_handlers() -> None:
+    """Flush handlers so the last DEBUG line survives a native Gtk abort."""
+    for handler in logging.root.handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+
+
+def _debug_listbox_start(op: str, **fields: object) -> None:
+    """Log entry into a ListBox mutation block (#201 crash isolation)."""
+    extras = " ".join(f"{key}={value!r}" for key, value in fields.items())
+    log.debug("start %s %s", op, extras)
+    _flush_log_handlers()
+
+
+def _debug_listbox_end(op: str, **fields: object) -> None:
+    """Log exit from a ListBox mutation block; missing end narrows crash site."""
+    extras = " ".join(f"{key}={value!r}" for key, value in fields.items())
+    log.debug("end %s %s", op, extras)
+    _flush_log_handlers()
+
+
 OnFolderSelected = Callable[[MailAccount, str], None]
 SetStatus = Callable[[str], None]
 OnRefreshAccount = Callable[[str], None]
@@ -554,8 +578,21 @@ class MailSidebar:
 
         self._sidebar_selecting = True
         try:
-            self._clear_listbox(folder_list)
-            folder_list.append(self._make_loading_row("Loading Folders…"))
+            _debug_listbox_start(
+                "reload_account_clear",
+                account_uid=account_uid,
+                selecting=True,
+                load_generation=self._load_generation,
+            )
+            try:
+                self._clear_listbox(folder_list)
+                folder_list.append(self._make_loading_row("Loading Folders…"))
+            finally:
+                _debug_listbox_end(
+                    "reload_account_clear",
+                    account_uid=account_uid,
+                    load_generation=self._load_generation,
+                )
         finally:
             self._sidebar_selecting = False
         # Count this load against pending so a mid-startup reload cannot make
@@ -1389,11 +1426,33 @@ class MailSidebar:
         # Block row-selected → activate while rebuilding. Gtk.ListBox SINGLE
         # selection fires row-selected on each append; re-entering activate /
         # unselect_all from inside append corrupts the list sequence (segfault).
+        already_selecting = self._sidebar_selecting
         self._sidebar_selecting = True
         load_error = error
         folder_count = 0
+        _debug_listbox_start(
+            "folders_loaded_rebuild",
+            load_id=load_id,
+            account_uid=account_uid,
+            already_selecting=already_selecting,
+            load_generation=self._load_generation,
+            has_error=load_error is not None,
+            folder_count=0 if folders is None else len(folders),
+        )
         try:
-            self._clear_listbox(folder_list)
+            _debug_listbox_start(
+                "folders_loaded_clear",
+                load_id=load_id,
+                account_uid=account_uid,
+            )
+            try:
+                self._clear_listbox(folder_list)
+            finally:
+                _debug_listbox_end(
+                    "folders_loaded_clear",
+                    load_id=load_id,
+                    account_uid=account_uid,
+                )
 
             if load_error is not None:
                 label_text = format_folder_load_error(load_error)
@@ -1406,32 +1465,83 @@ class MailSidebar:
                 error_label.set_margin_start(12)
                 error_label.set_margin_end(12)
                 error_label.set_margin_bottom(8)
-                folder_list.append(self._wrap_list_row(error_label))
-                self._add_outbox_row(account_uid)
-                health = self._mail.get_account_connect_health(account_uid)
-                if health == "ok":
-                    if is_network_unavailable_error(load_error):
-                        new_health = "not_connected"
-                    elif is_sign_in_required_error(load_error):
-                        new_health = "needs_sign_in"
-                    else:
-                        new_health = "not_connected"
-                    self._mail.set_account_connect_health(account_uid, new_health)
-                # Keep offline/degraded accounts visible in the unified Inboxes list.
-                self._add_inbox_row_unavailable(account_uid)
-                self._update_account_offline_marker(account_uid)
+                _debug_listbox_start(
+                    "folders_loaded_error_row",
+                    load_id=load_id,
+                    account_uid=account_uid,
+                )
+                try:
+                    folder_list.append(self._wrap_list_row(error_label))
+                    self._add_outbox_row(account_uid)
+                    health = self._mail.get_account_connect_health(account_uid)
+                    if health == "ok":
+                        if is_network_unavailable_error(load_error):
+                            new_health = "not_connected"
+                        elif is_sign_in_required_error(load_error):
+                            new_health = "needs_sign_in"
+                        else:
+                            new_health = "not_connected"
+                        self._mail.set_account_connect_health(account_uid, new_health)
+                    # Keep offline/degraded accounts visible in the unified Inboxes list.
+                    self._add_inbox_row_unavailable(account_uid)
+                    self._update_account_offline_marker(account_uid)
+                finally:
+                    _debug_listbox_end(
+                        "folders_loaded_error_row",
+                        load_id=load_id,
+                        account_uid=account_uid,
+                    )
             else:
                 assert folders is not None
                 folders = filter_sidebar_folders(folders)
                 self._account_folders[account_uid] = folders
                 folder_count = len(folders)
-                for folder in folders:
-                    folder_list.append(self._make_folder_row(account_uid, folder))
+                _debug_listbox_start(
+                    "folders_loaded_append_rows",
+                    load_id=load_id,
+                    account_uid=account_uid,
+                    folder_count=folder_count,
+                )
+                try:
+                    for index, folder in enumerate(folders):
+                        _debug_listbox_start(
+                            "folders_loaded_append_one",
+                            load_id=load_id,
+                            account_uid=account_uid,
+                            index=index,
+                            folder=folder.get("full_name"),
+                        )
+                        try:
+                            folder_list.append(
+                                self._make_folder_row(account_uid, folder)
+                            )
+                        finally:
+                            _debug_listbox_end(
+                                "folders_loaded_append_one",
+                                load_id=load_id,
+                                account_uid=account_uid,
+                                index=index,
+                                folder=folder.get("full_name"),
+                            )
 
-                self._add_outbox_row(account_uid)
-                self._add_inbox_row(account_uid, folders)
+                    self._add_outbox_row(account_uid)
+                    self._add_inbox_row(account_uid, folders)
+                finally:
+                    _debug_listbox_end(
+                        "folders_loaded_append_rows",
+                        load_id=load_id,
+                        account_uid=account_uid,
+                        folder_count=folder_count,
+                    )
         finally:
             self._sidebar_selecting = False
+            _debug_listbox_end(
+                "folders_loaded_rebuild",
+                load_id=load_id,
+                account_uid=account_uid,
+                folder_count=folder_count,
+                has_error=load_error is not None,
+            )
 
         if load_error is not None:
             self._folder_loads_pending = max(0, self._folder_loads_pending - 1)
@@ -1661,28 +1771,41 @@ class MailSidebar:
         if self._inbox_list is None:
             return
 
-        row = self._inbox_list.get_first_child()
-        while row is not None:
-            next_row = row.get_next_sibling()
-            if getattr(row, "account_uid", None) == account_uid:
-                self._inbox_list.remove(row)
-            row = next_row
-
-        account = self._accounts_by_uid.get(account_uid)
-        display = account.display_label if account else account_uid
-        full_name = inbox_folder.get("full_name")
-        if isinstance(full_name, str) and full_name:
-            self._account_inbox_folders[account_uid] = full_name
-        self._inbox_list.append(
-            self._make_folder_row(
-                account_uid, inbox_folder, display=display, show_offline_badge=True
-            )
+        _debug_listbox_start(
+            "replace_inbox_row",
+            account_uid=account_uid,
+            selecting=self._sidebar_selecting,
+            folder=inbox_folder.get("full_name"),
         )
-        row = self._inbox_list.get_last_child()
-        if isinstance(row, Gtk.ListBoxRow):
-            self._setup_inbox_row_drag(row)
-        self._sort_inbox_list()
-        self._update_account_offline_marker(account_uid)
+        try:
+            row = self._inbox_list.get_first_child()
+            while row is not None:
+                next_row = row.get_next_sibling()
+                if getattr(row, "account_uid", None) == account_uid:
+                    self._inbox_list.remove(row)
+                row = next_row
+
+            account = self._accounts_by_uid.get(account_uid)
+            display = account.display_label if account else account_uid
+            full_name = inbox_folder.get("full_name")
+            if isinstance(full_name, str) and full_name:
+                self._account_inbox_folders[account_uid] = full_name
+            self._inbox_list.append(
+                self._make_folder_row(
+                    account_uid, inbox_folder, display=display, show_offline_badge=True
+                )
+            )
+            row = self._inbox_list.get_last_child()
+            if isinstance(row, Gtk.ListBoxRow):
+                self._setup_inbox_row_drag(row)
+            self._sort_inbox_list()
+            self._update_account_offline_marker(account_uid)
+        finally:
+            _debug_listbox_end(
+                "replace_inbox_row",
+                account_uid=account_uid,
+                selecting=self._sidebar_selecting,
+            )
 
     def _current_inbox_order_from_list(self) -> list[str]:
         if self._inbox_list is None:
@@ -1706,27 +1829,37 @@ class MailSidebar:
         if self._inbox_list is None:
             return
 
-        placeholders: list[Gtk.ListBoxRow] = []
-        rows_by_uid: dict[str, Gtk.ListBoxRow] = {}
-        row = self._inbox_list.get_first_child()
-        while row is not None:
-            next_row = row.get_next_sibling()
-            uid = getattr(row, "account_uid", None)
-            self._inbox_list.remove(row)
-            if uid:
-                rows_by_uid[uid] = row
-            else:
-                placeholders.append(row)
-            row = next_row
+        _debug_listbox_start(
+            "sort_inbox_list",
+            selecting=self._sidebar_selecting,
+        )
+        try:
+            placeholders: list[Gtk.ListBoxRow] = []
+            rows_by_uid: dict[str, Gtk.ListBoxRow] = {}
+            row = self._inbox_list.get_first_child()
+            while row is not None:
+                next_row = row.get_next_sibling()
+                uid = getattr(row, "account_uid", None)
+                self._inbox_list.remove(row)
+                if uid:
+                    rows_by_uid[uid] = row
+                else:
+                    placeholders.append(row)
+                row = next_row
 
-        for placeholder in placeholders:
-            self._inbox_list.append(placeholder)
+            for placeholder in placeholders:
+                self._inbox_list.append(placeholder)
 
-        present = list(rows_by_uid.keys())
-        self._register_inbox_accounts(present)
-        order = self._resolve_inbox_order(present)
-        for uid in order:
-            self._inbox_list.append(rows_by_uid[uid])
+            present = list(rows_by_uid.keys())
+            self._register_inbox_accounts(present)
+            order = self._resolve_inbox_order(present)
+            for uid in order:
+                self._inbox_list.append(rows_by_uid[uid])
+        finally:
+            _debug_listbox_end(
+                "sort_inbox_list",
+                selecting=self._sidebar_selecting,
+            )
 
     def _move_inbox_row(self, source_uid: str, target_uid: str, *, after: bool) -> None:
         order = self._current_inbox_order_from_list()
@@ -1952,19 +2085,34 @@ class MailSidebar:
         folder_list = self._folder_lists.get(account_uid)
         if folder_list is None:
             return
-        count = count_queued_for_account(account_uid)
-        folder_list.append(
-            self._make_folder_row(
-                account_uid,
-                outbox_folder_dict(count),
-                display="Outbox",
-            )
+        _debug_listbox_start(
+            "add_outbox_row",
+            account_uid=account_uid,
+            selecting=self._sidebar_selecting,
         )
+        try:
+            count = count_queued_for_account(account_uid)
+            folder_list.append(
+                self._make_folder_row(
+                    account_uid,
+                    outbox_folder_dict(count),
+                    display="Outbox",
+                )
+            )
+        finally:
+            _debug_listbox_end(
+                "add_outbox_row",
+                account_uid=account_uid,
+            )
 
     @staticmethod
     def _clear_listbox(listbox: Gtk.ListBox) -> None:
-        while child := listbox.get_first_child():
-            listbox.remove(child)
+        _debug_listbox_start("clear_listbox")
+        try:
+            while child := listbox.get_first_child():
+                listbox.remove(child)
+        finally:
+            _debug_listbox_end("clear_listbox")
 
     def _on_folder_row_selected(
         self, listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None
@@ -1995,12 +2143,17 @@ class MailSidebar:
 
     def clear_folder_selection(self) -> None:
         """Clear sidebar highlights without dropping the saved folder for restore."""
+        _debug_listbox_start(
+            "clear_folder_selection",
+            selecting=self._sidebar_selecting,
+        )
         self._sidebar_selecting = True
         try:
             for listbox in self._all_folder_listboxes():
                 listbox.unselect_all()
         finally:
             self._sidebar_selecting = False
+            _debug_listbox_end("clear_folder_selection")
         self._activated_folder = None
 
     def restore_folder_selection(self, account_uid: str, folder_name: str) -> bool:
@@ -2020,19 +2173,34 @@ class MailSidebar:
         if not account_uid or not folder_name:
             return
 
-        for other in self._all_folder_listboxes():
-            if other is not listbox:
-                other.unselect_all()
+        _debug_listbox_start(
+            "sync_folder_row_selection",
+            account_uid=account_uid,
+            folder_name=folder_name,
+            selecting=self._sidebar_selecting,
+        )
+        try:
+            for other in self._all_folder_listboxes():
+                if other is not listbox:
+                    other.unselect_all()
 
-        self._sidebar_selecting = True
-        listbox.select_row(row)
-        for other in self._all_folder_listboxes():
-            if other is listbox:
-                continue
-            mirror = self._find_folder_row(other, account_uid, folder_name)
-            if mirror is not None:
-                other.select_row(mirror)
-        self._sidebar_selecting = False
+            self._sidebar_selecting = True
+            try:
+                listbox.select_row(row)
+                for other in self._all_folder_listboxes():
+                    if other is listbox:
+                        continue
+                    mirror = self._find_folder_row(other, account_uid, folder_name)
+                    if mirror is not None:
+                        other.select_row(mirror)
+            finally:
+                self._sidebar_selecting = False
+        finally:
+            _debug_listbox_end(
+                "sync_folder_row_selection",
+                account_uid=account_uid,
+                folder_name=folder_name,
+            )
 
     def _activate_folder_row(self, listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
         account_uid = getattr(row, "account_uid", None)

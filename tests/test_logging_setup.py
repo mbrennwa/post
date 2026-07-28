@@ -75,28 +75,42 @@ class LoggingSetupTests(unittest.TestCase):
             if getattr(handler, "name", None) == logging_setup._STREAM_HANDLER_NAME:
                 handler.setStream(stream)
         logger = logging.getLogger("post.test.logging")
+        logger.debug("debug-only-event")
         logger.info("info-only-event")
         logger.warning("warning-event")
         for handler in logging.root.handlers:
             handler.flush()
 
         text = path.read_text(encoding="utf-8")
+        self.assertIn("debug-only-event", text)
         self.assertIn("info-only-event", text)
         self.assertIn("warning-event", text)
         stream_text = stream.getvalue()
+        self.assertNotIn("debug-only-event", stream_text)
         self.assertNotIn("info-only-event", stream_text)
         self.assertIn("warning-event", stream_text)
 
-    def test_post_log_level_debug_enables_debug_to_file(self) -> None:
-        with mock.patch.dict(os.environ, {"POST_LOG_LEVEL": "DEBUG"}):
+    def test_default_debug_goes_to_file(self) -> None:
+        path = logging_setup.configure_logging()
+        logger = logging.getLogger("post.test.logging")
+        logger.debug("debug-event")
+        for handler in logging.root.handlers:
+            handler.flush()
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("debug-event", text)
+
+    def test_post_log_level_warning_raises_file_threshold(self) -> None:
+        with mock.patch.dict(os.environ, {"POST_LOG_LEVEL": "WARNING"}):
             logging_setup._reset_for_tests()
             path = logging_setup.configure_logging()
             logger = logging.getLogger("post.test.logging")
             logger.debug("debug-event")
+            logger.warning("warning-event")
             for handler in logging.root.handlers:
                 handler.flush()
             text = path.read_text(encoding="utf-8")
-            self.assertIn("debug-event", text)
+            self.assertNotIn("debug-event", text)
+            self.assertIn("warning-event", text)
 
     def test_open_log_file_uri(self) -> None:
         uri = logging_setup.open_log_file_uri()
