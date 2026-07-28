@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import logging
-import os
 import sys
 import warnings
 
@@ -22,15 +20,14 @@ from post.window import MainWindow
 
 
 def main() -> int:
-    # POST_LOG_LEVEL=DEBUG enables mail I/O task tracing (io_thread, eds send path).
+    # Always-on rotating file log under XDG state (~/.local/state/post/post.log).
+    # POST_LOG_LEVEL=DEBUG enables mail I/O task tracing (io_thread, eds send path)
+    # and raises file + stderr verbosity.
     # POST_DEBUG_SEARCH=1 enables folder search tracing (post.search logger).
-    log_level_name = os.environ.get("POST_LOG_LEVEL")
-    if log_level_name:
-        logging.basicConfig(
-            level=getattr(logging, log_level_name.upper(), logging.DEBUG)
-        )
+    from post.logging_setup import configure_logging
     from post.mail.search_debug import configure_search_debug_logging
 
+    configure_logging()
     configure_search_debug_logging()
     # PyGObject adds an extra ref when Python vfuncs return GObjects; harmless at exit.
     warnings.filterwarnings(
