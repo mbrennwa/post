@@ -51,7 +51,10 @@ On a fresh machine, install system dependencies first:
 # Run unit tests
 ./scripts/check.sh
 
-# Run with mail I/O debug tracing
+# Always-on diagnostics log: ~/.local/state/post/post.log
+# (Settings → About → Open Log File)
+
+# Run with mail I/O debug tracing (file + stderr)
 POST_LOG_LEVEL=DEBUG ./run.sh
 ```
 

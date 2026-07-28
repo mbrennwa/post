@@ -33,7 +33,14 @@ Post runs blocking Camel / Evolution Data Server (EDS) work on a **single dedica
 
 ## Debugging
 
-Set `POST_LOG_LEVEL=DEBUG` when launching Post to enable mail I/O task tracing (`post.mail.io_thread`) and send-phase logs (`post.mail.eds`):
+Post always writes a rotating application log to
+``$XDG_STATE_HOME/post/post.log`` (default ``~/.local/state/post/post.log``),
+2 MiB × 3 backups. Default levels: **INFO+** to the file, **WARNING+** to
+stderr/journal. Settings → About → **Open Log File** opens it for bug reports.
+
+Set `POST_LOG_LEVEL=DEBUG` when launching Post to enable mail I/O task tracing
+(`post.mail.io_thread`) and send-phase logs (`post.mail.eds`), and to raise both
+file and stderr verbosity:
 
 ```bash
 POST_LOG_LEVEL=DEBUG PYTHONPATH=src python3 -m post.main
@@ -51,7 +58,7 @@ POST_DEBUG_SEARCH=1 PYTHONPATH=src python3 -m post.main
 
 Search trace lines use the `post.search` logger and show load scheduling, mail-thread work, filter progress, and UI callback drops.
 
-Default log level is quiet (no console handler unless `POST_LOG_LEVEL` is set).
+Without `POST_LOG_LEVEL`, stderr stays at WARNING+; the on-disk log still records INFO+.
 
 ## Unit tests
 
