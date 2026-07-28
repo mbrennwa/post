@@ -150,9 +150,13 @@ class MessageBatchRangesTests(unittest.TestCase):
         self.assertEqual(MESSAGE_LIST_UI_BATCH_SIZE, 100)
 
     def test_bind_cap_constant(self) -> None:
-        from post.mail.message_list_state import MESSAGE_LIST_UI_BIND_CAP
+        from post.mail.message_list_state import (
+            MESSAGE_LIST_UI_BIND_CAP,
+            MESSAGE_LIST_UI_BIND_MORE,
+        )
 
         self.assertEqual(MESSAGE_LIST_UI_BIND_CAP, 500)
+        self.assertEqual(MESSAGE_LIST_UI_BIND_MORE, 500)
 
     def test_heavy_folder_name(self) -> None:
         from post.mail.message_list_state import is_heavy_folder_name
@@ -160,8 +164,39 @@ class MessageBatchRangesTests(unittest.TestCase):
         self.assertTrue(is_heavy_folder_name("Archive"))
         self.assertTrue(is_heavy_folder_name("INBOX/Archive"))
         self.assertTrue(is_heavy_folder_name("[Google Mail]/All Mail"))
+        self.assertTrue(is_heavy_folder_name("Trash"))
+        self.assertTrue(is_heavy_folder_name("Deleted Items"))
+        self.assertTrue(is_heavy_folder_name("Junk"))
+        self.assertTrue(is_heavy_folder_name("Spam"))
         self.assertFalse(is_heavy_folder_name("Inbox"))
         self.assertFalse(is_heavy_folder_name("Sent Items"))
+
+    def test_offline_folder_priority_order(self) -> None:
+        from post.mail.message_list_state import (
+            OFFLINE_PRIORITY_ARCHIVE,
+            OFFLINE_PRIORITY_JUNK,
+            OFFLINE_PRIORITY_ORDINARY,
+            OFFLINE_PRIORITY_TRASH,
+            offline_folder_priority,
+        )
+
+        self.assertEqual(offline_folder_priority("INBOX"), OFFLINE_PRIORITY_ORDINARY)
+        self.assertEqual(offline_folder_priority("Archive"), OFFLINE_PRIORITY_ARCHIVE)
+        self.assertEqual(offline_folder_priority("Trash"), OFFLINE_PRIORITY_TRASH)
+        self.assertEqual(offline_folder_priority("Junk"), OFFLINE_PRIORITY_JUNK)
+        self.assertLess(OFFLINE_PRIORITY_ORDINARY, OFFLINE_PRIORITY_ARCHIVE)
+        self.assertLess(OFFLINE_PRIORITY_ARCHIVE, OFFLINE_PRIORITY_TRASH)
+        self.assertLess(OFFLINE_PRIORITY_TRASH, OFFLINE_PRIORITY_JUNK)
+
+        # Camel flags win over ambiguous names when provided.
+        self.assertEqual(
+            offline_folder_priority(
+                "Custom",
+                folder_flags=4096,
+                type_junk=4096,
+            ),
+            OFFLINE_PRIORITY_JUNK,
+        )
 
     def test_lists_equivalent_samples_large_lists(self) -> None:
         from post.mail.message_list_state import message_lists_equivalent_for_ui

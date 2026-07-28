@@ -83,11 +83,11 @@ class QueueableNetworkErrorTests(unittest.TestCase):
 
         self.assertEqual(
             offline_cache_status_text(account_label="Work", folder_name="Inbox"),
-            "Caching mail for offline use · Work · Inbox",
+            "Caching mail for offline use · Work · Inbox (bodies for local headers)",
         )
         self.assertEqual(
             offline_cache_status_text(account_label="Work", folder_name=""),
-            "Caching mail for offline use · Work · folders",
+            "Caching mail for offline use · Work · folders (bodies for local headers)",
         )
 
 

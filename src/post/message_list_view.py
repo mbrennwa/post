@@ -32,6 +32,7 @@ OnSelectionChanged = Callable[[], None]
 OnItemActivated = Callable[[str], None]
 OnItemPressed = Callable[[str], None]
 OnItemContextMenu = Callable[[str, Gtk.Widget, float, float], None]
+OnNearEnd = Callable[[], None]
 SearchMetaLabelResolver = Callable[[dict[str, Any]], str | None]
 
 
@@ -95,6 +96,8 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self._on_item_activated: OnItemActivated | None = None
         self._on_item_pressed: OnItemPressed | None = None
         self._on_item_context_menu: OnItemContextMenu | None = None
+        self._on_near_end: OnNearEnd | None = None
+        self._near_end_emitted = False
         self._restoring_selection = False
         self._drag_account_uid: str | None = None
         self._drag_folder_name: str | None = None
@@ -114,6 +117,10 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self._list_view.connect("activate", self._on_list_view_activate)
         self._setup_list_drag_source()
         self.set_child(self._list_view)
+        adj = self.get_vadjustment()
+        if adj is not None:
+            adj.connect("value-changed", self._on_adjustment_changed)
+            adj.connect("changed", self._on_adjustment_changed)
 
     def set_search_meta_label_resolver(
         self, resolver: SearchMetaLabelResolver | None
@@ -168,11 +175,13 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         on_item_activated: OnItemActivated | None = None,
         on_item_pressed: OnItemPressed | None = None,
         on_item_context_menu: OnItemContextMenu | None = None,
+        on_near_end: OnNearEnd | None = None,
     ) -> None:
         self._on_selection_changed = on_selection_changed
         self._on_item_activated = on_item_activated
         self._on_item_pressed = on_item_pressed
         self._on_item_context_menu = on_item_context_menu
+        self._on_near_end = on_near_end
 
     def set_restoring_selection(self, restoring: bool) -> None:
         self._restoring_selection = restoring
@@ -184,9 +193,52 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self._list_key_positions.clear()
         self._selection.unselect_all()
         self._store.remove_all()
+        self._near_end_emitted = False
 
     def item_count(self) -> int:
         return self._store.get_n_items()
+
+    def reset_near_end(self) -> None:
+        """Allow another near-end callback after more rows were appended."""
+        self._near_end_emitted = False
+
+    def after_content_appended(self) -> None:
+        """Re-arm and re-check near-end after rows were appended.
+
+        Dragging the scrollbar thumb to the bottom only moves the adjustment
+        once; after we append content ``upper`` grows and no further
+        ``value-changed`` fires while the thumb stays put. Re-check on idle so
+        load-more keeps going until the viewport is no longer near the end.
+        """
+        self._near_end_emitted = False
+        GLib.idle_add(self._idle_recheck_near_end)
+
+    def _idle_recheck_near_end(self) -> bool:
+        adj = self.get_vadjustment()
+        if adj is not None:
+            self._on_adjustment_changed(adj)
+        return False
+
+    def _is_near_end(self, adj: Gtk.Adjustment) -> bool:
+        upper = adj.get_upper()
+        page = adj.get_page_size()
+        value = adj.get_value()
+        if upper <= 0:
+            return False
+        if upper <= page:
+            # All content fits — treat as at end so callers can bind more.
+            return True
+        distance_from_bottom = upper - (value + page)
+        # Within ~2 pages, or pinned to the bottom (scrollbar drag-to-end).
+        return distance_from_bottom <= max(page * 2.0, 1.0)
+
+    def _on_adjustment_changed(self, adj: Gtk.Adjustment) -> None:
+        if self._on_near_end is None or self._near_end_emitted:
+            return
+        if not self._is_near_end(adj):
+            return
+        self._near_end_emitted = True
+        self._on_near_end()
 
     def set_messages(self, messages: Iterable[dict[str, Any]], *, folder_name: str) -> None:
         at_top = self._is_scrolled_to_top()
