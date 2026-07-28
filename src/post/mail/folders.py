@@ -6,13 +6,21 @@
 from __future__ import annotations
 
 
-def format_folder_label(display: str, unread: int, total: int) -> str:
+def format_folder_label(
+    display: str,
+    unread: int,
+    total: int,
+    *,
+    status_pending: bool = False,
+) -> str:
     if unread >= 0 and total >= 0:
         return f"{display} ({unread}/{total})"
     if total >= 0:
         return f"{display} ({total})"
     if unread >= 0:
         return f"{display} ({unread})"
+    if status_pending:
+        return f"{display} (working…)"
     return display
 
 

@@ -25,6 +25,7 @@ import collections
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -108,6 +109,7 @@ class MailIoThread:
         self._current_is_background = False
         self._current_task_id = 0
         self._background_preempted = False
+        self._inside_pump = False
         self._on_background_preempt: Callable[[], None] | None = None
         self._on_background_resume: Callable[[], None] | None = None
         self._ready = threading.Event()
@@ -131,8 +133,12 @@ class MailIoThread:
     def _enqueue_interactive(self, task: _IoTask, *, front: bool = False) -> None:
         preempt: Callable[[], None] | None = None
         with self._work_available:
+            # While pump_until drains interactive work cooperatively, do not
+            # fire background preempt — that cancels the async op we are
+            # pumping (e.g. Archive refresh_info) (#208).
             if (
                 self._current_is_background
+                and not self._inside_pump
                 and self._on_background_preempt is not None
                 and not self._background_preempted
             ):
@@ -186,6 +192,86 @@ class MailIoThread:
     def has_interactive_work_pending(self) -> bool:
         with self._lock:
             return bool(self._interactive)
+
+    def pump_until(
+        self,
+        done: threading.Event,
+        *,
+        timeout_seconds: float | None = None,
+        run_interactive: bool = True,
+        on_timeout_cancel: Callable[[], None] | None = None,
+    ) -> bool:
+        """Pump the mail-thread GLib context until ``done`` is set (#208).
+
+        Must run on the mail I/O thread (e.g. inside a background task waiting on
+        Camel async ``refresh_info``). When ``run_interactive`` is True, pending
+        interactive tasks are drained between iterations so opening a message or
+        switching folders is not frozen behind Graph.
+        """
+        if not is_mail_io_thread():
+            raise RuntimeError("pump_until must run on the mail I/O thread")
+        context = GLib.MainContext.get_thread_default()
+        if context is None:
+            raise RuntimeError("mail I/O thread has no thread-default GMainContext")
+        deadline = (
+            None
+            if timeout_seconds is None
+            else time.monotonic() + max(0.0, timeout_seconds)
+        )
+        timed_out = False
+        with self._work_available:
+            self._inside_pump = True
+        try:
+            while not done.is_set():
+                if deadline is not None and time.monotonic() >= deadline:
+                    timed_out = True
+                    if on_timeout_cancel is not None:
+                        on_timeout_cancel()
+                    break
+                if run_interactive:
+                    nested: _IoTask | None = None
+                    with self._work_available:
+                        if self._interactive:
+                            nested = self._interactive.popleft()
+                    if nested is not None:
+                        self._run_task_body(nested, nested_under_pump=True)
+                        continue
+                if context.pending():
+                    context.iteration(False)
+                else:
+                    with self._work_available:
+                        if done.is_set():
+                            break
+                        if run_interactive and self._interactive:
+                            continue
+                        self._work_available.wait(timeout=0.05)
+            if timed_out and not done.is_set():
+                # Brief grace so cancel can deliver the async finish callback.
+                grace_deadline = time.monotonic() + 2.0
+                while not done.is_set() and time.monotonic() < grace_deadline:
+                    if context.pending():
+                        context.iteration(False)
+                    else:
+                        time.sleep(0.02)
+            return done.is_set()
+        finally:
+            with self._work_available:
+                self._inside_pump = False
+
+    def _run_task_body(
+        self, task: _IoTask, *, nested_under_pump: bool = False
+    ) -> None:
+        func_name = getattr(task.func, "__qualname__", repr(task.func))
+        try:
+            task.result["value"] = task.func(*task.args, **task.kwargs)
+        except BaseException as exc:
+            task.result["error"] = exc
+            log.debug("Mail I/O task failed func=%s", func_name, exc_info=True)
+        finally:
+            if task.done is not None:
+                task.done.set()
+            if not nested_under_pump:
+                self._maybe_resume_background(task)
 
     def run_sync(self, func: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
         if is_mail_io_thread():

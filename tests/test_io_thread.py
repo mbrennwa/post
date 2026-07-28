@@ -173,6 +173,53 @@ class MailIoThreadTests(unittest.TestCase):
         self._io.run_sync(lambda: None)
         self.assertEqual(results, ["background", "interactive"])
 
+    def test_pump_until_runs_interactive_while_waiting(self) -> None:
+        done = threading.Event()
+        saw_interactive = threading.Event()
+        order: list[str] = []
+
+        def background() -> None:
+            def interactive() -> None:
+                order.append("interactive")
+                saw_interactive.set()
+                done.set()
+
+            self._io.submit(interactive)
+            order.append("pump-start")
+            finished = self._io.pump_until(done, timeout_seconds=5.0)
+            order.append("pump-end")
+            self.assertTrue(finished)
+
+        self._io.submit_background(background)
+        self.assertTrue(saw_interactive.wait(timeout=5.0))
+        self._io.run_sync(lambda: None)
+        self.assertEqual(order, ["pump-start", "interactive", "pump-end"])
+
+    def test_pump_until_does_not_preempt_background(self) -> None:
+        """Interactive work during pump must not cancel the pumped async op."""
+        done = threading.Event()
+        started = threading.Event()
+        preempted = threading.Event()
+
+        def background() -> None:
+            started.set()
+
+            def interactive() -> None:
+                done.set()
+
+            self._io.submit(interactive)
+            self._io.pump_until(done, timeout_seconds=5.0)
+
+        def on_preempt() -> None:
+            preempted.set()
+
+        self._io.set_background_preempt_callbacks(on_preempt, None)
+        self._io.submit_background(background)
+        self.assertTrue(started.wait(timeout=5.0))
+        self._io.run_sync(lambda: None)
+        self.assertFalse(preempted.is_set())
+        self._io.set_background_preempt_callbacks(None, None)
+
 
 class MailIoThreadWatchdogTests(unittest.TestCase):
     @classmethod

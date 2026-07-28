@@ -311,7 +311,12 @@ def offline_status_text(*, queued_count: int) -> str:
 
 def offline_cache_status_text(*, account_label: str, folder_name: str) -> str:
     folder = folder_name or "folders"
-    return f"{OFFLINE_CACHE_STATUS_PREFIX} · {account_label} · {folder}"
+    # Body downsync caches MIME for headers Camel already knows; it does not
+    # by itself grow the message list toward the full server folder (#208).
+    return (
+        f"{OFFLINE_CACHE_STATUS_PREFIX} · {account_label} · {folder} "
+        f"(bodies for local headers)"
+    )
 
 
 def load_queued_outbound_message(queue_id: str) -> QueuedOutboundMessage:
