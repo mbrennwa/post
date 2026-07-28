@@ -19,6 +19,7 @@ gi.require_version("GObject", "2.0")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
 from post.mail import MailService
+from post.mail import folder_status_cache
 from post.mail.eds import MailAccount
 from post.mail.io_thread import get_mail_io_thread
 from post.folder_dialogs import confirm_action, prompt_folder_name, show_error
@@ -44,6 +45,7 @@ from post.mail.folders import (
     resolve_move_menu_state,
     resolve_sidebar_context_menu,
 )
+from post.mail.message_list_state import is_heavy_folder_name
 from post.mail.offline_settings import account_is_user_offline
 from post.mail.send_queue import (
     count_queued_for_account,
@@ -179,6 +181,8 @@ class MailSidebar:
         self._context_popover: Gtk.PopoverMenu | None = None
         self._account_reload_callbacks: dict[str, AccountRefreshComplete] = {}
         self._folder_count_poll_generation = 0
+        # Heavy folders awaiting first trusted STATUS poll (#208).
+        self._heavy_status_pending: set[tuple[str, str]] = set()
 
         self._sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
@@ -248,8 +252,37 @@ class MailSidebar:
         )
 
     def update_folder_row(
-        self, account_uid: str, folder_name: str, unread: int, total: int
+        self,
+        account_uid: str,
+        folder_name: str,
+        unread: int,
+        total: int,
+        *,
+        status_trusted: bool = False,
     ) -> None:
+        if is_heavy_folder_name(folder_name):
+            # Callers may pass Camel summary sizes; never show those as STATUS.
+            folder_status_cache.observe(
+                account_uid,
+                folder_name,
+                unread,
+                total,
+                trusted=status_trusted,
+            )
+            unread, total = folder_status_cache.resolve_sidebar(
+                account_uid, folder_name, unread, total
+            )
+            key = (account_uid, folder_name)
+            if total >= 0:
+                self._heavy_status_pending.discard(key)
+            elif (
+                self._network_available
+                and not account_is_user_offline(account_uid)
+                and folder_status_cache.load(account_uid, folder_name) is None
+            ):
+                self._heavy_status_pending.add(key)
+
+        pending = (account_uid, folder_name) in self._heavy_status_pending
         for folder_list in self._all_folder_listboxes():
             row = folder_list.get_first_child()
             while row is not None:
@@ -262,7 +295,14 @@ class MailSidebar:
                     label = self._folder_row_label(row)
                     if label is not None:
                         display = getattr(row, "display_name", folder_name)
-                        label.set_label(format_folder_label(display, unread, total))
+                        label.set_label(
+                            format_folder_label(
+                                display,
+                                unread,
+                                total,
+                                status_pending=pending,
+                            )
+                        )
                 row = row.get_next_sibling()
 
     @staticmethod
@@ -491,9 +531,46 @@ class MailSidebar:
                 if folder_name not in wanted:
                     continue
                 if unread < 0 and total < 0:
-                    continue
-                self.update_folder_row(account_uid, folder_name, unread, total)
+                    # Clear poisoned summary-sized badges (show name only).
+                    if not is_heavy_folder_name(folder_name):
+                        continue
+                self.update_folder_row(
+                    account_uid,
+                    folder_name,
+                    unread,
+                    total,
+                    status_trusted=True,
+                )
+        # STATUS poll for this account finished (success or error) — stop
+        # "working…" even if we still lack a trusted total.
+        self._clear_heavy_status_pending_for_account(account_uid)
         self._poll_account_folder_counts_at(generation, account_uids, index + 1)
+
+    def _clear_heavy_status_pending_for_account(self, account_uid: str) -> None:
+        pending = [
+            folder_name
+            for pending_uid, folder_name in self._heavy_status_pending
+            if pending_uid == account_uid
+        ]
+        for folder_name in pending:
+            self._heavy_status_pending.discard((account_uid, folder_name))
+            # Refresh label: drop "(working…)" if counts are still unknown.
+            for folder_list in self._all_folder_listboxes():
+                row = folder_list.get_first_child()
+                while row is not None:
+                    if (
+                        getattr(row, "account_uid", None) == account_uid
+                        and getattr(row, "folder_name", None) == folder_name
+                    ):
+                        unread = int(getattr(row, "unread", -1))
+                        total = int(getattr(row, "total", -1))
+                        label = self._folder_row_label(row)
+                        if label is not None:
+                            display = getattr(row, "display_name", folder_name)
+                            label.set_label(
+                                format_folder_label(display, unread, total)
+                            )
+                    row = row.get_next_sibling()
 
     def _inbox_folder_name(self, account_uid: str) -> str | None:
         inbox_name = self._account_inbox_folders.get(account_uid)
@@ -1994,7 +2071,21 @@ class MailSidebar:
             display = folder.get("display_name") or folder.get("full_name") or "?"
         unread = folder.get("unread", -1)
         total = folder.get("total", -1)
-        label_text = format_folder_label(display, unread, total)
+        folder_name = folder.get("full_name")
+        pending = False
+        if (
+            isinstance(folder_name, str)
+            and is_heavy_folder_name(folder_name)
+            and total < 0
+            and self._network_available
+            and not account_is_user_offline(account_uid)
+            and folder_status_cache.load(account_uid, folder_name) is None
+        ):
+            self._heavy_status_pending.add((account_uid, folder_name))
+            pending = True
+        label_text = format_folder_label(
+            display, unread, total, status_pending=pending
+        )
 
         label = Gtk.Label(label=label_text, xalign=0, hexpand=True)
         label.set_margin_start(12)
@@ -2014,7 +2105,7 @@ class MailSidebar:
         else:
             row.set_child(label)
         row.account_uid = account_uid
-        row.folder_name = folder.get("full_name")
+        row.folder_name = folder_name
         row.display_name = display
         row.unread = unread
         row.total = total

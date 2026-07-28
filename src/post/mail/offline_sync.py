@@ -19,6 +19,10 @@ from gi.repository import Camel, Gio, GLib
 
 from post.mail.folders import folder_can_contain_messages
 from post.mail.io_thread import get_mail_io_thread
+from post.mail.message_list_state import (
+    is_heavy_folder_name,
+    offline_folder_priority,
+)
 from post.mail.offline_settings import (
     account_is_user_offline,
     apply_offline_sync_to_folder,
@@ -182,18 +186,6 @@ class OfflineBodySyncCoordinator:
             folder_index += 1
             if not isinstance(folder, Camel.OfflineFolder):
                 continue
-            # Archive/Trash/Junk are often huge (M365 Archive ≈ 10k+). Downsyncing
-            # bodies for them OOMs the process; skip for offline backfill.
-            try:
-                flags = int(folder.get_flags())
-            except Exception:
-                flags = 0
-            if flags & (
-                Camel.FolderInfoFlags.TYPE_ARCHIVE
-                | Camel.FolderInfoFlags.TYPE_TRASH
-                | Camel.FolderInfoFlags.TYPE_JUNK
-            ):
-                continue
             apply_offline_sync_to_folder(folder, mode)
             if not folder.can_downsync():
                 continue
@@ -206,7 +198,23 @@ class OfflineBodySyncCoordinator:
                     active=True,
                 )
             )
+            # Do not call continue_heavy_folder_index with refresh here: M365
+            # refresh_info can pin post-mail-io (#208). Index local summary only
+            # after body downsync so the list tracks newly cached headers.
             self._downsync_folder_sync(folder, expression, cancellable)
+            if is_heavy_folder_name(folder_name) and not cancellable.is_cancelled():
+                try:
+                    self._mail.continue_heavy_folder_index(
+                        account_uid,
+                        folder_name,
+                        allow_refresh=False,
+                    )
+                except Exception:
+                    log.debug(
+                        "Post-downsync local index failed for %r",
+                        folder_name,
+                        exc_info=True,
+                    )
 
         return True
 
@@ -261,30 +269,77 @@ class OfflineBodySyncCoordinator:
                 )
                 return None
 
-        return folders
+        return self._sort_folders_by_offline_priority(folders)
+
+    @staticmethod
+    def _sort_folders_by_offline_priority(
+        folders: list[Camel.Folder],
+    ) -> list[Camel.Folder]:
+        """Ordinary → Archive → Trash → Junk (#208)."""
+
+        def sort_key(folder: Camel.Folder) -> tuple[int, str]:
+            name = folder.get_full_name() or ""
+            try:
+                flags = int(folder.get_flags())
+            except Exception:
+                flags = 0
+            priority = offline_folder_priority(
+                name,
+                folder_flags=flags,
+                type_archive=int(Camel.FolderInfoFlags.TYPE_ARCHIVE),
+                type_trash=int(Camel.FolderInfoFlags.TYPE_TRASH),
+                type_junk=int(Camel.FolderInfoFlags.TYPE_JUNK),
+            )
+            return (priority, name.lower())
+
+        return sorted(folders, key=sort_key)
 
     def _downsync_folder_sync(
         self,
         folder: Camel.OfflineFolder,
         expression: str,
-        cancellable: Gio.Cancellable,
+        account_cancellable: Gio.Cancellable,
     ) -> None:
-        if cancellable.is_cancelled():
+        """Downsync one folder; timeout cancels only this folder (#208)."""
+        if account_cancellable.is_cancelled():
             return
         folder_name = folder.get_full_name() or ""
-        timer = threading.Timer(
-            _OFFLINE_DOWNSYNC_TIMEOUT_SECONDS, cancellable.cancel
+        chunk_cancellable = Gio.Cancellable()
+        stop_watch = threading.Event()
+
+        def _watch_account_and_timeout() -> None:
+            deadline = time.monotonic() + _OFFLINE_DOWNSYNC_TIMEOUT_SECONDS
+            while not stop_watch.is_set():
+                if account_cancellable.is_cancelled():
+                    chunk_cancellable.cancel()
+                    return
+                if time.monotonic() >= deadline:
+                    chunk_cancellable.cancel()
+                    return
+                stop_watch.wait(0.05)
+
+        watcher = threading.Thread(
+            target=_watch_account_and_timeout,
+            name="post-offline-downsync-watch",
+            daemon=True,
         )
         started = time.monotonic()
-        timer.start()
+        watcher.start()
         try:
-            folder.downsync_sync(expression, cancellable)
+            folder.downsync_sync(expression, chunk_cancellable)
         except GLib.Error as exc:
             if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
                 elapsed = time.monotonic() - started
-                if elapsed >= _OFFLINE_DOWNSYNC_TIMEOUT_SECONDS * 0.9:
+                if account_cancellable.is_cancelled():
+                    log.debug(
+                        "Offline downsync cancelled for folder %r after %.1fs",
+                        folder_name,
+                        elapsed,
+                    )
+                elif elapsed >= _OFFLINE_DOWNSYNC_TIMEOUT_SECONDS * 0.9:
                     log.warning(
-                        "Offline downsync timed out after %.1fs for folder %r",
+                        "Offline downsync timed out after %.1fs for folder %r "
+                        "(continuing with next folder)",
                         elapsed,
                         folder_name,
                     )
@@ -301,4 +356,5 @@ class OfflineBodySyncCoordinator:
                 exc_info=True,
             )
         finally:
-            timer.cancel()
+            stop_watch.set()
+            watcher.join(timeout=1.0)

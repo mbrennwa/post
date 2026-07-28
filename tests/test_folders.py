@@ -53,6 +53,12 @@ class FormatFolderLabelTests(unittest.TestCase):
     def test_no_counts(self) -> None:
         self.assertEqual(format_folder_label("Archive", -1, -1), "Archive")
 
+    def test_status_pending(self) -> None:
+        self.assertEqual(
+            format_folder_label("Archive", -1, -1, status_pending=True),
+            "Archive (working…)",
+        )
+
 
 class GuessInboxTests(unittest.TestCase):
     def test_inbox_full_name(self) -> None:
