@@ -174,14 +174,16 @@ class OfflineDownsyncTimeoutTests(unittest.TestCase):
 
         mail = mock.Mock()
         coordinator = OfflineBodySyncCoordinator(mail)
-        cancellable = Gio.Cancellable()
+        account_cancellable = Gio.Cancellable()
         folder = mock.Mock()
         folder.get_full_name.return_value = "INBOX"
+        saw_chunk_cancel = {"value": False}
 
         def blocking_downsync(_expression: str, cancel: Gio.Cancellable) -> None:
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
                 if cancel.is_cancelled():
+                    saw_chunk_cancel["value"] = True
                     raise GLib.Error.new_literal(
                         Gio.io_error_quark(),
                         "Operation was cancelled",
@@ -194,11 +196,39 @@ class OfflineDownsyncTimeoutTests(unittest.TestCase):
 
         with mock.patch.object(offline_sync, "_OFFLINE_DOWNSYNC_TIMEOUT_SECONDS", 0.1):
             started = time.monotonic()
-            coordinator._downsync_folder_sync(folder, "(match-all)", cancellable)
+            coordinator._downsync_folder_sync(
+                folder, "(match-all)", account_cancellable
+            )
             elapsed = time.monotonic() - started
 
-        self.assertTrue(cancellable.is_cancelled())
+        # Per-folder timeout must not cancel the whole account pass (#208).
+        self.assertFalse(account_cancellable.is_cancelled())
+        self.assertTrue(saw_chunk_cancel["value"])
         self.assertLess(elapsed, 1.0)
+
+    def test_sort_folders_archive_before_trash_and_junk(self) -> None:
+        from post.mail.offline_sync import OfflineBodySyncCoordinator
+
+        inbox = mock.Mock()
+        inbox.get_full_name.return_value = "INBOX"
+        inbox.get_flags.return_value = 0
+        archive = mock.Mock()
+        archive.get_full_name.return_value = "Archive"
+        archive.get_flags.return_value = 0
+        trash = mock.Mock()
+        trash.get_full_name.return_value = "Trash"
+        trash.get_flags.return_value = 0
+        junk = mock.Mock()
+        junk.get_full_name.return_value = "Junk"
+        junk.get_flags.return_value = 0
+
+        ordered = OfflineBodySyncCoordinator._sort_folders_by_offline_priority(
+            [junk, trash, archive, inbox]
+        )
+        self.assertEqual(
+            [f.get_full_name() for f in ordered],
+            ["INBOX", "Archive", "Trash", "Junk"],
+        )
 
 
 class ShutdownSyncTests(unittest.TestCase):

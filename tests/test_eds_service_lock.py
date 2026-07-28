@@ -78,6 +78,19 @@ class ServiceLockReleaseTests(unittest.TestCase):
         service.cancel_folder_list.assert_called_once()
         service.offline_sync.cancel_all.assert_called_once()
 
+    def test_hold_offline_body_sync_blocks_resume_until_released(self) -> None:
+        service = MailService(registry=mock.Mock())
+        coordinator = mock.Mock()
+        service._offline_sync = coordinator
+
+        service.hold_offline_body_sync(True)
+        coordinator.cancel_all.assert_called_once()
+        service.schedule_offline_body_sync()
+        coordinator.schedule_all_accounts.assert_not_called()
+
+        service.hold_offline_body_sync(False)
+        coordinator.schedule_all_accounts.assert_called_once()
+
     def test_folder_list_register_keeps_sibling_cancellables(self) -> None:
         service = MailService(registry=mock.Mock())
         first = mock.Mock()
