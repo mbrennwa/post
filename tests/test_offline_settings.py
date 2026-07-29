@@ -143,6 +143,7 @@ class OfflineSyncYieldTests(unittest.TestCase):
 
         mail = mock.Mock()
         mail.get_account.return_value = mock.Mock(display_label="Test")
+        mail.offline_body_sync_is_held.return_value = False
         coordinator = OfflineBodySyncCoordinator(mail)
 
         folder = mock.Mock()
