@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from post.mail import folder_status_cache
+from post.mail.graph_folder_counts import graph_well_known_folder_id
 
 
 class FolderStatusCacheTests(unittest.TestCase):
@@ -36,10 +37,61 @@ class FolderStatusCacheTests(unittest.TestCase):
             (-1, -1),
         )
 
-    def test_persists_large_status_and_never_shrinks_with_summary(self) -> None:
+    def test_trusted_echo_of_local_index_does_not_lock_in(self) -> None:
         self.assertEqual(
             folder_status_cache.observe(
-                "acct", "Archive", 3803, 28177, trusted=True
+                "acct",
+                "Archive",
+                96,
+                1170,
+                trusted=True,
+                local_indexed=1173,
+            ),
+            (96, 1170),
+        )
+        self.assertIsNone(folder_status_cache.load("acct", "Archive"))
+        self.assertEqual(
+            folder_status_cache.resolve_sidebar("acct", "Archive", 96, 1170),
+            (-1, -1),
+        )
+
+    def test_trusted_near_local_index_does_not_lock_in(self) -> None:
+        # Growing Camel summary ~1320 must not become "the server total".
+        self.assertEqual(
+            folder_status_cache.observe(
+                "acct",
+                "Archive",
+                117,
+                1320,
+                trusted=True,
+                local_indexed=1300,
+            ),
+            (117, 1320),
+        )
+        self.assertIsNone(folder_status_cache.load("acct", "Archive"))
+
+    def test_untrusted_large_total_does_not_lock_in_as_status(self) -> None:
+        self.assertEqual(
+            folder_status_cache.observe(
+                "acct", "Archive", 79, 1000, trusted=False
+            ),
+            (79, 1000),
+        )
+        self.assertIsNone(folder_status_cache.load("acct", "Archive"))
+        self.assertEqual(
+            folder_status_cache.resolve_sidebar("acct", "Archive", 79, 1000),
+            (-1, -1),
+        )
+
+    def test_graph_sized_total_locks_in(self) -> None:
+        self.assertEqual(
+            folder_status_cache.observe(
+                "acct",
+                "Archive",
+                3803,
+                28177,
+                trusted=True,
+                local_indexed=1300,
             ),
             (3803, 28177),
         )
@@ -47,10 +99,37 @@ class FolderStatusCacheTests(unittest.TestCase):
             folder_status_cache.load("acct", "Archive"),
             (3803, 28177),
         )
-        # Local Camel summary / poisoned REFRESH must not overwrite STATUS.
+
+    def test_scrub_summary_echo_clears_poison(self) -> None:
+        folder_status_cache.observe(
+            "acct", "Archive", 117, 28177, trusted=True, local_indexed=100
+        )
+        # Simulate a later poison write by saving directly then scrubbing.
+        folder_status_cache.clear("acct", "Archive")
+        folder_status_cache._save("acct", "Archive", 117, 1320)
+        self.assertEqual(
+            folder_status_cache.load("acct", "Archive"),
+            (117, 1320),
+        )
+        folder_status_cache.scrub_if_summary_echo("acct", "Archive", 1300)
+        self.assertIsNone(folder_status_cache.load("acct", "Archive"))
+
+    def test_persists_large_status_and_never_shrinks(self) -> None:
+        self.assertEqual(
+            folder_status_cache.observe(
+                "acct", "Archive", 3803, 28177, trusted=True
+            ),
+            (3803, 28177),
+        )
         self.assertEqual(
             folder_status_cache.observe(
                 "acct", "Archive", 53, 530, trusted=True
+            ),
+            (3803, 28177),
+        )
+        self.assertEqual(
+            folder_status_cache.observe(
+                "acct", "Archive", 79, 1000, trusted=True
             ),
             (3803, 28177),
         )
@@ -59,41 +138,19 @@ class FolderStatusCacheTests(unittest.TestCase):
             (3803, 28177),
         )
 
-    def test_trusted_refresh_may_shrink_still_large_totals(self) -> None:
-        folder_status_cache.observe(
-            "acct", "Archive", 100, 20000, trusted=True
-        )
-        self.assertEqual(
-            folder_status_cache.observe(
-                "acct", "Archive", 50, 15000, trusted=True
-            ),
-            (50, 15000),
-        )
+    def test_index_caught_up_rejects_unknown_and_echo(self) -> None:
+        self.assertFalse(folder_status_cache.index_caught_up(400, -1))
+        self.assertFalse(folder_status_cache.index_caught_up(1300, 1320))
+        self.assertFalse(folder_status_cache.index_caught_up(400, 28177))
+        self.assertTrue(folder_status_cache.index_caught_up(28177, 28177))
 
-    def test_untrusted_summary_never_shrinks_large_high_water(self) -> None:
-        folder_status_cache.observe(
-            "acct", "Archive", 100, 20000, trusted=True
-        )
-        self.assertEqual(
-            folder_status_cache.observe(
-                "acct", "Archive", 50, 15000, trusted=False
-            ),
-            (100, 20000),
-        )
 
-    def test_best_without_cache_returns_input(self) -> None:
-        self.assertEqual(
-            folder_status_cache.best("acct", "Archive", 1, 2),
-            (1, 2),
-        )
-
-    def test_resolve_shows_large_folderinfo_before_cache(self) -> None:
-        self.assertEqual(
-            folder_status_cache.resolve_sidebar(
-                "acct", "Archive", 3803, 28177
-            ),
-            (3803, 28177),
-        )
+class GraphFolderCountsTests(unittest.TestCase):
+    def test_well_known_ids(self) -> None:
+        self.assertEqual(graph_well_known_folder_id("Archive"), "archive")
+        self.assertEqual(graph_well_known_folder_id("Junk Email"), "junkemail")
+        self.assertEqual(graph_well_known_folder_id("Deleted Items"), "deleteditems")
+        self.assertIsNone(graph_well_known_folder_id("Projects/Foo"))
 
 
 if __name__ == "__main__":

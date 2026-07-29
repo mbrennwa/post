@@ -35,6 +35,120 @@ class HeavyFolderIndexCacheTests(unittest.TestCase):
         )
 
 
+class HeavyFolderIndexInteractiveYieldTests(unittest.TestCase):
+    @mock.patch("post.mail.eds.get_mail_io_thread")
+    @mock.patch("post.mail.eds.folder_get_uids")
+    def test_interactive_pending_does_not_set_refresh_done(
+        self,
+        _folder_get_uids: mock.Mock,
+        get_io: mock.Mock,
+    ) -> None:
+        """Interactive work must yield without permanently skipping refresh."""
+        from post.mail.eds import MailService, _FolderMessageIndex
+
+        io_thread = mock.Mock()
+        io_thread.has_interactive_work_pending.return_value = True
+        get_io.return_value = io_thread
+
+        mail = MailService.__new__(MailService)
+        mail._lock = mock.MagicMock()
+        mail._heavy_index_sessions = {}
+        mail._folder_indexes = {
+            ("acct", "Archive"): _FolderMessageIndex(
+                messages=[{"uid": "1"}], unread=0, total=28177
+            )
+        }
+        mail._open_folder_unlocked = mock.Mock(return_value=mock.Mock())
+        mail._cached_folder_stats_unlocked = mock.Mock(
+            return_value=(3803, 28177)
+        )
+
+        progress = mail._continue_heavy_folder_index_unlocked(
+            "acct",
+            "Archive",
+            cursor={"pending_server_refresh": True},
+            allow_refresh=True,
+        )
+        self.assertFalse(progress.done)
+        self.assertFalse(progress.cursor.get("refresh_done"))
+        self.assertTrue(progress.cursor.get("yield_for_interactive"))
+        self.assertTrue(progress.cursor.get("pending_server_refresh"))
+
+
+class HeavyFolderPrepareSkipTests(unittest.TestCase):
+    @mock.patch("post.mail.eds.folder_status_cache")
+    @mock.patch("post.mail.eds.get_mail_io_thread")
+    @mock.patch("post.mail.eds.folder_get_uids")
+    def test_skips_prepare_when_index_already_large(
+        self,
+        folder_get_uids: mock.Mock,
+        get_io: mock.Mock,
+        status_cache: mock.Mock,
+    ) -> None:
+        """Large local indexes must not call prepare_content_refresh (#208)."""
+        from post.mail.eds import (
+            MailService,
+            _FolderMessageIndex,
+            _HEAVY_FOLDER_PREPARE_MIN_INDEXED,
+        )
+
+        io_thread = mock.Mock()
+        io_thread.has_interactive_work_pending.return_value = False
+        io_thread.pump_until.return_value = True
+        get_io.return_value = io_thread
+        status_cache.load.return_value = (100, 28177)
+        status_cache.index_caught_up.return_value = False
+
+        messages = [
+            {"uid": str(i), "subject": f"m{i}"}
+            for i in range(_HEAVY_FOLDER_PREPARE_MIN_INDEXED)
+        ]
+        folder_get_uids.return_value = [str(i) for i in range(len(messages))]
+
+        folder = mock.Mock()
+        folder.prepare_content_refresh = mock.Mock()
+        folder.refresh_info = mock.Mock()
+        folder.refresh_info_finish = mock.Mock()
+        folder.get_message_count.return_value = len(messages)
+
+        mail = MailService.__new__(MailService)
+        mail._lock = mock.MagicMock()
+        mail._heavy_index_sessions = {}
+        mail._folder_indexes = {
+            ("acct", "Archive"): _FolderMessageIndex(
+                messages=messages, unread=0, total=28177
+            )
+        }
+        mail._open_folder_unlocked = mock.Mock(return_value=folder)
+        mail._cached_folder_stats_unlocked = mock.Mock(
+            return_value=(100, 28177)
+        )
+        mail._register_heavy_index_refresh_cancellable = mock.Mock()
+        mail._unregister_heavy_index_refresh_cancellable = mock.Mock()
+
+        def _refresh(_prio, _canc, callback, _data):
+            callback(folder, mock.Mock(), None)
+
+        folder.refresh_info.side_effect = _refresh
+
+        progress = mail._continue_heavy_folder_index_unlocked(
+            "acct",
+            "Archive",
+            cursor={
+                "pending_server_refresh": True,
+                "status_seeded": True,
+            },
+            allow_refresh=True,
+        )
+        folder.prepare_content_refresh.assert_not_called()
+        self.assertFalse(progress.done)
+        self.assertTrue(
+            mail._heavy_index_sessions[("acct", "Archive")].get(
+                "did_prepare_content_refresh"
+            )
+        )
+
+
 class OfflineSyncNoHeavyIndexTests(unittest.TestCase):
     @mock.patch("post.mail.offline_sync.get_mail_io_thread")
     def test_run_account_sync_does_not_call_heavy_folder_index(
@@ -50,6 +164,7 @@ class OfflineSyncNoHeavyIndexTests(unittest.TestCase):
         mail = mock.Mock()
         mail.get_account.return_value = mock.Mock(display_label="Test")
         mail.continue_heavy_folder_index = mock.Mock()
+        mail.offline_body_sync_is_held.return_value = False
         coordinator = OfflineBodySyncCoordinator(mail)
 
         import gi
