@@ -723,6 +723,11 @@ class MailSidebar:
                 on_complete,
             )
 
+        # Qualname shows up in mail-I/O still-running warnings (#210).
+        short = account_uid[:8] if account_uid else "?"
+        worker.__qualname__ = (
+            f"MailSidebar.refresh_folder_row[{short}/{folder_name}]"
+        )
         get_mail_io_thread().submit(worker)
 
     @staticmethod
