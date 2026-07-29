@@ -12,7 +12,11 @@ import gi
 gi.require_version("Camel", "1.2")
 from gi.repository import Camel
 
-from post.mail.camel_util import camel_uid_to_api, folder_get_message_info
+from post.mail.camel_util import (
+    camel_uid_to_api,
+    folder_get_message_info,
+    folder_get_unread_count,
+)
 
 
 def persist_folder_flags(
@@ -92,7 +96,7 @@ def mark_message_seen(
         Camel.MessageFlags.SEEN,
         on_seen_changed=on_seen_changed,
     )
-    unread = folder.get_unread_message_count()
+    unread = folder_get_unread_count(folder)
     total = folder.get_message_count()
     if update_folder_counts is not None:
         update_folder_counts(unread, total)

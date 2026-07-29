@@ -29,17 +29,25 @@ class CamelUidListTests(unittest.TestCase):
         self.assertEqual(camel_uid_list(""), [])
 
 
+class _LegacyFolder:
+    def __init__(self, uids, *, fail_utf8: bool = False):
+        self._uids = uids
+        self._fail_utf8 = fail_utf8
+
+    def get_uids(self):
+        if self._fail_utf8:
+            raise UnicodeDecodeError(
+                "utf-8", b"\xff", 0, 1, "invalid start byte"
+            )
+        return list(self._uids)
+
+
 class FolderGetUidsTests(unittest.TestCase):
     def test_uses_get_uids_when_utf8_safe(self) -> None:
-        folder = mock.Mock()
-        folder.get_uids.return_value = ["1", "2"]
-        self.assertEqual(folder_get_uids(folder), ["1", "2"])
+        self.assertEqual(folder_get_uids(_LegacyFolder(["1", "2"])), ["1", "2"])
 
     def test_falls_back_when_get_uids_is_not_utf8(self) -> None:
-        folder = mock.Mock()
-        folder.get_uids.side_effect = UnicodeDecodeError(
-            "utf-8", b"\xff", 0, 1, "invalid start byte"
-        )
+        folder = _LegacyFolder(["1"], fail_utf8=True)
         with mock.patch(
             "post.mail.camel_util._folder_uids_via_ctypes",
             return_value=["uidb64:ov8="],

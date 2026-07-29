@@ -59,6 +59,7 @@ from .camel_util import (
     camel_uid_list,
     folder_get_message_info,
     folder_get_uids,
+    folder_get_unread_count,
     folder_search_uids,
     normalize_camel_uid,
 )
@@ -2931,7 +2932,7 @@ class MailService:
                 folder.expunge_sync(None)
         folder.refresh_info_sync(None)
         self._invalidate_folder_index(account_uid, folder_name)
-        unread = folder.get_unread_message_count()
+        unread = folder_get_unread_count(folder)
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
         return {
@@ -3125,7 +3126,7 @@ class MailService:
                         ):
                             return (-1, -1)
                     raise
-                return folder.get_unread_message_count(), folder.get_message_count()
+                return folder_get_unread_count(folder), folder.get_message_count()
             finally:
                 timer.cancel()
                 self._unregister_folder_refresh_cancellable(cancellable)
@@ -4196,7 +4197,7 @@ class MailService:
                     folder.refresh_info_sync(cancellable)
                 finally:
                     self._unregister_folder_refresh_cancellable(cancellable)
-            unread = folder.get_unread_message_count()
+            unread = folder_get_unread_count(folder)
             total = folder.get_message_count()
 
             uids = folder_get_uids(folder)
@@ -4386,7 +4387,7 @@ class MailService:
                             Gio.IOErrorEnum.CANCELLED,
                         )
                     refresh_done = True
-                    camel_unread = folder.get_unread_message_count()
+                    camel_unread = folder_get_unread_count(folder)
                     camel_total = folder.get_message_count()
                     if known_total > 0 and camel_total < known_total:
                         log.debug(
@@ -4811,7 +4812,7 @@ class MailService:
             raise ValueError(f"Message not found: {message_uid}")
 
         if info.get_flags() & Camel.MessageFlags.SEEN:
-            return folder.get_unread_message_count(), folder.get_message_count()
+            return folder_get_unread_count(folder), folder.get_message_count()
 
         return self._mark_message_seen_unlocked(
             folder, account_uid, folder_name, message_uid
@@ -4859,7 +4860,7 @@ class MailService:
             Camel.MessageFlags.SEEN,
             flag_value,
         )
-        unread = folder.get_unread_message_count()
+        unread = folder_get_unread_count(folder)
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
         queued = False
@@ -4947,7 +4948,7 @@ class MailService:
                 op_type="set_seen",
                 seen=seen,
             )
-        unread = folder.get_unread_message_count()
+        unread = folder_get_unread_count(folder)
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
         return {
@@ -5049,7 +5050,7 @@ class MailService:
                     if updates
                     else True,
                 )
-        unread = folder.get_unread_message_count()
+        unread = folder_get_unread_count(folder)
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
         return {
@@ -5159,7 +5160,7 @@ class MailService:
         source_folder.refresh_info_sync(None)
 
         moved_uids = list(message_uids)
-        source_unread = source_folder.get_unread_message_count()
+        source_unread = folder_get_unread_count(source_folder)
         source_total = source_folder.get_message_count()
         self._remove_messages_from_cache(
             account_uid, folder_name, moved_uids, source_unread, source_total
@@ -5485,7 +5486,7 @@ class MailService:
                     )
                     destination_uids = []
 
-            source_unread = source_folder.get_unread_message_count()
+            source_unread = folder_get_unread_count(source_folder)
             source_total = source_folder.get_message_count()
             self._remove_messages_from_cache(
                 account_uid, source_folder_name, moved_uids, source_unread, source_total
