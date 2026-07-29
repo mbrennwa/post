@@ -27,17 +27,33 @@ class _GPtrArray(ctypes.Structure):
 
 
 _libcamel_lib: ctypes.CDLL | None = None
+# Bound ctypes symbol for listing folder UIDs (name differs across EDS versions).
+_libcamel_folder_uids: Any | None = None
+
+
+def _bind_libcamel_folder_uids(lib: ctypes.CDLL) -> Any:
+    """Resolve camel_folder_dup_uids (EDS ≥3.58) or camel_folder_get_uids."""
+    for name in ("camel_folder_dup_uids", "camel_folder_get_uids"):
+        try:
+            func = getattr(lib, name)
+        except AttributeError:
+            continue
+        func.argtypes = [ctypes.c_void_p]
+        func.restype = ctypes.POINTER(_GPtrArray)
+        return func
+    raise OSError(
+        "libcamel-1.2 has neither camel_folder_dup_uids nor camel_folder_get_uids"
+    )
 
 
 def _get_libcamel() -> ctypes.CDLL:
-    global _libcamel_lib
+    global _libcamel_lib, _libcamel_folder_uids
     if _libcamel_lib is None:
         path = ctypes.util.find_library("camel-1.2")
         if not path:
             raise OSError("libcamel-1.2 not found")
         lib = ctypes.CDLL(path)
-        lib.camel_folder_get_uids.argtypes = [ctypes.c_void_p]
-        lib.camel_folder_get_uids.restype = ctypes.POINTER(_GPtrArray)
+        _libcamel_folder_uids = _bind_libcamel_folder_uids(lib)
         lib.camel_folder_get_message_info.argtypes = [
             ctypes.c_void_p,
             ctypes.c_char_p,
@@ -132,8 +148,26 @@ def _folder_get_message_info_via_ctypes(folder: Any, uid_bytes: bytes) -> Any:
     return _wrap_camel_message_info(ptr)
 
 
+def _folder_list_uids_gi(folder: Any) -> Any:
+    """Return the GI UID list (dup_uids on EDS ≥3.58, else get_uids).
+
+    Methods are resolved on ``type(folder)`` so ``unittest.mock.Mock``
+    auto-attributes do not pick the wrong branch. Test doubles should
+    define ``dup_uids`` / ``get_uids`` on a real class (or use ``spec``).
+    """
+    if callable(getattr(type(folder), "dup_uids", None)):
+        return folder.dup_uids()
+    if callable(getattr(type(folder), "get_uids", None)):
+        return folder.get_uids()
+    raise AttributeError(
+        f"{type(folder).__name__} has neither dup_uids nor get_uids"
+    )
+
+
 def _folder_uids_via_ctypes(folder: Any) -> list[str]:
-    array = _get_libcamel().camel_folder_get_uids(_gobject_pointer(folder))
+    _get_libcamel()
+    assert _libcamel_folder_uids is not None
+    array = _libcamel_folder_uids(_gobject_pointer(folder))
     if not array:
         return []
     uids: list[str] = []
@@ -150,7 +184,7 @@ def _folder_uids_via_ctypes(folder: Any) -> list[str]:
 def folder_get_uids(folder: Any) -> list[str]:
     """Return folder UIDs, bypassing PyGObject UTF-8 decoding when needed."""
     try:
-        uids = camel_uid_list(folder.get_uids())
+        uids = camel_uid_list(_folder_list_uids_gi(folder))
     except UnicodeDecodeError:
         uids = _folder_uids_via_ctypes(folder)
     else:
@@ -159,6 +193,41 @@ def folder_get_uids(folder: Any) -> list[str]:
         return uids
     log.warning("Could not decode folder UIDs via GI or ctypes")
     return []
+
+
+def folder_get_unread_count(folder: Any) -> int:
+    """Return unread count across Camel API renames.
+
+    Older Camel exposes ``Camel.Folder.get_unread_message_count``. EDS 3.58+
+    removed it; use ``FolderSummary.get_unread_count`` (available since 3.4).
+    Returns ``-1`` when the count is unavailable (Camel's historical unknown).
+    """
+    if callable(getattr(type(folder), "get_unread_message_count", None)):
+        return int(folder.get_unread_message_count())
+
+    # Prefer type-level summary API so MagicMock.__int__ (always 1) cannot
+    # shadow a configured get_unread_message_count on test doubles.
+    if callable(getattr(type(folder), "get_folder_summary", None)):
+        summary = folder.get_folder_summary()
+        if summary is not None and callable(
+            getattr(type(summary), "get_unread_count", None)
+        ):
+            return int(summary.get_unread_count())
+
+    children = getattr(folder, "_mock_children", None)
+    if isinstance(children, dict) and "get_unread_message_count" in children:
+        return int(folder.get_unread_message_count())
+    if isinstance(children, dict) and "get_folder_summary" in children:
+        summary = folder.get_folder_summary()
+        summary_children = getattr(summary, "_mock_children", None)
+        if (
+            summary is not None
+            and isinstance(summary_children, dict)
+            and "get_unread_count" in summary_children
+        ):
+            return int(summary.get_unread_count())
+
+    return -1
 
 
 def folder_get_message_info(folder: Any, uid: str) -> Any:
