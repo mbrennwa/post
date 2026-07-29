@@ -1979,15 +1979,20 @@ class MailSidebar:
 
             target_row = inbox_list.get_row_at_y(int(y))
             if target_row is None:
-                order = self._current_inbox_order_from_list()
-                if source_uid not in order:
-                    return False
-                order.remove(source_uid)
-                order.append(source_uid)
-                self._inbox_order = order
-                self._sort_inbox_list()
-                self._persist_view_state()
-                return True
+                was_selecting = self._sidebar_selecting
+                self._sidebar_selecting = True
+                try:
+                    order = self._current_inbox_order_from_list()
+                    if source_uid not in order:
+                        return False
+                    order.remove(source_uid)
+                    order.append(source_uid)
+                    self._inbox_order = order
+                    self._sort_inbox_list()
+                    self._persist_view_state()
+                    return True
+                finally:
+                    self._sidebar_selecting = was_selecting
 
             target_uid = getattr(target_row, "account_uid", None)
             if not target_uid or target_uid == source_uid:
@@ -1995,8 +2000,13 @@ class MailSidebar:
 
             allocation = target_row.get_allocation()
             after = y > allocation.y + allocation.height / 2
-            self._move_inbox_row(source_uid, target_uid, after=after)
-            return True
+            was_selecting = self._sidebar_selecting
+            self._sidebar_selecting = True
+            try:
+                self._move_inbox_row(source_uid, target_uid, after=after)
+                return True
+            finally:
+                self._sidebar_selecting = was_selecting
 
         drop_target.connect("drop", drop)
         inbox_list.add_controller(drop_target)
@@ -2270,23 +2280,24 @@ class MailSidebar:
             folder_name=folder_name,
             selecting=self._sidebar_selecting,
         )
+        already_selecting = self._sidebar_selecting
+        # (#201) Gtk may emit selection callbacks during unselect_all/select_row
+        # transitions; keep the guard enabled for the whole phase.
+        self._sidebar_selecting = True
         try:
             for other in self._all_folder_listboxes():
                 if other is not listbox:
                     other.unselect_all()
 
-            self._sidebar_selecting = True
-            try:
-                listbox.select_row(row)
-                for other in self._all_folder_listboxes():
-                    if other is listbox:
-                        continue
-                    mirror = self._find_folder_row(other, account_uid, folder_name)
-                    if mirror is not None:
-                        other.select_row(mirror)
-            finally:
-                self._sidebar_selecting = False
+            listbox.select_row(row)
+            for other in self._all_folder_listboxes():
+                if other is listbox:
+                    continue
+                mirror = self._find_folder_row(other, account_uid, folder_name)
+                if mirror is not None:
+                    other.select_row(mirror)
         finally:
+            self._sidebar_selecting = already_selecting
             _debug_listbox_end(
                 "sync_folder_row_selection",
                 account_uid=account_uid,
