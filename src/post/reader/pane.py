@@ -19,7 +19,6 @@ from gi.repository import Gdk, Gtk, WebKit
 from post.mail.helpers import (
     format_attachment_size,
     format_reader_header,
-    reader_toggle_button_state,
 )
 from post.preferences import (
     MESSAGE_APPEARANCE_ADAPT_TEXT,
@@ -31,14 +30,34 @@ from post.reader.html import build_reader_document
 from post.wrap_label import WrappingLabel, configure_ellipsize_label, set_label_wrap_mode
 
 
+class _ClampingBoxLayout(Gtk.BoxLayout):
+    """BoxLayout that never reports natural size below minimum.
+
+    Under tight height-for-width passes, Gtk.BoxLayout can compute
+    natural < minimum for MessageReaderPane (wrapping header + WebKit).
+    """
+
+    __gtype_name__ = "PostClampingBoxLayout"
+
+    def do_measure(
+        self, widget: Gtk.Widget, orientation: Gtk.Orientation, for_size: int
+    ) -> tuple[int, int, int, int]:
+        minimum, natural, min_baseline, nat_baseline = Gtk.BoxLayout.do_measure(
+            self, widget, orientation, for_size
+        )
+        if natural < minimum:
+            natural = minimum
+        return minimum, natural, min_baseline, nat_baseline
+
+
 class MessageReaderPane(Gtk.Box):
     """Inline or window reader: header, actions, attachments, and WebKit body."""
+
+    __gtype_name__ = "MessageReaderPane"
 
     def __init__(
         self,
         *,
-        on_read_toggle: Callable[[], None],
-        on_flag_toggle: Callable[[], None],
         on_reply: Callable[[], None],
         on_reply_all: Callable[[], None],
         on_forward: Callable[[], None],
@@ -50,8 +69,9 @@ class MessageReaderPane(Gtk.Box):
         on_open_uri: Callable[[str], None],
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self._on_read_toggle = on_read_toggle
-        self._on_flag_toggle = on_flag_toggle
+        layout = _ClampingBoxLayout(orientation=Gtk.Orientation.VERTICAL)
+        layout.set_spacing(8)
+        self.set_layout_manager(layout)
         self._on_reply = on_reply
         self._on_reply_all = on_reply_all
         self._on_forward = on_forward
@@ -73,6 +93,7 @@ class MessageReaderPane(Gtk.Box):
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
         )
         self._reader_subject.add_css_class("title-2")
+        self._reader_subject.set_max_width_chars(1)
         self._reader_subject.set_hexpand(True)
         self._reader_subject.set_halign(Gtk.Align.FILL)
         self._reader_subject.set_visible(False)
@@ -115,6 +136,8 @@ class MessageReaderPane(Gtk.Box):
         )
         reader_empty_label = Gtk.Label(label="No Message Selected")
         reader_empty_label.add_css_class("dim-label")
+        configure_ellipsize_label(reader_empty_label)
+        reader_empty_label.set_halign(Gtk.Align.CENTER)
         reader_empty_box.append(reader_empty_label)
         self._reader_body_stack.add_named(reader_empty_box, "empty")
 
@@ -125,6 +148,7 @@ class MessageReaderPane(Gtk.Box):
         settings.set_enable_html5_local_storage(False)
         self._web_view.connect("decide-policy", self._on_web_view_decide_policy)
         self._web_view.set_vexpand(True)
+        self._web_view.set_hexpand(True)
         self._reader_body_stack.add_named(self._web_view, "content")
         self._reader_body_stack.set_visible_child_name("empty")
 
@@ -144,25 +168,6 @@ class MessageReaderPane(Gtk.Box):
         )
         self._unsubscribe_btn.set_visible(False)
         outer.append(self._unsubscribe_btn)
-
-        flag_group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        flag_group.add_css_class("linked")
-
-        self._read_toggle_btn = self._make_message_action_button(
-            "mail-mark-read-symbolic",
-            "Mark as Read",
-            self._on_read_toggle,
-        )
-        self._read_toggle_btn.add_css_class("message-read-action")
-        self._flag_toggle_btn = self._make_message_action_button(
-            "mail-flag-symbolic",
-            "Flag",
-            self._on_flag_toggle,
-        )
-        self._flag_toggle_btn.add_css_class("message-flagged")
-        flag_group.append(self._read_toggle_btn)
-        flag_group.append(self._flag_toggle_btn)
-        outer.append(flag_group)
 
         reply_group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         reply_group.add_css_class("linked")
@@ -201,13 +206,9 @@ class MessageReaderPane(Gtk.Box):
 
     def set_actions_sensitive(self, sensitive: bool) -> None:
         self._unsubscribe_btn.set_sensitive(sensitive)
-        self._read_toggle_btn.set_sensitive(sensitive)
-        self._flag_toggle_btn.set_sensitive(sensitive)
         self._reply_btn.set_sensitive(sensitive)
         self._reply_all_btn.set_sensitive(sensitive)
         self._forward_btn.set_sensitive(sensitive)
-        if sensitive:
-            self._refresh_toggle_buttons()
 
     def _update_unsubscribe_button(self, msg: dict[str, Any] | None) -> None:
         has_action = bool(msg and msg.get("unsubscribe"))
@@ -225,23 +226,6 @@ class MessageReaderPane(Gtk.Box):
         if kind not in ("post", "open") or not isinstance(url, str) or not url:
             return
         self._on_unsubscribe({"kind": kind, "url": url})
-
-    def update_toggle_buttons(self, flags: dict[str, Any]) -> None:
-        toggles = reader_toggle_button_state(flags)
-        for button, state in (
-            (self._read_toggle_btn, toggles["read"]),
-            (self._flag_toggle_btn, toggles["flag"]),
-        ):
-            button.set_icon_name(state["icon"])
-            button.set_tooltip_text(state["tooltip"])
-            if state["styled_action"]:
-                button.add_css_class(state["action_class"])
-            else:
-                button.remove_css_class(state["action_class"])
-
-    def _refresh_toggle_buttons(self) -> None:
-        if self._current_message is not None:
-            self.update_toggle_buttons(self._current_message.get("flags") or {})
 
     def show_loading(self) -> None:
         self._current_message = None
@@ -322,7 +306,6 @@ class MessageReaderPane(Gtk.Box):
         current_flags = dict(self._current_message.get("flags") or {})
         current_flags.update(flags)
         self._current_message["flags"] = current_flags
-        self._refresh_toggle_buttons()
 
     def refresh_document(
         self,

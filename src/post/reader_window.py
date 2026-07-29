@@ -24,7 +24,11 @@ from post.header_bar import add_end_window_controls
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.eds import MailAccount, MessageNotAvailableError
-from post.mail.helpers import perform_one_click_unsubscribe, write_temp_attachment
+from post.mail.helpers import (
+    perform_one_click_unsubscribe,
+    reader_toggle_button_state,
+    write_temp_attachment,
+)
 from post.mail.io_thread import get_mail_io_thread
 from post.open_uri import open_uri_externally
 from post.preferences import get_load_remote_content, get_message_appearance
@@ -94,6 +98,21 @@ class ReaderWindow(Adw.ApplicationWindow):
 
         header = Adw.HeaderBar()
         add_end_window_controls(header)
+
+        self._read_toggle_btn = Gtk.Button(icon_name="mail-mark-read-symbolic")
+        self._read_toggle_btn.set_tooltip_text("Mark as Read")
+        self._read_toggle_btn.add_css_class("message-read-action")
+        self._read_toggle_btn.set_sensitive(False)
+        self._read_toggle_btn.connect("clicked", self._on_read_toggle)
+        header.pack_start(self._read_toggle_btn)
+
+        self._flag_toggle_btn = Gtk.Button(icon_name="mail-flag-symbolic")
+        self._flag_toggle_btn.set_tooltip_text("Flag")
+        self._flag_toggle_btn.add_css_class("message-flagged")
+        self._flag_toggle_btn.set_sensitive(False)
+        self._flag_toggle_btn.connect("clicked", self._on_flag_toggle)
+        header.pack_start(self._flag_toggle_btn)
+
         self._archive_btn = Gtk.Button(
             icon_name="mail-archive-symbolic",
             tooltip_text="Archive",
@@ -111,8 +130,6 @@ class ReaderWindow(Adw.ApplicationWindow):
         header.pack_start(self._trash_btn)
 
         self._reader_pane = MessageReaderPane(
-            on_read_toggle=self._on_read_toggle,
-            on_flag_toggle=self._on_flag_toggle,
             on_reply=self._on_reply,
             on_reply_all=self._on_reply_all,
             on_forward=self._on_forward,
@@ -166,6 +183,7 @@ class ReaderWindow(Adw.ApplicationWindow):
             current_flags.update(flags)
             self._current_message["flags"] = current_flags
         self._reader_pane.update_message_flags(flags)
+        self._refresh_flag_toggle_buttons()
 
     def notify_message_moved(self, uid: str) -> None:
         if uid != self._message_uid:
@@ -176,6 +194,33 @@ class ReaderWindow(Adw.ApplicationWindow):
         state = self._get_move_state()
         self._archive_btn.set_sensitive(bool(state.get("can_archive")))
         self._trash_btn.set_sensitive(bool(state.get("can_trash")))
+
+    @staticmethod
+    def _apply_toggle_button_presentation(
+        button: Gtk.Button, state: dict[str, Any]
+    ) -> None:
+        button.set_icon_name(state["icon"])
+        button.set_tooltip_text(state["tooltip"])
+        if state["styled_action"]:
+            button.add_css_class(state["action_class"])
+        else:
+            button.remove_css_class(state["action_class"])
+
+    def _refresh_flag_toggle_buttons(self) -> None:
+        if self._current_message is None:
+            self._read_toggle_btn.set_sensitive(False)
+            self._flag_toggle_btn.set_sensitive(False)
+            return
+        flags = self._current_message.get("flags") or {}
+        toggles = reader_toggle_button_state(flags)
+        self._apply_toggle_button_presentation(
+            self._read_toggle_btn, toggles["read"]
+        )
+        self._apply_toggle_button_presentation(
+            self._flag_toggle_btn, toggles["flag"]
+        )
+        self._read_toggle_btn.set_sensitive(True)
+        self._flag_toggle_btn.set_sensitive(True)
 
     def _load_message(self) -> None:
         self._read_generation += 1
@@ -221,17 +266,21 @@ class ReaderWindow(Adw.ApplicationWindow):
             return False
 
         if isinstance(error, MessageNotAvailableError):
+            self._current_message = None
             self._reader_pane.show_unavailable(
                 error.user_message(),
                 dark=self._app_prefers_dark(),
             )
             self.set_title("Message unavailable")
+            self._refresh_flag_toggle_buttons()
             show_error_toast(self, error.user_message())
             return False
 
         if error is not None:
+            self._current_message = None
             self._reader_pane.show_error(error, dark=self._app_prefers_dark())
             self.set_title("Could not read message")
+            self._refresh_flag_toggle_buttons()
             show_error_toast(self, f"Read error: {error}")
             return False
 
@@ -250,6 +299,7 @@ class ReaderWindow(Adw.ApplicationWindow):
             dark=self._app_prefers_dark(),
             message_appearance=self._message_appearance,
         )
+        self._refresh_flag_toggle_buttons()
         self._on_message_loaded(
             self._message_uid,
             self._account.uid,
@@ -354,6 +404,7 @@ class ReaderWindow(Adw.ApplicationWindow):
             current_flags.update(flags)
             self._current_message["flags"] = current_flags
         self._reader_pane.update_message_flags(flags)
+        self._refresh_flag_toggle_buttons()
         self._on_flags_updated(self._message_uid, flags)
         return False
 
