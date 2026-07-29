@@ -177,6 +177,22 @@ class ReadPathDispatchTests(unittest.TestCase):
 
         self.assertEqual(stats, {"INBOX": (1, 3)})
 
+    def test_account_folder_stats_registers_timeout_cancellable(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        service._folder_tree_cache["acct-1"] = [
+            {"full_name": "INBOX", "unread": 0, "total": 1},
+        ]
+        store = mock.Mock()
+        store.get_folder_info_sync.return_value = None
+
+        with mock.patch.object(service, "_get_store_unlocked", return_value=store):
+            service._get_account_folder_stats_unlocked("acct-1")
+
+        cancellable = store.get_folder_info_sync.call_args.args[2]
+        self.assertIsNotNone(cancellable)
+        self.assertEqual(service._folder_refresh_cancellables, set())
+
 
 class FolderStatsOfflineFallbackTests(unittest.TestCase):
     def test_returns_memory_index_when_offline(self) -> None:

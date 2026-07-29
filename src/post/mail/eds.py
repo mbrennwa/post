@@ -170,7 +170,8 @@ _TRANSFER_TIMEOUT_SECONDS = 45
 # Post-transfer synchronize/refresh must not pin the mail I/O thread forever
 # after Camel has already moved messages (M365 Graph can hang here).
 _TRANSFER_POST_TIMEOUT_SECONDS = 30
-# Per-folder refresh_info_sync for sidebar counts must not pin post-mail-io (#197).
+# Per-folder refresh_info_sync / store FolderInfo REFRESH for sidebar counts
+# must not pin post-mail-io (#197, #210).
 _FOLDER_STATS_TIMEOUT_SECONDS = 15
 # Stay below Camel IMAPx MAX_UIDSET_ITEMS (100) to avoid spurious uidset warnings
 # in evolution-data-server 3.56 when batching UID MOVE/COPY commands.
@@ -3076,6 +3077,9 @@ class MailService:
                 return stats[folder_name]
             return (-1, -1)
 
+        # Never hold MailService._lock across Camel network I/O (#210): GTK and
+        # other mail-thread helpers that need the lock would freeze for the
+        # full refresh_info_sync duration (or until cancel is honored).
         with self._lock:
             store = self._get_store_unlocked(account_uid)
             if not self._network_available:
@@ -3089,53 +3093,61 @@ class MailService:
                 )
                 if indexed is not None:
                     return indexed
-            cancellable = Gio.Cancellable()
-            self._register_folder_refresh_cancellable(cancellable)
-            timer = threading.Timer(
-                _FOLDER_STATS_TIMEOUT_SECONDS, cancellable.cancel
-            )
-            timer.start()
-            try:
-                if cancellable.is_cancelled():
+
+        cancellable = Gio.Cancellable()
+        self._register_folder_refresh_cancellable(cancellable)
+        timer = threading.Timer(
+            _FOLDER_STATS_TIMEOUT_SECONDS, cancellable.cancel
+        )
+        timer.start()
+        try:
+            if cancellable.is_cancelled():
+                with self._lock:
                     cached = self._cached_folder_stats_unlocked(
                         account_uid, folder_name
                     )
-                    if cached is not None:
-                        return cached
-                    raise GLib.Error.new_literal(
-                        Gio.io_error_quark(),
-                        "Operation was cancelled",
-                        Gio.IOErrorEnum.CANCELLED,
-                    )
-                folder = store.get_folder_sync(folder_name, 0, cancellable)
-                if folder is None:
-                    raise ValueError(f"Folder not found: {folder_name}")
-                try:
-                    folder.refresh_info_sync(cancellable)
-                except GLib.Error as exc:
-                    if exc.matches(
-                        Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
-                    ) or is_network_unavailable_error(exc):
+                if cached is not None:
+                    return cached
+                raise GLib.Error.new_literal(
+                    Gio.io_error_quark(),
+                    "Operation was cancelled",
+                    Gio.IOErrorEnum.CANCELLED,
+                )
+            folder = store.get_folder_sync(folder_name, 0, cancellable)
+            if folder is None:
+                raise ValueError(f"Folder not found: {folder_name}")
+            try:
+                folder.refresh_info_sync(cancellable)
+            except GLib.Error as exc:
+                if exc.matches(
+                    Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
+                ) or is_network_unavailable_error(exc):
+                    with self._lock:
                         cached = self._cached_folder_stats_unlocked(
                             account_uid, folder_name
                         )
-                        if cached is not None:
-                            return cached
-                        if exc.matches(
-                            Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
-                        ):
-                            return (-1, -1)
-                    raise
-                return folder_get_unread_count(folder), folder.get_message_count()
-            finally:
-                timer.cancel()
-                self._unregister_folder_refresh_cancellable(cancellable)
+                        if cached is None:
+                            cached = self._folder_index_stats_unlocked(
+                                account_uid, folder_name
+                            )
+                    if cached is not None:
+                        return cached
+                    if exc.matches(
+                        Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
+                    ):
+                        return (-1, -1)
+                raise
+            return folder_get_unread_count(folder), folder.get_message_count()
+        finally:
+            timer.cancel()
+            self._unregister_folder_refresh_cancellable(cancellable)
 
     def _get_account_folder_stats_unlocked(
         self, account_uid: str
     ) -> dict[str, tuple[int, int]]:
         def _stats_from_cached_tree() -> dict[str, tuple[int, int]]:
-            cached = self._folder_tree_cache.get(account_uid) or []
+            with self._lock:
+                cached = self._folder_tree_cache.get(account_uid) or []
             out: dict[str, tuple[int, int]] = {}
             for folder in cached:
                 name = folder.get("full_name")
@@ -3161,6 +3173,12 @@ class MailService:
         )
         cancellable = Gio.Cancellable()
         self._register_folder_refresh_cancellable(cancellable)
+        # Bound store FolderInfo REFRESH the same way as per-folder stats (#210).
+        # Heavy-folder get_folder_stats falls into this path on cache miss.
+        timer = threading.Timer(
+            _FOLDER_STATS_TIMEOUT_SECONDS, cancellable.cancel
+        )
+        timer.start()
         try:
             if cancellable.is_cancelled():
                 return _stats_from_cached_tree()
@@ -3172,6 +3190,7 @@ class MailService:
                 return _stats_from_cached_tree()
             raise
         finally:
+            timer.cancel()
             self._unregister_folder_refresh_cancellable(cancellable)
         # Camel M365 can fail without setting GError (#156); keep prior counts.
         if root is None:
