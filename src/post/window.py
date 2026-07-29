@@ -51,6 +51,7 @@ from post.mail.message_list_state import (
     MESSAGE_LIST_UI_BIND_CAP,
     MESSAGE_LIST_UI_BIND_MORE,
     is_heavy_folder_name,
+    message_list_fingerprint,
     message_lists_equivalent_for_ui,
     prepended_message_count,
 )
@@ -286,6 +287,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._offline_download_status = ""
         self._status_hint = ""
         self._offline_held_for_load_generation: int | None = None
+        self._heavy_index_in_progress: tuple[str, str] | None = None
+        self._heavy_bind_catchup_load_id: int | None = None
         self._network_available = Gio.NetworkMonitor.get_default().get_network_available()
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1350,8 +1353,26 @@ class MainWindow(Adw.ApplicationWindow):
         self._mail.hold_offline_body_sync(True)
         self._refresh_status_display()
 
+    def _heavy_folder_still_selected(self, load_id: int) -> bool:
+        """True while the open folder is still this heavy-folder load (#208)."""
+        if load_id != self._messages_load_generation:
+            return False
+        account = self._current_account
+        folder = self._current_folder
+        return (
+            account is not None
+            and folder is not None
+            and is_heavy_folder_name(folder)
+        )
+
     def _release_offline_sync_for_folder_work(self, load_id: int) -> None:
         if self._offline_held_for_load_generation != load_id:
+            return
+        # Keep holding while the clicked heavy folder stays selected so Gmail
+        # (or any other account) offline backfill cannot steal status / mail I/O.
+        if self._heavy_folder_still_selected(load_id):
+            self._offline_download_status = ""
+            self._refresh_status_display()
             return
         self._offline_held_for_load_generation = None
         self._mail.hold_offline_body_sync(False)
@@ -2976,9 +2997,68 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self._message_list_view.append_messages(more, folder_name=folder_name)
         self._message_list_bound_count = already + len(more)
+        log.info(
+            "Heavy-folder UI append bound %s/%s now=%d of %d",
+            account.uid,
+            folder_name,
+            self._message_list_bound_count,
+            len(messages),
+        )
         self._update_message_status(account, folder_name)
         # Keep loading if the scrollbar is still pinned at the bottom (drag-to-end).
         self._message_list_view.after_content_appended()
+
+    def _schedule_bind_unbound_heavy_messages(self, load_id: int) -> None:
+        """Bind already-indexed older rows without rebuilding the top (#208).
+
+        Graph backfill does not change the newest window, so a full rebind looks
+        idle. Append unbound rows in batches so the list length grows and scroll
+        reaches newly indexed mail even while refresh_info is still running.
+        """
+        if self._heavy_bind_catchup_load_id == load_id:
+            return
+        self._heavy_bind_catchup_load_id = load_id
+
+        def _append_batch() -> bool:
+            if load_id != self._messages_load_generation:
+                if self._heavy_bind_catchup_load_id == load_id:
+                    self._heavy_bind_catchup_load_id = None
+                return False
+            if self._search_query is not None:
+                self._heavy_bind_catchup_load_id = None
+                return False
+            messages = self._current_folder_messages
+            account = self._current_account
+            folder_name = self._current_folder
+            if not messages or account is None or not folder_name:
+                self._heavy_bind_catchup_load_id = None
+                return False
+            already = self._message_list_bound_count
+            if already >= len(messages):
+                self._heavy_bind_catchup_load_id = None
+                return False
+            if self._message_list_populating:
+                return True
+            more = messages[already : already + MESSAGE_LIST_UI_BIND_MORE]
+            if not more:
+                self._heavy_bind_catchup_load_id = None
+                return False
+            self._message_list_view.append_messages(more, folder_name=folder_name)
+            self._message_list_bound_count = already + len(more)
+            log.info(
+                "Heavy-folder UI catch-up bind %s/%s now=%d of %d",
+                account.uid,
+                folder_name,
+                self._message_list_bound_count,
+                len(messages),
+            )
+            self._update_message_status(account, folder_name)
+            if self._message_list_bound_count < len(messages):
+                return True
+            self._heavy_bind_catchup_load_id = None
+            return False
+
+        GLib.timeout_add(50, _append_batch)
 
     def _message_flags_for_uid(self, uid: str) -> dict:
         message = self._message_list_view.get_message(uid)
@@ -3057,6 +3137,14 @@ class MainWindow(Adw.ApplicationWindow):
         cursor: dict | None = None,
     ) -> None:
         """Chunked Archive/Trash/Junk header index; preemptible (#208)."""
+        self._heavy_index_in_progress = (account_uid, folder_name)
+        log.info(
+            "Heavy-folder UI start index load_id=%s %s/%s cursor=%s",
+            load_id,
+            account_uid,
+            folder_name,
+            sorted((cursor or {}).keys()),
+        )
         get_mail_io_thread().submit_background(
             self._run_heavy_folder_index_slice,
             load_id,
@@ -3064,6 +3152,34 @@ class MainWindow(Adw.ApplicationWindow):
             folder_name,
             cursor,
         )
+
+    def _heavy_index_still_active(
+        self, account_uid: str, folder_name: str
+    ) -> bool:
+        """True while Archive/etc. indexing should keep running for this folder."""
+        return (
+            self._heavy_index_in_progress == (account_uid, folder_name)
+            and self._current_account is not None
+            and self._current_account.uid == account_uid
+            and self._current_folder == folder_name
+        )
+
+    def _adopt_heavy_index_load_id(
+        self, load_id: int, account_uid: str, folder_name: str
+    ) -> int | None:
+        """Keep indexing across same-folder reloads that bump generation (#208).
+
+        ``_load_messages`` always increments ``_messages_load_generation``. If we
+        drop stale slices and also refuse to start a second indexer, Archive
+        growth freezes until the user leaves and re-opens the folder.
+        """
+        if load_id == self._messages_load_generation:
+            return load_id
+        if self._heavy_index_still_active(account_uid, folder_name):
+            return self._messages_load_generation
+        if self._heavy_index_in_progress == (account_uid, folder_name):
+            self._heavy_index_in_progress = None
+        return None
 
     def _run_heavy_folder_index_slice(
         self,
@@ -3073,29 +3189,83 @@ class MainWindow(Adw.ApplicationWindow):
         cursor: dict | None,
     ) -> None:
         """Continue heavy-folder indexing on the mail I/O thread (#208)."""
-        if load_id != self._messages_load_generation:
+        load_id_opt = self._adopt_heavy_index_load_id(
+            load_id, account_uid, folder_name
+        )
+        if load_id_opt is None:
             return
+        load_id = load_id_opt
         if cursor and cursor.get("pending_server_refresh"):
             GLib.idle_add(
                 self._set_status,
                 f"Fetching {folder_name} headers from server…",
             )
         try:
+            def _mid_refresh_progress(mid: object) -> None:
+                GLib.idle_add(
+                    self._on_heavy_folder_index_progress,
+                    load_id,
+                    account_uid,
+                    folder_name,
+                    mid,
+                )
+
             progress = self._mail.continue_heavy_folder_index(
-                account_uid, folder_name, cursor=cursor
+                account_uid,
+                folder_name,
+                cursor=cursor,
+                on_progress=_mid_refresh_progress,
             )
         except Exception as exc:
             if isinstance(exc, GLib.Error) and exc.matches(
                 Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
             ):
+                # Soft cancel / leave — resume if this folder is still open.
+                if self._heavy_index_still_active(account_uid, folder_name):
+                    resume_id = self._messages_load_generation
+                    resume_cursor = {
+                        "refresh_done": False,
+                        "pending_server_refresh": True,
+                        "status_seeded": True,
+                        "did_prepare_content_refresh": True,
+                    }
+
+                    def _resume_after_cancel() -> bool:
+                        if not self._heavy_index_still_active(
+                            account_uid, folder_name
+                        ):
+                            return False
+                        self._start_background_heavy_folder_index(
+                            resume_id,
+                            account_uid,
+                            folder_name,
+                            cursor=resume_cursor,
+                        )
+                        return False
+
+                    GLib.timeout_add(500, _resume_after_cancel)
+                    return
+                if self._heavy_index_in_progress == (account_uid, folder_name):
+                    self._heavy_index_in_progress = None
                 GLib.idle_add(self._on_messages_sync_finished, load_id, False)
                 return
             if is_network_unavailable_error(exc):
+                if self._heavy_index_in_progress == (account_uid, folder_name):
+                    self._heavy_index_in_progress = None
                 GLib.idle_add(self._on_messages_sync_finished, load_id, False)
                 return
             log_mail_error(log, "Failed to index heavy folder", exc)
+            if self._heavy_index_in_progress == (account_uid, folder_name):
+                self._heavy_index_in_progress = None
             GLib.idle_add(self._on_messages_sync_finished, load_id, False)
             return
+
+        load_id_opt = self._adopt_heavy_index_load_id(
+            load_id, account_uid, folder_name
+        )
+        if load_id_opt is None:
+            return
+        load_id = load_id_opt
 
         GLib.idle_add(
             self._on_heavy_folder_index_progress,
@@ -3104,7 +3274,27 @@ class MainWindow(Adw.ApplicationWindow):
             folder_name,
             progress,
         )
-        if progress.done or load_id != self._messages_load_generation:
+        if progress.done:
+            return
+        cursor = progress.cursor or {}
+        if cursor.get("yield_for_interactive"):
+            # Avoid a tight background resubmit loop while interactive mail I/O
+            # is queued (#208).
+            def _resume_after_yield() -> bool:
+                adopted = self._adopt_heavy_index_load_id(
+                    load_id, account_uid, folder_name
+                )
+                if adopted is None:
+                    return False
+                self._start_background_heavy_folder_index(
+                    adopted,
+                    account_uid,
+                    folder_name,
+                    cursor=cursor,
+                )
+                return False
+
+            GLib.timeout_add(250, _resume_after_yield)
             return
         # Yield to interactive work, then resume from cursor.
         get_mail_io_thread().submit_background(
@@ -3140,38 +3330,123 @@ class MainWindow(Adw.ApplicationWindow):
         server_total = server[1] if server is not None else -1
         from post.mail.folder_status_cache import MIN_TRUSTED_STATUS_TOTAL
 
+        keep_indexing = not progress.done
         if not progress.done:
             if server_total >= MIN_TRUSTED_STATUS_TOTAL and server_total > indexed:
                 self._set_status(
-                    f"Indexing {folder_name}… {indexed} local "
-                    f"(server reports {server_total})"
-                )
-            elif progress.total > indexed:
-                self._set_status(
-                    f"Indexing {folder_name}… {indexed}/{progress.total}"
+                    f"Fetching {folder_name} headers… {indexed} of "
+                    f"{server_total} on server"
                 )
             else:
                 self._set_status(
-                    f"Indexing {folder_name}… {indexed} local messages"
+                    f"Fetching {folder_name} headers… {indexed} indexed so far"
                 )
             self._message_sync_in_progress = True
         else:
-            self._message_sync_in_progress = False
+            from post.mail.folder_status_cache import index_caught_up
 
-        # List/status use indexed size; keep server_total only for messaging.
-        total = indexed
-        if server_total >= MIN_TRUSTED_STATUS_TOTAL and server_total > total:
-            # Remember server size for "Showing N of M indexed (server S)".
-            total = indexed
+            # Indexer may finish after a partial Graph refresh while STATUS is
+            # still much larger — keep chasing while this folder stays open.
+            if (
+                server_total >= MIN_TRUSTED_STATUS_TOTAL
+                and not index_caught_up(indexed, server_total)
+            ):
+                keep_indexing = True
+                self._message_sync_in_progress = True
+                self._set_status(
+                    f"Fetching {folder_name} headers… {indexed} of "
+                    f"{server_total} on server"
+                )
+
+                def _retry_heavy_refresh() -> bool:
+                    if load_id != self._messages_load_generation:
+                        return False
+                    if self._current_folder != folder_name:
+                        return False
+                    # Preserve prepare/seed flags — a bare cursor re-runs
+                    # prepare_content_refresh and wipes M365 sync progress.
+                    retry_cursor = dict(progress.cursor or {})
+                    retry_cursor.update(
+                        {
+                            "refresh_done": False,
+                            "pending_server_refresh": True,
+                            "status_seeded": True,
+                            "did_prepare_content_refresh": True,
+                            "indexed_after_refresh": indexed,
+                        }
+                    )
+                    log.info(
+                        "Heavy-folder UI retry catch-up load_id=%s %s/%s "
+                        "indexed=%d server_total=%d",
+                        load_id,
+                        account_uid,
+                        folder_name,
+                        indexed,
+                        server_total,
+                    )
+                    self._start_background_heavy_folder_index(
+                        load_id,
+                        account_uid,
+                        folder_name,
+                        cursor=retry_cursor,
+                    )
+                    return False
+
+                GLib.timeout_add(2000, _retry_heavy_refresh)
+            else:
+                self._message_sync_in_progress = False
+                if self._heavy_index_in_progress == (account_uid, folder_name):
+                    self._heavy_index_in_progress = None
 
         current = self._current_folder_messages or []
+        # Always keep the in-memory list current so scroll-to-load-more can reach
+        # newly indexed *older* headers (Graph backfill rarely changes the top).
+        grew = indexed > len(current)
+        top_unchanged = (
+            bool(current)
+            and bool(messages)
+            and message_list_fingerprint(current[:MESSAGE_LIST_UI_BIND_CAP])
+            == message_list_fingerprint(messages[:MESSAGE_LIST_UI_BIND_CAP])
+        )
+        log.info(
+            "Heavy-folder UI progress load_id=%s %s/%s indexed=%d "
+            "prev=%d server_total=%d done=%s keep=%s grew=%s "
+            "top_unchanged=%s bound=%d",
+            load_id,
+            account_uid,
+            folder_name,
+            indexed,
+            len(current),
+            server_total,
+            progress.done,
+            keep_indexing,
+            grew,
+            top_unchanged,
+            self._message_list_bound_count,
+        )
+
         if message_lists_equivalent_for_ui(
             current,
             messages,
             current_total=self._message_total,
             refreshed_total=indexed,
         ):
-            if progress.done:
+            log.info(
+                "Heavy-folder UI skip rebind (equivalent) %s/%s indexed=%d "
+                "bound=%d",
+                account_uid,
+                folder_name,
+                indexed,
+                self._message_list_bound_count,
+            )
+            # Index may have grown earlier while we kept the top rows; bind the
+            # unbound older rows so the list length grows without a top rebuild.
+            if indexed > self._message_list_bound_count > 0:
+                self._current_folder_messages = messages
+                self._message_total = indexed
+                self._update_message_status(account, folder_name)
+                self._schedule_bind_unbound_heavy_messages(load_id)
+            if not keep_indexing:
                 GLib.idle_add(self._on_messages_sync_finished, load_id, False)
                 self._update_message_status(account, folder_name)
             return False
@@ -3182,22 +3457,59 @@ class MainWindow(Adw.ApplicationWindow):
         if not messages:
             self._message_empty_label.set_label(f"No Messages in {folder_name}")
             self._message_stack.set_visible_child_name("empty")
-            self._update_message_status(account, folder_name)
-            if progress.done:
+            if not keep_indexing:
+                self._update_message_status(account, folder_name)
                 GLib.idle_add(self._on_messages_sync_finished, load_id, False)
             return False
 
         self._message_stack.set_visible_child_name("list")
+
+        if grew and top_unchanged and self._message_list_bound_count > 0:
+            # Older headers appended below the visible newest window — do not
+            # rebuild Gtk (scroll jump). Bind the new rows below so scroll can
+            # reach them even while the user stays at the top (#208).
+            log.info(
+                "Heavy-folder UI keep top rows; binding older mail below "
+                "%s/%s indexed=%d bound=%d",
+                account_uid,
+                folder_name,
+                indexed,
+                self._message_list_bound_count,
+            )
+            self._update_message_status(account, folder_name)
+            self._schedule_bind_unbound_heavy_messages(load_id)
+            if keep_indexing and server_total >= MIN_TRUSTED_STATUS_TOTAL:
+                self._set_status(
+                    f"Fetching {folder_name} headers… {indexed} of "
+                    f"{server_total} on server · older mail loading "
+                    f"(scroll down for more)"
+                )
+            elif keep_indexing:
+                self._set_status(
+                    f"Fetching {folder_name} headers… {indexed} indexed · "
+                    f"older mail loading (scroll down for more)"
+                )
+            return False
+
+        log.info(
+            "Heavy-folder UI rebind list %s/%s indexed=%d",
+            account_uid,
+            folder_name,
+            indexed,
+        )
+
+        def _after_rebind() -> None:
+            if keep_indexing:
+                self._schedule_bind_unbound_heavy_messages(load_id)
+            else:
+                self._on_messages_sync_finished(load_id, False)
+
         self._apply_messages_to_list(
             messages,
             folder_name,
             account=account,
             load_id=load_id,
-            on_complete=(
-                (lambda: self._on_messages_sync_finished(load_id, False))
-                if progress.done
-                else (lambda: self._update_message_status(account, folder_name))
-            ),
+            on_complete=_after_rebind,
         )
         return False
 
@@ -3564,9 +3876,41 @@ class MainWindow(Adw.ApplicationWindow):
         if not self._network_available:
             sync = False
 
+        # Same Archive/etc. already indexing: do not bump generation, clear the
+        # list, or start a Camel summary rebuild — that cancels Graph mid-flight
+        # and can collapse thousands of indexed headers back to ~1.3k (#208).
+        if (
+            self._search_query is None
+            and not force_sync
+            and not skip_disk_cache
+            and not is_post_outbox_folder(folder_name)
+            and is_heavy_folder_name(folder_name)
+            and self._heavy_index_in_progress == (account_uid, folder_name)
+            and self._current_folder == folder_name
+            and self._current_account is not None
+            and self._current_account.uid == account_uid
+        ):
+            log.info(
+                "Heavy-folder UI ignore reload while indexing %s/%s "
+                "(bound=%d indexed=%d)",
+                account_uid,
+                folder_name,
+                self._message_list_bound_count,
+                len(self._current_folder_messages or []),
+            )
+            self._hold_offline_sync_for_folder_work(
+                self._messages_load_generation
+            )
+            if self._current_folder_messages:
+                self._schedule_bind_unbound_heavy_messages(
+                    self._messages_load_generation
+                )
+            return
+
         self._messages_load_generation += 1
         load_id = self._messages_load_generation
         self._messages_load_expects_search = self._search_query is not None
+        self._heavy_bind_catchup_load_id = None
 
         # Abort background folder-info REFRESH / refresh_info_sync so the new
         # folder load is not stuck behind Camel I/O (#170 hang on switch).
@@ -3574,6 +3918,23 @@ class MainWindow(Adw.ApplicationWindow):
         # into permanent "Loading folders…".
         self._mail.cancel_folder_search()
         self._mail.cancel_folder_refresh()
+        # Cancel an in-flight Archive/etc. Graph refresh when navigating away
+        # from the folder being indexed. Do not use ``_current_folder`` here —
+        # ``_prepare_folder_selection`` already updated it to the new folder
+        # before ``_load_messages`` runs (#208).
+        indexing = self._heavy_index_in_progress
+        if indexing is not None:
+            idx_account, idx_folder = indexing
+            leaving_indexed = (
+                idx_account != account_uid or idx_folder != folder_name
+            )
+            if leaving_indexed or not is_heavy_folder_name(folder_name):
+                self._mail.cancel_heavy_folder_index_refresh()
+                if leaving_indexed:
+                    self._mail.clear_heavy_folder_index_session(
+                        idx_account, idx_folder
+                    )
+                self._heavy_index_in_progress = None
         self._sidebar.cancel_folder_count_poll()
         # Pause Gmail/etc. offline backfill so this folder owns mail I/O + status.
         self._hold_offline_sync_for_folder_work(load_id)
@@ -3735,6 +4096,17 @@ class MainWindow(Adw.ApplicationWindow):
             # Heavy folders (Archive/Trash/Junk) use a chunked preemptible
             # indexer instead of a full uncapped refresh_info reindex (#208).
             if use_background_sync and is_heavy_folder_name(folder_name):
+                if self._heavy_index_in_progress == (account_uid, folder_name):
+                    # Same folder already indexing — do not start a second
+                    # refresh_info (and do not prepare_content_refresh again).
+                    log.info(
+                        "Heavy-folder UI skip duplicate indexer %s/%s "
+                        "load_id=%s",
+                        account_uid,
+                        folder_name,
+                        load_id,
+                    )
+                    return
                 if not send_pending:
                     self._start_background_heavy_folder_index(
                         load_id, account_uid, folder_name
@@ -3743,6 +4115,11 @@ class MainWindow(Adw.ApplicationWindow):
 
                     def heavy_after_send() -> None:
                         if load_id != self._messages_load_generation:
+                            return
+                        if self._heavy_index_in_progress == (
+                            account_uid,
+                            folder_name,
+                        ):
                             return
                         self._start_background_heavy_folder_index(
                             load_id, account_uid, folder_name
@@ -4003,12 +4380,15 @@ class MainWindow(Adw.ApplicationWindow):
         if load_id != self._messages_load_generation:
             return False
         self._message_sync_in_progress = False
+        account = self._current_account
+        folder = self._current_folder
+        # Keep ``_heavy_index_in_progress`` until catch-up or leave; the release
+        # path still holds offline sync while a heavy folder stays selected.
         self._release_offline_sync_for_folder_work(load_id)
         if changed:
             return False
-        account = self._current_account
-        if account is not None and self._current_folder is not None:
-            self._update_message_status(account, self._current_folder)
+        if account is not None and folder is not None:
+            self._update_message_status(account, folder)
         return False
 
     def _stop_superseded_message_loading(self, load_id: int) -> bool:

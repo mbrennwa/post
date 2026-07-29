@@ -200,6 +200,8 @@ class MailIoThread:
         timeout_seconds: float | None = None,
         run_interactive: bool = True,
         on_timeout_cancel: Callable[[], None] | None = None,
+        on_heartbeat: Callable[[float], None] | None = None,
+        heartbeat_seconds: float = 5.0,
     ) -> bool:
         """Pump the mail-thread GLib context until ``done`` is set (#208).
 
@@ -207,27 +209,43 @@ class MailIoThread:
         Camel async ``refresh_info``). When ``run_interactive`` is True, pending
         interactive tasks are drained between iterations so opening a message or
         switching folders is not frozen behind Graph.
+
+        ``on_heartbeat(elapsed_seconds)`` is called about every
+        ``heartbeat_seconds`` while still waiting (for log-file debugging).
         """
         if not is_mail_io_thread():
             raise RuntimeError("pump_until must run on the mail I/O thread")
         context = GLib.MainContext.get_thread_default()
         if context is None:
             raise RuntimeError("mail I/O thread has no thread-default GMainContext")
+        started = time.monotonic()
         deadline = (
             None
             if timeout_seconds is None
-            else time.monotonic() + max(0.0, timeout_seconds)
+            else started + max(0.0, timeout_seconds)
+        )
+        next_heartbeat = (
+            started + max(0.5, heartbeat_seconds)
+            if on_heartbeat is not None
+            else None
         )
         timed_out = False
         with self._work_available:
             self._inside_pump = True
         try:
             while not done.is_set():
-                if deadline is not None and time.monotonic() >= deadline:
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
                     timed_out = True
                     if on_timeout_cancel is not None:
                         on_timeout_cancel()
                     break
+                if next_heartbeat is not None and now >= next_heartbeat:
+                    try:
+                        on_heartbeat(now - started)
+                    except Exception:
+                        log.debug("pump_until heartbeat failed", exc_info=True)
+                    next_heartbeat = now + max(0.5, heartbeat_seconds)
                 if run_interactive:
                     nested: _IoTask | None = None
                     with self._work_available:

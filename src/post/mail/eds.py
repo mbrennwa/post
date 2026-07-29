@@ -35,6 +35,7 @@ from gi.repository import Camel, EDataServer, GLib, Gio
 
 from . import folder_index_cache
 from . import folder_status_cache
+from . import graph_folder_counts
 from .helpers import (
     message_info_to_dict,
     message_is_read_unflagged,
@@ -243,8 +244,22 @@ def _apply_heavy_status_high_water(
     out: dict[str, tuple[int, int]] = {}
     for name, (unread, total) in stats.items():
         if is_heavy_folder_name(name):
+            local_indexed: int | None = None
+            cached = folder_index_cache.load(account_uid, name)
+            if cached is not None:
+                local_indexed = len(cached[0])
+            # Scrub poisoned summary-echo high-water before merging.
+            if local_indexed is not None:
+                folder_status_cache.scrub_if_summary_echo(
+                    account_uid, name, local_indexed
+                )
             folder_status_cache.observe(
-                account_uid, name, unread, total, trusted=True
+                account_uid,
+                name,
+                unread,
+                total,
+                trusted=True,
+                local_indexed=local_indexed,
             )
             out[name] = folder_status_cache.resolve_sidebar(
                 account_uid, name, unread, total
@@ -272,9 +287,20 @@ class HeavyFolderIndexProgress:
     cursor: dict[str, Any] = field(default_factory=dict)
 
 
-# Bound refresh_info for heavy-folder index slices so Graph cannot pin mail I/O (#208).
-# Async+pump allows interactive work during wait; keep a hard ceiling anyway.
-_HEAVY_FOLDER_REFRESH_TIMEOUT_SECONDS = 45
+# Heavy-folder Graph refresh follows Evolution's model: run refresh_info to
+# completion (full M365 delta). Soft-cancelling mid-flight often yields zero
+# new UIDs. Cancel only when leaving the folder (#208).
+# Log a heartbeat while waiting on Graph so post.log shows live progress (#208).
+_HEAVY_FOLDER_REFRESH_HEARTBEAT_SECONDS = 2.0
+# After a successful refresh that adds no new UIDs, retry with
+# prepare_content_refresh this many times before giving up (#208).
+_HEAVY_FOLDER_REFRESH_STALL_LIMIT = 8
+# One completed refresh_info per slice, then materialize and return to the UI.
+_HEAVY_FOLDER_REFRESH_PAGES_PER_SLICE = 1
+_HEAVY_FOLDER_REFRESH_SLICE_BUDGET_SECONDS = 960.0
+# Skip prepare_content_refresh once the local index is already substantial —
+# resetting M365 sync state throws away progress (#208).
+_HEAVY_FOLDER_PREPARE_MIN_INDEXED = 500
 
 
 def _folder_index_is_cacheable(index: _FolderMessageIndex) -> bool:
@@ -492,6 +518,17 @@ class MailService:
     _folder_refresh_cancellables: set[Gio.Cancellable] = field(
         default_factory=set, init=False, repr=False
     )
+    # Heavy-folder Graph refresh_info while Archive/etc. is open. Not cancelled
+    # by sidebar count polls (cancel_folder_refresh) — only by explicit
+    # cancel_heavy_folder_index_refresh when leaving the folder (#208).
+    _heavy_index_refresh_cancellables: set[Gio.Cancellable] = field(
+        default_factory=set, init=False, repr=False
+    )
+    # Survives load_id / cursor resets so we do not keep calling
+    # prepare_content_refresh (which wipes M365 sync progress) (#208).
+    _heavy_index_sessions: dict[tuple[str, str], dict[str, Any]] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _folder_list_state_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
@@ -532,7 +569,11 @@ class MailService:
                 cancellable.cancel()
 
     def cancel_folder_refresh(self) -> None:
-        """Abort folder-info REFRESH / refresh_info_sync (not sidebar tree loads)."""
+        """Abort folder-info REFRESH / refresh_info_sync (not sidebar tree loads).
+
+        Does not cancel an in-flight heavy-folder Archive refresh — that would
+        freeze header growth at the local summary size (#208).
+        """
         with self._folder_list_state_lock:
             cancellables = list(self._folder_refresh_cancellables)
             self._folder_refresh_cancellables.clear()
@@ -540,6 +581,43 @@ class MailService:
             search_trace("folder_refresh_cancel", count=len(cancellables))
             for cancellable in cancellables:
                 cancellable.cancel()
+
+    def cancel_heavy_folder_index_refresh(self) -> None:
+        """Abort heavy-folder Graph refresh when leaving Archive/Trash/Junk."""
+        with self._folder_list_state_lock:
+            cancellables = list(self._heavy_index_refresh_cancellables)
+            self._heavy_index_refresh_cancellables.clear()
+        for cancellable in cancellables:
+            cancellable.cancel()
+
+    def clear_heavy_folder_index_session(
+        self, account_uid: str, folder_name: str
+    ) -> None:
+        """Drop per-folder prepare/seed flags when navigating away (#208)."""
+        self._heavy_index_sessions.pop((account_uid, folder_name), None)
+
+    def _heavy_index_session(self, account_uid: str, folder_name: str) -> dict[str, Any]:
+        key = (account_uid, folder_name)
+        session = self._heavy_index_sessions.get(key)
+        if session is None:
+            session = {
+                "did_prepare_content_refresh": False,
+                "status_seeded": False,
+            }
+            self._heavy_index_sessions[key] = session
+        return session
+
+    def _register_heavy_index_refresh_cancellable(
+        self, cancellable: Gio.Cancellable
+    ) -> None:
+        with self._folder_list_state_lock:
+            self._heavy_index_refresh_cancellables.add(cancellable)
+
+    def _unregister_heavy_index_refresh_cancellable(
+        self, cancellable: Gio.Cancellable
+    ) -> None:
+        with self._folder_list_state_lock:
+            self._heavy_index_refresh_cancellables.discard(cancellable)
 
     def _register_folder_list_cancellable(
         self, cancellable: Gio.Cancellable
@@ -616,6 +694,10 @@ class MailService:
             self.offline_sync.cancel_all()
         else:
             self.schedule_offline_body_sync()
+
+    def offline_body_sync_is_held(self) -> bool:
+        """True while folder opens / heavy-folder indexing owns mail I/O (#208)."""
+        return self._offline_body_sync_held
 
     def schedule_offline_body_sync(self, account_uid: str | None = None) -> None:
         if self._offline_body_sync_held:
@@ -3058,6 +3140,82 @@ class MailService:
         with self._lock:
             return self._cached_folder_stats_unlocked(account_uid, folder_name)
 
+    def _seed_heavy_folder_status_from_graph_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        local_indexed: int = 0,
+    ) -> None:
+        """Lock in Graph totalItemCount as STATUS for M365 heavy folders (#208)."""
+        try:
+            account = self.get_account(account_uid)
+        except Exception:
+            return
+        if (account.backend or "").lower() != "microsoft365":
+            return
+        if folder_status_cache.load(account_uid, folder_name) is not None:
+            return
+        try:
+            store = self._get_store_unlocked(account_uid)
+            session = self._ensure_session()
+        except Exception:
+            log.debug(
+                "Graph STATUS seed: no store/session for %s",
+                account_uid,
+                exc_info=True,
+            )
+            return
+        cancellable = Gio.Cancellable()
+        try:
+            ok, token, _expires = session.get_oauth2_access_token_sync(
+                store, cancellable
+            )
+        except Exception:
+            log.debug(
+                "Graph STATUS seed: OAuth token failed for %s",
+                account_uid,
+                exc_info=True,
+            )
+            return
+        if not ok or not token:
+            return
+        counts = graph_folder_counts.fetch_mail_folder_counts(
+            token, folder_name, cancellable=cancellable
+        )
+        if counts is None:
+            log.info(
+                "Graph STATUS seed: no counts for %s/%s",
+                account_uid,
+                folder_name,
+            )
+            return
+        unread, total = counts
+        folder_status_cache.observe(
+            account_uid,
+            folder_name,
+            unread,
+            total,
+            trusted=True,
+            local_indexed=local_indexed,
+        )
+        loaded = folder_status_cache.load(account_uid, folder_name)
+        if loaded is not None:
+            log.info(
+                "Graph STATUS seed for %s/%s: unread=%d total=%d",
+                account_uid,
+                folder_name,
+                loaded[0],
+                loaded[1],
+            )
+            # Keep sidebar tree cache in sync with the real server total.
+            with self._lock:
+                cached = self._folder_tree_cache.get(account_uid)
+                if cached is not None:
+                    self._folder_tree_cache[account_uid] = (
+                        _merge_heavy_folder_status_into_tree(account_uid, cached)
+                    )
+
     def _get_folder_stats_unlocked(
         self, account_uid: str, folder_name: str
     ) -> tuple[int, int]:
@@ -3999,6 +4157,50 @@ class MailService:
         sync: bool,
     ) -> tuple[_FolderMessageIndex, FolderIndexSource]:
         key = (account_uid, folder_name)
+        heavy = is_heavy_folder_name(folder_name)
+        if sync and heavy:
+            # Archive/Trash/Junk are grown by continue_heavy_folder_index.
+            # A full Camel refresh_info rebuild here collapses a multi-thousand
+            # progressive index back to the local summary (~1.3k) and wipes
+            # disk (#208). Prefer memory/disk; seed from local summary only
+            # when nothing is cached yet.
+            existing = self._folder_indexes.get(key)
+            source: FolderIndexSource = "memory"
+            if existing is None:
+                cached = folder_index_cache.load(account_uid, folder_name)
+                if cached is not None:
+                    messages, unread, total = cached
+                    existing = _FolderMessageIndex(
+                        messages=messages,
+                        unread=unread,
+                        total=total,
+                    )
+                    self._folder_indexes[key] = existing
+                    source = "disk_cache"
+            if existing is not None and existing.messages:
+                log.info(
+                    "Heavy-folder skip sync rebuild for %s/%s "
+                    "(keeping %d indexed headers)",
+                    account_uid,
+                    folder_name,
+                    len(existing.messages),
+                )
+                return existing, source
+            index = self._build_folder_index_unlocked(
+                account_uid, folder_name, sync=False
+            )
+            self._folder_indexes[key] = index
+            if index.messages:
+                folder_index_cache.save(
+                    account_uid,
+                    folder_name,
+                    index.messages,
+                    index.unread,
+                    index.total,
+                    grow_only=True,
+                )
+            return index, "local"
+
         if sync:
             index = self._build_folder_index_unlocked(
                 account_uid, folder_name, sync=True
@@ -4011,6 +4213,7 @@ class MailService:
                     index.messages,
                     index.unread,
                     index.total,
+                    grow_only=heavy,
                 )
             return index, "server"
 
@@ -4061,7 +4264,28 @@ class MailService:
                     index.messages,
                     index.unread,
                     index.total,
+                    grow_only=heavy,
                 )
+            elif heavy:
+                existing = folder_index_cache.load(account_uid, folder_name)
+                if existing is not None and len(existing[0]) > len(index.messages):
+                    messages, unread, total = existing
+                    index = _FolderMessageIndex(
+                        messages=messages,
+                        unread=unread,
+                        total=total,
+                    )
+                    self._folder_indexes[key] = index
+                    return index, "disk_cache"
+                if _should_save_heavy_folder_index(index.messages, existing):
+                    folder_index_cache.save(
+                        account_uid,
+                        folder_name,
+                        index.messages,
+                        index.unread,
+                        max(index.total, len(index.messages)),
+                        grow_only=True,
+                    )
         return index, "local"
 
     def _is_missing_folder_error(self, exc: GLib.Error) -> bool:
@@ -4262,12 +4486,17 @@ class MailService:
         *,
         cursor: dict[str, Any] | None = None,
         allow_refresh: bool = True,
+        on_progress: Callable[[HeavyFolderIndexProgress], None] | None = None,
     ) -> HeavyFolderIndexProgress:
         """Advance one preemptible slice of a heavy-folder header index (#208).
 
         ``allow_refresh=False`` skips ``refresh_info_sync`` and only materializes
         headers already present in the local Camel summary (used when a prior
         refresh timed out, or from callers that must not pin mail I/O).
+
+        ``on_progress`` is invoked from the mail I/O thread when headers grow
+        mid-``refresh_info`` (Evolution adds summary rows as Graph delta pages
+        arrive; Post mirrors that so the UI is not frozen for minutes).
         """
         return run_on_mail_thread(
             self._continue_heavy_folder_index_unlocked,
@@ -4275,6 +4504,7 @@ class MailService:
             folder_name,
             cursor=cursor,
             allow_refresh=allow_refresh,
+            on_progress=on_progress,
         )
 
     def _continue_heavy_folder_index_unlocked(
@@ -4284,12 +4514,31 @@ class MailService:
         *,
         cursor: dict[str, Any] | None = None,
         allow_refresh: bool = True,
+        on_progress: Callable[[HeavyFolderIndexProgress], None] | None = None,
     ) -> HeavyFolderIndexProgress:
         state = dict(cursor or {})
         key = (account_uid, folder_name)
+        log.info(
+            "Heavy-folder slice start %s/%s allow_refresh=%s cursor_keys=%s "
+            "pending_server_refresh=%s refresh_done=%s uid_offset=%s "
+            "uid_pending=%s",
+            account_uid,
+            folder_name,
+            allow_refresh,
+            sorted(state.keys()),
+            state.get("pending_server_refresh"),
+            state.get("refresh_done"),
+            state.get("uid_offset"),
+            len(state["uids"]) if isinstance(state.get("uids"), list) else None,
+        )
 
         folder = self._open_folder_unlocked(account_uid, folder_name)
         if folder is None:
+            log.warning(
+                "Heavy-folder slice abort %s/%s: folder not open",
+                account_uid,
+                folder_name,
+            )
             return HeavyFolderIndexProgress(
                 messages=[], unread=0, total=0, done=True, cursor={}
             )
@@ -4327,179 +4576,675 @@ class MailService:
         }
 
         refresh_done = bool(state.get("refresh_done"))
+        refresh_attempts = int(state.get("refresh_attempts") or 0)
+        refresh_stalls = int(state.get("refresh_stalls") or 0)
+        prev_uid_count = int(state.get("uid_count_after_refresh") or 0)
+        prev_indexed = int(state.get("indexed_after_refresh") or 0)
+        status_seeded = bool(state.get("status_seeded"))
+        did_prepare = bool(state.get("did_prepare_content_refresh"))
+        session = self._heavy_index_session(account_uid, folder_name)
+        status_seeded = status_seeded or bool(session.get("status_seeded"))
+        did_prepare = did_prepare or bool(
+            session.get("did_prepare_content_refresh")
+        )
         uids: list[str] | None = state.get("uids")
         if uids is not None and not isinstance(uids, list):
             uids = None
         uid_offset = int(state.get("uid_offset") or 0)
+        pending_server_refresh = bool(state.get("pending_server_refresh"))
+        # Offline / explicit skip: local Camel summary only (no Graph refresh).
+        local_only = (not allow_refresh) or bool(state.get("refresh_skipped"))
+
+        # Seed STATUS from Microsoft Graph totalItemCount (real ~28k), not Camel
+        # summary (~1.3k). Scrub any poisoned high-water that only echoes the
+        # local index. Deferred until the refresh phase so local UID indexing
+        # can update the list first.
+        if (
+            allow_refresh
+            and not local_only
+            and not status_seeded
+            and pending_server_refresh
+            and is_heavy_folder_name(folder_name)
+        ):
+            status_seeded = True
+            session["status_seeded"] = True
+            folder_status_cache.scrub_if_summary_echo(
+                account_uid, folder_name, len(known_messages)
+            )
+            self._seed_heavy_folder_status_from_graph_unlocked(
+                account_uid, folder_name, local_indexed=len(known_messages)
+            )
+            if folder_status_cache.load(account_uid, folder_name) is None:
+                try:
+                    self._get_account_folder_stats_unlocked(account_uid)
+                except Exception:
+                    log.debug(
+                        "Heavy-folder STATUS seed failed for %s/%s",
+                        account_uid,
+                        folder_name,
+                        exc_info=True,
+                    )
+            status = self._cached_folder_stats_unlocked(account_uid, folder_name)
+            if status is not None:
+                status_unread, status_total = status
+                if status_total > total:
+                    total = status_total
+                    if status_unread >= 0:
+                        unread = status_unread
+                known_total = total
+                known_unread = unread
 
         if not refresh_done:
-            skip_refresh = (not allow_refresh) or bool(
-                state.get("refresh_skipped")
-            )
-            if (
-                not skip_refresh
-                and get_mail_io_thread().has_interactive_work_pending()
-            ):
-                skip_refresh = True
-            pending_server_refresh = bool(state.get("pending_server_refresh"))
-
-            if skip_refresh:
-                # Local summary only — never pin mail I/O on Graph refresh (#208).
-                uids = folder_get_uids(folder)
+            if local_only:
+                all_uids = folder_get_uids(folder)
+                uids = [u for u in all_uids if str(u) not in by_uid]
                 uid_offset = 0
                 refresh_done = True
-            elif not pending_server_refresh:
-                # Phase 1: index whatever Camel already has so the list moves
-                # past a stale disk cache before Graph refresh runs (#208).
-                if uids is None:
-                    uids = folder_get_uids(folder)
-                    uid_offset = 0
-                # Fall through to UID batch below; when local UIDs are done,
-                # return pending_server_refresh instead of done=True.
-            else:
-                cancellable = Gio.Cancellable()
-                self._register_folder_refresh_cancellable(cancellable)
-                started = time.monotonic()
-                refresh_error: BaseException | None = None
-                try:
-                    if cancellable.is_cancelled():
-                        raise GLib.Error.new_literal(
-                            Gio.io_error_quark(),
-                            "Operation was cancelled",
-                            Gio.IOErrorEnum.CANCELLED,
-                        )
-                    # Async refresh + pump so interactive mail I/O can run while
-                    # Graph fetches Archive headers (#208 / #189).
-                    done_event = threading.Event()
-                    finish_error: list[BaseException] = []
-
-                    def _on_refresh_ready(
-                        _obj: object | None,
-                        result: Gio.AsyncResult,
-                        _data: object | None = None,
-                    ) -> None:
-                        try:
-                            folder.refresh_info_finish(result)
-                        except BaseException as exc:  # noqa: BLE001 — deliver to waiter
-                            finish_error.append(exc)
-                        finally:
-                            done_event.set()
-
-                    folder.refresh_info(
-                        GLib.PRIORITY_DEFAULT,
-                        cancellable,
-                        _on_refresh_ready,
-                        None,
-                    )
-                    finished = get_mail_io_thread().pump_until(
-                        done_event,
-                        timeout_seconds=_HEAVY_FOLDER_REFRESH_TIMEOUT_SECONDS,
-                        run_interactive=True,
-                        on_timeout_cancel=cancellable.cancel,
-                    )
-                    if finish_error:
-                        raise finish_error[0]
-                    if not finished:
-                        raise GLib.Error.new_literal(
-                            Gio.io_error_quark(),
-                            "Operation was cancelled",
-                            Gio.IOErrorEnum.CANCELLED,
-                        )
-                    refresh_done = True
-                    camel_unread = folder_get_unread_count(folder)
-                    camel_total = folder.get_message_count()
-                    if known_total > 0 and camel_total < known_total:
-                        log.debug(
-                            "Keeping larger known totals for %s/%s "
-                            "(known=%d/%d, camel=%d/%d)",
-                            account_uid,
-                            folder_name,
-                            known_unread,
-                            known_total,
-                            camel_unread,
-                            camel_total,
-                        )
-                    else:
-                        unread = camel_unread
-                        total = camel_total
-                    if is_heavy_folder_name(folder_name) and total >= 0:
-                        folder_status_cache.observe(
-                            account_uid,
-                            folder_name,
-                            unread,
-                            total,
-                            trusted=True,
-                        )
-                    uids = folder_get_uids(folder)
-                    uid_offset = 0
-                except GLib.Error as exc:
-                    refresh_error = exc
-                    if exc.matches(
-                        Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
-                    ):
-                        elapsed = time.monotonic() - started
-                        log.warning(
-                            "Heavy-folder refresh cancelled after %.1fs "
-                            "for %s/%s; continuing with local summary "
-                            "(%d known headers)",
-                            elapsed,
-                            account_uid,
-                            folder_name,
-                            len(known_messages),
-                        )
-                        # Never abort the indexer on cancel/timeout — fall
-                        # back to local UIDs so the list keeps what we have
-                        # and status is not stuck on "Fetching…" (#208).
-                        unread = known_unread
-                        total = known_total
-                        uids = folder_get_uids(folder)
-                        uid_offset = 0
-                        refresh_done = True
-                    elif self._is_missing_folder_error(exc):
-                        return HeavyFolderIndexProgress(
-                            messages=[],
-                            unread=0,
-                            total=0,
-                            done=True,
-                            cursor={},
-                        )
-                    else:
-                        raise
-                finally:
-                    self._unregister_folder_refresh_cancellable(cancellable)
-                    if refresh_error is not None:
-                        log.debug(
-                            "Heavy-folder refresh ended for %s/%s: %s",
-                            account_uid,
-                            folder_name,
-                            refresh_error,
-                        )
-
-        assert uids is not None
-        if not uids:
-            # Empty local summary — keep any larger known disk index.
-            if known_messages:
-                index = _FolderMessageIndex(
-                    messages=known_messages,
-                    unread=known_unread,
-                    total=known_total,
+            elif get_mail_io_thread().has_interactive_work_pending():
+                # Yield without claiming refresh_done — retry next slice (#208).
+                log.info(
+                    "Heavy-folder yield for interactive %s/%s indexed=%d",
+                    account_uid,
+                    folder_name,
+                    len(by_uid),
                 )
-                with self._lock:
-                    self._folder_indexes[key] = index
                 return HeavyFolderIndexProgress(
                     messages=known_messages,
                     unread=known_unread,
                     total=known_total,
-                    done=True,
-                    cursor={},
+                    done=False,
+                    cursor={
+                        "refresh_done": False,
+                        "pending_server_refresh": pending_server_refresh,
+                        "refresh_attempts": refresh_attempts,
+                        "refresh_stalls": refresh_stalls,
+                        "uid_count_after_refresh": prev_uid_count,
+                        "indexed_after_refresh": prev_indexed,
+                        "status_seeded": status_seeded,
+                        "did_prepare_content_refresh": did_prepare,
+                        "uids": uids,
+                        "uid_offset": uid_offset,
+                        "yield_for_interactive": True,
+                    },
                 )
+            elif not pending_server_refresh:
+                # Phase 1: index any local UIDs not already in the grow-only index.
+                if uids is None:
+                    all_uids = folder_get_uids(folder)
+                    uids = [u for u in all_uids if str(u) not in by_uid]
+                    uid_offset = 0
+                    if not uids:
+                        # Local headers already indexed — fetch more from server.
+                        return HeavyFolderIndexProgress(
+                            messages=known_messages,
+                            unread=known_unread,
+                            total=max(known_total, len(known_messages)),
+                            done=False,
+                            cursor={
+                                "refresh_done": False,
+                                "pending_server_refresh": True,
+                                "refresh_attempts": refresh_attempts,
+                                "refresh_stalls": refresh_stalls,
+                                "uid_count_after_refresh": len(all_uids),
+                                "indexed_after_refresh": len(known_messages),
+                                "status_seeded": status_seeded,
+                                "did_prepare_content_refresh": did_prepare,
+                            },
+                        )
+            else:
+                # Phase 2: pull one or more Graph pages, materialize only NEW UIDs.
+                # Re-scanning the whole folder after every +25 page was O(n²) (#208).
+                slice_deadline = (
+                    time.monotonic() + _HEAVY_FOLDER_REFRESH_SLICE_BUDGET_SECONDS
+                )
+                pages = 0
+                camel_uid_count = prev_uid_count
+                while pages < _HEAVY_FOLDER_REFRESH_PAGES_PER_SLICE:
+                    if get_mail_io_thread().has_interactive_work_pending():
+                        log.info(
+                            "Heavy-folder page loop yield for interactive "
+                            "%s/%s pages=%d indexed=%d",
+                            account_uid,
+                            folder_name,
+                            pages,
+                            len(by_uid),
+                        )
+                        break
+                    if pages > 0 and time.monotonic() >= slice_deadline:
+                        log.info(
+                            "Heavy-folder page loop slice budget exhausted "
+                            "%s/%s pages=%d indexed=%d",
+                            account_uid,
+                            folder_name,
+                            pages,
+                            len(by_uid),
+                        )
+                        break
+                    cancellable = Gio.Cancellable()
+                    self._register_heavy_index_refresh_cancellable(cancellable)
+                    started = time.monotonic()
+                    refresh_error: BaseException | None = None
+                    page_grew = False
+                    try:
+                        if cancellable.is_cancelled():
+                            raise GLib.Error.new_literal(
+                                Gio.io_error_quark(),
+                                "Operation was cancelled",
+                                Gio.IOErrorEnum.CANCELLED,
+                            )
+                        # Full re-check at most once per open, and never once the
+                        # local index is already large — prepare_content_refresh
+                        # resets M365 sync state and undoes header progress (#208).
+                        should_prepare = (
+                            not did_prepare
+                            and pages == 0
+                            and len(by_uid) < _HEAVY_FOLDER_PREPARE_MIN_INDEXED
+                        ) or (
+                            refresh_stalls >= 2
+                            and len(by_uid) < _HEAVY_FOLDER_PREPARE_MIN_INDEXED
+                        )
+                        if should_prepare:
+                            prepare = getattr(
+                                folder, "prepare_content_refresh", None
+                            )
+                            if callable(prepare):
+                                log.info(
+                                    "Heavy-folder prepare_content_refresh for "
+                                    "%s/%s (attempt=%d stalls=%d page=%d "
+                                    "indexed=%d)",
+                                    account_uid,
+                                    folder_name,
+                                    refresh_attempts + 1,
+                                    refresh_stalls,
+                                    pages,
+                                    len(by_uid),
+                                )
+                                prepare()
+                                did_prepare = True
+                                session["did_prepare_content_refresh"] = True
+                                refresh_stalls = 0
+                        elif pages == 0 and not did_prepare:
+                            # Mark prepared-skipped so retries do not keep
+                            # trying a destructive full re-check.
+                            did_prepare = True
+                            session["did_prepare_content_refresh"] = True
+                            log.info(
+                                "Heavy-folder skip prepare_content_refresh for "
+                                "%s/%s (indexed=%d) — continue delta sync",
+                                account_uid,
+                                folder_name,
+                                len(by_uid),
+                            )
+                        done_event = threading.Event()
+                        finish_error: list[BaseException] = []
+
+                        def _on_refresh_ready(
+                            _obj: object | None,
+                            result: Gio.AsyncResult,
+                            _data: object | None = None,
+                        ) -> None:
+                            try:
+                                folder.refresh_info_finish(result)
+                            except BaseException as exc:  # noqa: BLE001
+                                finish_error.append(exc)
+                            finally:
+                                done_event.set()
+
+                        log.info(
+                            "Heavy-folder refresh_info start %s/%s "
+                            "attempt=%d page=%d indexed=%d "
+                            "did_prepare=%s stalls=%d (no soft timeout; "
+                            "cancel on leave)",
+                            account_uid,
+                            folder_name,
+                            refresh_attempts + 1,
+                            pages,
+                            len(by_uid),
+                            did_prepare,
+                            refresh_stalls,
+                        )
+                        folder.refresh_info(
+                            GLib.PRIORITY_DEFAULT,
+                            cancellable,
+                            _on_refresh_ready,
+                            None,
+                        )
+
+                        def _persist_and_publish_mid_progress(
+                            *, reason: str
+                        ) -> None:
+                            nonlocal existing_disk, unread, total
+                            messages_mid = sort_messages_newest_first(
+                                list(by_uid.values())
+                            )
+                            pub_total = max(
+                                known_total, total, len(messages_mid)
+                            )
+                            pub_unread = (
+                                known_unread
+                                if known_unread >= 0
+                                else unread
+                            )
+                            index_mid = _FolderMessageIndex(
+                                messages=messages_mid,
+                                unread=pub_unread,
+                                total=pub_total,
+                            )
+                            with self._lock:
+                                existing_mem = self._folder_indexes.get(key)
+                                if (
+                                    existing_mem is not None
+                                    and len(existing_mem.messages)
+                                    > len(messages_mid)
+                                ):
+                                    messages_mid = list(existing_mem.messages)
+                                    pub_unread = existing_mem.unread
+                                    pub_total = max(
+                                        existing_mem.total, pub_total
+                                    )
+                                    index_mid = _FolderMessageIndex(
+                                        messages=messages_mid,
+                                        unread=pub_unread,
+                                        total=pub_total,
+                                    )
+                                self._folder_indexes[key] = index_mid
+                            if _should_save_heavy_folder_index(
+                                messages_mid, existing_disk
+                            ):
+                                folder_index_cache.save(
+                                    account_uid,
+                                    folder_name,
+                                    messages_mid,
+                                    pub_unread,
+                                    pub_total,
+                                    grow_only=True,
+                                )
+                                existing_disk = (
+                                    messages_mid,
+                                    pub_unread,
+                                    pub_total,
+                                )
+                            log.info(
+                                "Heavy-folder mid-refresh %s %s/%s "
+                                "indexed=%d",
+                                reason,
+                                account_uid,
+                                folder_name,
+                                len(messages_mid),
+                            )
+                            if on_progress is None:
+                                return
+                            try:
+                                on_progress(
+                                    HeavyFolderIndexProgress(
+                                        messages=messages_mid,
+                                        unread=pub_unread,
+                                        total=pub_total,
+                                        done=False,
+                                        cursor={
+                                            "refresh_done": False,
+                                            "pending_server_refresh": True,
+                                            "status_seeded": status_seeded,
+                                            "did_prepare_content_refresh": (
+                                                did_prepare
+                                            ),
+                                        },
+                                    )
+                                )
+                            except Exception:
+                                log.debug(
+                                    "Heavy-folder mid-refresh progress "
+                                    "callback failed",
+                                    exc_info=True,
+                                )
+
+                        def _refresh_heartbeat(elapsed: float) -> None:
+                            # Evolution adds Camel summary rows as each Graph
+                            # delta page arrives inside refresh_info. Poll for
+                            # new UIDs here so the message list grows during
+                            # the long wait (#208).
+                            all_uids_hb = folder_get_uids(folder)
+                            pending_hb = [
+                                u
+                                for u in all_uids_hb
+                                if str(u) not in by_uid
+                            ]
+                            materialized_hb = 0
+                            for uid in pending_hb:
+                                if (
+                                    materialized_hb
+                                    >= HEAVY_FOLDER_INDEX_BATCH_SIZE
+                                ):
+                                    break
+                                info = folder_get_message_info(folder, uid)
+                                if info is None:
+                                    continue
+                                try:
+                                    by_uid[str(uid)] = message_info_to_dict(
+                                        info, uid=uid
+                                    )
+                                    materialized_hb += 1
+                                except (OSError, OverflowError, ValueError):
+                                    continue
+                            log.info(
+                                "Heavy-folder refresh_info waiting %s/%s "
+                                "elapsed=%.1fs indexed=%d camel_uids=%d "
+                                "new=%d page=%d",
+                                account_uid,
+                                folder_name,
+                                elapsed,
+                                len(by_uid),
+                                len(all_uids_hb),
+                                materialized_hb,
+                                pages,
+                            )
+                            if materialized_hb:
+                                _persist_and_publish_mid_progress(
+                                    reason="heartbeat"
+                                )
+
+                        finished = get_mail_io_thread().pump_until(
+                            done_event,
+                            timeout_seconds=None,
+                            run_interactive=True,
+                            on_timeout_cancel=None,
+                            on_heartbeat=_refresh_heartbeat,
+                            heartbeat_seconds=_HEAVY_FOLDER_REFRESH_HEARTBEAT_SECONDS,
+                        )
+                        if finish_error:
+                            raise finish_error[0]
+                        if not finished:
+                            # Only reached if cancelled while waiting (leave folder).
+                            raise GLib.Error.new_literal(
+                                Gio.io_error_quark(),
+                                "Heavy-folder refresh cancelled",
+                                Gio.IOErrorEnum.CANCELLED,
+                            )
+                        refresh_attempts += 1
+                        pages += 1
+                        camel_unread = folder_get_unread_count(folder)
+                        camel_total = folder.get_message_count()
+                        if not (known_total > 0 and camel_total < known_total):
+                            unread = camel_unread
+                            total = camel_total
+                        if is_heavy_folder_name(folder_name) and total >= 0:
+                            folder_status_cache.observe(
+                                account_uid,
+                                folder_name,
+                                unread,
+                                total,
+                                trusted=False,
+                            )
+                            status_after = folder_status_cache.load(
+                                account_uid, folder_name
+                            )
+                            if status_after is not None:
+                                unread, total = (
+                                    status_after[0],
+                                    max(total, status_after[1]),
+                                )
+                        all_uids = folder_get_uids(folder)
+                        camel_uid_count = len(all_uids)
+                        pending = [
+                            u for u in all_uids if str(u) not in by_uid
+                        ]
+                        log.info(
+                            "Heavy-folder refresh page for %s/%s: %d UIDs "
+                            "(%d new, indexed=%d, camel_total=%d)",
+                            account_uid,
+                            folder_name,
+                            camel_uid_count,
+                            len(pending),
+                            len(by_uid),
+                            camel_total,
+                        )
+                        if not pending:
+                            refresh_stalls += 1
+                            refresh_done = True
+                            uids = []
+                            uid_offset = 0
+                            if refresh_stalls >= _HEAVY_FOLDER_REFRESH_STALL_LIMIT:
+                                break
+                            # Stall: may prepare_content_refresh only while
+                            # the local index is still small (#208).
+                            continue
+                        refresh_stalls = 0
+                        page_grew = True
+                        # Materialize every new UID from this page now (usually
+                        # tens, not thousands) so the next refresh can run soon.
+                        for uid in pending:
+                            if get_mail_io_thread().has_interactive_work_pending():
+                                uids = [
+                                    u
+                                    for u in pending
+                                    if str(u) not in by_uid
+                                ]
+                                uid_offset = 0
+                                refresh_done = True
+                                break
+                            info = folder_get_message_info(folder, uid)
+                            if info is None:
+                                continue
+                            try:
+                                by_uid[str(uid)] = message_info_to_dict(
+                                    info, uid=uid
+                                )
+                            except (OSError, OverflowError, ValueError):
+                                log.debug(
+                                    "Skipping message %r in %r due to invalid "
+                                    "metadata",
+                                    uid,
+                                    folder_name,
+                                    exc_info=True,
+                                )
+                        else:
+                            uids = []
+                            uid_offset = 0
+                            refresh_done = True
+                            # More Graph pages while this slice has budget.
+                            continue
+                        break
+                    except GLib.Error as exc:
+                        refresh_error = exc
+                        if exc.matches(
+                            Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
+                        ):
+                            elapsed = time.monotonic() - started
+                            refresh_attempts += 1
+                            log.warning(
+                                "Heavy-folder refresh cancelled after %.1fs "
+                                "for %s/%s (attempt %d); will retry while "
+                                "folder stays open (%d known headers)",
+                                elapsed,
+                                account_uid,
+                                folder_name,
+                                refresh_attempts,
+                                len(by_uid),
+                            )
+                            unread = known_unread
+                            total = known_total
+                            all_uids = folder_get_uids(folder)
+                            camel_uid_count = len(all_uids)
+                            pending = [
+                                u for u in all_uids if str(u) not in by_uid
+                            ]
+                            # Materialize a batch of any UIDs Camel already has
+                            # so soft-timeout yields move the indexed count (#208).
+                            materialized = 0
+                            for uid in pending:
+                                if materialized >= HEAVY_FOLDER_INDEX_BATCH_SIZE:
+                                    break
+                                if get_mail_io_thread().has_interactive_work_pending():
+                                    break
+                                info = folder_get_message_info(folder, uid)
+                                if info is None:
+                                    continue
+                                try:
+                                    by_uid[str(uid)] = message_info_to_dict(
+                                        info, uid=uid
+                                    )
+                                    materialized += 1
+                                except (OSError, OverflowError, ValueError):
+                                    log.debug(
+                                        "Skipping message %r in %r due to "
+                                        "invalid metadata",
+                                        uid,
+                                        folder_name,
+                                        exc_info=True,
+                                    )
+                            uids = [
+                                u for u in all_uids if str(u) not in by_uid
+                            ]
+                            uid_offset = 0
+                            refresh_done = bool(uids)
+                            pending_server_refresh = True
+                            if materialized:
+                                log.info(
+                                    "Heavy-folder soft-yield materialized %d "
+                                    "headers for %s/%s (indexed=%d)",
+                                    materialized,
+                                    account_uid,
+                                    folder_name,
+                                    len(by_uid),
+                                )
+                        elif self._is_missing_folder_error(exc):
+                            return HeavyFolderIndexProgress(
+                                messages=[],
+                                unread=0,
+                                total=0,
+                                done=True,
+                                cursor={},
+                            )
+                        else:
+                            raise
+                        break
+                    finally:
+                        self._unregister_heavy_index_refresh_cancellable(
+                            cancellable
+                        )
+                        if refresh_error is not None:
+                            log.debug(
+                                "Heavy-folder refresh ended for %s/%s: %s",
+                                account_uid,
+                                folder_name,
+                                refresh_error,
+                            )
+                    if not page_grew and refresh_error is not None:
+                        break
+
+                prev_uid_count = camel_uid_count
+                prev_indexed = len(by_uid)
+
+        if uids is None:
+            uids = []
+        if not uids:
+            # No pending UIDs to materialize — persist and decide whether to
+            # refresh again.
+            messages = sort_messages_newest_first(list(by_uid.values()))
+            if known_total > total:
+                total = known_total
+                unread = known_unread
+            if not messages and known_messages:
+                messages = known_messages
+                unread = known_unread
+                total = known_total
             index = _FolderMessageIndex(
-                messages=[], unread=unread, total=total
+                messages=messages, unread=unread, total=total
             )
             with self._lock:
+                existing_mem = self._folder_indexes.get(key)
+                if existing_mem is not None and len(existing_mem.messages) > len(
+                    messages
+                ):
+                    messages = list(existing_mem.messages)
+                    unread = existing_mem.unread
+                    total = max(existing_mem.total, total)
+                    index = _FolderMessageIndex(
+                        messages=messages, unread=unread, total=total
+                    )
                 self._folder_indexes[key] = index
+            if existing_disk is None or len(messages) >= len(existing_disk[0]):
+                if is_heavy_folder_name(folder_name):
+                    if _should_save_heavy_folder_index(messages, existing_disk):
+                        save_total = max(total, len(messages))
+                        save_unread = (
+                            unread if total >= save_total else known_unread
+                        )
+                        folder_index_cache.save(
+                            account_uid,
+                            folder_name,
+                            messages,
+                            save_unread,
+                            save_total,
+                            grow_only=True,
+                        )
+                elif _folder_index_is_cacheable(index):
+                    save_total = max(total, len(messages))
+                    save_unread = unread if total >= save_total else known_unread
+                    folder_index_cache.save(
+                        account_uid,
+                        folder_name,
+                        messages,
+                        save_unread,
+                        save_total,
+                    )
+            status_total = status[1] if status is not None else total
+            if is_heavy_folder_name(folder_name):
+                cached_status = folder_status_cache.load(account_uid, folder_name)
+                if cached_status is not None:
+                    status_total = max(status_total, cached_status[1])
+                    total = max(total, cached_status[1])
+            behind_status = not folder_status_cache.index_caught_up(
+                len(messages), status_total
+            )
+            # After a growth page, immediately schedule another refresh.
+            if allow_refresh and not local_only and (
+                behind_status
+                or refresh_stalls < _HEAVY_FOLDER_REFRESH_STALL_LIMIT
+            ):
+                log.info(
+                    "Heavy-folder slice continue refresh %s/%s indexed=%d "
+                    "status_total=%d behind=%s stalls=%d attempts=%d",
+                    account_uid,
+                    folder_name,
+                    len(messages),
+                    status_total,
+                    behind_status,
+                    refresh_stalls,
+                    refresh_attempts,
+                )
+                return HeavyFolderIndexProgress(
+                    messages=messages,
+                    unread=unread,
+                    total=max(total, status_total, len(messages)),
+                    done=False,
+                    cursor={
+                        "refresh_done": False,
+                        "pending_server_refresh": True,
+                        "refresh_attempts": refresh_attempts,
+                        "refresh_stalls": refresh_stalls,
+                        "uid_count_after_refresh": prev_uid_count,
+                        "indexed_after_refresh": len(messages),
+                        "status_seeded": status_seeded,
+                        "did_prepare_content_refresh": did_prepare,
+                    },
+                )
+            log.info(
+                "Heavy-folder slice done %s/%s indexed=%d status_total=%d "
+                "stalls=%d attempts=%d",
+                account_uid,
+                folder_name,
+                len(messages),
+                status_total,
+                refresh_stalls,
+                refresh_attempts,
+            )
             return HeavyFolderIndexProgress(
-                messages=[], unread=unread, total=total, done=True, cursor={}
+                messages=messages,
+                unread=unread,
+                total=total,
+                done=True,
+                cursor={},
             )
 
         end = min(uid_offset + HEAVY_FOLDER_INDEX_BATCH_SIZE, len(uids))
@@ -4507,6 +5252,9 @@ class MailService:
         for uid in uids[uid_offset:end]:
             if get_mail_io_thread().has_interactive_work_pending():
                 break
+            if str(uid) in by_uid:
+                processed += 1
+                continue
             info = folder_get_message_info(folder, uid)
             if info is None:
                 processed += 1
@@ -4544,9 +5292,21 @@ class MailService:
             self._folder_indexes[key] = index
 
         if existing_disk is None or len(messages) >= len(existing_disk[0]):
-            if _should_save_heavy_folder_index(messages, existing_disk) or (
-                _folder_index_is_cacheable(index)
-            ):
+            if is_heavy_folder_name(folder_name):
+                if _should_save_heavy_folder_index(messages, existing_disk):
+                    save_total = max(total, len(messages))
+                    save_unread = (
+                        unread if total >= save_total else known_unread
+                    )
+                    folder_index_cache.save(
+                        account_uid,
+                        folder_name,
+                        messages,
+                        save_unread,
+                        save_total,
+                        grow_only=True,
+                    )
+            elif _folder_index_is_cacheable(index):
                 # Persist message rows; keep max(total, len) so partial Camel
                 # counts cannot shrink a prior STATUS-sized total on disk.
                 save_total = max(total, len(messages))
@@ -4559,25 +5319,60 @@ class MailService:
                     save_total,
                 )
 
-        done = uid_offset >= len(uids)
+        batch_complete = uid_offset >= len(uids)
         next_cursor: dict[str, Any] = {}
-        if not done:
-            next_cursor = {
-                "refresh_done": refresh_done,
-                "uids": uids,
-                "uid_offset": uid_offset,
+        done = False
+        status_total = status[1] if status is not None else total
+        if is_heavy_folder_name(folder_name):
+            cached_status = folder_status_cache.load(account_uid, folder_name)
+            if cached_status is not None:
+                status_total = max(status_total, cached_status[1])
+                total = max(total, cached_status[1])
+                unread = cached_status[0] if cached_status[1] >= total else unread
+
+        def _cursor_base(**extra: Any) -> dict[str, Any]:
+            base = {
+                "refresh_attempts": refresh_attempts,
+                "refresh_stalls": refresh_stalls,
+                "uid_count_after_refresh": prev_uid_count,
+                "indexed_after_refresh": prev_indexed,
+                "status_seeded": status_seeded,
+                "did_prepare_content_refresh": did_prepare,
             }
-        elif (
-            allow_refresh
-            and not refresh_done
-            and not bool(state.get("refresh_skipped"))
-        ):
-            # Local summary indexed — next slice fetches server headers (#208).
-            next_cursor = {
-                "refresh_done": False,
-                "pending_server_refresh": True,
-            }
-            done = False
+            base.update(extra)
+            return base
+
+        if not batch_complete:
+            next_cursor = _cursor_base(
+                refresh_done=refresh_done,
+                pending_server_refresh=False,
+                uids=uids,
+                uid_offset=uid_offset,
+            )
+        elif allow_refresh and not local_only:
+            # Local/new UIDs indexed — fetch more server headers (#208).
+            next_cursor = _cursor_base(
+                refresh_done=False,
+                pending_server_refresh=True,
+                indexed_after_refresh=len(messages),
+            )
+        else:
+            done = True
+
+        log.info(
+            "Heavy-folder slice materialize %s/%s indexed=%d processed=%d "
+            "uid_offset=%d/%d batch_complete=%s done=%s "
+            "pending_server_refresh=%s",
+            account_uid,
+            folder_name,
+            len(messages),
+            processed,
+            uid_offset,
+            len(uids),
+            batch_complete,
+            done,
+            bool(next_cursor.get("pending_server_refresh")),
+        )
         return HeavyFolderIndexProgress(
             messages=messages,
             unread=unread,

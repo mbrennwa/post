@@ -89,6 +89,25 @@ class FolderIndexCacheTests(unittest.TestCase):
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["folder_name"], "Archive/2026")
 
+    def test_grow_only_refuses_shrink(self) -> None:
+        large = [{"uid": str(i)} for i in range(10)]
+        folder_index_cache.save(
+            "acct-1", "Archive", large, unread=1, total=28266, grow_only=True
+        )
+        folder_index_cache.save(
+            "acct-1",
+            "Archive",
+            [{"uid": "1"}],
+            unread=0,
+            total=1,
+            grow_only=True,
+        )
+        loaded = folder_index_cache.load("acct-1", "Archive")
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(len(loaded[0]), 10)
+        self.assertEqual(loaded[2], 28266)
+
 
 if __name__ == "__main__":
     unittest.main()
