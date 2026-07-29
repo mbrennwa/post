@@ -30,7 +30,31 @@ def save(
     messages: list[dict[str, Any]],
     unread: int,
     total: int,
+    *,
+    grow_only: bool = False,
 ) -> None:
+    """Persist folder index metadata.
+
+    When ``grow_only`` is True (heavy folders), never replace a larger on-disk
+    index with a smaller Camel summary (#208).
+    """
+    if grow_only:
+        existing = load(account_uid, folder_name)
+        if existing is not None:
+            existing_messages, existing_unread, existing_total = existing
+            if len(messages) < len(existing_messages):
+                log.warning(
+                    "Refusing to shrink folder index for %s/%s "
+                    "(disk=%d, incoming=%d)",
+                    account_uid,
+                    folder_name,
+                    len(existing_messages),
+                    len(messages),
+                )
+                return
+            total = max(total, existing_total, len(messages))
+            if unread < 0:
+                unread = existing_unread
     path = _cache_path(account_uid, folder_name)
     payload = {
         "version": _CACHE_VERSION,
