@@ -323,8 +323,8 @@ class MainWindow(Adw.ApplicationWindow):
         search_row.set_halign(Gtk.Align.FILL)
         search_row.set_hexpand(True)
         search_row.set_valign(Gtk.Align.CENTER)
-        search_row.append(self._header_search_entry)
         search_row.append(self._search_scope_dropdown)
+        search_row.append(self._header_search_entry)
 
         search_title = Gtk.Box()
         search_title.set_halign(Gtk.Align.FILL)
