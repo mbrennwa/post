@@ -131,6 +131,15 @@ class OfflineBodySyncCoordinator:
         folders: list[Camel.Folder] | None = None,
         folder_index: int = 0,
     ) -> None:
+        # Respect interactive Archive/folder holds: do not resume body backfill
+        # while the UI has paused offline sync (#208).
+        if self._mail.offline_body_sync_is_held():
+            self._running.discard(account_uid)
+            self._cancellables.pop(account_uid, None)
+            if not self._running:
+                self._notify_progress(None)
+            return
+        complete = False
         try:
             complete = self._run_account_sync(
                 account_uid,
@@ -170,6 +179,8 @@ class OfflineBodySyncCoordinator:
 
         while folder_index < len(folders):
             if cancellable.is_cancelled():
+                return True
+            if self._mail.offline_body_sync_is_held():
                 return True
             if get_mail_io_thread().has_interactive_work_pending():
                 get_mail_io_thread().submit_background(
