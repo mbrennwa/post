@@ -17,8 +17,53 @@ from post.mail.camel_util import (
     camel_uid_to_bytes,
     folder_get_message_info,
     folder_get_uids,
+    folder_get_unread_count,
     folder_search_uids,
 )
+
+
+class _LegacyFolder:
+    """Stub with pre-3.58 Camel Folder UID / unread APIs."""
+
+    def __init__(self, uids=None, unread=0, *, fail_utf8: bool = False):
+        self._uids = uids if uids is not None else ["1", "2"]
+        self._unread = unread
+        self._fail_utf8 = fail_utf8
+
+    def get_uids(self):
+        if self._fail_utf8:
+            raise UnicodeDecodeError(
+                "utf-8", b"\xff", 0, 1, "invalid start byte"
+            )
+        return list(self._uids)
+
+    def get_unread_message_count(self):
+        return self._unread
+
+
+class _ModernFolder:
+    """Stub with EDS ≥3.58 Camel Folder UID / unread APIs."""
+
+    def __init__(self, uids=None, unread=0, *, fail_utf8: bool = False):
+        self._uids = uids if uids is not None else ["9", "10"]
+        self._unread = unread
+        self._fail_utf8 = fail_utf8
+
+    def dup_uids(self):
+        if self._fail_utf8:
+            raise UnicodeDecodeError(
+                "utf-8", b"\xff", 0, 1, "invalid start byte"
+            )
+        return list(self._uids)
+
+    def get_folder_summary(self):
+        unread = self._unread
+
+        class _Summary:
+            def get_unread_count(self_inner):
+                return unread
+
+        return _Summary()
 
 
 class CamelUidEncodingTests(unittest.TestCase):
@@ -45,21 +90,50 @@ class CamelUidEncodingTests(unittest.TestCase):
 
 class FolderGetUidsTests(unittest.TestCase):
     def test_uses_get_uids_when_utf8_safe(self) -> None:
-        folder = mock.Mock()
-        folder.get_uids.return_value = ["1", "2"]
-        self.assertEqual(folder_get_uids(folder), ["1", "2"])
+        self.assertEqual(folder_get_uids(_LegacyFolder(["1", "2"])), ["1", "2"])
+
+    def test_uses_dup_uids_on_modern_camel(self) -> None:
+        self.assertEqual(folder_get_uids(_ModernFolder(["9", "10"])), ["9", "10"])
 
     def test_falls_back_when_get_uids_is_not_utf8(self) -> None:
-        folder = mock.Mock()
-        folder.get_uids.side_effect = UnicodeDecodeError(
-            "utf-8", b"\xff", 0, 1, "invalid start byte"
-        )
+        folder = _LegacyFolder(fail_utf8=True)
         with mock.patch(
             "post.mail.camel_util._folder_uids_via_ctypes",
             return_value=[f"{_UID_B64_PREFIX}ov8="],
         ) as fallback:
             self.assertEqual(folder_get_uids(folder), [f"{_UID_B64_PREFIX}ov8="])
         fallback.assert_called_once_with(folder)
+
+    def test_falls_back_when_dup_uids_is_not_utf8(self) -> None:
+        folder = _ModernFolder(fail_utf8=True)
+        with mock.patch(
+            "post.mail.camel_util._folder_uids_via_ctypes",
+            return_value=[f"{_UID_B64_PREFIX}ov8="],
+        ) as fallback:
+            self.assertEqual(folder_get_uids(folder), [f"{_UID_B64_PREFIX}ov8="])
+        fallback.assert_called_once_with(folder)
+
+
+class FolderGetUnreadCountTests(unittest.TestCase):
+    def test_legacy_get_unread_message_count(self) -> None:
+        self.assertEqual(folder_get_unread_count(_LegacyFolder(unread=3)), 3)
+
+    def test_modern_folder_summary_unread(self) -> None:
+        self.assertEqual(folder_get_unread_count(_ModernFolder(unread=5)), 5)
+
+    def test_mock_legacy_return_value(self) -> None:
+        folder = mock.Mock()
+        folder.get_unread_message_count.return_value = 4
+        self.assertEqual(folder_get_unread_count(folder), 4)
+
+    def test_magicmock_legacy_return_value(self) -> None:
+        folder = mock.MagicMock()
+        folder.get_unread_message_count.return_value = 0
+        self.assertEqual(folder_get_unread_count(folder), 0)
+
+    def test_unconfigured_mock_returns_unknown(self) -> None:
+        self.assertEqual(folder_get_unread_count(mock.Mock()), -1)
+        self.assertEqual(folder_get_unread_count(mock.MagicMock()), -1)
 
 
 class FolderGetMessageInfoTests(unittest.TestCase):
