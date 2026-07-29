@@ -78,8 +78,10 @@ class WrappingLabel(Gtk.Label):
             return Gtk.Label.do_measure(self, orientation, for_size)
 
         if orientation == Gtk.Orientation.HORIZONTAL:
-            if for_size > 0:
-                return 0, for_size, -1, -1
+            # Claim no horizontal size so parents wrap us to the allocated
+            # width. Returning ``for_size`` here is wrong: for a horizontal
+            # measure, for_size is a height constraint, and it can make a
+            # parent report natural width < min width (and crash GTK).
             return 0, 0, -1, -1
 
         if for_size > 0:

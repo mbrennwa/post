@@ -33,6 +33,7 @@ from post.mail.helpers import (
     reader_toggle_button_state,
     should_offer_send_again,
     sort_messages_newest_first,
+    uniform_bool_state,
 )
 from post.mail.search import annotate_search_match
 
@@ -416,6 +417,24 @@ class FetchAttachmentSearchLocationTests(unittest.TestCase):
             "acct-1", "Sent", "42", 0
         )
         on_ready.assert_called_once_with("file.pdf", b"%PDF", None)
+
+
+class UniformBoolStateTests(unittest.TestCase):
+    def test_empty_returns_none(self) -> None:
+        self.assertIsNone(uniform_bool_state([]))
+
+    def test_uniform_true(self) -> None:
+        self.assertTrue(uniform_bool_state([True, True, True]))
+
+    def test_uniform_false(self) -> None:
+        self.assertFalse(uniform_bool_state([False, False]))
+
+    def test_mixed_returns_none(self) -> None:
+        self.assertIsNone(uniform_bool_state([True, False, True]))
+
+    def test_single_value(self) -> None:
+        self.assertTrue(uniform_bool_state([True]))
+        self.assertFalse(uniform_bool_state([False]))
 
 
 class ReaderToggleButtonStateTests(unittest.TestCase):

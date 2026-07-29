@@ -376,28 +376,42 @@ def message_menu_count_suffix(count: int) -> str:
     return f" ({count})" if count > 1 else ""
 
 
+def uniform_bool_state(states: list[bool]) -> bool | None:
+    """Return the shared value when all *states* match; otherwise ``None``.
+
+    Empty or mixed lists return ``None``. Used by header toggles and by
+    ``read_menu_items`` / ``flag_menu_items`` for context-menu actions.
+    """
+    if not states:
+        return None
+    first = states[0]
+    if any(state != first for state in states[1:]):
+        return None
+    return first
+
+
 def read_menu_items(seen_states: list[bool]) -> list[str]:
     """Return read-menu actions to show: ``read``, ``unread``, or both."""
+    uniform = uniform_bool_state(seen_states)
+    if uniform is True:
+        return ["unread"]
+    if uniform is False:
+        return ["read"]
     if not seen_states:
         return []
-    items: list[str] = []
-    if not all(seen_states):
-        items.append("read")
-    if any(seen_states):
-        items.append("unread")
-    return items
+    return ["read", "unread"]
 
 
 def flag_menu_items(flagged_states: list[bool]) -> list[str]:
     """Return flag-menu actions to show: ``flag``, ``unflag``, or both."""
+    uniform = uniform_bool_state(flagged_states)
+    if uniform is True:
+        return ["unflag"]
+    if uniform is False:
+        return ["flag"]
     if not flagged_states:
         return []
-    items: list[str] = []
-    if not all(flagged_states):
-        items.append("flag")
-    if any(flagged_states):
-        items.append("unflag")
-    return items
+    return ["flag", "unflag"]
 
 
 def should_offer_send_again(*, selection_count: int, source_is_sent: bool) -> bool:
