@@ -40,11 +40,13 @@ class WrappingLabelTests(unittest.TestCase):
         self.assertEqual(minimum, 0)
         self.assertEqual(natural, 0)
 
-    def test_horizontal_measure_with_constraint_uses_width(self) -> None:
+    def test_horizontal_measure_ignores_opposite_size_constraint(self) -> None:
+        # For HORIZONTAL measure, for_size is a height, not a width. Claiming
+        # natural width == for_size makes parents report natural < min.
         label = WrappingLabel(label=_LONG_LINE, wrap=True)
         minimum, natural, _, _ = label.measure(Gtk.Orientation.HORIZONTAL, 200)
         self.assertEqual(minimum, 0)
-        self.assertEqual(natural, 200)
+        self.assertEqual(natural, 0)
 
     def test_vertical_measure_with_width_constraint_returns_height(self) -> None:
         label = WrappingLabel(label=_LONG_LINE, wrap=True)
@@ -57,6 +59,45 @@ class WrappingLabelTests(unittest.TestCase):
         minimum, natural, _, _ = plain.measure(Gtk.Orientation.HORIZONTAL, -1)
         self.assertGreater(natural, 200)
         self.assertGreater(minimum, 0)
+
+    def test_reader_header_row_natural_width_at_least_minimum(self) -> None:
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        header.set_hexpand(True)
+        subject = WrappingLabel(
+            label="A fairly long subject that should wrap in the reader",
+            xalign=0,
+            wrap=True,
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+        )
+        subject.set_max_width_chars(1)
+        subject.set_hexpand(True)
+        subject.set_halign(Gtk.Align.FILL)
+        subject_box = Gtk.Box()
+        subject_box.set_hexpand(True)
+        subject_box.append(subject)
+        header.append(subject_box)
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        actions.add_css_class("linked")
+        for icon in (
+            "mail-reply-sender-symbolic",
+            "mail-reply-all-symbolic",
+            "mail-forward-symbolic",
+        ):
+            button = Gtk.Button()
+            button.set_icon_name(icon)
+            actions.append(button)
+        header.append(actions)
+
+        pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        pane.append(header)
+        for for_size in (-1, 124, 649):
+            minimum, natural, _, _ = pane.measure(Gtk.Orientation.HORIZONTAL, for_size)
+            self.assertGreaterEqual(
+                natural,
+                minimum,
+                f"for_size={for_size} natural={natural} min={minimum}",
+            )
 
     def test_message_list_row_natural_width_at_least_minimum(self) -> None:
         preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)

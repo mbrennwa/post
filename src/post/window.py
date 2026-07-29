@@ -9,6 +9,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from typing import Any
 
 import gi
 
@@ -96,7 +97,9 @@ from post.mail.helpers import (
     perform_one_click_unsubscribe,
     read_menu_items,
     read_menu_label,
+    reader_toggle_button_state,
     should_offer_send_again,
+    uniform_bool_state,
     write_temp_attachment,
 )
 from post.message_list_activate import (
@@ -348,6 +351,20 @@ class MainWindow(Adw.ApplicationWindow):
         compose_btn.connect("clicked", self._on_compose_new_clicked)
         header_actions.append(compose_btn)
 
+        self._header_read_btn = Gtk.Button(icon_name="mail-mark-read-symbolic")
+        self._header_read_btn.set_tooltip_text("Mark as Read")
+        self._header_read_btn.add_css_class("message-read-action")
+        self._header_read_btn.set_sensitive(False)
+        self._header_read_btn.connect("clicked", self._on_header_read_toggle_clicked)
+        header_actions.append(self._header_read_btn)
+
+        self._header_flag_btn = Gtk.Button(icon_name="mail-flag-symbolic")
+        self._header_flag_btn.set_tooltip_text("Flag")
+        self._header_flag_btn.add_css_class("message-flagged")
+        self._header_flag_btn.set_sensitive(False)
+        self._header_flag_btn.connect("clicked", self._on_header_flag_toggle_clicked)
+        header_actions.append(self._header_flag_btn)
+
         self._header_archive_btn = Gtk.Button(icon_name="mail-archive-symbolic")
         self._header_archive_btn.set_tooltip_text("Archive")
         self._header_archive_btn.set_sensitive(False)
@@ -486,8 +503,6 @@ class MainWindow(Adw.ApplicationWindow):
         content_panes.append(sep2)
 
         self._reader_pane = MessageReaderPane(
-            on_read_toggle=self._on_read_toggle_clicked,
-            on_flag_toggle=self._on_flag_toggle_clicked,
             on_reply=self._on_reply_clicked,
             on_reply_all=self._on_reply_all_clicked,
             on_forward=self._on_forward_clicked,
@@ -1005,41 +1020,40 @@ class MainWindow(Adw.ApplicationWindow):
             return {}
         return self._message_flags_for_uid(self._current_message_uid)
 
-    def _reader_action_uid(self) -> str | None:
-        if self._current_message_uid is None:
-            return None
+    @staticmethod
+    def _apply_toggle_button_presentation(
+        button: Gtk.Button, state: dict[str, Any]
+    ) -> None:
+        button.set_icon_name(state["icon"])
+        button.set_tooltip_text(state["tooltip"])
+        if state["styled_action"]:
+            button.add_css_class(state["action_class"])
+        else:
+            button.remove_css_class(state["action_class"])
+
+    def _on_header_read_toggle_clicked(self, *_args) -> None:
         selected = self._message_list_view.get_selected_uids()
-        if len(selected) != 1 or selected[0] != self._current_message_uid:
-            return None
-        return self._current_message_uid
-
-    def _ensure_uid_selected(self, uid: str) -> None:
-        if uid not in self._message_list_view.get_selected_uids():
-            self._message_list_view.select_uid(uid)
-
-    def _ensure_uid_selected_idle(self, uid: str) -> bool:
-        self._ensure_uid_selected(uid)
-        return False
-
-    def _on_read_toggle_clicked(self, *_args) -> None:
-        uid = self._reader_action_uid()
-        if uid is None:
+        if not selected:
             return
-        flags = self._message_flags_for_uid(uid)
-        self._set_message_flags("seen", seen=not flags.get("seen", True), uids=[uid])
-        GLib.idle_add(self._ensure_uid_selected_idle, uid)
-
-    def _on_flag_toggle_clicked(self, *_args) -> None:
-        uid = self._reader_action_uid()
-        if uid is None:
-            return
-        flags = self._message_flags_for_uid(uid)
-        self._set_message_flags(
-            "flagged",
-            flagged=not flags.get("flagged", False),
-            uids=[uid],
+        seen = uniform_bool_state(
+            self._message_seen_states_for_uids(selected, self._message_flags_for_uid)
         )
-        GLib.idle_add(self._ensure_uid_selected_idle, uid)
+        if seen is None:
+            return
+        self._set_message_flags("seen", seen=not seen, uids=selected)
+
+    def _on_header_flag_toggle_clicked(self, *_args) -> None:
+        selected = self._message_list_view.get_selected_uids()
+        if not selected:
+            return
+        flagged = uniform_bool_state(
+            self._message_flagged_states_for_uids(
+                selected, self._message_flags_for_uid
+            )
+        )
+        if flagged is None:
+            return
+        self._set_message_flags("flagged", flagged=not flagged, uids=selected)
 
     def _setup_compose_action(self) -> None:
         compose_action = Gio.SimpleAction.new("compose-new", None)
@@ -5768,9 +5782,11 @@ class MainWindow(Adw.ApplicationWindow):
             elif count > 1:
                 self._set_status(f"Queued {count} actions — will sync when online")
             self._refresh_status_display()
+            self._update_message_toolbar()
             return
         if count > 1:
             self._set_status(f"Updated {count} messages")
+        self._update_message_toolbar()
 
     def _on_message_list_selection_changed(self) -> None:
         GLib.idle_add(self._on_message_list_selection_changed_idle)
@@ -5838,6 +5854,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         can_archive = False
         can_trash = False
+        can_toggle_flags = False
         if selected:
             locations = [
                 location
@@ -5868,7 +5885,38 @@ class MainWindow(Adw.ApplicationWindow):
                     )
                     for account_uid, folder_name, _message_uid in locations
                 )
+                can_toggle_flags = bool(non_outbox) and len(non_outbox) == len(
+                    locations
+                )
 
+        seen = None
+        flagged = None
+        if can_toggle_flags:
+            flags_for_uid = self._message_flags_for_uid
+            seen = uniform_bool_state(
+                self._message_seen_states_for_uids(selected, flags_for_uid)
+            )
+            flagged = uniform_bool_state(
+                self._message_flagged_states_for_uids(selected, flags_for_uid)
+            )
+            if seen is not None or flagged is not None:
+                toggles = reader_toggle_button_state(
+                    {
+                        "seen": True if seen is None else seen,
+                        "flagged": False if flagged is None else flagged,
+                    }
+                )
+                if seen is not None:
+                    self._apply_toggle_button_presentation(
+                        self._header_read_btn, toggles["read"]
+                    )
+                if flagged is not None:
+                    self._apply_toggle_button_presentation(
+                        self._header_flag_btn, toggles["flag"]
+                    )
+
+        self._header_read_btn.set_sensitive(seen is not None)
+        self._header_flag_btn.set_sensitive(flagged is not None)
         self._header_archive_btn.set_sensitive(can_archive)
         self._header_trash_btn.set_sensitive(can_trash)
         return False

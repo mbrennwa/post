@@ -40,8 +40,6 @@ class MessageReaderPaneTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.pane = MessageReaderPane(
-            on_read_toggle=_noop,
-            on_flag_toggle=_noop,
             on_reply=_noop,
             on_reply_all=_noop,
             on_forward=_noop,
@@ -79,8 +77,6 @@ class MessageReaderPaneTests(unittest.TestCase):
             clicked.append(action)
 
         pane = MessageReaderPane(
-            on_read_toggle=_noop,
-            on_flag_toggle=_noop,
             on_reply=_noop,
             on_reply_all=_noop,
             on_forward=_noop,
@@ -108,7 +104,7 @@ class MessageReaderPaneTests(unittest.TestCase):
             [{"kind": "open", "url": "https://example.com/unsub"}],
         )
 
-    def test_unsubscribe_button_is_left_of_read(self) -> None:
+    def test_unsubscribe_button_is_left_of_reply(self) -> None:
         outer = self.pane._message_actions
         children: list[Gtk.Widget] = []
         child = outer.get_first_child()
@@ -117,12 +113,13 @@ class MessageReaderPaneTests(unittest.TestCase):
             child = child.get_next_sibling()
         self.assertGreaterEqual(len(children), 2)
         self.assertIs(children[0], self.pane._unsubscribe_btn)
-        flag_group = children[1]
-        self.assertIs(flag_group.get_first_child(), self.pane._read_toggle_btn)
+        reply_group = children[1]
+        self.assertIs(reply_group.get_first_child(), self.pane._reply_btn)
 
     def test_clear_resets_current_message(self) -> None:
+        msg = _sample_message()
         self.pane.show_message(
-            _sample_message(),
+            msg,
             body={"plain": "Body text", "html": None},
             allow_remote=False,
             dark=False,
@@ -130,6 +127,24 @@ class MessageReaderPaneTests(unittest.TestCase):
         )
         self.pane.clear()
         self.assertIsNone(self.pane.current_message)
+
+    def test_horizontal_measure_natural_at_least_minimum(self) -> None:
+        self.pane.show_message(
+            _sample_message(),
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        for for_size in (-1, 124, 200, 649):
+            minimum, natural, _, _ = self.pane.measure(
+                Gtk.Orientation.HORIZONTAL, for_size
+            )
+            self.assertGreaterEqual(
+                natural,
+                minimum,
+                f"for_size={for_size} natural={natural} min={minimum}",
+            )
 
     def test_update_message_flags_merges_flags(self) -> None:
         msg = _sample_message(seen=False, flagged=False)
