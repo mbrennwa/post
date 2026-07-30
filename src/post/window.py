@@ -3024,7 +3024,7 @@ class MainWindow(Adw.ApplicationWindow):
                     else "no_gtk_change"
                 ),
             )
-            log.info(
+            log.debug(
                 "Heavy-folder UI append bound %s/%s now=%d of %d gtk_store=%d",
                 account.uid,
                 folder_name,
@@ -3093,7 +3093,7 @@ class MainWindow(Adw.ApplicationWindow):
                 ),
                 note="top_unchanged_scroll_down_for_new_rows",
             )
-            log.info(
+            log.debug(
                 "Heavy-folder UI catch-up bind %s/%s now=%d of %d gtk_store=%d",
                 account.uid,
                 folder_name,
@@ -3187,7 +3187,7 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> None:
         """Chunked Archive/Trash/Junk header index; preemptible (#208)."""
         self._heavy_index_in_progress = (account_uid, folder_name)
-        log.info(
+        log.debug(
             "Heavy-folder UI start index load_id=%s %s/%s cursor=%s",
             load_id,
             account_uid,
@@ -3439,7 +3439,7 @@ class MainWindow(Adw.ApplicationWindow):
                         retry_cursor["force_prepare_incomplete_delta"] = True
                     else:
                         retry_cursor["did_prepare_content_refresh"] = True
-                    log.info(
+                    log.debug(
                         "Heavy-folder UI retry catch-up load_id=%s %s/%s "
                         "indexed=%d server_total=%d force_incomplete=%s",
                         load_id,
@@ -3474,7 +3474,7 @@ class MainWindow(Adw.ApplicationWindow):
             == message_list_fingerprint(messages[:MESSAGE_LIST_UI_BIND_CAP])
         )
         store_n = self._message_list_view.item_count()
-        log.info(
+        log.debug(
             "Heavy-folder UI progress load_id=%s %s/%s indexed=%d "
             "prev=%d server_total=%d done=%s keep=%s grew=%s "
             "top_unchanged=%s bound=%d gtk_store=%d pipeline_id=%s",
@@ -3517,7 +3517,7 @@ class MainWindow(Adw.ApplicationWindow):
                     else "no_list_change_expected"
                 ),
             )
-            log.info(
+            log.debug(
                 "Heavy-folder UI skip rebind (equivalent) %s/%s indexed=%d "
                 "bound=%d gtk_store=%d",
                 account_uid,
@@ -3567,7 +3567,7 @@ class MainWindow(Adw.ApplicationWindow):
                 gtk_store=store_n,
                 visible="top_unchanged_scroll_down_for_new_rows",
             )
-            log.info(
+            log.debug(
                 "Heavy-folder UI keep top rows; binding older mail below "
                 "%s/%s indexed=%d bound=%d gtk_store=%d",
                 account_uid,
@@ -3605,7 +3605,7 @@ class MainWindow(Adw.ApplicationWindow):
             prev_gtk_store=store_n,
             visible="top_may_change_full_rebind",
         )
-        log.info(
+        log.debug(
             "Heavy-folder UI rebind list %s/%s indexed=%d",
             account_uid,
             folder_name,
@@ -4023,7 +4023,7 @@ class MainWindow(Adw.ApplicationWindow):
             and self._current_account is not None
             and self._current_account.uid == account_uid
         ):
-            log.info(
+            log.debug(
                 "Heavy-folder UI ignore reload while indexing %s/%s "
                 "(bound=%d indexed=%d)",
                 account_uid,
@@ -4233,7 +4233,7 @@ class MainWindow(Adw.ApplicationWindow):
                 if self._heavy_index_in_progress == (account_uid, folder_name):
                     # Same folder already indexing — do not start a second
                     # refresh_info (and do not prepare_content_refresh again).
-                    log.info(
+                    log.debug(
                         "Heavy-folder UI skip duplicate indexer %s/%s "
                         "load_id=%s",
                         account_uid,

@@ -309,6 +309,8 @@ _HEAVY_FOLDER_INCOMPLETE_CAMEL_GAP = 100
 _HEAVY_FOLDER_INCOMPLETE_PREPARE_LIMIT = 3
 # How often to re-publish Syncing progress during a silent rewalk (#208).
 _HEAVY_FOLDER_REWALK_PROGRESS_SECONDS = 10.0
+# Sparse INFO while a large Archive sync is healthy (#208) — not every heartbeat.
+_HEAVY_FOLDER_INFO_PROGRESS_UID_STEP = 1000
 
 # Monotonic id so request → arrive → index → list lines can be grepped together.
 _heavy_pipeline_seq = 0
@@ -326,11 +328,14 @@ def _log_heavy_pipeline(
     folder_name: str,
     *,
     pipeline_id: str,
+    level: int = logging.DEBUG,
     **fields: Any,
 ) -> None:
     """Structured Archive/Trash/Junk pipeline logs (#208).
 
-    Stages:
+    Default is DEBUG so normal runs do not flood ``post.log``. Callers pass
+    ``level=logging.INFO`` for sparse milestones (request start, incomplete
+    keep-alive). Stages:
       request — Post asked Camel/Graph for more headers (``refresh_info``)
       arrive  — Camel summary UID count grew (server data landed locally)
       index   — Post folder-index gained header rows
@@ -342,7 +347,8 @@ def _log_heavy_pipeline(
         if value is not None
     ]
     suffix = (" " + " ".join(parts)) if parts else ""
-    log.info(
+    log.log(
+        level,
         "Heavy-folder pipeline stage=%s id=%s %s/%s%s",
         stage,
         pipeline_id,
@@ -4240,7 +4246,7 @@ class MailService:
                     self._folder_indexes[key] = existing
                     source = "disk_cache"
             if existing is not None and existing.messages:
-                log.info(
+                log.debug(
                     "Heavy-folder skip sync rebuild for %s/%s "
                     "(keeping %d indexed headers)",
                     account_uid,
@@ -4582,7 +4588,7 @@ class MailService:
         key = (account_uid, folder_name)
         # Correlation id for request → arrive → index → list (#208 debug).
         active_pipeline_id = str(state.get("pipeline_id") or "") or None
-        log.info(
+        log.debug(
             "Heavy-folder slice start %s/%s allow_refresh=%s cursor_keys=%s "
             "pending_server_refresh=%s refresh_done=%s uid_offset=%s "
             "uid_pending=%s pipeline_id=%s",
@@ -4714,7 +4720,7 @@ class MailService:
                 refresh_done = True
             elif get_mail_io_thread().has_interactive_work_pending():
                 # Yield without claiming refresh_done — retry next slice (#208).
-                log.info(
+                log.debug(
                     "Heavy-folder yield for interactive %s/%s indexed=%d",
                     account_uid,
                     folder_name,
@@ -4779,7 +4785,7 @@ class MailService:
                 camel_uid_count = prev_uid_count
                 while pages < _HEAVY_FOLDER_REFRESH_PAGES_PER_SLICE:
                     if get_mail_io_thread().has_interactive_work_pending():
-                        log.info(
+                        log.debug(
                             "Heavy-folder page loop yield for interactive "
                             "%s/%s pages=%d indexed=%d",
                             account_uid,
@@ -4789,7 +4795,7 @@ class MailService:
                         )
                         break
                     if pages > 0 and time.monotonic() >= slice_deadline:
-                        log.info(
+                        log.debug(
                             "Heavy-folder page loop slice budget exhausted "
                             "%s/%s pages=%d indexed=%d",
                             account_uid,
@@ -4898,6 +4904,7 @@ class MailService:
                             account_uid,
                             folder_name,
                             pipeline_id=pipeline_id,
+                            level=logging.INFO,
                             action="refresh_info",
                             attempt=refresh_attempts + 1,
                             page=pages,
@@ -4906,7 +4913,7 @@ class MailService:
                             did_prepare=did_prepare,
                             stalls=refresh_stalls,
                         )
-                        log.info(
+                        log.debug(
                             "Heavy-folder refresh_info start %s/%s "
                             "id=%s attempt=%d page=%d indexed=%d "
                             "did_prepare=%s stalls=%d (no soft timeout; "
@@ -5022,9 +5029,11 @@ class MailService:
 
                         last_camel_uids = camel_uids_before
                         last_rewalk_progress = 0.0
+                        last_info_progress_uids = camel_uids_before
 
                         def _refresh_heartbeat(elapsed: float) -> None:
                             nonlocal last_camel_uids, last_rewalk_progress
+                            nonlocal last_info_progress_uids
                             # Evolution adds Camel summary rows as each Graph
                             # delta page arrives inside refresh_info. Poll for
                             # new UIDs here so the message list grows during
@@ -5047,6 +5056,24 @@ class MailService:
                                     elapsed_s=round(elapsed, 1),
                                     source="camel_summary_during_refresh",
                                 )
+                                step = _HEAVY_FOLDER_INFO_PROGRESS_UID_STEP
+                                if (
+                                    camel_now // step
+                                    > last_info_progress_uids // step
+                                ):
+                                    last_info_progress_uids = camel_now
+                                    log.info(
+                                        "Heavy-folder sync progress %s/%s "
+                                        "id=%s camel_uids=%d known_total=%d "
+                                        "indexed=%d elapsed=%.0fs",
+                                        account_uid,
+                                        folder_name,
+                                        pipeline_id,
+                                        camel_now,
+                                        known_total,
+                                        len(by_uid),
+                                        elapsed,
+                                    )
                                 last_camel_uids = camel_now
                             elif behind and (
                                 elapsed - last_rewalk_progress
@@ -5095,7 +5122,7 @@ class MailService:
                                 if behind and not arrived_delta
                                 else ""
                             )
-                            log.info(
+                            log.debug(
                                 "Heavy-folder refresh_info waiting %s/%s "
                                 "id=%s elapsed=%.1fs indexed=%d camel_uids=%d "
                                 "new=%d page=%d%s",
@@ -5219,7 +5246,7 @@ class MailService:
                                 camel_uids_delta=arrived_total,
                                 source="refresh_info_finished",
                             )
-                        log.info(
+                        log.debug(
                             "Heavy-folder refresh page for %s/%s id=%s: "
                             "%d UIDs (%d new, indexed=%d, camel_total=%d)",
                             account_uid,
@@ -5269,6 +5296,7 @@ class MailService:
                                     account_uid,
                                     folder_name,
                                     pipeline_id=pipeline_id,
+                                    level=logging.INFO,
                                     camel_uids=camel_uid_count,
                                     camel_uids_delta=0,
                                     known_total=known_total,
@@ -5457,7 +5485,7 @@ class MailService:
                                     indexed=len(by_uid),
                                     indexed_delta=materialized,
                                 )
-                                log.info(
+                                log.debug(
                                     "Heavy-folder soft-yield materialized %d "
                                     "headers for %s/%s (indexed=%d)",
                                     materialized,
@@ -5565,7 +5593,7 @@ class MailService:
                 or force_incomplete
                 or refresh_stalls < _HEAVY_FOLDER_REFRESH_STALL_LIMIT
             ):
-                log.info(
+                log.debug(
                     "Heavy-folder slice continue refresh %s/%s indexed=%d "
                     "status_total=%d behind=%s stalls=%d attempts=%d "
                     "force_incomplete=%s",
@@ -5728,7 +5756,7 @@ class MailService:
         else:
             done = True
 
-        log.info(
+        log.debug(
             "Heavy-folder slice materialize %s/%s indexed=%d processed=%d "
             "uid_offset=%d/%d batch_complete=%s done=%s "
             "pending_server_refresh=%s",
