@@ -27,7 +27,12 @@ from post.gtk_schedule import schedule_on_gtk_main
 from post.header_bar import add_end_window_controls
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
-from post.mail.eds import MailAccount, MessageNotAvailableError, OfflineSyncProgress
+from post.mail.eds import (
+    MailAccount,
+    MessageNotAvailableError,
+    OfflineSyncProgress,
+    _log_heavy_pipeline,
+)
 from post.mail.io_thread import get_mail_io_thread
 from post.mail.sync_watcher import MailSyncWatcher
 from post.message_list_view import VirtualMessageList
@@ -292,6 +297,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._offline_held_for_load_generation: int | None = None
         self._heavy_index_in_progress: tuple[str, str] | None = None
         self._heavy_bind_catchup_load_id: int | None = None
+        self._heavy_pipeline_id: str | None = None
         self._network_available = Gio.NetworkMonitor.get_default().get_network_available()
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1463,15 +1469,18 @@ class MainWindow(Adw.ApplicationWindow):
         return True
 
     def _on_sync_folder_changed(self, account_uid: str, folder_name: str) -> None:
-        # Heavy-folder header refresh emits Folder::changed; invalidating the
-        # index mid-index wipes progress and a follow-up reload preempt-cancels
-        # the Graph refresh (#208).
+        # Heavy-folder header refresh emits Folder::changed. Invalidating the
+        # grow-only index (even after leaving the folder) wipes thousands of
+        # headers; a reopen then rebuilds from a shrunk Camel summary and may
+        # call prepare_content_refresh (#208).
+        if is_heavy_folder_name(folder_name):
+            self._sidebar.refresh_folder_row(account_uid, folder_name)
+            return
         if (
             self._message_sync_in_progress
             and self._current_account is not None
             and self._current_account.uid == account_uid
             and self._current_folder == folder_name
-            and is_heavy_folder_name(folder_name)
         ):
             self._sidebar.refresh_folder_row(account_uid, folder_name)
             return
@@ -3011,13 +3020,32 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self._message_list_view.append_messages(more, folder_name=folder_name)
         self._message_list_bound_count = already + len(more)
-        log.info(
-            "Heavy-folder UI append bound %s/%s now=%d of %d",
-            account.uid,
-            folder_name,
-            self._message_list_bound_count,
-            len(messages),
-        )
+        if is_heavy_folder_name(folder_name):
+            store_n = self._message_list_view.item_count()
+            _log_heavy_pipeline(
+                "list",
+                account.uid,
+                folder_name,
+                pipeline_id=self._heavy_pipeline_id or "ui-append",
+                action="near_end_append",
+                appended=len(more),
+                bound=self._message_list_bound_count,
+                indexed=len(messages),
+                gtk_store=store_n,
+                visible=(
+                    "scroll_or_near_end"
+                    if store_n > already
+                    else "no_gtk_change"
+                ),
+            )
+            log.debug(
+                "Heavy-folder UI append bound %s/%s now=%d of %d gtk_store=%d",
+                account.uid,
+                folder_name,
+                self._message_list_bound_count,
+                len(messages),
+                store_n,
+            )
         self._update_message_status(account, folder_name)
         # Keep loading if the scrollbar is still pinned at the bottom (drag-to-end).
         self._message_list_view.after_content_appended()
@@ -3059,12 +3087,33 @@ class MainWindow(Adw.ApplicationWindow):
                 return False
             self._message_list_view.append_messages(more, folder_name=folder_name)
             self._message_list_bound_count = already + len(more)
-            log.info(
-                "Heavy-folder UI catch-up bind %s/%s now=%d of %d",
+            store_n = self._message_list_view.item_count()
+            pipeline_id = self._heavy_pipeline_id or "ui-catchup"
+            _log_heavy_pipeline(
+                "list",
+                account.uid,
+                folder_name,
+                pipeline_id=pipeline_id,
+                action="catchup_bind",
+                load_id=load_id,
+                appended=len(more),
+                bound=self._message_list_bound_count,
+                indexed=len(messages),
+                gtk_store=store_n,
+                visible=(
+                    "older_rows_below_top_scroll_for_new"
+                    if store_n >= self._message_list_bound_count
+                    else "gtk_store_lag"
+                ),
+                note="top_unchanged_scroll_down_for_new_rows",
+            )
+            log.debug(
+                "Heavy-folder UI catch-up bind %s/%s now=%d of %d gtk_store=%d",
                 account.uid,
                 folder_name,
                 self._message_list_bound_count,
                 len(messages),
+                store_n,
             )
             self._update_message_status(account, folder_name)
             if self._message_list_bound_count < len(messages):
@@ -3152,7 +3201,7 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> None:
         """Chunked Archive/Trash/Junk header index; preemptible (#208)."""
         self._heavy_index_in_progress = (account_uid, folder_name)
-        log.info(
+        log.debug(
             "Heavy-folder UI start index load_id=%s %s/%s cursor=%s",
             load_id,
             account_uid,
@@ -3338,6 +3387,12 @@ class MainWindow(Adw.ApplicationWindow):
 
         messages = progress.messages
         indexed = len(messages)
+        cursor = progress.cursor or {}
+        pipeline_id = str(cursor.get("pipeline_id") or "") or None
+        if pipeline_id:
+            self._heavy_pipeline_id = pipeline_id
+        else:
+            pipeline_id = self._heavy_pipeline_id or "ui-progress"
         # Sidebar STATUS totals come from folder-info polls — never overwrite
         # them with partial Camel / folder-index counts (#208 confusion).
         server = self._mail.get_folder_status_totals(account_uid, folder_name)
@@ -3379,24 +3434,34 @@ class MainWindow(Adw.ApplicationWindow):
                         return False
                     # Preserve prepare/seed flags — a bare cursor re-runs
                     # prepare_content_refresh and wipes M365 sync progress.
+                    # Exception: incomplete-delta keep-alive must allow prepare
+                    # so a stale/empty Graph cursor can be reset (#208).
                     retry_cursor = dict(progress.cursor or {})
+                    force_incomplete = bool(
+                        retry_cursor.get("force_prepare_incomplete_delta")
+                    )
                     retry_cursor.update(
                         {
                             "refresh_done": False,
                             "pending_server_refresh": True,
                             "status_seeded": True,
-                            "did_prepare_content_refresh": True,
                             "indexed_after_refresh": indexed,
                         }
                     )
-                    log.info(
+                    if force_incomplete:
+                        retry_cursor["did_prepare_content_refresh"] = False
+                        retry_cursor["force_prepare_incomplete_delta"] = True
+                    else:
+                        retry_cursor["did_prepare_content_refresh"] = True
+                    log.debug(
                         "Heavy-folder UI retry catch-up load_id=%s %s/%s "
-                        "indexed=%d server_total=%d",
+                        "indexed=%d server_total=%d force_incomplete=%s",
                         load_id,
                         account_uid,
                         folder_name,
                         indexed,
                         server_total,
+                        force_incomplete,
                     )
                     self._start_background_heavy_folder_index(
                         load_id,
@@ -3422,10 +3487,11 @@ class MainWindow(Adw.ApplicationWindow):
             and message_list_fingerprint(current[:MESSAGE_LIST_UI_BIND_CAP])
             == message_list_fingerprint(messages[:MESSAGE_LIST_UI_BIND_CAP])
         )
-        log.info(
+        store_n = self._message_list_view.item_count()
+        log.debug(
             "Heavy-folder UI progress load_id=%s %s/%s indexed=%d "
             "prev=%d server_total=%d done=%s keep=%s grew=%s "
-            "top_unchanged=%s bound=%d",
+            "top_unchanged=%s bound=%d gtk_store=%d pipeline_id=%s",
             load_id,
             account_uid,
             folder_name,
@@ -3437,6 +3503,8 @@ class MainWindow(Adw.ApplicationWindow):
             grew,
             top_unchanged,
             self._message_list_bound_count,
+            store_n,
+            pipeline_id,
         )
 
         if message_lists_equivalent_for_ui(
@@ -3445,17 +3513,36 @@ class MainWindow(Adw.ApplicationWindow):
             current_total=self._message_total,
             refreshed_total=indexed,
         ):
-            log.info(
+            will_catchup = indexed > self._message_list_bound_count > 0
+            _log_heavy_pipeline(
+                "list",
+                account_uid,
+                folder_name,
+                pipeline_id=pipeline_id,
+                action="skip_rebind_equivalent",
+                load_id=load_id,
+                indexed=indexed,
+                bound=self._message_list_bound_count,
+                gtk_store=store_n,
+                catchup_scheduled=will_catchup,
+                visible=(
+                    "no_top_change_catchup_binds_older"
+                    if will_catchup
+                    else "no_list_change_expected"
+                ),
+            )
+            log.debug(
                 "Heavy-folder UI skip rebind (equivalent) %s/%s indexed=%d "
-                "bound=%d",
+                "bound=%d gtk_store=%d",
                 account_uid,
                 folder_name,
                 indexed,
                 self._message_list_bound_count,
+                store_n,
             )
             # Index may have grown earlier while we kept the top rows; bind the
             # unbound older rows so the list length grows without a top rebuild.
-            if indexed > self._message_list_bound_count > 0:
+            if will_catchup:
                 self._current_folder_messages = messages
                 self._message_total = indexed
                 self._update_message_status(account, folder_name)
@@ -3482,13 +3569,26 @@ class MainWindow(Adw.ApplicationWindow):
             # Older headers appended below the visible newest window — do not
             # rebuild Gtk (scroll jump). Bind the new rows below so scroll can
             # reach them even while the user stays at the top (#208).
-            log.info(
+            _log_heavy_pipeline(
+                "list",
+                account_uid,
+                folder_name,
+                pipeline_id=pipeline_id,
+                action="keep_top_bind_older",
+                load_id=load_id,
+                indexed=indexed,
+                bound=self._message_list_bound_count,
+                gtk_store=store_n,
+                visible="top_unchanged_scroll_down_for_new_rows",
+            )
+            log.debug(
                 "Heavy-folder UI keep top rows; binding older mail below "
-                "%s/%s indexed=%d bound=%d",
+                "%s/%s indexed=%d bound=%d gtk_store=%d",
                 account_uid,
                 folder_name,
                 indexed,
                 self._message_list_bound_count,
+                store_n,
             )
             self._update_message_status(account, folder_name)
             self._schedule_bind_unbound_heavy_messages(load_id)
@@ -3505,7 +3605,21 @@ class MainWindow(Adw.ApplicationWindow):
                 )
             return False
 
-        log.info(
+        bind_cap = min(indexed, MESSAGE_LIST_UI_BIND_CAP)
+        _log_heavy_pipeline(
+            "list",
+            account_uid,
+            folder_name,
+            pipeline_id=pipeline_id,
+            action="rebind_list",
+            load_id=load_id,
+            indexed=indexed,
+            bind_cap=bind_cap,
+            prev_bound=self._message_list_bound_count,
+            prev_gtk_store=store_n,
+            visible="top_may_change_full_rebind",
+        )
+        log.debug(
             "Heavy-folder UI rebind list %s/%s indexed=%d",
             account_uid,
             folder_name,
@@ -3513,6 +3627,25 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
         def _after_rebind() -> None:
+            if load_id != self._messages_load_generation:
+                return
+            after_store = self._message_list_view.item_count()
+            _log_heavy_pipeline(
+                "list",
+                account_uid,
+                folder_name,
+                pipeline_id=pipeline_id,
+                action="rebind_complete",
+                load_id=load_id,
+                indexed=indexed,
+                bound=self._message_list_bound_count,
+                gtk_store=after_store,
+                visible=(
+                    "rows_in_gtk_store"
+                    if after_store > 0
+                    else "gtk_store_empty"
+                ),
+            )
             if keep_indexing:
                 self._schedule_bind_unbound_heavy_messages(load_id)
             else:
@@ -3904,7 +4037,7 @@ class MainWindow(Adw.ApplicationWindow):
             and self._current_account is not None
             and self._current_account.uid == account_uid
         ):
-            log.info(
+            log.debug(
                 "Heavy-folder UI ignore reload while indexing %s/%s "
                 "(bound=%d indexed=%d)",
                 account_uid,
@@ -3925,6 +4058,7 @@ class MainWindow(Adw.ApplicationWindow):
         load_id = self._messages_load_generation
         self._messages_load_expects_search = self._search_query is not None
         self._heavy_bind_catchup_load_id = None
+        self._heavy_pipeline_id = None
 
         # Abort background folder-info REFRESH / refresh_info_sync so the new
         # folder load is not stuck behind Camel I/O (#170 hang on switch).
@@ -4113,7 +4247,7 @@ class MainWindow(Adw.ApplicationWindow):
                 if self._heavy_index_in_progress == (account_uid, folder_name):
                     # Same folder already indexing — do not start a second
                     # refresh_info (and do not prepare_content_refresh again).
-                    log.info(
+                    log.debug(
                         "Heavy-folder UI skip duplicate indexer %s/%s "
                         "load_id=%s",
                         account_uid,

@@ -183,6 +183,10 @@ class MailSidebar:
         self._folder_count_poll_generation = 0
         # Heavy folders awaiting first trusted STATUS poll (#208).
         self._heavy_status_pending: set[tuple[str, str]] = set()
+        # Account UIDs whose folder ListBox is mid-rebuild. Nested reload_account
+        # must not clear_listbox during append (Gtk GSequence / #201 segfault).
+        self._rebuilding_folder_lists: set[str] = set()
+        self._pending_account_reloads: set[str] = set()
 
         self._sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
@@ -653,6 +657,17 @@ class MailSidebar:
         if on_complete is not None:
             self._account_reload_callbacks[account_uid] = on_complete
 
+        # Nested clear during folders_loaded_append corrupts Gtk.ListBox (#201).
+        if account_uid in self._rebuilding_folder_lists:
+            self._pending_account_reloads.add(account_uid)
+            log.info(
+                "Deferring reload_account for %s until folder ListBox rebuild "
+                "finishes",
+                account_uid,
+            )
+            return
+
+        self._pending_account_reloads.discard(account_uid)
         self._sidebar_selecting = True
         try:
             _debug_listbox_start(
@@ -679,6 +694,14 @@ class MailSidebar:
             self._startup_folder_total += 1
             self._update_startup_folder_load_status()
         self._start_folder_load(self._load_generation, account)
+
+    def _flush_pending_account_reload(self, account_uid: str) -> bool:
+        if account_uid not in self._pending_account_reloads:
+            return False
+        if account_uid in self._rebuilding_folder_lists:
+            return True
+        self.reload_account(account_uid)
+        return False
 
     def refresh_folder_row(
         self,
@@ -1510,6 +1533,7 @@ class MailSidebar:
         # unselect_all from inside append corrupts the list sequence (segfault).
         already_selecting = self._sidebar_selecting
         self._sidebar_selecting = True
+        self._rebuilding_folder_lists.add(account_uid)
         load_error = error
         folder_count = 0
         _debug_listbox_start(
@@ -1616,7 +1640,8 @@ class MailSidebar:
                         folder_count=folder_count,
                     )
         finally:
-            self._sidebar_selecting = False
+            self._rebuilding_folder_lists.discard(account_uid)
+            self._sidebar_selecting = already_selecting
             _debug_listbox_end(
                 "folders_loaded_rebuild",
                 load_id=load_id,
@@ -1624,6 +1649,10 @@ class MailSidebar:
                 folder_count=folder_count,
                 has_error=load_error is not None,
             )
+
+        if account_uid in self._pending_account_reloads:
+            pending_uid = account_uid
+            GLib.idle_add(self._flush_pending_account_reload, pending_uid)
 
         if load_error is not None:
             self._folder_loads_pending = max(0, self._folder_loads_pending - 1)
@@ -2084,6 +2113,9 @@ class MailSidebar:
     ) -> Gtk.ListBoxRow:
         if display is None:
             display = folder.get("display_name") or folder.get("full_name") or "?"
+        if isinstance(display, str):
+            # Pango rejects unpaired surrogates / invalid UTF-8 label text.
+            display = display.encode("utf-8", errors="replace").decode("utf-8")
         unread = folder.get("unread", -1)
         total = folder.get("total", -1)
         folder_name = folder.get("full_name")

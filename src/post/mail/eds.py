@@ -301,6 +301,61 @@ _HEAVY_FOLDER_REFRESH_SLICE_BUDGET_SECONDS = 960.0
 # Skip prepare_content_refresh once the local index is already substantial —
 # resetting M365 sync state throws away progress (#208).
 _HEAVY_FOLDER_PREPARE_MIN_INDEXED = 500
+# Camel summary clearly short of Graph/STATUS total → incomplete delta (#208).
+# Mid-refresh ``new=0`` here is usually a full-delta rewalk of known UIDs, not a
+# hang. Empty refresh finishes while still behind → force prepare + keep alive.
+_HEAVY_FOLDER_INCOMPLETE_CAMEL_GAP = 100
+# Cap how often we clear the M365 delta link while still behind (#208).
+_HEAVY_FOLDER_INCOMPLETE_PREPARE_LIMIT = 3
+# How often to re-publish Syncing progress during a silent rewalk (#208).
+_HEAVY_FOLDER_REWALK_PROGRESS_SECONDS = 10.0
+# Sparse INFO while a large Archive sync is healthy (#208) — not every heartbeat.
+_HEAVY_FOLDER_INFO_PROGRESS_UID_STEP = 1000
+
+# Monotonic id so request → arrive → index → list lines can be grepped together.
+_heavy_pipeline_seq = 0
+
+
+def _next_heavy_pipeline_id() -> str:
+    global _heavy_pipeline_seq
+    _heavy_pipeline_seq += 1
+    return f"hf{_heavy_pipeline_seq}"
+
+
+def _log_heavy_pipeline(
+    stage: str,
+    account_uid: str,
+    folder_name: str,
+    *,
+    pipeline_id: str,
+    level: int = logging.DEBUG,
+    **fields: Any,
+) -> None:
+    """Structured Archive/Trash/Junk pipeline logs (#208).
+
+    Default is DEBUG so normal runs do not flood ``post.log``. Callers pass
+    ``level=logging.INFO`` for sparse milestones (request start, incomplete
+    keep-alive). Stages:
+      request — Post asked Camel/Graph for more headers (``refresh_info``)
+      arrive  — Camel summary UID count grew (server data landed locally)
+      index   — Post folder-index gained header rows
+      list    — Gtk message list bind/append (see ``visible`` for UX expectation)
+    """
+    parts = [
+        f"{key}={value}"
+        for key, value in fields.items()
+        if value is not None
+    ]
+    suffix = (" " + " ".join(parts)) if parts else ""
+    log.log(
+        level,
+        "Heavy-folder pipeline stage=%s id=%s %s/%s%s",
+        stage,
+        pipeline_id,
+        account_uid,
+        folder_name,
+        suffix,
+    )
 
 
 def _folder_index_is_cacheable(index: _FolderMessageIndex) -> bool:
@@ -317,6 +372,19 @@ def _should_save_heavy_folder_index(
     if existing is None:
         return bool(messages)
     return len(messages) > len(existing[0])
+
+
+def _heavy_folder_camel_behind_server(camel_uids: int, known_total: int) -> bool:
+    """True when Camel summary is clearly short of server STATUS (#208).
+
+    Interrupted M365 deltas leave Archive with thousands of local UIDs, an empty
+    or stale delta link, and Graph ``totalItemCount`` still much larger. A full
+    ``refresh_info`` then rewalks known headers with ``new=0`` for a long time
+    before UID count grows again.
+    """
+    if known_total <= 0:
+        return False
+    return (known_total - max(0, camel_uids)) >= _HEAVY_FOLDER_INCOMPLETE_CAMEL_GAP
 
 
 def _read_unflagged_uids(index: _FolderMessageIndex) -> list[str]:
@@ -4178,7 +4246,7 @@ class MailService:
                     self._folder_indexes[key] = existing
                     source = "disk_cache"
             if existing is not None and existing.messages:
-                log.info(
+                log.debug(
                     "Heavy-folder skip sync rebuild for %s/%s "
                     "(keeping %d indexed headers)",
                     account_uid,
@@ -4518,10 +4586,12 @@ class MailService:
     ) -> HeavyFolderIndexProgress:
         state = dict(cursor or {})
         key = (account_uid, folder_name)
-        log.info(
+        # Correlation id for request → arrive → index → list (#208 debug).
+        active_pipeline_id = str(state.get("pipeline_id") or "") or None
+        log.debug(
             "Heavy-folder slice start %s/%s allow_refresh=%s cursor_keys=%s "
             "pending_server_refresh=%s refresh_done=%s uid_offset=%s "
-            "uid_pending=%s",
+            "uid_pending=%s pipeline_id=%s",
             account_uid,
             folder_name,
             allow_refresh,
@@ -4530,7 +4600,15 @@ class MailService:
             state.get("refresh_done"),
             state.get("uid_offset"),
             len(state["uids"]) if isinstance(state.get("uids"), list) else None,
+            active_pipeline_id,
         )
+
+        def _cursor_with_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
+            if not active_pipeline_id:
+                return payload
+            out = dict(payload)
+            out.setdefault("pipeline_id", active_pipeline_id)
+            return out
 
         folder = self._open_folder_unlocked(account_uid, folder_name)
         if folder is None:
@@ -4642,7 +4720,7 @@ class MailService:
                 refresh_done = True
             elif get_mail_io_thread().has_interactive_work_pending():
                 # Yield without claiming refresh_done — retry next slice (#208).
-                log.info(
+                log.debug(
                     "Heavy-folder yield for interactive %s/%s indexed=%d",
                     account_uid,
                     folder_name,
@@ -4653,19 +4731,21 @@ class MailService:
                     unread=known_unread,
                     total=known_total,
                     done=False,
-                    cursor={
-                        "refresh_done": False,
-                        "pending_server_refresh": pending_server_refresh,
-                        "refresh_attempts": refresh_attempts,
-                        "refresh_stalls": refresh_stalls,
-                        "uid_count_after_refresh": prev_uid_count,
-                        "indexed_after_refresh": prev_indexed,
-                        "status_seeded": status_seeded,
-                        "did_prepare_content_refresh": did_prepare,
-                        "uids": uids,
-                        "uid_offset": uid_offset,
-                        "yield_for_interactive": True,
-                    },
+                    cursor=_cursor_with_pipeline(
+                        {
+                            "refresh_done": False,
+                            "pending_server_refresh": pending_server_refresh,
+                            "refresh_attempts": refresh_attempts,
+                            "refresh_stalls": refresh_stalls,
+                            "uid_count_after_refresh": prev_uid_count,
+                            "indexed_after_refresh": prev_indexed,
+                            "status_seeded": status_seeded,
+                            "did_prepare_content_refresh": did_prepare,
+                            "uids": uids,
+                            "uid_offset": uid_offset,
+                            "yield_for_interactive": True,
+                        }
+                    ),
                 )
             elif not pending_server_refresh:
                 # Phase 1: index any local UIDs not already in the grow-only index.
@@ -4680,16 +4760,20 @@ class MailService:
                             unread=known_unread,
                             total=max(known_total, len(known_messages)),
                             done=False,
-                            cursor={
-                                "refresh_done": False,
-                                "pending_server_refresh": True,
-                                "refresh_attempts": refresh_attempts,
-                                "refresh_stalls": refresh_stalls,
-                                "uid_count_after_refresh": len(all_uids),
-                                "indexed_after_refresh": len(known_messages),
-                                "status_seeded": status_seeded,
-                                "did_prepare_content_refresh": did_prepare,
-                            },
+                            cursor=_cursor_with_pipeline(
+                                {
+                                    "refresh_done": False,
+                                    "pending_server_refresh": True,
+                                    "refresh_attempts": refresh_attempts,
+                                    "refresh_stalls": refresh_stalls,
+                                    "uid_count_after_refresh": len(all_uids),
+                                    "indexed_after_refresh": len(
+                                        known_messages
+                                    ),
+                                    "status_seeded": status_seeded,
+                                    "did_prepare_content_refresh": did_prepare,
+                                }
+                            ),
                         )
             else:
                 # Phase 2: pull one or more Graph pages, materialize only NEW UIDs.
@@ -4701,7 +4785,7 @@ class MailService:
                 camel_uid_count = prev_uid_count
                 while pages < _HEAVY_FOLDER_REFRESH_PAGES_PER_SLICE:
                     if get_mail_io_thread().has_interactive_work_pending():
-                        log.info(
+                        log.debug(
                             "Heavy-folder page loop yield for interactive "
                             "%s/%s pages=%d indexed=%d",
                             account_uid,
@@ -4711,7 +4795,7 @@ class MailService:
                         )
                         break
                     if pages > 0 and time.monotonic() >= slice_deadline:
-                        log.info(
+                        log.debug(
                             "Heavy-folder page loop slice budget exhausted "
                             "%s/%s pages=%d indexed=%d",
                             account_uid,
@@ -4732,16 +4816,32 @@ class MailService:
                                 "Operation was cancelled",
                                 Gio.IOErrorEnum.CANCELLED,
                             )
-                        # Full re-check at most once per open, and never once the
-                        # local index is already large — prepare_content_refresh
-                        # resets M365 sync state and undoes header progress (#208).
-                        should_prepare = (
+                        # Full re-check when forced after an incomplete delta, or
+                        # at most once per open while the local index is still
+                        # small — prepare_content_refresh resets M365 sync state
+                        # and undoes header progress (#208).
+                        # Use max(memory, disk): Folder::changed used to wipe
+                        # memory while disk still held the progressive index.
+                        disk_indexed = (
+                            len(existing_disk[0])
+                            if existing_disk is not None
+                            else 0
+                        )
+                        indexed_for_prepare = max(len(by_uid), disk_indexed)
+                        force_prepare = bool(
+                            state.get("force_prepare_incomplete_delta")
+                            or session.get("force_prepare_incomplete_delta")
+                        )
+                        should_prepare = force_prepare or (
                             not did_prepare
                             and pages == 0
-                            and len(by_uid) < _HEAVY_FOLDER_PREPARE_MIN_INDEXED
+                            and indexed_for_prepare
+                            < _HEAVY_FOLDER_PREPARE_MIN_INDEXED
                         ) or (
-                            refresh_stalls >= 2
-                            and len(by_uid) < _HEAVY_FOLDER_PREPARE_MIN_INDEXED
+                            not force_prepare
+                            and refresh_stalls >= 2
+                            and indexed_for_prepare
+                            < _HEAVY_FOLDER_PREPARE_MIN_INDEXED
                         )
                         if should_prepare:
                             prepare = getattr(
@@ -4751,17 +4851,20 @@ class MailService:
                                 log.info(
                                     "Heavy-folder prepare_content_refresh for "
                                     "%s/%s (attempt=%d stalls=%d page=%d "
-                                    "indexed=%d)",
+                                    "indexed=%d disk=%d force_incomplete=%s)",
                                     account_uid,
                                     folder_name,
                                     refresh_attempts + 1,
                                     refresh_stalls,
                                     pages,
                                     len(by_uid),
+                                    disk_indexed,
+                                    force_prepare,
                                 )
                                 prepare()
                                 did_prepare = True
                                 session["did_prepare_content_refresh"] = True
+                                session["force_prepare_incomplete_delta"] = False
                                 refresh_stalls = 0
                         elif pages == 0 and not did_prepare:
                             # Mark prepared-skipped so retries do not keep
@@ -4770,10 +4873,12 @@ class MailService:
                             session["did_prepare_content_refresh"] = True
                             log.info(
                                 "Heavy-folder skip prepare_content_refresh for "
-                                "%s/%s (indexed=%d) — continue delta sync",
+                                "%s/%s (indexed=%d disk=%d) — continue delta "
+                                "sync",
                                 account_uid,
                                 folder_name,
                                 len(by_uid),
+                                disk_indexed,
                             )
                         done_event = threading.Event()
                         finish_error: list[BaseException] = []
@@ -4790,16 +4895,35 @@ class MailService:
                             finally:
                                 done_event.set()
 
-                        log.info(
+                        pipeline_id = _next_heavy_pipeline_id()
+                        active_pipeline_id = pipeline_id
+                        camel_uids_before = len(folder_get_uids(folder))
+                        indexed_before = len(by_uid)
+                        _log_heavy_pipeline(
+                            "request",
+                            account_uid,
+                            folder_name,
+                            pipeline_id=pipeline_id,
+                            level=logging.INFO,
+                            action="refresh_info",
+                            attempt=refresh_attempts + 1,
+                            page=pages,
+                            indexed=indexed_before,
+                            camel_uids=camel_uids_before,
+                            did_prepare=did_prepare,
+                            stalls=refresh_stalls,
+                        )
+                        log.debug(
                             "Heavy-folder refresh_info start %s/%s "
-                            "attempt=%d page=%d indexed=%d "
+                            "id=%s attempt=%d page=%d indexed=%d "
                             "did_prepare=%s stalls=%d (no soft timeout; "
                             "cancel on leave)",
                             account_uid,
                             folder_name,
+                            pipeline_id,
                             refresh_attempts + 1,
                             pages,
-                            len(by_uid),
+                            indexed_before,
                             did_prepare,
                             refresh_stalls,
                         )
@@ -4811,7 +4935,7 @@ class MailService:
                         )
 
                         def _persist_and_publish_mid_progress(
-                            *, reason: str
+                            *, reason: str, arrived: int = 0
                         ) -> None:
                             nonlocal existing_disk, unread, total
                             messages_mid = sort_messages_newest_first(
@@ -4864,13 +4988,17 @@ class MailService:
                                     pub_unread,
                                     pub_total,
                                 )
-                            log.info(
-                                "Heavy-folder mid-refresh %s %s/%s "
-                                "indexed=%d",
-                                reason,
+                            _log_heavy_pipeline(
+                                "index",
                                 account_uid,
                                 folder_name,
-                                len(messages_mid),
+                                pipeline_id=pipeline_id,
+                                reason=reason,
+                                indexed=len(messages_mid),
+                                indexed_delta=max(
+                                    0, len(messages_mid) - indexed_before
+                                ),
+                                arrived_since_request=arrived,
                             )
                             if on_progress is None:
                                 return
@@ -4888,6 +5016,7 @@ class MailService:
                                             "did_prepare_content_refresh": (
                                                 did_prepare
                                             ),
+                                            "pipeline_id": pipeline_id,
                                         },
                                     )
                                 )
@@ -4898,12 +5027,74 @@ class MailService:
                                     exc_info=True,
                                 )
 
+                        last_camel_uids = camel_uids_before
+                        last_rewalk_progress = 0.0
+                        last_info_progress_uids = camel_uids_before
+
                         def _refresh_heartbeat(elapsed: float) -> None:
+                            nonlocal last_camel_uids, last_rewalk_progress
+                            nonlocal last_info_progress_uids
                             # Evolution adds Camel summary rows as each Graph
                             # delta page arrives inside refresh_info. Poll for
                             # new UIDs here so the message list grows during
                             # the long wait (#208).
                             all_uids_hb = folder_get_uids(folder)
+                            camel_now = len(all_uids_hb)
+                            arrived_delta = max(0, camel_now - last_camel_uids)
+                            behind = _heavy_folder_camel_behind_server(
+                                camel_now, known_total
+                            )
+                            camel_gap = max(0, known_total - camel_now)
+                            if arrived_delta:
+                                _log_heavy_pipeline(
+                                    "arrive",
+                                    account_uid,
+                                    folder_name,
+                                    pipeline_id=pipeline_id,
+                                    camel_uids=camel_now,
+                                    camel_uids_delta=arrived_delta,
+                                    elapsed_s=round(elapsed, 1),
+                                    source="camel_summary_during_refresh",
+                                )
+                                step = _HEAVY_FOLDER_INFO_PROGRESS_UID_STEP
+                                if (
+                                    camel_now // step
+                                    > last_info_progress_uids // step
+                                ):
+                                    last_info_progress_uids = camel_now
+                                    log.info(
+                                        "Heavy-folder sync progress %s/%s "
+                                        "id=%s camel_uids=%d known_total=%d "
+                                        "indexed=%d elapsed=%.0fs",
+                                        account_uid,
+                                        folder_name,
+                                        pipeline_id,
+                                        camel_now,
+                                        known_total,
+                                        len(by_uid),
+                                        elapsed,
+                                    )
+                                last_camel_uids = camel_now
+                            elif behind and (
+                                elapsed - last_rewalk_progress
+                                >= _HEAVY_FOLDER_REWALK_PROGRESS_SECONDS
+                                or last_rewalk_progress == 0.0
+                            ):
+                                # Full delta with partial local summary rewalks
+                                # known UIDs first — count stays flat (#208).
+                                last_rewalk_progress = elapsed
+                                _log_heavy_pipeline(
+                                    "arrive",
+                                    account_uid,
+                                    folder_name,
+                                    pipeline_id=pipeline_id,
+                                    camel_uids=camel_now,
+                                    camel_uids_delta=0,
+                                    known_total=known_total,
+                                    camel_gap=camel_gap,
+                                    elapsed_s=round(elapsed, 1),
+                                    note="rewalking_or_waiting_graph",
+                                )
                             pending_hb = [
                                 u
                                 for u in all_uids_hb
@@ -4926,22 +5117,76 @@ class MailService:
                                     materialized_hb += 1
                                 except (OSError, OverflowError, ValueError):
                                     continue
-                            log.info(
+                            rewalk_note = (
+                                " rewalk_gap=%d" % camel_gap
+                                if behind and not arrived_delta
+                                else ""
+                            )
+                            log.debug(
                                 "Heavy-folder refresh_info waiting %s/%s "
-                                "elapsed=%.1fs indexed=%d camel_uids=%d "
-                                "new=%d page=%d",
+                                "id=%s elapsed=%.1fs indexed=%d camel_uids=%d "
+                                "new=%d page=%d%s",
                                 account_uid,
                                 folder_name,
+                                pipeline_id,
                                 elapsed,
                                 len(by_uid),
-                                len(all_uids_hb),
+                                camel_now,
                                 materialized_hb,
                                 pages,
+                                rewalk_note,
                             )
                             if materialized_hb:
                                 _persist_and_publish_mid_progress(
-                                    reason="heartbeat"
+                                    reason="heartbeat",
+                                    arrived=camel_now - camel_uids_before,
                                 )
+                            elif behind and (
+                                last_rewalk_progress == elapsed
+                            ):
+                                # Keep UI in Syncing without disk churn (#208).
+                                if on_progress is not None:
+                                    try:
+                                        messages_rw = (
+                                            sort_messages_newest_first(
+                                                list(by_uid.values())
+                                            )
+                                        )
+                                        on_progress(
+                                            HeavyFolderIndexProgress(
+                                                messages=messages_rw,
+                                                unread=(
+                                                    known_unread
+                                                    if known_unread >= 0
+                                                    else unread
+                                                ),
+                                                total=max(
+                                                    known_total,
+                                                    len(messages_rw),
+                                                ),
+                                                done=False,
+                                                cursor={
+                                                    "refresh_done": False,
+                                                    "pending_server_refresh": True,
+                                                    "status_seeded": (
+                                                        status_seeded
+                                                    ),
+                                                    "did_prepare_content_refresh": (
+                                                        did_prepare
+                                                    ),
+                                                    "pipeline_id": pipeline_id,
+                                                    "incomplete_delta": True,
+                                                    "camel_uids": camel_now,
+                                                    "camel_gap": camel_gap,
+                                                },
+                                            )
+                                        )
+                                    except Exception:
+                                        log.debug(
+                                            "Heavy-folder rewalk progress "
+                                            "callback failed",
+                                            exc_info=True,
+                                        )
 
                         finished = get_mail_io_thread().pump_until(
                             done_event,
@@ -4988,21 +5233,106 @@ class MailService:
                         pending = [
                             u for u in all_uids if str(u) not in by_uid
                         ]
-                        log.info(
-                            "Heavy-folder refresh page for %s/%s: %d UIDs "
-                            "(%d new, indexed=%d, camel_total=%d)",
+                        arrived_total = max(
+                            0, camel_uid_count - camel_uids_before
+                        )
+                        if arrived_total:
+                            _log_heavy_pipeline(
+                                "arrive",
+                                account_uid,
+                                folder_name,
+                                pipeline_id=pipeline_id,
+                                camel_uids=camel_uid_count,
+                                camel_uids_delta=arrived_total,
+                                source="refresh_info_finished",
+                            )
+                        log.debug(
+                            "Heavy-folder refresh page for %s/%s id=%s: "
+                            "%d UIDs (%d new, indexed=%d, camel_total=%d)",
                             account_uid,
                             folder_name,
+                            pipeline_id,
                             camel_uid_count,
                             len(pending),
                             len(by_uid),
                             camel_total,
                         )
                         if not pending:
-                            refresh_stalls += 1
                             refresh_done = True
                             uids = []
                             uid_offset = 0
+                            if _heavy_folder_camel_behind_server(
+                                camel_uid_count, known_total
+                            ):
+                                # Graph refresh finished with no new local UIDs
+                                # while STATUS still says we are far behind —
+                                # incomplete/stale delta. Force prepare a few
+                                # times, then keep retrying refresh (#208).
+                                prepares_done = int(
+                                    session.get("incomplete_prepare_count")
+                                    or 0
+                                )
+                                force_again = (
+                                    prepares_done
+                                    < _HEAVY_FOLDER_INCOMPLETE_PREPARE_LIMIT
+                                )
+                                if force_again:
+                                    session[
+                                        "force_prepare_incomplete_delta"
+                                    ] = True
+                                    session["did_prepare_content_refresh"] = (
+                                        False
+                                    )
+                                    session["incomplete_prepare_count"] = (
+                                        prepares_done + 1
+                                    )
+                                    did_prepare = False
+                                else:
+                                    session[
+                                        "force_prepare_incomplete_delta"
+                                    ] = False
+                                _log_heavy_pipeline(
+                                    "arrive",
+                                    account_uid,
+                                    folder_name,
+                                    pipeline_id=pipeline_id,
+                                    level=logging.INFO,
+                                    camel_uids=camel_uid_count,
+                                    camel_uids_delta=0,
+                                    known_total=known_total,
+                                    camel_gap=max(
+                                        0, known_total - camel_uid_count
+                                    ),
+                                    pending_new=0,
+                                    force_prepare=force_again,
+                                    incomplete_prepares=prepares_done
+                                    + (1 if force_again else 0),
+                                    note="incomplete_delta_keep_alive",
+                                )
+                                log.info(
+                                    "Heavy-folder incomplete delta keep-alive "
+                                    "%s/%s camel_uids=%d known_total=%d "
+                                    "gap=%d force_prepare=%s prepares=%d",
+                                    account_uid,
+                                    folder_name,
+                                    camel_uid_count,
+                                    known_total,
+                                    max(0, known_total - camel_uid_count),
+                                    force_again,
+                                    prepares_done + (1 if force_again else 0),
+                                )
+                                break
+                            refresh_stalls += 1
+                            _log_heavy_pipeline(
+                                "arrive",
+                                account_uid,
+                                folder_name,
+                                pipeline_id=pipeline_id,
+                                camel_uids=camel_uid_count,
+                                camel_uids_delta=0,
+                                pending_new=0,
+                                note="refresh_finished_no_new_uids",
+                            )
                             if refresh_stalls >= _HEAVY_FOLDER_REFRESH_STALL_LIMIT:
                                 break
                             # Stall: may prepare_content_refresh only while
@@ -5010,8 +5340,15 @@ class MailService:
                             continue
                         refresh_stalls = 0
                         page_grew = True
+                        # Growth means the delta is moving again (#208).
+                        if session.get("force_prepare_incomplete_delta") or (
+                            session.get("incomplete_prepare_count")
+                        ):
+                            session["force_prepare_incomplete_delta"] = False
+                            session["incomplete_prepare_count"] = 0
                         # Materialize every new UID from this page now (usually
                         # tens, not thousands) so the next refresh can run soon.
+                        materialized_page = 0
                         for uid in pending:
                             if get_mail_io_thread().has_interactive_work_pending():
                                 uids = [
@@ -5029,6 +5366,7 @@ class MailService:
                                 by_uid[str(uid)] = message_info_to_dict(
                                     info, uid=uid
                                 )
+                                materialized_page += 1
                             except (OSError, OverflowError, ValueError):
                                 log.debug(
                                     "Skipping message %r in %r due to invalid "
@@ -5041,8 +5379,30 @@ class MailService:
                             uids = []
                             uid_offset = 0
                             refresh_done = True
+                            if materialized_page:
+                                _log_heavy_pipeline(
+                                    "index",
+                                    account_uid,
+                                    folder_name,
+                                    pipeline_id=pipeline_id,
+                                    reason="refresh_page",
+                                    indexed=len(by_uid),
+                                    indexed_delta=materialized_page,
+                                    pending_left=0,
+                                )
                             # More Graph pages while this slice has budget.
                             continue
+                        if materialized_page:
+                            _log_heavy_pipeline(
+                                "index",
+                                account_uid,
+                                folder_name,
+                                pipeline_id=pipeline_id,
+                                reason="refresh_page_partial",
+                                indexed=len(by_uid),
+                                indexed_delta=materialized_page,
+                                pending_left=len(uids) if uids else 0,
+                            )
                         break
                     except GLib.Error as exc:
                         refresh_error = exc
@@ -5051,13 +5411,15 @@ class MailService:
                         ):
                             elapsed = time.monotonic() - started
                             refresh_attempts += 1
+                            pid = locals().get("pipeline_id") or "unknown"
                             log.warning(
                                 "Heavy-folder refresh cancelled after %.1fs "
-                                "for %s/%s (attempt %d); will retry while "
-                                "folder stays open (%d known headers)",
+                                "for %s/%s id=%s (attempt %d); will retry "
+                                "while folder stays open (%d known headers)",
                                 elapsed,
                                 account_uid,
                                 folder_name,
+                                pid,
                                 refresh_attempts,
                                 len(by_uid),
                             )
@@ -5068,6 +5430,21 @@ class MailService:
                             pending = [
                                 u for u in all_uids if str(u) not in by_uid
                             ]
+                            camel_before = locals().get("camel_uids_before")
+                            if isinstance(camel_before, int) and (
+                                camel_uid_count > camel_before
+                            ):
+                                _log_heavy_pipeline(
+                                    "arrive",
+                                    account_uid,
+                                    folder_name,
+                                    pipeline_id=pid,
+                                    camel_uids=camel_uid_count,
+                                    camel_uids_delta=(
+                                        camel_uid_count - camel_before
+                                    ),
+                                    source="cancelled_but_camel_grew",
+                                )
                             # Materialize a batch of any UIDs Camel already has
                             # so soft-timeout yields move the indexed count (#208).
                             materialized = 0
@@ -5099,7 +5476,16 @@ class MailService:
                             refresh_done = bool(uids)
                             pending_server_refresh = True
                             if materialized:
-                                log.info(
+                                _log_heavy_pipeline(
+                                    "index",
+                                    account_uid,
+                                    folder_name,
+                                    pipeline_id=pid,
+                                    reason="cancel_yield",
+                                    indexed=len(by_uid),
+                                    indexed_delta=materialized,
+                                )
+                                log.debug(
                                     "Heavy-folder soft-yield materialized %d "
                                     "headers for %s/%s (indexed=%d)",
                                     materialized,
@@ -5198,13 +5584,19 @@ class MailService:
                 len(messages), status_total
             )
             # After a growth page, immediately schedule another refresh.
+            # Incomplete Camel vs STATUS must keep chasing even after stalls (#208).
+            force_incomplete = bool(
+                session.get("force_prepare_incomplete_delta")
+            )
             if allow_refresh and not local_only and (
                 behind_status
+                or force_incomplete
                 or refresh_stalls < _HEAVY_FOLDER_REFRESH_STALL_LIMIT
             ):
-                log.info(
+                log.debug(
                     "Heavy-folder slice continue refresh %s/%s indexed=%d "
-                    "status_total=%d behind=%s stalls=%d attempts=%d",
+                    "status_total=%d behind=%s stalls=%d attempts=%d "
+                    "force_incomplete=%s",
                     account_uid,
                     folder_name,
                     len(messages),
@@ -5212,22 +5604,27 @@ class MailService:
                     behind_status,
                     refresh_stalls,
                     refresh_attempts,
+                    force_incomplete,
                 )
                 return HeavyFolderIndexProgress(
                     messages=messages,
                     unread=unread,
                     total=max(total, status_total, len(messages)),
                     done=False,
-                    cursor={
-                        "refresh_done": False,
-                        "pending_server_refresh": True,
-                        "refresh_attempts": refresh_attempts,
-                        "refresh_stalls": refresh_stalls,
-                        "uid_count_after_refresh": prev_uid_count,
-                        "indexed_after_refresh": len(messages),
-                        "status_seeded": status_seeded,
-                        "did_prepare_content_refresh": did_prepare,
-                    },
+                    cursor=_cursor_with_pipeline(
+                        {
+                            "refresh_done": False,
+                            "pending_server_refresh": True,
+                            "refresh_attempts": refresh_attempts,
+                            "refresh_stalls": refresh_stalls,
+                            "uid_count_after_refresh": prev_uid_count,
+                            "indexed_after_refresh": len(messages),
+                            "status_seeded": status_seeded,
+                            "did_prepare_content_refresh": did_prepare,
+                            "force_prepare_incomplete_delta": force_incomplete,
+                            "incomplete_delta": force_incomplete or behind_status,
+                        }
+                    ),
                 )
             log.info(
                 "Heavy-folder slice done %s/%s indexed=%d status_total=%d "
@@ -5244,7 +5641,7 @@ class MailService:
                 unread=unread,
                 total=total,
                 done=True,
-                cursor={},
+                cursor=_cursor_with_pipeline({}),
             )
 
         end = min(uid_offset + HEAVY_FOLDER_INDEX_BATCH_SIZE, len(uids))
@@ -5340,7 +5737,7 @@ class MailService:
                 "did_prepare_content_refresh": did_prepare,
             }
             base.update(extra)
-            return base
+            return _cursor_with_pipeline(base)
 
         if not batch_complete:
             next_cursor = _cursor_base(
@@ -5359,7 +5756,7 @@ class MailService:
         else:
             done = True
 
-        log.info(
+        log.debug(
             "Heavy-folder slice materialize %s/%s indexed=%d processed=%d "
             "uid_offset=%d/%d batch_complete=%s done=%s "
             "pending_server_refresh=%s",
@@ -5373,6 +5770,19 @@ class MailService:
             done,
             bool(next_cursor.get("pending_server_refresh")),
         )
+        if processed:
+            _log_heavy_pipeline(
+                "index",
+                account_uid,
+                folder_name,
+                pipeline_id=str(active_pipeline_id or "batch"),
+                reason="uid_batch",
+                indexed=len(messages),
+                indexed_delta=processed,
+                uid_offset=uid_offset,
+                uid_pending=len(uids),
+                batch_complete=batch_complete,
+            )
         return HeavyFolderIndexProgress(
             messages=messages,
             unread=unread,
@@ -6846,9 +7256,29 @@ class MailService:
     def _invalidate_folder_index(
         self, account_uid: str, folder_name: str | None
     ) -> None:
-        if folder_name:
-            self._folder_indexes.pop((account_uid, folder_name), None)
-            folder_index_cache.invalidate(account_uid, folder_name)
+        if not folder_name:
+            return
+        # Archive/Trash/Junk indexes are grown progressively across Graph pages.
+        # Folder::changed during refresh/cancel must not delete that work — a
+        # follow-up Camel summary rebuild collapses thousands of headers and
+        # then prepare_content_refresh forces a full delta reset (#208).
+        if is_heavy_folder_name(folder_name):
+            existing = self._folder_indexes.get((account_uid, folder_name))
+            disk = folder_index_cache.load(account_uid, folder_name)
+            kept = max(
+                len(existing.messages) if existing is not None else 0,
+                len(disk[0]) if disk is not None else 0,
+            )
+            log.info(
+                "Heavy-folder skip index invalidate for %s/%s "
+                "(keeping %d indexed headers)",
+                account_uid,
+                folder_name,
+                kept,
+            )
+            return
+        self._folder_indexes.pop((account_uid, folder_name), None)
+        folder_index_cache.invalidate(account_uid, folder_name)
 
     @staticmethod
     def guess_inbox(folders: list[dict]) -> str | None:
