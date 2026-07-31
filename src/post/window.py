@@ -3287,9 +3287,11 @@ class MainWindow(Adw.ApplicationWindow):
             return
         load_id = load_id_opt
         if cursor and cursor.get("pending_server_refresh"):
+            # Same wording as progress updates — avoid flickering with the
+            # "...indexed so far" / "...of N on server" lines (#208 Spam).
             GLib.idle_add(
                 self._set_status,
-                f"Fetching {folder_name} headers from server…",
+                f"Fetching {folder_name} headers…",
             )
         try:
             def _mid_refresh_progress(mid: object) -> None:
@@ -3425,11 +3427,14 @@ class MainWindow(Adw.ApplicationWindow):
         # them with partial Camel / folder-index counts (#208 confusion).
         server = self._mail.get_folder_status_totals(account_uid, folder_name)
         server_total = server[1] if server is not None else -1
-        from post.mail.folder_status_cache import MIN_TRUSTED_STATUS_TOTAL
+        from post.mail.folder_status_cache import status_total_is_trusted
 
         keep_indexing = not progress.done
         if not progress.done:
-            if server_total >= MIN_TRUSTED_STATUS_TOTAL and server_total > indexed:
+            if (
+                status_total_is_trusted(folder_name, server_total)
+                and server_total > indexed
+            ):
                 self._set_status(
                     f"Fetching {folder_name} headers… {indexed} of "
                     f"{server_total} on server"
@@ -3444,10 +3449,9 @@ class MainWindow(Adw.ApplicationWindow):
 
             # Indexer may finish after a partial Graph refresh while STATUS is
             # still much larger — keep chasing while this folder stays open.
-            if (
-                server_total >= MIN_TRUSTED_STATUS_TOTAL
-                and not index_caught_up(indexed, server_total)
-            ):
+            if status_total_is_trusted(
+                folder_name, server_total
+            ) and not index_caught_up(indexed, server_total, folder_name):
                 keep_indexing = True
                 self._message_sync_in_progress = True
                 self._set_status(
@@ -3620,7 +3624,9 @@ class MainWindow(Adw.ApplicationWindow):
             )
             self._update_message_status(account, folder_name)
             self._schedule_bind_unbound_heavy_messages(load_id)
-            if keep_indexing and server_total >= MIN_TRUSTED_STATUS_TOTAL:
+            if keep_indexing and status_total_is_trusted(
+                folder_name, server_total
+            ):
                 self._set_status(
                     f"Fetching {folder_name} headers… {indexed} of "
                     f"{server_total} on server · older mail loading "
@@ -4979,9 +4985,9 @@ class MainWindow(Adw.ApplicationWindow):
                 )
             return
 
-        # Trusted STATUS totals are large; Camel summary sizes (~hundreds) must
-        # not be labeled "on server" (#208).
-        from post.mail.folder_status_cache import MIN_TRUSTED_STATUS_TOTAL
+        # Trusted STATUS totals (large Archive, or any Trash/Junk lock-in) may
+        # be labeled "on server"; Camel summary sizes must not (#208).
+        from post.mail.folder_status_cache import status_total_is_trusted
 
         server_total = -1
         if is_heavy_folder_name(folder_name):
@@ -4995,7 +5001,7 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
         if is_heavy_folder_name(folder_name) and indexed >= 0:
-            trusted = server_total >= MIN_TRUSTED_STATUS_TOTAL
+            trusted = status_total_is_trusted(folder_name, server_total)
             if trusted and server_total > indexed:
                 if shown < indexed:
                     self._set_status(

@@ -139,7 +139,11 @@ from .folders import (
     validate_folder_display_name,
 )
 from post.preferences import get_account_user_online
-from .message_list_state import HEAVY_FOLDER_INDEX_BATCH_SIZE, is_heavy_folder_name
+from .message_list_state import (
+    HEAVY_FOLDER_INDEX_BATCH_SIZE,
+    is_heavy_folder_name,
+    is_trash_or_junk_folder_name,
+)
 from .offline_settings import apply_offline_settings_to_store, apply_offline_sync_to_folder
 from .offline_sync import OfflineBodySyncCoordinator, OfflineSyncProgress
 from .search import (
@@ -5581,17 +5585,46 @@ class MailService:
                     status_total = max(status_total, cached_status[1])
                     total = max(total, cached_status[1])
             behind_status = not folder_status_cache.index_caught_up(
-                len(messages), status_total
+                len(messages), status_total, folder_name
             )
-            # After a growth page, immediately schedule another refresh.
-            # Incomplete Camel vs STATUS must keep chasing even after stalls (#208).
+            # Spam/Trash/Junk are often <1000 messages. Without a locked STATUS
+            # total, behind_status stays true forever and the indexer never
+            # finishes (status flickers "from server" ↔ "so far"). After several
+            # no-growth refreshes, lock STATUS from the local index (#208).
+            if (
+                behind_status
+                and is_trash_or_junk_folder_name(folder_name)
+                and not folder_status_cache.status_total_is_trusted(
+                    folder_name, status_total
+                )
+                and refresh_stalls >= 2
+            ):
+                folder_status_cache.observe(
+                    account_uid,
+                    folder_name,
+                    unread if unread >= 0 else 0,
+                    len(messages),
+                    trusted=True,
+                )
+                status_total = len(messages)
+                total = max(total, status_total)
+                behind_status = False
+                log.info(
+                    "Heavy-folder Trash/Junk STATUS locked from local index "
+                    "%s/%s indexed=%d stalls=%d",
+                    account_uid,
+                    folder_name,
+                    len(messages),
+                    refresh_stalls,
+                )
+            # Keep chasing while behind STATUS or incomplete-delta keep-alive.
+            # Do not continue solely because stalls < limit — that left caught-up
+            # folders refreshing and flickering status forever (#208 Spam).
             force_incomplete = bool(
                 session.get("force_prepare_incomplete_delta")
             )
             if allow_refresh and not local_only and (
-                behind_status
-                or force_incomplete
-                or refresh_stalls < _HEAVY_FOLDER_REFRESH_STALL_LIMIT
+                behind_status or force_incomplete
             ):
                 log.debug(
                     "Heavy-folder slice continue refresh %s/%s indexed=%d "
