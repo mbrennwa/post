@@ -29,6 +29,7 @@ from post.icon_utils import apply_window_icon
 from post.mail import MailService
 from post.mail.eds import MailAccount, MessageNotAvailableError, OfflineSyncProgress
 from post.mail.io_thread import get_mail_io_thread
+from post.mail.mailto import MailtoCompose, parse_mailto_uri
 from post.mail.sync_watcher import MailSyncWatcher
 from post.message_list_view import VirtualMessageList
 from post.open_uri import open_uri_externally
@@ -1688,6 +1689,23 @@ class MainWindow(Adw.ApplicationWindow):
             account = MailService.pick_default_account(sendable) or sendable[0]
         self._present_compose_window(account, mode="new")
 
+    def open_compose_mailto(self, uri: str) -> None:
+        """Open a new compose window prefilled from a mailto: URI."""
+        try:
+            mailto = parse_mailto_uri(uri)
+        except ValueError:
+            self._set_status("Could not open mailto link")
+            return
+        sendable = self._mail.list_sendable_accounts()
+        if not sendable:
+            self._set_status("No mail account configured for sending")
+            return
+        account = self._compose_account()
+        if account is None or not account.can_send:
+            account = MailService.pick_default_account(sendable) or sendable[0]
+        # Present compose last so the main window does not cover it.
+        self._present_compose_window(account, mode="new", mailto=mailto)
+
     def _open_compose_on_message(self, mode: str) -> None:
         if not self._current_message_uid:
             prompt = "Select a message to forward" if mode == "forward" else "Select a message to reply"
@@ -1773,6 +1791,7 @@ class MainWindow(Adw.ApplicationWindow):
         draft_message_uid: str | None = None,
         draft_message: dict | None = None,
         outbox_queue_id: str | None = None,
+        mailto: MailtoCompose | None = None,
     ) -> None:
         window = ComposeWindow(
             parent=self,
@@ -1789,6 +1808,7 @@ class MainWindow(Adw.ApplicationWindow):
             draft_message_uid=draft_message_uid,
             draft_message=draft_message,
             outbox_queue_id=outbox_queue_id,
+            mailto=mailto,
         )
         self._compose_windows.append(window)
         window.connect(
