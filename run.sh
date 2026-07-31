@@ -70,10 +70,11 @@ Comment=Send and receive email
 Icon=$icon_png
 StartupWMClass=io.github.mbrennwa.Post
 TryExec=$post_bin
-Exec=$post_bin %U
+Exec=$post_bin %u
 Type=Application
 Terminal=false
 Categories=GNOME;GTK;Network;Email;
+MimeType=x-scheme-handler/mailto;
 StartupNotify=true
 EOF
   chmod 644 "$desktop_file"
