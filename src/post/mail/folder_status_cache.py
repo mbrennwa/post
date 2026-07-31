@@ -22,13 +22,16 @@ import logging
 import os
 from pathlib import Path
 
+from post.mail.message_list_state import is_trash_or_junk_folder_name
+
 log = logging.getLogger(__name__)
 
 _CACHE_VERSION = 3
 _CACHE_ROOT = Path.home() / ".cache" / "post" / "folder-status"
 
 # Totals below this are typical Camel local-summary sizes after opening a
-# large M365 Archive. Do not persist them as STATUS.
+# large M365 Archive. Do not persist them as Archive STATUS. Trash/Junk are
+# often legitimately smaller and use a separate lock-in path (#208).
 MIN_TRUSTED_STATUS_TOTAL = 1000
 
 
@@ -103,6 +106,10 @@ def scrub_if_summary_echo(
     account_uid: str, folder_name: str, local_indexed: int
 ) -> None:
     """Remove a high-water mark that only echoes the local index (#208)."""
+    # Trash/Junk STATUS is often <1000; the Archive echo heuristic must not
+    # wipe those legitimate totals.
+    if is_trash_or_junk_folder_name(folder_name):
+        return
     existing = load(account_uid, folder_name)
     if existing is None:
         return
@@ -143,19 +150,29 @@ def observe(
         return existing if existing is not None else (unread, total)
 
     if existing is None:
-        if trusted and total >= MIN_TRUSTED_STATUS_TOTAL:
-            if local_indexed is not None and looks_like_summary_echo(
-                total, local_indexed
-            ):
-                return unread, total
+        if not trusted:
+            return unread, total
+        # Trash/Junk: trusted STATUS may be small; persist it so the sidebar
+        # can show counts / drop "(working…)" instead of a permanent blank.
+        if is_trash_or_junk_folder_name(folder_name):
             _save(account_uid, folder_name, unread, total)
             return unread, total
+        # Archive / All Mail: refuse summary-sized first lock-in.
+        if total < MIN_TRUSTED_STATUS_TOTAL:
+            return unread, total
+        if local_indexed is not None and looks_like_summary_echo(
+            total, local_indexed
+        ):
+            return unread, total
+        _save(account_uid, folder_name, unread, total)
         return unread, total
 
     prev_unread, prev_total = existing
     if total > prev_total:
-        if local_indexed is not None and looks_like_summary_echo(
-            total, local_indexed
+        if (
+            not is_trash_or_junk_folder_name(folder_name)
+            and local_indexed is not None
+            and looks_like_summary_echo(total, local_indexed)
         ):
             # Do not raise the high-water with a summary echo.
             return prev_unread, prev_total
@@ -201,17 +218,36 @@ def resolve_sidebar(
     return -1, -1
 
 
-def index_caught_up(indexed: int, server_total: int) -> bool:
+def index_caught_up(
+    indexed: int,
+    server_total: int,
+    folder_name: str | None = None,
+) -> bool:
     """True when heavy-folder header index has caught a trusted STATUS (#208).
 
-    Unknown / summary-sized STATUS must not count as catch-up — that froze
-    Archive at ~1300 while the server still had ~28k.
+    Unknown / summary-sized Archive STATUS must not count as catch-up — that
+    froze Archive at ~1300 while the server still had ~28k. Trash/Junk STATUS
+    is often legitimately under 1000 once locked in.
     """
-    if server_total < MIN_TRUSTED_STATUS_TOTAL:
+    if not status_total_is_trusted(folder_name, server_total):
         return False
+    if folder_name and is_trash_or_junk_folder_name(folder_name):
+        return indexed >= server_total
     if looks_like_summary_echo(server_total, indexed):
         return False
     return indexed >= server_total
+
+
+def status_total_is_trusted(folder_name: str | None, server_total: int) -> bool:
+    """True when ``server_total`` is safe to show as STATUS / chase toward.
+
+    Archive requires a large lock-in; Trash/Junk may be small.
+    """
+    if server_total < 0:
+        return False
+    if is_trash_or_junk_folder_name(folder_name):
+        return True
+    return server_total >= MIN_TRUSTED_STATUS_TOTAL
 
 
 def _save(account_uid: str, folder_name: str, unread: int, total: int) -> None:
