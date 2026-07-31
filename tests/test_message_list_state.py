@@ -171,6 +171,19 @@ class MessageBatchRangesTests(unittest.TestCase):
         self.assertFalse(is_heavy_folder_name("Inbox"))
         self.assertFalse(is_heavy_folder_name("Sent Items"))
 
+    def test_trash_or_junk_folder_name(self) -> None:
+        from post.mail.message_list_state import (
+            is_archive_folder_name,
+            is_trash_or_junk_folder_name,
+        )
+
+        self.assertTrue(is_trash_or_junk_folder_name("Spam"))
+        self.assertTrue(is_trash_or_junk_folder_name("Junk Email"))
+        self.assertTrue(is_trash_or_junk_folder_name("Deleted Items"))
+        self.assertFalse(is_trash_or_junk_folder_name("Archive"))
+        self.assertTrue(is_archive_folder_name("Archive"))
+        self.assertFalse(is_archive_folder_name("Spam"))
+
     def test_offline_folder_priority_order(self) -> None:
         from post.mail.message_list_state import (
             OFFLINE_PRIORITY_ARCHIVE,

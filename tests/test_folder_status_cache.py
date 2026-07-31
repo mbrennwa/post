@@ -144,6 +144,65 @@ class FolderStatusCacheTests(unittest.TestCase):
         self.assertFalse(folder_status_cache.index_caught_up(400, 28177))
         self.assertTrue(folder_status_cache.index_caught_up(28177, 28177))
 
+    def test_trusted_small_trash_junk_locks_in(self) -> None:
+        self.assertEqual(
+            folder_status_cache.observe(
+                "acct", "Spam", 12, 319, trusted=True
+            ),
+            (12, 319),
+        )
+        self.assertEqual(
+            folder_status_cache.load("acct", "Spam"),
+            (12, 319),
+        )
+        self.assertEqual(
+            folder_status_cache.resolve_sidebar("acct", "Spam", -1, -1),
+            (12, 319),
+        )
+        self.assertEqual(
+            folder_status_cache.observe(
+                "acct", "Trash", 0, 47, trusted=True
+            ),
+            (0, 47),
+        )
+        self.assertEqual(folder_status_cache.load("acct", "Trash"), (0, 47))
+
+    def test_scrub_does_not_clear_small_junk_status(self) -> None:
+        folder_status_cache.observe(
+            "acct", "Junk", 3, 80, trusted=True
+        )
+        folder_status_cache.scrub_if_summary_echo("acct", "Junk", 80)
+        self.assertEqual(
+            folder_status_cache.load("acct", "Junk"),
+            (3, 80),
+        )
+
+    def test_index_caught_up_trash_junk_small_totals(self) -> None:
+        self.assertTrue(
+            folder_status_cache.index_caught_up(319, 319, "Spam")
+        )
+        self.assertFalse(
+            folder_status_cache.index_caught_up(200, 319, "Spam")
+        )
+        # Archive still rejects summary-sized catch-up.
+        self.assertFalse(
+            folder_status_cache.index_caught_up(530, 530, "Archive")
+        )
+
+    def test_status_total_is_trusted(self) -> None:
+        self.assertTrue(
+            folder_status_cache.status_total_is_trusted("Spam", 319)
+        )
+        self.assertFalse(
+            folder_status_cache.status_total_is_trusted("Spam", -1)
+        )
+        self.assertFalse(
+            folder_status_cache.status_total_is_trusted("Archive", 530)
+        )
+        self.assertTrue(
+            folder_status_cache.status_total_is_trusted("Archive", 28177)
+        )
+
 
 class GraphFolderCountsTests(unittest.TestCase):
     def test_well_known_ids(self) -> None:
