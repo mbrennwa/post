@@ -23,6 +23,7 @@ from gi.repository import Adw, Gio, GLib, Gtk
 from post.header_bar import add_end_window_controls, apply_header_corner_inset
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
+from post.mail.mailto import MailtoCompose
 from post.mail.compose import (
     ComposeAttachment,
     body_mentions_attachment,
@@ -418,6 +419,7 @@ class ComposeWindow(Adw.Window):
         draft_message_uid: str | None = None,
         draft_message: dict[str, Any] | None = None,
         outbox_queue_id: str | None = None,
+        mailto: MailtoCompose | None = None,
     ) -> None:
         super().__init__()
         self._parent_window = parent
@@ -438,6 +440,7 @@ class ComposeWindow(Adw.Window):
         self._draft_message_uid = draft_message_uid
         self._draft_message = draft_message
         self._outbox_queue_id = outbox_queue_id
+        self._mailto = mailto
         self._saving_draft = False
         self._draft_save_generation = 0
         self._draft_save_cancellable: Gio.Cancellable | None = None
@@ -1309,11 +1312,27 @@ class ComposeWindow(Adw.Window):
             )
             self._rebuild_attachment_rows()
         else:
+            mailto = self._mailto
+            if mailto is not None:
+                if mailto.to:
+                    self._to_entry.set_text(format_address_list(list(mailto.to)))
+                if mailto.cc:
+                    self._show_cc_field(format_address_list(list(mailto.cc)))
+                if mailto.bcc:
+                    self._bcc_entry.set_text(format_address_list(list(mailto.bcc)))
+                    self._bcc_row.set_visible(True)
+                    self._bcc_entry.set_can_focus(True)
+                    self._bcc_toggle_btn.set_label("Hide Bcc")
+                if mailto.subject:
+                    self._subject_entry.set_text(mailto.subject)
             body = compose_body_with_signature(
                 mode="new",
                 quoted_body="",
                 signature=signature,
             )
+            if mailto is not None and mailto.body:
+                # Signature block (if any) is "\n\n…"; keep mailto body above it.
+                body = mailto.body + body
             self._set_body_plain_text(body)
             self._tracked_signature = normalize_signature_text(signature) or None
             self._place_signature_mark()
