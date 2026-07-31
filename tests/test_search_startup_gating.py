@@ -522,5 +522,92 @@ class CachedHeaderSearchGateTests(unittest.TestCase):
             )
 
 
+class RebuildSearchScopeDropdownTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not Gtk.is_initialized():
+            Gtk.init()
+
+    def setUp(self) -> None:
+        self.window = mock.Mock()
+        self.window._search_scope = SearchScope(SEARCH_SCOPE_FOLDER)
+        self.window._search_scope_items = []
+        self.window._search_scope_dropdown = Gtk.DropDown()
+        self.window._search_scope_dropdown_updating = False
+        self.window._sidebar = mock.Mock()
+        self.window._sidebar.account_display_label = mock.Mock(
+            side_effect=lambda uid: f"{uid}@example.com"
+        )
+        self.window._set_search_scope_dropdown_selected = (
+            lambda scope: MainWindow._set_search_scope_dropdown_selected(
+                self.window, scope
+            )
+        )
+
+    def _labels(self) -> list[str]:
+        model = self.window._search_scope_dropdown.get_model()
+        assert model is not None
+        return [model.get_string(i) for i in range(model.get_n_items())]
+
+    def test_zero_accounts_omits_per_account_entries(self) -> None:
+        MainWindow._rebuild_search_scope_dropdown(self.window, [])
+        self.assertEqual(self._labels(), ["Selected Folder", "All Mail"])
+        self.assertEqual(
+            self.window._search_scope_items,
+            [
+                SearchScope(SEARCH_SCOPE_FOLDER),
+                SearchScope(SEARCH_SCOPE_ALL),
+            ],
+        )
+
+    def test_single_account_omits_redundant_account_entry(self) -> None:
+        MainWindow._rebuild_search_scope_dropdown(self.window, ["acct-1"])
+        self.assertEqual(self._labels(), ["Selected Folder", "All Mail"])
+        self.assertEqual(
+            self.window._search_scope_items,
+            [
+                SearchScope(SEARCH_SCOPE_FOLDER),
+                SearchScope(SEARCH_SCOPE_ALL),
+            ],
+        )
+        self.window._sidebar.account_display_label.assert_not_called()
+
+    def test_multiple_accounts_lists_each_account(self) -> None:
+        MainWindow._rebuild_search_scope_dropdown(
+            self.window, ["acct-1", "acct-2"]
+        )
+        self.assertEqual(
+            self._labels(),
+            [
+                "Selected Folder",
+                "acct-1@example.com",
+                "acct-2@example.com",
+                "All Mail",
+            ],
+        )
+        self.assertEqual(
+            self.window._search_scope_items,
+            [
+                SearchScope(SEARCH_SCOPE_FOLDER),
+                SearchScope(SEARCH_SCOPE_ACCOUNT, account_uid="acct-1"),
+                SearchScope(SEARCH_SCOPE_ACCOUNT, account_uid="acct-2"),
+                SearchScope(SEARCH_SCOPE_ALL),
+            ],
+        )
+
+    def test_single_account_remaps_saved_account_scope_to_all_mail(self) -> None:
+        self.window._search_scope = SearchScope(
+            SEARCH_SCOPE_ACCOUNT, account_uid="acct-1"
+        )
+        with mock.patch("post.window.set_search_scope") as set_search_scope:
+            MainWindow._rebuild_search_scope_dropdown(self.window, ["acct-1"])
+        self.assertEqual(self.window._search_scope, SearchScope(SEARCH_SCOPE_ALL))
+        set_search_scope.assert_called_once_with(SearchScope(SEARCH_SCOPE_ALL))
+        self.assertEqual(
+            self.window._search_scope_dropdown.get_selected(),
+            1,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

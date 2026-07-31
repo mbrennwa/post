@@ -2414,20 +2414,28 @@ class MainWindow(Adw.ApplicationWindow):
     def _rebuild_search_scope_dropdown(self, account_uids: list[str]) -> None:
         items: list[SearchScope] = [SearchScope(SEARCH_SCOPE_FOLDER)]
         labels = ["Selected Folder"]
-        for account_uid in account_uids:
-            items.append(SearchScope(SEARCH_SCOPE_ACCOUNT, account_uid=account_uid))
-            labels.append(self._sidebar.account_display_label(account_uid))
+        # Per-account scopes only matter with 2+ accounts; a single account
+        # entry would duplicate "All Mail" (#222).
+        if len(account_uids) > 1:
+            for account_uid in account_uids:
+                items.append(
+                    SearchScope(SEARCH_SCOPE_ACCOUNT, account_uid=account_uid)
+                )
+                labels.append(self._sidebar.account_display_label(account_uid))
         items.append(SearchScope(SEARCH_SCOPE_ALL))
         labels.append("All Mail")
 
         scope = self._search_scope
-        if (
-            scope.kind == SEARCH_SCOPE_ACCOUNT
-            and scope.account_uid not in account_uids
-        ):
-            scope = SearchScope(SEARCH_SCOPE_FOLDER)
-            self._search_scope = scope
-            set_search_scope(scope)
+        if scope.kind == SEARCH_SCOPE_ACCOUNT:
+            if scope.account_uid not in account_uids:
+                scope = SearchScope(SEARCH_SCOPE_FOLDER)
+                self._search_scope = scope
+                set_search_scope(scope)
+            elif len(account_uids) <= 1:
+                # Hidden account entry is equivalent to All Mail.
+                scope = SearchScope(SEARCH_SCOPE_ALL)
+                self._search_scope = scope
+                set_search_scope(scope)
 
         self._search_scope_items = items
         model = Gtk.StringList.new(labels)
