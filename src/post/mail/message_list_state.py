@@ -42,21 +42,34 @@ def _folder_leaf_name(folder_name: str | None) -> str:
     return lower.rsplit("/", 1)[-1]
 
 
+def is_archive_folder_name(folder_name: str | None) -> bool:
+    """True for Archive / All Mail (often tens of thousands of messages)."""
+    if not folder_name:
+        return False
+    lower = folder_name.strip().lower().replace("\\", "/")
+    leaf = lower.rsplit("/", 1)[-1]
+    if leaf in _ARCHIVE_LEAVES:
+        return True
+    return "[google mail]/all mail" in lower or "[gmail]/all mail" in lower
+
+
+def is_trash_or_junk_folder_name(folder_name: str | None) -> bool:
+    """True for Trash / Junk / Spam (often legitimately under 1000 messages)."""
+    if not folder_name:
+        return False
+    leaf = _folder_leaf_name(folder_name)
+    return leaf in _TRASH_LEAVES or leaf in _JUNK_LEAVES
+
+
 def is_heavy_folder_name(folder_name: str | None) -> bool:
     """Return True for folders where a full Camel reindex often OOMs (#189/#208).
 
     Includes Archive / All Mail, Trash, and Junk — valuable mail can land in
     Trash/Junk by accident and must still be indexed for list/search.
     """
-    if not folder_name:
-        return False
-    lower = folder_name.strip().lower().replace("\\", "/")
-    leaf = lower.rsplit("/", 1)[-1]
-    if leaf in _ARCHIVE_LEAVES or leaf in _TRASH_LEAVES or leaf in _JUNK_LEAVES:
-        return True
-    if "[google mail]/all mail" in lower or "[gmail]/all mail" in lower:
-        return True
-    return False
+    return is_archive_folder_name(folder_name) or is_trash_or_junk_folder_name(
+        folder_name
+    )
 
 
 def offline_folder_priority(
