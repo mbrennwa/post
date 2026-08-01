@@ -14,26 +14,28 @@ Big-picture capabilities for the current tree (refresh on every release — see
 
 **Implemented**
 
-- GNOME Online Accounts: IMAP, Gmail, Microsoft 365, and local machine mail
-- Read mail: accounts/folders, message list, reader pane
-- Compose, reply, forward; file attachments
-- Outbox and delayed send
-- Per-account online / take-offline
-- Offline body cache and search over cached content
-- Archive, trash, and junk handling
-- Installable `.deb` for Debian 12+ / Ubuntu 24.04+
-- Project landing page
+- IMAP, Gmail, Microsoft 365, and local machine mail (through GNOME Online Accounts)
+- Read mail: accounts/folders, message list, HTML reader (inline + separate window)
+- Search over message headers and bodies
+- Compose: new / reply / reply-all / forward; attachments; drafts; signatures; correspondent autocomplete
+- Outbox with delayed send
+- Offline: per-account take-offline, body-cache prefs, queued send / moves / drafts
+- Archive and trash with undo
+- Live folder sync; create / rename / delete folders; Empty Trash
+- Desktop mailto: handling
+- Unsubscribe from mailing lists
+- .DEB installer package (Debian 12+ and derived distros)
 
 **Not yet**
 
-- HTML / rich-text compose
-- Conversation threading
-- Unified inbox across accounts
-- RPM packages
-- Spell check in the composer
-- Drag-and-drop messages between folders
-- Move-to arbitrary folder picker
-- GNOME address book for compose autocomplete
+- HTML / rich-text compose, spell check, inline media
+- Unified inbox (single merged cross-account message list)
+- Drag-and-drop of messages onto folders, arbitrary message move with folder picker
+- Access GNOME address book for compose autocomplete
+- Clickable links in plain-text messages
+- Full header details view
+- Desktop notifications for new mail
+- RPM installer package
 
 
 ## Install
