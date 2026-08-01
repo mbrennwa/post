@@ -331,11 +331,11 @@ class BuildReaderDocumentTests(unittest.TestCase):
         """Outlook reply: new text is color-only; signature has white bg before appendonsend."""
         body_html = (
             '<div class="elementToProof" style="font-size: 12pt; color: rgb(0, 0, 0);">'
-            "Sehr geehrter Herr Brennwald</div>"
+            "Sehr geehrter Herr Example</div>"
             '<div class="elementToProof" style="font-size: 12pt; color: rgb(0, 0, 0);">'
             "Besten Dank für die Vollmacht.</div>"
             '<p style="background-color: rgb(255, 255, 255);">'
-            '<span style="color: rgb(0, 0, 0);">Marco Martone</span></p>'
+            '<span style="color: rgb(0, 0, 0);">Marco Colleague</span></p>'
             '<div id="appendonsend"></div>'
             "<hr>"
             '<blockquote><p style="color: rgb(0, 0, 0);">Quoted history</p></blockquote>'
@@ -434,7 +434,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
             body_html=(
                 "<style>.whitebox { background-color: #ffffff; padding: 12px; }</style>"
                 '<p style="color:#ffffff">Legible intro on dark shell</p>'
-                '<div class="whitebox"><p>Dear Gasometrix Sales Team,</p>'
+                '<div class="whitebox"><p>Dear Company Sales Team,</p>'
                 "<ul><li>Noble / Inert Gases: Helium (He), Argon (Ar)</li></ul></div>"
                 '<p style="color:#ffffff">Legible outro</p>'
             ),
@@ -483,7 +483,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         doc = build_reader_document(
             body_html=(
                 '<div class="elementToProof" style="background-color: rgb(255, 255, 255); '
-                'font-size: 12pt; color: black;">Dear Gasometrix Sales Team,</div>'
+                'font-size: 12pt; color: black;">Dear Company Sales Team,</div>'
                 '<div class="elementToProof" style="font-size: 12pt; color: black;">'
                 "Body on dark shell</div>"
             ),

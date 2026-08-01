@@ -5,6 +5,9 @@ __pycache__/
 dist/
 build/
 
+# Local #115 redaction maps (real addresses / brand strings — never commit)
+scripts/redact-issue-privacy.local.json
+
 # debian package build outputs
 debian/*.log
 debian/*.substvars

@@ -27,7 +27,7 @@ class LocalRecipientTests(unittest.TestCase):
     def test_external_is_not_local(self) -> None:
         self.assertFalse(
             is_local_recipient(
-                "user@gmail.com",
+                "user@example.com",
                 local_address="mbrennwa@localhost",
             )
         )
@@ -44,7 +44,7 @@ class LocalRecipientTests(unittest.TestCase):
         self.assertFalse(
             all_recipients_local(
                 to=["mbrennwa@localhost"],
-                cc=["other@gmail.com"],
+                cc=["other@example.com"],
                 bcc=None,
                 local_address="mbrennwa@localhost",
             )

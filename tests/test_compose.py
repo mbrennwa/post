@@ -207,7 +207,7 @@ class QuotePlainReplyTests(unittest.TestCase):
         self.assertIn("> Line two", body)
 
     def test_empty_body_placeholder(self) -> None:
-        body = quote_plain_reply({"from": "a@b.com", "date_sent": "today"}, None)
+        body = quote_plain_reply({"from": "a@example.com", "date_sent": "today"}, None)
         self.assertIn("(no message body)", body)
 
     def test_quote_uses_from_not_reply_to(self) -> None:
@@ -1129,9 +1129,9 @@ class BuildReplyReferencesTests(unittest.TestCase):
         self.assertEqual(
             build_reply_references(
                 "<a@b.c>",
-                "<xa@b.c@other.com>",
+                "<xa@b.c@example.com>",
             ),
-            "<xa@b.c@other.com> <a@b.c>",
+            "<xa@b.c@example.com> <a@b.c>",
         )
 
     def test_skips_duplicate_token(self) -> None:
@@ -1187,10 +1187,10 @@ class ReferencesNormalizationTests(unittest.TestCase):
         )
 
     def test_strips_embedded_newline_in_message_id_token(self) -> None:
-        broken = "<foo\r\n@bar.com> <baz@x.com>"
+        broken = "<foo\r\n@example.com> <baz@example.com>"
         self.assertEqual(
             normalize_references_header(broken),
-            "<foo@bar.com> <baz@x.com>",
+            "<foo@example.com> <baz@example.com>",
         )
 
     def test_folded_references_passes_compose_validation(self) -> None:
@@ -1454,7 +1454,7 @@ class SignatureComposeTests(unittest.TestCase):
     def test_reply_inserts_signature_before_quote(self) -> None:
         from post.mail.compose import compose_body_with_signature
 
-        quoted = "\n\nOn today, a@b.com wrote:\n> hi\n"
+        quoted = "\n\nOn today, a@example.com wrote:\n> hi\n"
         body = compose_body_with_signature(
             mode="reply",
             quoted_body=quoted,

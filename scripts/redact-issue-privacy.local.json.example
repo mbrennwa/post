@@ -1,0 +1,11 @@
+{
+  "emails": {
+    "person@private.example": "person@example.org",
+    "info@old-company.example": "info@company.example"
+  },
+  "words": [
+    {"pattern": "\\bold-company\\b", "repl": "company", "ignore_case": true},
+    {"pattern": "\\bold-brand\\b", "repl": "Brand", "ignore_case": true},
+    {"pattern": "123 Fake Street, 8000 Example City", "repl": "Example Street 1, 8000 Example City"}
+  ]
+}

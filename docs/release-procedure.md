@@ -40,23 +40,31 @@ screenshots (`./scripts/prepare-demo-screenshot.sh`).
    ./scripts/audit-issue-privacy.sh
    ```
 
-   It must exit 0. It scans all issues/comments for `user-attachments` media and
-   non-placeholder emails, and greps the repo tree for known sensitive strings.
+   It must exit 0. It scans issues **and** PRs (bodies + comments) for
+   `user-attachments` media, non-placeholder emails, and known brand/org
+   strings; walks the repo tree for the same; refuses image files under
+   `.github/issue-assets/`; and checks git history for private author emails
+   and deleted issue-asset screenshots. Use `SKIP_HISTORY=1` only when you
+   intentionally want tracker/tree checks alone.
 
 2. Scrub anything the audit reports:
-   - **Issues / comments:** remove `<img … user-attachments …>` tags; replace
-     real addresses/subjects in pasted logs with placeholders; note
-     `*(Screenshot redacted — #115 privacy audit.)*`.
-   - **Repo:** replace fixtures/docs/examples; delete or replace private files
-     under `.github/issue-assets/` (and elsewhere). Prefer sanitized captures
-     only.
+   - **Issues / PRs / comments:** remove `<img … user-attachments …>` tags;
+     replace real addresses/subjects/brand names in pasted logs with
+     placeholders; note `*(Screenshot redacted — #115 privacy audit.)*`.
+     Helper: copy `scripts/redact-issue-privacy.local.json.example` to
+     `scripts/redact-issue-privacy.local.json` (gitignored), fill maps, then
+     `python3 scripts/redact-issue-privacy.py [nums…]`.
+   - **Repo:** replace fixtures/docs/examples; delete private files under
+     `.github/issue-assets/` (and elsewhere). Prefer sanitized captures only.
+     Never commit the local redaction map.
    - **Landing page / README screenshots:** only after this pass is clean.
 
-3. Spot-check recent PRs, release drafts, and wiki/Pages content the same way.
+3. Spot-check release drafts and wiki/Pages content the same way.
 
-4. If private blobs were ever committed, decide whether a history rewrite is
-   required before making the repo (more) public — deleting the file on `main`
-   alone does not remove it from old commits.
+4. If private blobs or non-public author emails remain in **git history**,
+   rewrite before making the repo public (deleting a file on `main` alone does
+   not remove it from old commits). That requires `git filter-repo` (or
+   equivalent) and a force-push — coordinate with anyone who has clones.
 
 **Do not tag until step 1 exits 0 and remaining manual items are done.**
 

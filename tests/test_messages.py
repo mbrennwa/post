@@ -514,7 +514,7 @@ class PaginateMessagesTests(unittest.TestCase):
 
 class FormatRecipientHeaderTests(unittest.TestCase):
     def test_plain_string(self) -> None:
-        self.assertEqual(format_recipient_header("a@b.com"), "a@b.com")
+        self.assertEqual(format_recipient_header("a@example.com"), "a@example.com")
 
     def test_camel_internet_address(self) -> None:
         import gi

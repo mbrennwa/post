@@ -251,7 +251,7 @@ class FilterMessagesByQueryTests(unittest.TestCase):
             {"uid": "1", "subject": "Einladung", "flags": {"seen": True}},
         ]
         html = (
-            "<p>eBaugesuche project invitation</p>"
+            "<p>Example project invitation</p>"
             '<img src="data:image/png;base64,CHhEwzIZ0NcVewZoet">'
         )
 
@@ -271,8 +271,8 @@ class FilterMessagesByQueryTests(unittest.TestCase):
         messages = [
             {
                 "uid": "1",
-                "subject": "diyAudio notification",
-                "from": "diyAudio <contact@mail.diyaudio.com>",
+                "subject": "ExampleForum notification",
+                "from": "ExampleForum <contact@mail.example.com>",
                 "flags": {"seen": True},
             },
         ]
@@ -281,11 +281,11 @@ class FilterMessagesByQueryTests(unittest.TestCase):
             return searchable_body_text(
                 plain=(
                     "View this direct message:\n"
-                    "https://www.diyaudio.com/direct-messages/abc?token=xEwzNoise"
+                    "https://www.example.com/direct-messages/abc?token=xEwzNoise"
                 ),
                 html=(
-                    "<p>pras1170 has sent you a direct message at diyAudio.</p>"
-                    "<p><a href=\"https://www.diyaudio.com/direct-messages/abc?"
+                    "<p>user1170 has sent you a direct message at ExampleForum.</p>"
+                    "<p><a href=\"https://www.example.com/direct-messages/abc?"
                     "token=xEwzNoise\">View this direct message</a></p>"
                 ),
             )
