@@ -44,6 +44,14 @@ _MESSAGE_APPEARANCE_VALUES: frozenset[str] = frozenset(
 
 _DEFAULT_WINDOW_WIDTH = 1100
 _DEFAULT_WINDOW_HEIGHT = 720
+_DEFAULT_SIDEBAR_WIDTH = 240
+_DEFAULT_MESSAGE_LIST_WIDTH = 320
+# Pane column floors for Gtk.Paned (#229). Keep public so layout code matches prefs.
+MIN_SIDEBAR_WIDTH = 160
+MIN_MESSAGE_LIST_WIDTH = 240
+_MIN_SIDEBAR_WIDTH = MIN_SIDEBAR_WIDTH
+_MIN_MESSAGE_LIST_WIDTH = MIN_MESSAGE_LIST_WIDTH
+_MAX_PANE_WIDTH = 1200
 
 
 def _load_raw() -> dict[str, Any]:
@@ -341,14 +349,24 @@ def set_show_evolution_local(value: bool) -> None:
     _save_raw(data)
 
 
+def _clamp_pane_width(value: object, *, default: int, minimum: int) -> int:
+    try:
+        width = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(_MAX_PANE_WIDTH, width))
+
+
 def get_window_state() -> dict[str, int | bool]:
-    """Return persisted main-window geometry."""
+    """Return persisted main-window geometry and pane widths."""
     raw = _load_raw().get("window")
     if not isinstance(raw, dict):
         return {
             "width": _DEFAULT_WINDOW_WIDTH,
             "height": _DEFAULT_WINDOW_HEIGHT,
             "maximized": False,
+            "sidebar_width": _DEFAULT_SIDEBAR_WIDTH,
+            "message_list_width": _DEFAULT_MESSAGE_LIST_WIDTH,
         }
 
     width = raw.get("width", _DEFAULT_WINDOW_WIDTH)
@@ -360,15 +378,55 @@ def get_window_state() -> dict[str, int | bool]:
     except (TypeError, ValueError):
         width = _DEFAULT_WINDOW_WIDTH
         height = _DEFAULT_WINDOW_HEIGHT
-    return {"width": width, "height": height, "maximized": maximized}
+    sidebar_width = _clamp_pane_width(
+        raw.get("sidebar_width", _DEFAULT_SIDEBAR_WIDTH),
+        default=_DEFAULT_SIDEBAR_WIDTH,
+        minimum=_MIN_SIDEBAR_WIDTH,
+    )
+    message_list_width = _clamp_pane_width(
+        raw.get("message_list_width", _DEFAULT_MESSAGE_LIST_WIDTH),
+        default=_DEFAULT_MESSAGE_LIST_WIDTH,
+        minimum=_MIN_MESSAGE_LIST_WIDTH,
+    )
+    return {
+        "width": width,
+        "height": height,
+        "maximized": maximized,
+        "sidebar_width": sidebar_width,
+        "message_list_width": message_list_width,
+    }
 
 
-def set_window_state(*, width: int, height: int, maximized: bool) -> None:
+def set_window_state(
+    *,
+    width: int,
+    height: int,
+    maximized: bool,
+    sidebar_width: int | None = None,
+    message_list_width: int | None = None,
+) -> None:
     data = _load_raw()
+    existing = data.get("window") if isinstance(data.get("window"), dict) else {}
+    if sidebar_width is None:
+        sidebar_width = existing.get("sidebar_width", _DEFAULT_SIDEBAR_WIDTH)
+    if message_list_width is None:
+        message_list_width = existing.get(
+            "message_list_width", _DEFAULT_MESSAGE_LIST_WIDTH
+        )
     data["window"] = {
         "width": max(400, int(width)),
         "height": max(300, int(height)),
         "maximized": bool(maximized),
+        "sidebar_width": _clamp_pane_width(
+            sidebar_width,
+            default=_DEFAULT_SIDEBAR_WIDTH,
+            minimum=_MIN_SIDEBAR_WIDTH,
+        ),
+        "message_list_width": _clamp_pane_width(
+            message_list_width,
+            default=_DEFAULT_MESSAGE_LIST_WIDTH,
+            minimum=_MIN_MESSAGE_LIST_WIDTH,
+        ),
     }
     _save_raw(data)
 

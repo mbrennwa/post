@@ -12,7 +12,11 @@ gi.require_version("Pango", "1.0")
 
 from gi.repository import Gtk, Pango
 
-from post.wrap_label import WrappingLabel, configure_ellipsize_label
+from post.wrap_label import (
+    WrappingLabel,
+    configure_ellipsize_label,
+    configure_pane_scrolled_window,
+)
 
 _LONG_LINE = (
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -152,6 +156,22 @@ class WrappingLabelTests(unittest.TestCase):
         row.append(attachment)
         minimum, natural, _, _ = row.measure(Gtk.Orientation.HORIZONTAL, 649)
         self.assertGreaterEqual(natural, minimum)
+
+    def test_pane_scrolled_window_pins_horizontal_adjustment(self) -> None:
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        child = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        child.set_size_request(800, 40)
+        scroll.set_child(child)
+        configure_pane_scrolled_window(scroll)
+        adj = scroll.get_hadjustment()
+        self.assertIsNotNone(adj)
+        assert adj is not None
+        adj.set_lower(0)
+        adj.set_upper(800)
+        adj.set_page_size(120)
+        adj.set_value(200)
+        self.assertEqual(adj.get_value(), 0)
 
 
 if __name__ == "__main__":

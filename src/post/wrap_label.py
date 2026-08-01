@@ -42,6 +42,50 @@ def configure_ellipsize_label(label: Gtk.Label) -> Gtk.Label:
     return label
 
 
+def configure_pane_scrolled_window(scroll: Gtk.ScrolledWindow) -> Gtk.ScrolledWindow:
+    """Keep pane content left-aligned and clip overflow on the right (#229).
+
+    When a scrolled child is wider than the pane, GTK can raise the horizontal
+    adjustment as the pane shrinks, which clips text on the left. Pin the
+    adjustment to 0 and hide overflow so narrowing cuts off the right edge.
+    """
+    scroll.set_propagate_natural_width(False)
+    scroll.set_overflow(Gtk.Overflow.HIDDEN)
+    bound: dict[str, object | None] = {"adj": None, "value_id": None, "changed_id": None}
+
+    def _keep_left(*_args) -> None:
+        adj = scroll.get_hadjustment()
+        if adj is not None and adj.get_value() != 0:
+            adj.set_value(0)
+
+    def _bind_hadjustment(*_args) -> None:
+        adj = scroll.get_hadjustment()
+        prev = bound["adj"]
+        if prev is adj:
+            _keep_left()
+            return
+        if prev is not None:
+            value_id = bound["value_id"]
+            changed_id = bound["changed_id"]
+            if value_id is not None:
+                prev.disconnect(value_id)
+            if changed_id is not None:
+                prev.disconnect(changed_id)
+        bound["adj"] = adj
+        bound["value_id"] = None
+        bound["changed_id"] = None
+        if adj is None:
+            return
+        bound["value_id"] = adj.connect("value-changed", _keep_left)
+        bound["changed_id"] = adj.connect("changed", _keep_left)
+        _keep_left()
+
+    scroll.connect("notify::hadjustment", _bind_hadjustment)
+    scroll.connect("notify::width", _keep_left)
+    _bind_hadjustment()
+    return scroll
+
+
 class WrappingLabel(Gtk.Label):
     """A label that wraps without forcing its parent layout to grow horizontally."""
 
