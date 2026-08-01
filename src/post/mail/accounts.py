@@ -253,6 +253,9 @@ def should_list_local_account(source: EDataServer.Source) -> bool:
     if uid == BUILTIN_LOCAL_UID:
         return True
     if uid != POST_LOCAL_ACCOUNT_UID:
+        # Screenshot/demo sessions may register extra local Maildir accounts.
+        if os.environ.get("POST_DEMO") == "1" and uid.startswith("post-demo-"):
+            return is_local_account_usable(source)
         log.debug("Skipping non-Post local account %s", uid)
         return False
     if not is_local_account_usable(source):
