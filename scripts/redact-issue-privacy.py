@@ -1,65 +1,76 @@
 #!/usr/bin/env python3
-"""One-shot redaction helper for #115 privacy pruning (issues + comments)."""
+"""Redaction helper for #115 privacy pruning (issues, PRs, comments).
+
+Sensitive address/word maps live in an untracked local file so they are not
+committed:
+
+  scripts/redact-issue-privacy.local.json
+
+Copy the example file and fill in real → placeholder pairs when needed:
+
+  cp scripts/redact-issue-privacy.local.json.example \\
+     scripts/redact-issue-privacy.local.json
+"""
 from __future__ import annotations
 
 import json
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 REPO = "mbrennwa/post"
+SCRIPT_DIR = Path(__file__).resolve().parent
+LOCAL_MAP = SCRIPT_DIR / "redact-issue-privacy.local.json"
 
-# Real / sensitive addresses → placeholders
-EMAIL_MAP = {
-    "matthias@brennwald.org": "person@example.org",
-    "matthias.brennwald@eawag.ch": "person@institute.example",
-    "Matthias.Brennwald@eawag.ch": "person@institute.example",
-    "info@gasometrix.com": "info@company.example",
-    "info@klotzholz.com": "info@vendor.example",
-    "m.martone@ctcag.ch": "colleague@example.com",
-    "turicumfit@cc.magicline.com": "newsletter@example.com",
-    "xyz@abc.com": "xyz@example.com",
-    "email@account.abc": "email@account.example",
-    "abc@x.com.extra": "abc@example.com.extra",
-    "abc@x.com": "abc@example.com",
-}
-
-# Broader word replacements for account/host hints in prose
-WORD_MAP = [
-    (re.compile(r"\beawag\b", re.I), "institute"),
-    (re.compile(r"\bbrennwald\b", re.I), "example"),
-    (re.compile(r"\bgasometrix\b", re.I), "company"),
-    (re.compile(r"\bklotzholz\b", re.I), "vendor"),
-    (re.compile(r"Käferholzstrasse 173, 8046 Zürich", re.I), "Example Street 1, 8000 Example City"),
-    (re.compile(r"Vollmacht Wärmepumpe[^\n<]*", re.I), "Example subject about a heat pump"),
-]
+# Safe defaults committed in-tree (no real addresses). Extended by LOCAL_MAP.
+EMAIL_MAP: dict[str, str] = {}
+WORD_MAP: list[tuple[re.Pattern[str], str]] = []
 
 IMG_MD = re.compile(r"!\[[^\]]*\]\(https://github\.com/user-attachments/assets/[^)]+\)")
 IMG_HTML = re.compile(
     r"<img\b[^>]*src=\"https://github\.com/user-attachments/assets/[^\"]+\"[^>]*/?>",
     re.I,
 )
-# bare URLs on their own line
 ATTACH_URL = re.compile(r"https://github\.com/user-attachments/assets/[A-Za-z0-9-]+")
 
 REDACTION_NOTE = "*(Screenshot redacted — #115 privacy audit.)*"
+
+
+def _load_local_maps() -> None:
+    global EMAIL_MAP, WORD_MAP
+    if not LOCAL_MAP.is_file():
+        print(
+            f"note: {LOCAL_MAP.name} missing — only attachment stripping "
+            "and built-in word patterns apply",
+            file=sys.stderr,
+        )
+        return
+    data = json.loads(LOCAL_MAP.read_text(encoding="utf-8"))
+    emails = data.get("emails") or {}
+    if not isinstance(emails, dict):
+        raise SystemExit(f"{LOCAL_MAP}: 'emails' must be an object")
+    EMAIL_MAP = {str(k): str(v) for k, v in emails.items()}
+    extra_words = data.get("words") or []
+    for entry in extra_words:
+        if not isinstance(entry, dict) or "pattern" not in entry or "repl" not in entry:
+            raise SystemExit(f"{LOCAL_MAP}: each words[] entry needs pattern + repl")
+        flags = re.I if entry.get("ignore_case", True) else 0
+        WORD_MAP.append((re.compile(entry["pattern"], flags), str(entry["repl"])))
 
 
 def redact_text(text: str) -> str:
     if not text:
         return text
     out = text
-    # Longest emails first
     for old in sorted(EMAIL_MAP, key=len, reverse=True):
         out = out.replace(old, EMAIL_MAP[old])
     for pat, repl in WORD_MAP:
         out = pat.sub(repl, out)
 
-    had_img = bool(IMG_MD.search(out) or IMG_HTML.search(out) or ATTACH_URL.search(out))
     out = IMG_MD.sub(REDACTION_NOTE, out)
     out = IMG_HTML.sub(REDACTION_NOTE, out)
     out = ATTACH_URL.sub(REDACTION_NOTE, out)
-    # Collapse duplicate consecutive notes
     out = re.sub(
         r"(\*\(Screenshot redacted — #115 privacy audit\.\)\*\s*){2,}",
         REDACTION_NOTE + "\n\n",
@@ -72,9 +83,7 @@ def gh_api(method: str, path: str, body: dict | None = None) -> dict | list:
     cmd = ["gh", "api", "-X", method, path]
     if body is not None:
         cmd.extend(["--input", "-"])
-        raw = subprocess.check_output(
-            cmd, input=json.dumps(body), text=True
-        )
+        raw = subprocess.check_output(cmd, input=json.dumps(body), text=True)
     else:
         raw = subprocess.check_output(cmd, text=True)
     return json.loads(raw) if raw.strip() else {}
@@ -87,7 +96,8 @@ def patch_issue(num: int) -> bool:
     if new == body:
         return False
     gh_api("PATCH", f"repos/{REPO}/issues/{num}", {"body": new})
-    print(f"  patched issue #{num} body")
+    kind = "pull" if issue.get("pull_request") else "issue"
+    print(f"  patched {kind} #{num} body")
     return True
 
 
@@ -106,7 +116,19 @@ def patch_comments(num: int) -> int:
 
 
 def main() -> int:
-    nums = [int(x) for x in sys.argv[1:]] or [64, 115, 117, 118, 150, 197, 208, 222]
+    _load_local_maps()
+    nums = [int(x) for x in sys.argv[1:]] or [
+        64,
+        115,
+        117,
+        118,
+        150,
+        171,
+        188,
+        197,
+        208,
+        222,
+    ]
     changed = 0
     for num in nums:
         print(f"#{num}")
