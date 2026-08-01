@@ -7,8 +7,8 @@ Writes timestamped warnings, errors, and notable operational events to an
 on-disk rotating log under XDG state. Does not log message bodies, passwords,
 OAuth tokens, or full MIME.
 
-Default file level is DEBUG for now so #201 ListBox rebuild breadcrumbs are
-captured without setting POST_LOG_LEVEL. Stderr/journal stays WARNING+.
+Default on-disk level is INFO; stderr/journal stays WARNING+. Set
+``POST_LOG_LEVEL=DEBUG`` for mail I/O / heavy-folder / search traces.
 """
 
 from __future__ import annotations
@@ -178,10 +178,8 @@ def configure_logging() -> Path:
         file_level = env_level
         stream_level = env_level
     else:
-        # Temporary for #201: keep ListBox mutation DEBUG breadcrumbs on disk
-        # without requiring POST_LOG_LEVEL. Revisit once the crash is isolated.
-        root_level = logging.DEBUG
-        file_level = logging.DEBUG
+        root_level = logging.INFO
+        file_level = logging.INFO
         stream_level = logging.WARNING
 
     root = logging.getLogger()
