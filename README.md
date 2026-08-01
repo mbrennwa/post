@@ -104,8 +104,8 @@ This project was developed with substantial assistance from AI coding tools. The
 
 Every release (testing, final, or otherwise) follows
 **[docs/release-procedure.md](docs/release-procedure.md)** — privacy prune,
-license/provenance, README Status update, automated checks, packaging smoke
-test, then tag. Privacy audit:
+license/provenance, update README Implemented / Not yet, automated checks,
+packaging smoke test, then tag. Privacy audit:
 
 ```bash
 ./scripts/audit-issue-privacy.sh
