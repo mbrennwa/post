@@ -41,13 +41,19 @@ for row in issues:
     for c in data.get("comments") or []:
         texts.append((f"comment:{c['author']['login']}", c.get("body") or ""))
     for where, text in texts:
-        if "user-attachments/assets" in text:
+        # Require /assets/ so checklist prose mentioning "user-attachments" is OK.
+        if "user-attachments/assets/" in text:
             found.append((n, where, "user-attachments screenshot"))
         for m in EMAIL_RE.findall(text):
             if m.lower() in MAINTAINER:
                 continue
             domain = m.split("@", 1)[1].lower()
-            if domain in SAFE_DOMAINS or domain.endswith(".example"):
+            if (
+                domain in SAFE_DOMAINS
+                or domain.endswith(".example")
+                or "example.com" in domain
+                or "example.org" in domain
+            ):
                 continue
             if "github" in domain:
                 continue
@@ -59,14 +65,38 @@ if found:
         print(f"  #{n} {where}: {detail}")
     sys.exit(1)
 
-print("Privacy audit OK: no user-attachments or non-placeholder emails in issues/comments.")
+print(
+    "Privacy audit OK: no user-attachments screenshots or "
+    "non-placeholder emails in issues/comments."
+)
 PY
 
-# Repo tree (fast local grep)
-if rg -n --glob '!scripts/audit-issue-privacy.sh' \
-    -e 'brennwald|klotzholz|ebaugesuche|matthias@' . 2>/dev/null; then
-  echo "Privacy audit FAILED: sensitive strings in repo tree" >&2
-  exit 1
+# Repo tree (fast local grep). Prefer ripgrep when available.
+TREE_PAT='brennwald|klotzholz|ebaugesuche|gasometrix|matthias@'
+EXCLUDE_GLOBS=(
+  '--glob' '!scripts/audit-issue-privacy.sh'
+  '--glob' '!scripts/redact-issue-privacy.py'
+  '--glob' '!scripts/prepare-demo-screenshot.sh'
+  '--glob' '!.github/issue-assets/README.md'
+  '--glob' '!.git/**'
+  '--glob' '!.venv/**'
+)
+if command -v rg >/dev/null; then
+  if rg -n "${EXCLUDE_GLOBS[@]}" -e "$TREE_PAT" . 2>/dev/null; then
+    echo "Privacy audit FAILED: sensitive strings in repo tree" >&2
+    exit 1
+  fi
+else
+  if grep -RInE "$TREE_PAT" \
+      --exclude=audit-issue-privacy.sh \
+      --exclude=redact-issue-privacy.py \
+      --exclude=prepare-demo-screenshot.sh \
+      --exclude-dir=.git --exclude-dir=.venv --exclude-dir=__pycache__ \
+      . 2>/dev/null \
+      | grep -v '.github/issue-assets/README.md'; then
+    echo "Privacy audit FAILED: sensitive strings in repo tree" >&2
+    exit 1
+  fi
 fi
 
 echo "Repo tree OK."
