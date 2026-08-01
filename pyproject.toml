@@ -44,6 +44,23 @@ apt_depends = [
   "desktop-file-utils",
 ]
 
+[tool.rpm]
+# Fedora packages provided by the distro (not PyPI).
+# Target venv uses --system-site-packages (see rpm %post); same pattern as .deb.
+dnf_requires = [
+  "python3 >= 3.10",
+  "python3-pip",
+  "python3-gobject",
+  "gtk4",
+  "libadwaita",
+  "glib2",
+  "webkitgtk6",
+  "evolution-data-server",
+  "evolution-ews",
+  "librsvg2-tools",
+  "desktop-file-utils",
+]
+
 [tool.setuptools.data-files]
 "share/applications" = ["data/io.github.mbrennwa.Post.desktop"]
 "share/icons/hicolor/48x48/apps" = [

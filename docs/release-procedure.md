@@ -103,18 +103,26 @@ drifted.
 Runs all unit tests (including licensing metadata in `tests/test_licensing.py`)
 and `reuse lint`.
 
-Ensure no Debian build artifacts are in the working tree before `reuse lint`
-(run `make deb` only in a clean tree; build outputs belong in `dist/` and
-untracked `debian/post/` staging).
+Ensure no package build artifacts are in the working tree before `reuse lint`
+(run `make deb` / `make rpm` only in a clean tree; build outputs belong in
+`dist/`, untracked `debian/post/` staging, and `.rpmbuild/`).
 
-## 6. Packaging (#4)
+## 6. Packaging (#4, #227)
 
 1. `debian/changelog` upstream version matches `pyproject.toml`.
-2. `make deb` produces `dist/post_<version>_all.deb`.
-3. Smoke-test install on Debian 12+ or Ubuntu 24.04+:
+2. `rpm/post.spec` `Version:` matches `pyproject.toml` (update `%changelog`).
+3. `make deb` produces `dist/post_<version>_all.deb`.
+4. `make rpm` produces `dist/post-<version>-1.noarch.rpm` (Fedora host or
+   container with `rpm-build`).
+5. Smoke-test install:
 
    ```bash
+   # Debian 12+ / Ubuntu 24.04+
    sudo apt install ./dist/post_*_all.deb
+   post
+
+   # Fedora
+   sudo dnf install ./dist/post-*-1.noarch.rpm
    post
    ```
 
@@ -130,12 +138,13 @@ untracked `debian/post/` staging).
    git push origin v<version>
    ```
 
-4. CI (`.github/workflows/release-deb.yml`) builds the `.deb` and attaches it to
-   the GitHub Release (prerelease flag set automatically for `.devN` versions).
+4. CI (`.github/workflows/release-deb.yml`) builds the `.deb` and `.rpm` and
+   attaches both to the GitHub Release (prerelease flag set automatically for
+   `.devN` versions).
 
 ## 8. Post-tag verify
 
-1. GitHub Release page shows the expected `.deb` and prerelease flag.
+1. GitHub Release page shows the expected `.deb`, `.rpm`, and prerelease flag.
 2. Install instructions on the landing page and README still match the Releases
    URL and version.
 3. Privacy audit still passes after any last-minute issue edits tied to the
