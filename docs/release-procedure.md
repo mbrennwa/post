@@ -72,16 +72,19 @@ screenshots (`./scripts/prepare-demo-screenshot.sh`).
 4. Record any findings in the release issue or PR; no incompatible unattributed
    third-party code in the release tree.
 
-## 4. README feature status (#228)
+## 4. Update README Implemented vs Not yet (#228)
 
-Update the **Status** section in `README.md` so it reflects this release:
+Before tagging, refresh the **Status** section in `README.md`:
 
-- **Implemented** — big-picture capabilities that ship and are usable.
-- **Not yet** — big-picture gaps users should not assume exist.
+1. **Implemented** — big-picture capabilities that ship and are usable in this
+   release.
+2. **Not yet** — big-picture gaps users should not assume exist.
+3. Move items between the lists when something landed or was dropped; remove
+   items that are no longer relevant (do not list speculative roadmap).
 
 Keep the lists short and product-level (accounts, compose, search, packaging,
-…), not every open bug. Bump or date the section so it matches the version
-being tagged. Align the landing-page pitch with the same story if it drifted.
+…), not every open bug. Align the landing-page pitch with the same story if it
+drifted.
 
 ## 5. Automated checks
 
