@@ -6,6 +6,36 @@ Post is in active development. Do not assume it is bulletproof for productive en
 
 Project site: [mbrennwa.github.io/post](https://mbrennwa.github.io/post)
 
+
+## Status
+
+Big-picture capabilities for the current tree (refresh on every release — see
+[docs/release-procedure.md](docs/release-procedure.md)).
+
+**Implemented**
+
+- GNOME Online Accounts: IMAP, Gmail, Microsoft 365, and local machine mail
+- Read mail: accounts/folders, message list, reader pane
+- Compose, reply, forward; file attachments
+- Outbox and delayed send
+- Per-account online / take-offline
+- Offline body cache and search over cached content
+- Archive, trash, and junk handling
+- Installable `.deb` for Debian 12+ / Ubuntu 24.04+
+- Project landing page
+
+**Not yet**
+
+- HTML / rich-text compose
+- Conversation threading
+- Unified inbox across accounts
+- RPM packages
+- Spell check in the composer
+- Drag-and-drop messages between folders
+- Move-to arbitrary folder picker
+- GNOME address book for compose autocomplete
+
+
 ## Install
 
 On Debian 12+, Ubuntu 24.04+, or similar DEB-based distros:
@@ -68,15 +98,19 @@ Known third-party code and artwork: EvolutionMCP (MIT) and the Adwaita GNOME Onl
 
 This project was developed with substantial assistance from AI coding tools. The code was reviewed through iterative development, discussion, testing, and acceptance by the project maintainer.
 
-### Compliance checks
+### Releases
 
-Before releases, run:
+Every release (testing, final, or otherwise) follows
+**[docs/release-procedure.md](docs/release-procedure.md)** — privacy prune,
+license/provenance, README Status update, automated checks, packaging smoke
+test, then tag. Privacy audit:
 
 ```bash
+./scripts/audit-issue-privacy.sh
 ./scripts/check.sh
 ```
 
-CI runs the same checks on every push, pull request, and release:
+CI runs unit tests and `reuse lint` on every push, pull request, and release:
 
 - **Unit tests** — including licensing checks in `tests/test_licensing.py` (SPDX headers, known third-party attribution, license file consistency).
 - **REUSE lint** — verifies REUSE metadata across the repository.

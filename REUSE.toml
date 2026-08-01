@@ -73,7 +73,7 @@ path = [
     "docs/mail-threading.md",
     "docs/offline-body-cache.md",
     "docs/offline.md",
-    "docs/release-checklist.md",
+    "docs/release-procedure.md",
     "docs/index.html",
     "docs/assets/style.css",
     "docs/.nojekyll",
