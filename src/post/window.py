@@ -116,6 +116,8 @@ from post.reader.pane import MessageReaderPane
 from post.reader_window import ReaderWindow
 from post.preferences import (
     MessageAppearance,
+    MIN_MESSAGE_LIST_WIDTH,
+    MIN_SIDEBAR_WIDTH,
     OFFLINE_BODY_SYNC_ALL,
     OFFLINE_BODY_SYNC_LAST_MONTH,
     OFFLINE_BODY_SYNC_LAST_YEAR,
@@ -140,6 +142,7 @@ from post.preferences import (
 from post.mail.offline_settings import account_is_user_offline
 from post.sidebar import MailSidebar
 from post.toast import show_error_toast, show_toast
+from post.wrap_label import WrappingLabel
 
 log = logging.getLogger(__name__)
 
@@ -161,6 +164,10 @@ list.navigation-sidebar {{
   margin-top: 0;
   padding-top: 0;
 }}
+list.navigation-sidebar label,
+expander.sidebar-section label {{
+  min-width: 0;
+}}
 expander.sidebar-section > title {{
   min-height: 0;
   padding-top: 4px;
@@ -169,6 +176,15 @@ expander.sidebar-section > title {{
 expander.sidebar-section {{
   margin-top: 0;
   padding-top: 0;
+}}
+/* Single 1px divider (theme wide-handle / borders look like a double line). */
+paned.horizontal > separator {{
+  min-width: 1px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background-color: alpha(@window_fg_color, 0.12);
+  box-shadow: none;
 }}
 separator.header-divider {{
   min-height: 1px;
@@ -391,9 +407,36 @@ class MainWindow(Adw.ApplicationWindow):
         header_divider.add_css_class("header-divider")
         outer.append(header_divider)
 
-        content_panes = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        content_panes.set_vexpand(True)
-        outer.append(content_panes)
+        self._sidebar_width = int(window_state["sidebar_width"])
+        self._message_list_width = int(window_state["message_list_width"])
+        self._pane_widths_ready = False
+        self._pane_map_restored = False
+
+        self._outer_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self._outer_paned.set_vexpand(True)
+        self._outer_paned.set_hexpand(True)
+        self._outer_paned.set_overflow(Gtk.Overflow.HIDDEN)
+        # Narrow handle: single separator line (wide handle looks like a double line).
+        self._outer_paned.set_wide_handle(False)
+        self._outer_paned.set_resize_start_child(False)
+        self._outer_paned.set_resize_end_child(True)
+        # shrink=True allocates the start child at a negative x when dragged below
+        # its minimum, which clips content on the left (#229).
+        self._outer_paned.set_shrink_start_child(False)
+        self._outer_paned.set_shrink_end_child(True)
+        outer.append(self._outer_paned)
+
+        self._inner_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self._inner_paned.set_vexpand(True)
+        self._inner_paned.set_hexpand(True)
+        self._inner_paned.set_overflow(Gtk.Overflow.HIDDEN)
+        self._inner_paned.set_wide_handle(False)
+        # Keep message-list width stable on window resize; only the drag handle
+        # (and restore) should change it (#229).
+        self._inner_paned.set_resize_start_child(False)
+        self._inner_paned.set_resize_end_child(True)
+        self._inner_paned.set_shrink_start_child(False)
+        self._inner_paned.set_shrink_end_child(True)
 
         self._sidebar = MailSidebar(
             self._mail,
@@ -415,15 +458,15 @@ class MainWindow(Adw.ApplicationWindow):
         )
         sidebar_widget = self._sidebar.widget
         sidebar_widget.set_margin_top(_SIDEBAR_TOP_INSET)
-        content_panes.append(sidebar_widget)
-
-        sep1 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-        sep1.set_vexpand(True)
-        content_panes.append(sep1)
+        sidebar_widget.set_overflow(Gtk.Overflow.HIDDEN)
+        self._outer_paned.set_start_child(sidebar_widget)
+        self._outer_paned.set_end_child(self._inner_paned)
 
         self._message_stack = Gtk.Stack()
-        self._message_stack.set_size_request(320, -1)
-        self._message_stack.set_hexpand(False)
+        # Minimum width for the list column; paned position owns the actual width.
+        self._message_stack.set_size_request(MIN_MESSAGE_LIST_WIDTH, -1)
+        self._message_stack.set_hexpand(True)
+        self._message_stack.set_overflow(Gtk.Overflow.HIDDEN)
         self._message_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self._message_stack.set_transition_duration(150)
 
@@ -442,14 +485,18 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_loading_progress.set_show_text(False)
         self._message_loading_progress.set_visible(False)
         loading_box.append(self._message_loading_progress)
-        self._message_loading_label = Gtk.Label(label="Loading Messages…")
-        self._message_loading_label.set_wrap(True)
+        self._message_loading_label = WrappingLabel(
+            label="Loading Messages…",
+            wrap=True,
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+        )
         self._message_loading_label.add_css_class("dim-label")
         loading_box.append(self._message_loading_label)
         self._message_stack.add_named(loading_box, "loading")
 
         self._message_list_view = VirtualMessageList()
         self._message_scroll = self._message_list_view
+        self._message_list_view.set_size_request(MIN_MESSAGE_LIST_WIDTH, -1)
         self._message_list_view.set_callbacks(
             on_selection_changed=self._on_message_list_selection_changed,
             on_item_activated=self._on_message_list_item_activated,
@@ -474,8 +521,11 @@ class MainWindow(Adw.ApplicationWindow):
         empty_icon.set_pixel_size(48)
         empty_icon.add_css_class("dim-label")
         empty_box.append(empty_icon)
-        self._message_empty_label = Gtk.Label(label="No Messages")
-        self._message_empty_label.set_wrap(True)
+        self._message_empty_label = WrappingLabel(
+            label="No Messages",
+            wrap=True,
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+        )
         self._message_empty_label.add_css_class("dim-label")
         empty_box.append(self._message_empty_label)
         self._message_stack.add_named(empty_box, "empty")
@@ -492,8 +542,11 @@ class MainWindow(Adw.ApplicationWindow):
         error_icon.set_pixel_size(48)
         error_icon.add_css_class("warning")
         error_box.append(error_icon)
-        self._message_error_label = Gtk.Label(label="")
-        self._message_error_label.set_wrap(True)
+        self._message_error_label = WrappingLabel(
+            label="",
+            wrap=True,
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+        )
         self._message_error_label.set_justify(Gtk.Justification.CENTER)
         error_box.append(self._message_error_label)
         retry_btn = Gtk.Button(label="Try Again")
@@ -502,12 +555,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_stack.add_named(error_box, "error")
 
         self._message_stack.set_visible_child_name("list")
-
-        content_panes.append(self._message_stack)
-
-        sep2 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-        sep2.set_vexpand(True)
-        content_panes.append(sep2)
 
         self._reader_pane = MessageReaderPane(
             on_reply=self._on_reply_clicked,
@@ -524,10 +571,16 @@ class MainWindow(Adw.ApplicationWindow):
         self._reader_pane.set_margin_top(_SIDEBAR_TOP_INSET)
         self._reader_pane.set_margin_bottom(12)
 
+        self._inner_paned.set_start_child(self._message_stack)
+        self._inner_paned.set_end_child(self._reader_pane)
+
         style_manager = Adw.StyleManager.get_default()
         style_manager.connect("notify::dark", self._on_app_dark_changed)
 
-        content_panes.append(self._reader_pane)
+        self._outer_paned.connect("notify::position", self._on_pane_position_changed)
+        self._inner_paned.connect("notify::position", self._on_pane_position_changed)
+        self._outer_paned.connect("map", self._on_outer_paned_map)
+        GLib.idle_add(self._restore_pane_widths)
 
         self._status_bar = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
@@ -727,6 +780,41 @@ class MainWindow(Adw.ApplicationWindow):
             self._last_normal_width = width
             self._last_normal_height = height
 
+    def _restore_pane_widths(self) -> bool:
+        self._pane_widths_ready = False
+        self._sidebar_width = max(MIN_SIDEBAR_WIDTH, int(self._sidebar_width))
+        self._message_list_width = max(
+            MIN_MESSAGE_LIST_WIDTH, int(self._message_list_width)
+        )
+        self._outer_paned.set_position(self._sidebar_width)
+        self._inner_paned.set_position(self._message_list_width)
+        self._pane_widths_ready = True
+        return GLib.SOURCE_REMOVE
+
+    def _on_outer_paned_map(self, *_args) -> None:
+        if self._pane_map_restored:
+            return
+        self._pane_map_restored = True
+        self._restore_pane_widths()
+
+    def _on_pane_position_changed(self, paned: Gtk.Paned, *_args) -> None:
+        if not self._pane_widths_ready:
+            return
+        position = int(paned.get_position())
+        if paned is self._outer_paned:
+            if position < MIN_SIDEBAR_WIDTH:
+                paned.set_position(MIN_SIDEBAR_WIDTH)
+                return
+            self._sidebar_width = position
+        elif paned is self._inner_paned:
+            if position < MIN_MESSAGE_LIST_WIDTH:
+                paned.set_position(MIN_MESSAGE_LIST_WIDTH)
+                return
+            self._message_list_width = position
+        else:
+            return
+        self._persist_window_state()
+
     def _persist_window_state(self) -> None:
         if self.is_maximized():
             width = self._last_normal_width
@@ -737,10 +825,19 @@ class MainWindow(Adw.ApplicationWindow):
             if width > 0 and height > 0:
                 self._last_normal_width = width
                 self._last_normal_height = height
+        if self._pane_widths_ready:
+            outer_pos = int(self._outer_paned.get_position())
+            inner_pos = int(self._inner_paned.get_position())
+            if outer_pos > 0:
+                self._sidebar_width = outer_pos
+            if inner_pos > 0:
+                self._message_list_width = inner_pos
         set_window_state(
             width=width,
             height=height,
             maximized=self.is_maximized(),
+            sidebar_width=self._sidebar_width,
+            message_list_width=self._message_list_width,
         )
 
     def _on_close_request(self, *_args) -> bool:

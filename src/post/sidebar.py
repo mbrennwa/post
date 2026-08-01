@@ -56,6 +56,7 @@ from post.mail.send_queue import (
 )
 from post.mail.account_status import account_not_online_badge
 from post.preferences import (
+    MIN_SIDEBAR_WIDTH,
     account_supports_user_offline,
     get_account_user_online,
     get_sidebar_state,
@@ -63,6 +64,7 @@ from post.preferences import (
     resolve_inbox_display_order,
     set_sidebar_state,
 )
+from post.wrap_label import configure_ellipsize_label, configure_pane_scrolled_window
 
 log = logging.getLogger(__name__)
 
@@ -192,8 +194,10 @@ class MailSidebar:
 
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_size_request(240, -1)
+        # Minimum width for the sidebar column; paned position owns the actual width.
+        scroll.set_size_request(MIN_SIDEBAR_WIDTH, -1)
         scroll.set_child(self._sidebar_box)
+        configure_pane_scrolled_window(scroll)
         self._widget = scroll
         self._setup_context_menu()
 
@@ -2074,7 +2078,7 @@ class MailSidebar:
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         label = Gtk.Label(label=account.display_label, xalign=0, hexpand=True)
         label.add_css_class("heading")
-        label.set_ellipsize(3)
+        configure_ellipsize_label(label)
         label.set_margin_bottom(4)
         offline_icon = Gtk.Image.new_from_icon_name("network-offline-symbolic")
         offline_icon.set_tooltip_text("Account Offline")
@@ -2135,6 +2139,7 @@ class MailSidebar:
         )
 
         label = Gtk.Label(label=label_text, xalign=0, hexpand=True)
+        configure_ellipsize_label(label)
         label.set_margin_start(12)
         label.set_margin_end(6 if show_offline_badge else 12)
         row = Gtk.ListBoxRow()

@@ -153,16 +153,63 @@ class PreferencesTests(unittest.TestCase):
             self.assertEqual(state["width"], 1100)
             self.assertEqual(state["height"], 720)
             self.assertFalse(state["maximized"])
+            self.assertEqual(state["sidebar_width"], 240)
+            self.assertEqual(state["message_list_width"], 320)
 
     def test_window_state_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "preferences.json")
             with mock.patch("post.preferences._PREF_PATH", path):
-                set_window_state(width=1280, height=800, maximized=True)
+                set_window_state(
+                    width=1280,
+                    height=800,
+                    maximized=True,
+                    sidebar_width=280,
+                    message_list_width=400,
+                )
                 state = get_window_state()
                 self.assertEqual(state["width"], 1280)
                 self.assertEqual(state["height"], 800)
                 self.assertTrue(state["maximized"])
+                self.assertEqual(state["sidebar_width"], 280)
+                self.assertEqual(state["message_list_width"], 400)
+
+    def test_window_state_pane_widths_clamped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "preferences.json")
+            with mock.patch("post.preferences._PREF_PATH", path):
+                set_window_state(
+                    width=1100,
+                    height=720,
+                    maximized=False,
+                    sidebar_width=10,
+                    message_list_width=9999,
+                )
+                state = get_window_state()
+                self.assertEqual(state["sidebar_width"], 160)
+                self.assertEqual(state["message_list_width"], 1200)
+
+                set_window_state(width=1100, height=720, maximized=False)
+                preserved = get_window_state()
+                self.assertEqual(preserved["sidebar_width"], 160)
+                self.assertEqual(preserved["message_list_width"], 1200)
+
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "window": {
+                                "width": 1100,
+                                "height": 720,
+                                "maximized": False,
+                                "sidebar_width": "nope",
+                                "message_list_width": None,
+                            }
+                        },
+                        handle,
+                    )
+                invalid = get_window_state()
+                self.assertEqual(invalid["sidebar_width"], 240)
+                self.assertEqual(invalid["message_list_width"], 320)
 
     def test_sidebar_state_defaults(self) -> None:
         with mock.patch(

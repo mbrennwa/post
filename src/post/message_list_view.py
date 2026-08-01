@@ -20,7 +20,11 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
 from post.mail.dnd import MESSAGE_TRANSFER_MIME, MessageTransferPayload, encode_message_transfer
 from post.mail.folders import is_post_outbox_folder
-from post.wrap_label import WrappingLabel, configure_ellipsize_label
+from post.wrap_label import (
+    WrappingLabel,
+    configure_ellipsize_label,
+    configure_pane_scrolled_window,
+)
 from post.mail.helpers import (
     format_message_list_date,
     message_has_attachments,
@@ -88,6 +92,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         super().__init__()
         self.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.set_vexpand(True)
+        configure_pane_scrolled_window(self)
 
         self._folder_name = ""
         self._list_key_positions: dict[str, int] = {}
@@ -114,6 +119,8 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         self._list_view = Gtk.ListView(model=self._selection, factory=factory)
         self._list_view.add_css_class("message-list")
         self._list_view.set_can_focus(True)
+        self._list_view.set_overflow(Gtk.Overflow.HIDDEN)
+        self._list_view.set_hexpand(True)
         self._list_view.connect("activate", self._on_list_view_activate)
         self._setup_list_drag_source()
         self.set_child(self._list_view)
@@ -473,6 +480,8 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         outer.append(dot_column)
 
         preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        preview.set_hexpand(True)
+        preview.set_halign(Gtk.Align.FILL)
         preview.set_margin_start(4)
         preview.set_margin_end(12)
         preview.set_margin_top(8)
@@ -485,10 +494,12 @@ class VirtualMessageList(Gtk.ScrolledWindow):
 
         date_label = Gtk.Label(xalign=0)
         date_label.add_css_class("dim-label")
-        date_label.set_halign(Gtk.Align.START)
+        date_label.set_halign(Gtk.Align.FILL)
+        configure_ellipsize_label(date_label)
         preview.append(date_label)
 
         bottom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bottom_row.set_hexpand(True)
         meta = Gtk.Label(xalign=0, ellipsize=3)
         configure_ellipsize_label(meta)
         meta.add_css_class("dim-label")
