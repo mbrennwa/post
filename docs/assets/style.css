@@ -170,19 +170,15 @@ a:hover {
   animation: pulse 6s ease-in-out infinite;
 }
 
-.screenshot-placeholder {
+.hero-visual img {
   position: relative;
   z-index: 1;
-  min-height: clamp(14rem, 40vw, 22rem);
-  display: grid;
-  place-items: center;
-  text-align: center;
-  padding: 2rem;
+  display: block;
+  width: 100%;
+  height: auto;
   border-radius: var(--radius) var(--radius) 0 0;
-  border: 1px dashed var(--line);
+  border: 1px solid var(--line);
   border-bottom: none;
-  background: rgba(28, 36, 48, 0.65);
-  color: var(--ink-muted);
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
 }
 
