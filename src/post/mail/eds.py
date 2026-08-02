@@ -124,7 +124,6 @@ from .compose import (
     build_draft_mime_message,
     build_plain_mime_message,
     new_outbound_mime_identifiers,
-    normalize_email,
     normalize_references_header,
 )
 from .correspondents import Correspondent, collect_correspondents
@@ -2717,13 +2716,7 @@ class MailService:
     def _build_correspondents_index_unlocked(
         self, account_uid: str
     ) -> list[Correspondent]:
-        """Build autocomplete from in-memory / disk folder indexes only (#156)."""
-        account = self.get_account(account_uid)
-        exclude_emails: set[str] = set()
-        for raw in (account.from_address, account.email):
-            if raw:
-                exclude_emails.add(normalize_email(raw))
-
+        """Build autocomplete from in-memory / disk folder indexes only (#156, #240)."""
         folders = self._folders_for_correspondents_unlocked(account_uid)
         messages: list[dict] = []
         for folder in folders:
@@ -2741,7 +2734,7 @@ class MailService:
                 messages.extend(cached_messages)
 
         messages.sort(key=lambda message: message.get("sort_date") or 0, reverse=True)
-        correspondents = collect_correspondents(messages, exclude_emails=exclude_emails)
+        correspondents = collect_correspondents(messages)
         return correspondents[:_MAX_CORRESPONDENTS]
 
     def list_folders(
