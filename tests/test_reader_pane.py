@@ -5,16 +5,22 @@ from __future__ import annotations
 
 import unittest
 from typing import Any
+from unittest.mock import MagicMock
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("WebKit", "6.0")
+gi.require_version("Gio", "2.0")
 
-from gi.repository import Gtk, WebKit
+from gi.repository import Gio, Gtk, WebKit
 
 from post.preferences import MESSAGE_APPEARANCE_ADAPT_TEXT
-from post.reader.pane import MessageReaderPane, strip_reader_context_menu
+from post.reader.pane import (
+    MessageReaderPane,
+    prepend_address_context_menu_items,
+    strip_reader_context_menu,
+)
 
 
 def _noop(*_args: Any, **_kwargs: Any) -> None:
@@ -27,16 +33,42 @@ def _menu_actions(menu: WebKit.ContextMenu) -> list[str | int]:
         if item.is_separator():
             actions.append("SEP")
         else:
-            actions.append(int(item.get_stock_action()))
+            stock = int(item.get_stock_action())
+            if stock == int(WebKit.ContextMenuAction.CUSTOM):
+                actions.append(item.get_title() or "CUSTOM")
+            else:
+                actions.append(stock)
     return actions
+
+
+def _make_pane(
+    *,
+    on_unsubscribe: Any = _noop,
+    on_new_message_to: Any = _noop,
+    on_search_messages_from: Any = _noop,
+    can_search_messages: Any = None,
+) -> MessageReaderPane:
+    return MessageReaderPane(
+        on_reply=_noop,
+        on_reply_all=_noop,
+        on_forward=_noop,
+        on_unsubscribe=on_unsubscribe,
+        on_attachment_clicked=_noop,
+        on_attachment_context_menu=_noop,
+        on_open_uri=_noop,
+        on_new_message_to=on_new_message_to,
+        on_search_messages_from=on_search_messages_from,
+        can_search_messages=can_search_messages or (lambda: True),
+    )
 
 
 def _sample_message(*, seen: bool = True, flagged: bool = False) -> dict[str, Any]:
     return {
         "uid": "42",
         "subject": "Hello",
-        "from": "sender@example.com",
-        "date": "2026-01-01",
+        "from": "Alice <sender@example.com>",
+        "to": "Bob <bob@example.com>",
+        "date_received": "2026-01-01 12:00:00",
         "flags": {"seen": seen, "flagged": flagged},
         "attachments": [],
     }
@@ -49,15 +81,7 @@ class MessageReaderPaneTests(unittest.TestCase):
             Gtk.init()
 
     def setUp(self) -> None:
-        self.pane = MessageReaderPane(
-            on_reply=_noop,
-            on_reply_all=_noop,
-            on_forward=_noop,
-            on_unsubscribe=_noop,
-            on_attachment_clicked=_noop,
-            on_attachment_context_menu=_noop,
-            on_open_uri=_noop,
-        )
+        self.pane = _make_pane()
 
     def test_show_message_exposes_current_message(self) -> None:
         msg = _sample_message()
@@ -69,6 +93,51 @@ class MessageReaderPaneTests(unittest.TestCase):
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
         self.assertIs(self.pane.current_message, msg)
+
+    def test_show_message_builds_interactive_address_rows(self) -> None:
+        self.pane.show_message(
+            _sample_message(),
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertFalse(self.pane._reader_meta.get_visible())
+        rows: list[Gtk.Widget] = []
+        child = self.pane._reader_meta.get_next_sibling()
+        while child is not None:
+            rows.append(child)
+            child = child.get_next_sibling()
+        self.assertGreaterEqual(len(rows), 3)
+        labels = []
+        for row in rows:
+            field = row.get_first_child()
+            assert field is not None
+            labels.append(field.get_label())
+        self.assertEqual(labels[0], "From:")
+        self.assertIn("To:", labels)
+        self.assertIn("Date:", labels)
+
+    def test_address_menu_callbacks(self) -> None:
+        composed: list[str] = []
+        searched: list[str] = []
+        pane = _make_pane(
+            on_new_message_to=composed.append,
+            on_search_messages_from=searched.append,
+        )
+        pane._context_address = "sender@example.com"
+        pane._on_address_new_message_activate()
+        pane._on_address_search_from_activate()
+        self.assertEqual(composed, ["sender@example.com"])
+        self.assertEqual(searched, ["sender@example.com"])
+
+    def test_address_search_action_disabled_when_search_unavailable(self) -> None:
+        pane = _make_pane(can_search_messages=lambda: False)
+        pane._sync_address_search_action()
+        self.assertFalse(pane._address_search_action.get_enabled())
+        pane._can_search_messages = lambda: True
+        pane._sync_address_search_action()
+        self.assertTrue(pane._address_search_action.get_enabled())
 
     def test_unsubscribe_button_hidden_by_default(self) -> None:
         self.pane.show_message(
@@ -86,15 +155,7 @@ class MessageReaderPaneTests(unittest.TestCase):
         def on_unsubscribe(action: dict[str, str]) -> None:
             clicked.append(action)
 
-        pane = MessageReaderPane(
-            on_reply=_noop,
-            on_reply_all=_noop,
-            on_forward=_noop,
-            on_unsubscribe=on_unsubscribe,
-            on_attachment_clicked=_noop,
-            on_attachment_context_menu=_noop,
-            on_open_uri=_noop,
-        )
+        pane = _make_pane(on_unsubscribe=on_unsubscribe)
         msg = _sample_message()
         msg["unsubscribe"] = {
             "kind": "open",
@@ -250,4 +311,52 @@ class MessageReaderPaneTests(unittest.TestCase):
         self.assertEqual(
             _menu_actions(menu),
             [int(WebKit.ContextMenuAction.COPY)],
+        )
+
+    def test_prepend_address_context_menu_items(self) -> None:
+        menu = WebKit.ContextMenu.new()
+        menu.append(
+            WebKit.ContextMenuItem.new_from_stock_action(WebKit.ContextMenuAction.COPY)
+        )
+        new_action = Gio.SimpleAction.new("address-new-message", None)
+        search_action = Gio.SimpleAction.new("address-search-from", None)
+        prepend_address_context_menu_items(
+            menu,
+            new_message_action=new_action,
+            search_from_action=search_action,
+            email="sender@example.com",
+        )
+        self.assertEqual(
+            _menu_actions(menu),
+            [
+                "New Message to sender@example.com…",
+                "Search Messages from sender@example.com",
+                "SEP",
+                int(WebKit.ContextMenuAction.COPY),
+            ],
+        )
+
+    def test_web_view_context_menu_adds_mailto_actions(self) -> None:
+        menu = WebKit.ContextMenu.new()
+        menu.append(
+            WebKit.ContextMenuItem.new_from_stock_action(WebKit.ContextMenuAction.COPY)
+        )
+        hit = MagicMock()
+        hit.context_is_link.return_value = True
+        hit.get_link_uri.return_value = "mailto:Sender%20%3Csender@example.com%3E"
+        handled = self.pane._on_web_view_context_menu(
+            self.pane._web_view,
+            menu,
+            hit,
+        )
+        self.assertFalse(handled)
+        self.assertEqual(self.pane._context_address, "sender@example.com")
+        self.assertEqual(
+            _menu_actions(menu),
+            [
+                "New Message to sender@example.com…",
+                "Search Messages from sender@example.com",
+                "SEP",
+                int(WebKit.ContextMenuAction.COPY),
+            ],
         )
