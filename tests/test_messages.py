@@ -13,15 +13,18 @@ from post.mail.folders import is_sent_folder_name
 from post.mail.helpers import (
     _decode_attachment_filename,
     _decode_header_value,
+    bare_email_from_address,
     enrich_message_dict_from_mime,
     flag_menu_items,
     flag_menu_label,
     format_attachment_size,
+    format_from_search_query,
     format_message_datetime,
     format_forward_quote_header,
     format_reader_header,
     format_message_list_date,
     format_recipient_header,
+    mailto_primary_email,
     message_has_attachments,
     message_info_to_dict,
     message_is_flagged,
@@ -30,6 +33,7 @@ from post.mail.helpers import (
     paginate_messages,
     read_menu_items,
     read_menu_label,
+    reader_header_rows,
     reader_toggle_button_state,
     should_offer_send_again,
     sort_messages_newest_first,
@@ -164,6 +168,49 @@ class FormatReaderHeaderTests(unittest.TestCase):
             {"from": "Alice", "to": "Bob", "bcc": "  ", "date_sent": "2026-06-19 14:30:00"}
         )
         self.assertNotIn("Bcc:", header)
+
+
+class AddressContextHelperTests(unittest.TestCase):
+    def test_format_from_search_query_plain(self) -> None:
+        self.assertEqual(
+            format_from_search_query("user@example.com"),
+            "from: user@example.com",
+        )
+
+    def test_format_from_search_query_quotes_spaces(self) -> None:
+        self.assertEqual(
+            format_from_search_query('Alice "Ada" <a@example.com>'),
+            'from: "Alice \\"Ada\\" <a@example.com>"',
+        )
+
+    def test_bare_email_from_address(self) -> None:
+        self.assertEqual(
+            bare_email_from_address("Alice <alice@example.com>"),
+            "alice@example.com",
+        )
+
+    def test_mailto_primary_email(self) -> None:
+        self.assertEqual(
+            mailto_primary_email("mailto:Alice%20%3Calice@example.com%3E"),
+            "alice@example.com",
+        )
+        self.assertEqual(mailto_primary_email("https://example.com"), "")
+
+    def test_reader_header_rows_addresses_and_date(self) -> None:
+        rows = reader_header_rows(
+            {
+                "from": "Alice <alice@example.com>",
+                "to": "Bob <bob@example.com>, Carol <carol@example.com>",
+                "cc": "Dave <dave@example.com>",
+                "date_received": "2026-06-19 14:30:00",
+            }
+        )
+        by_label = {row.label: row for row in rows}
+        self.assertEqual(by_label["From"].addresses, ("Alice <alice@example.com>",))
+        self.assertEqual(len(by_label["To"].addresses), 2)
+        self.assertEqual(by_label["Cc"].addresses, ("Dave <dave@example.com>",))
+        self.assertEqual(by_label["Date"].plain, "2026-06-19 14:30:00")
+        self.assertEqual(by_label["Date"].addresses, ())
 
 
 class FormatForwardQuoteHeaderTests(unittest.TestCase):

@@ -11,6 +11,7 @@ import ctypes
 import html
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any
@@ -532,6 +533,77 @@ def format_reader_header(msg: dict[str, Any]) -> str:
 def format_forward_quote_header(msg: dict[str, Any]) -> str:
     """Forwarded-message preamble; never includes Bcc."""
     return "\n".join(_format_header_lines(msg, include_bcc=False))
+
+
+def format_from_search_query(email: str) -> str:
+    """Build a ``from: `` search string for *email* (quote when needed)."""
+    value = (email or "").strip()
+    if not value:
+        return ""
+    if any(ch.isspace() for ch in value) or '"' in value or "\\" in value:
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'from: "{escaped}"'
+    return f"from: {value}"
+
+
+def bare_email_from_address(display_or_email: str) -> str:
+    """Return a lowercase bare email, or empty string when none can be parsed."""
+    from .compose import normalize_email
+
+    return normalize_email(display_or_email)
+
+
+def mailto_primary_email(uri: str) -> str:
+    """Return the first bare To address from a mailto URI, or empty string."""
+    from .compose import normalize_email
+    from .mailto import parse_mailto_uri
+
+    try:
+        mailto = parse_mailto_uri(uri)
+    except ValueError:
+        return ""
+    if not mailto.to:
+        return ""
+    return normalize_email(mailto.to[0])
+
+
+@dataclass(frozen=True)
+class ReaderHeaderRow:
+    """One reader meta row: address field or plain text (Date)."""
+
+    label: str
+    addresses: tuple[str, ...] = ()
+    plain: str | None = None
+
+
+def reader_header_rows(msg: dict[str, Any]) -> list[ReaderHeaderRow]:
+    """Structured reader header rows for interactive address widgets."""
+    from .compose import parse_address_header
+
+    rows: list[ReaderHeaderRow] = []
+
+    def add_address_field(label: str, raw: str) -> None:
+        displays = tuple(parse_address_header(raw))
+        if displays:
+            rows.append(ReaderHeaderRow(label=label, addresses=displays))
+        elif (raw or "").strip():
+            rows.append(ReaderHeaderRow(label=label, plain=raw.strip()))
+
+    add_address_field("From", msg.get("from") or "")
+    reply_to = (msg.get("reply_to") or "").strip()
+    if reply_to and _reply_to_differs_from_from(msg.get("from", ""), reply_to):
+        add_address_field("Reply-To", reply_to)
+    add_address_field("To", msg.get("to") or "")
+    cc = (msg.get("cc") or "").strip()
+    if cc:
+        add_address_field("Cc", cc)
+    bcc = (msg.get("bcc") or "").strip()
+    if bcc:
+        add_address_field("Bcc", bcc)
+    date = msg.get("date_received") or msg.get("date_sent") or ""
+    if date:
+        rows.append(ReaderHeaderRow(label="Date", plain=str(date)))
+    return rows
 
 
 def sort_messages_newest_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

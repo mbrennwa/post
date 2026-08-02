@@ -39,6 +39,8 @@ log = logging.getLogger(__name__)
 
 SetStatus = Callable[[str], None]
 OnCompose = Callable[[str, dict[str, Any]], None]
+OnAddressEmail = Callable[[str], None]
+CanSearchMessages = Callable[[], bool]
 OnRequestMove = Callable[[str, str, str, str], None]
 OnFlagsUpdated = Callable[[str, dict[str, Any]], None]
 OnMessageLoaded = Callable[[str, str, str, dict[str, Any]], None]
@@ -59,6 +61,9 @@ class ReaderWindow(Adw.ApplicationWindow):
         message_uid: str,
         set_status: SetStatus,
         on_compose: OnCompose,
+        on_new_message_to: OnAddressEmail,
+        on_search_messages_from: OnAddressEmail,
+        can_search_messages: CanSearchMessages,
         on_request_move: OnRequestMove,
         on_flags_updated: OnFlagsUpdated,
         on_message_loaded: OnMessageLoaded,
@@ -79,6 +84,9 @@ class ReaderWindow(Adw.ApplicationWindow):
         self._message_uid = message_uid
         self._set_status = set_status
         self._on_compose = on_compose
+        self._on_new_message_to = on_new_message_to
+        self._on_search_messages_from = on_search_messages_from
+        self._can_search_messages = can_search_messages
         self._on_request_move = on_request_move
         self._on_flags_updated = on_flags_updated
         self._on_message_loaded = on_message_loaded
@@ -137,6 +145,9 @@ class ReaderWindow(Adw.ApplicationWindow):
             on_attachment_clicked=self._on_attachment_clicked,
             on_attachment_context_menu=self._on_attachment_context_menu,
             on_open_uri=self._open_uri_externally,
+            on_new_message_to=self._on_new_message_to,
+            on_search_messages_from=self._on_search_messages_from,
+            can_search_messages=self._can_search_messages,
         )
         self._reader_pane.set_margin_start(16)
         self._reader_pane.set_margin_end(16)

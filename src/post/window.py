@@ -100,6 +100,7 @@ from post.settings_window import SettingsWindow
 from post.mail.helpers import (
     flag_menu_items,
     flag_menu_label,
+    format_from_search_query,
     perform_one_click_unsubscribe,
     read_menu_items,
     read_menu_label,
@@ -564,6 +565,9 @@ class MainWindow(Adw.ApplicationWindow):
             on_attachment_clicked=self._on_reader_attachment_clicked,
             on_attachment_context_menu=self._on_reader_attachment_context_menu,
             on_open_uri=self._open_uri_externally,
+            on_new_message_to=self._on_new_message_to_address,
+            on_search_messages_from=self._search_messages_from_address,
+            can_search_messages=lambda: self._header_search_entry.get_sensitive(),
         )
         self._reader_pane.set_hexpand(True)
         self._reader_pane.set_margin_start(16)
@@ -1810,6 +1814,26 @@ class MainWindow(Adw.ApplicationWindow):
             account = MailService.pick_default_account(sendable) or sendable[0]
         # Present compose last so the main window does not cover it.
         self._present_compose_window(account, mode="new", mailto=mailto)
+
+    def _on_new_message_to_address(self, email: str) -> None:
+        address = (email or "").strip()
+        if not address:
+            return
+        self.open_compose_mailto(f"mailto:{address}")
+
+    def _search_messages_from_address(self, email: str) -> None:
+        """Search for messages from *email* using the current search scope."""
+        query = format_from_search_query(email)
+        if not query:
+            return
+        if not self._header_search_entry.get_sensitive():
+            return
+        self.present()
+        self._search_entry_updating = True
+        self._header_search_entry.set_text(query)
+        self._search_entry_updating = False
+        self._header_search_entry.set_position(-1)
+        self._apply_search_from_entry()
 
     def _open_compose_on_message(self, mode: str) -> None:
         if not self._current_message_uid:
@@ -6524,6 +6548,9 @@ class MainWindow(Adw.ApplicationWindow):
             message_uid=message_uid,
             set_status=self._set_status,
             on_compose=self._on_reader_window_compose,
+            on_new_message_to=self._on_new_message_to_address,
+            on_search_messages_from=self._search_messages_from_address,
+            can_search_messages=lambda: self._header_search_entry.get_sensitive(),
             on_request_move=self._on_reader_window_request_move,
             on_flags_updated=self._on_reader_window_flags_updated,
             on_message_loaded=self._on_reader_window_message_loaded,
