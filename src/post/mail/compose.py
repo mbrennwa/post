@@ -224,8 +224,11 @@ def draft_addresses_to_internet_address(addresses: list[str]) -> Any | None:
     return container if container.length() > 0 else None
 
 
-# Reply / forward subject prefixes (case-insensitive). Both lists are stripped
-# when normalizing so mixed stacks like "AW: Re: Fwd: topic" collapse cleanly.
+# Reply / forward subject prefixes (case-insensitive).
+# Strategy: strip known localized reply/forward prefixes (stacked), then always
+# re-prefix with English ``Re:`` / ``Fwd:``. No account/UI locale chooses the
+# outgoing prefix; the lists are pragmatic MUA coverage, not full i18n.
+# Mixed stacks like "AW: Re: Fwd: topic" collapse cleanly.
 _REPLY_SUBJECT_PREFIXES = (
     "re",
     "aw",
@@ -562,6 +565,9 @@ def extract_reply_address(from_header: str) -> str:
     return addresses[0]
 
 
+# Contiguous ``>`` runs only (RFC 3676 / #40). Space-separated markers such as
+# ``> > text`` are not normalized, and signature lines (``-- ``) inside quoted
+# blocks get no special unquoting — both are unsupported.
 _QUOTE_LINE_RE = re.compile(r"^(>+)( ?)(.*)$")
 
 

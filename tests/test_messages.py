@@ -108,13 +108,35 @@ class FormatReaderHeaderTests(unittest.TestCase):
                 "date_sent": "2026-06-19 14:30:00",
             }
         )
-        self.assertIn("CC: Carol <carol@example.com>", header)
+        self.assertIn("Cc: Carol <carol@example.com>", header)
 
     def test_omits_cc_when_empty(self) -> None:
         header = format_reader_header(
             {"from": "Alice", "to": "Bob", "cc": "  ", "date_sent": "2026-06-19 14:30:00"}
         )
-        self.assertNotIn("CC:", header)
+        self.assertNotIn("Cc:", header)
+
+    def test_includes_subject_when_present(self) -> None:
+        header = format_reader_header(
+            {
+                "from": "Alice",
+                "to": "Bob",
+                "subject": "Hello there",
+                "date_sent": "2026-06-19 14:30:00",
+            }
+        )
+        self.assertIn("Subject: Hello there", header)
+
+    def test_omits_subject_when_empty(self) -> None:
+        header = format_reader_header(
+            {
+                "from": "Alice",
+                "to": "Bob",
+                "subject": "  ",
+                "date_sent": "2026-06-19 14:30:00",
+            }
+        )
+        self.assertNotIn("Subject:", header)
 
     def test_includes_reply_to_when_different_from_from(self) -> None:
         header = format_reader_header(
@@ -237,7 +259,31 @@ class FormatForwardQuoteHeaderTests(unittest.TestCase):
                 "date_sent": "2026-06-19 14:30:00",
             }
         )
-        self.assertIn("CC: Carol <carol@example.com>", header)
+        self.assertIn("Cc: Carol <carol@example.com>", header)
+
+    def test_includes_subject_when_present(self) -> None:
+        header = format_forward_quote_header(
+            {
+                "from": "Alice",
+                "to": "Bob",
+                "subject": "Meeting notes",
+                "date_sent": "2026-06-19 14:30:00",
+            }
+        )
+        self.assertIn("Subject: Meeting notes", header)
+        lines = header.splitlines()
+        self.assertEqual(lines[-1], "Subject: Meeting notes")
+
+    def test_omits_subject_when_empty(self) -> None:
+        header = format_forward_quote_header(
+            {
+                "from": "Alice",
+                "to": "Bob",
+                "subject": "  ",
+                "date_sent": "2026-06-19 14:30:00",
+            }
+        )
+        self.assertNotIn("Subject:", header)
 
 
 class FormatMessageDatetimeTests(unittest.TestCase):

@@ -515,13 +515,16 @@ def _format_header_lines(msg: dict[str, Any], *, include_bcc: bool) -> list[str]
     lines.append(f"To: {msg.get('to', '')}")
     cc = (msg.get("cc") or "").strip()
     if cc:
-        lines.append(f"CC: {cc}")
+        lines.append(f"Cc: {cc}")
     if include_bcc:
         bcc = (msg.get("bcc") or "").strip()
         if bcc:
             lines.append(f"Bcc: {bcc}")
     date = msg.get("date_received") or msg.get("date_sent") or ""
     lines.append(f"Date: {date}")
+    subject = (msg.get("subject") or "").strip()
+    if subject:
+        lines.append(f"Subject: {subject}")
     return lines
 
 

@@ -7,8 +7,11 @@ import os
 import tempfile
 import unittest
 
+from post.mail.accounts import LocalMailConfig
+from post.mail.compose import build_plain_mime_message, envelope_recipient_addresses
 from post.mail.local_delivery import (
     all_recipients_local,
+    deliver_local_message,
     deliver_to_maildir,
     deliver_to_spool,
     is_local_recipient,
@@ -79,3 +82,48 @@ class LocalDeliveryTests(unittest.TestCase):
             self.assertEqual(len(names), 1)
             with open(os.path.join(new_dir, names[0]), "rb") as handle:
                 self.assertIn(b"Subject: hi", handle.read())
+
+    def test_deliver_local_message_omits_bcc_from_maildir_bytes(self) -> None:
+        to = ["bob@localhost"]
+        bcc = ["secret@localhost"]
+        self.assertEqual(
+            envelope_recipient_addresses(to, bcc=bcc),
+            ["bob@localhost", "secret@localhost"],
+        )
+        self.assertTrue(
+            all_recipients_local(
+                to=to,
+                cc=None,
+                bcc=bcc,
+                local_address="alice@localhost",
+            )
+        )
+
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@localhost",
+            to=to,
+            cc=None,
+            bcc=bcc,
+            subject="Private",
+            body="Hello",
+            include_bcc_header=False,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config = LocalMailConfig(
+                enabled=True,
+                mail_type="maildir",
+                path=tmp,
+                from_name="Alice",
+                from_address="alice@localhost",
+            )
+            deliver_local_message(config, message, envelope_from="alice@localhost")
+            new_dir = os.path.join(tmp, "new")
+            names = os.listdir(new_dir)
+            self.assertEqual(len(names), 1)
+            with open(os.path.join(new_dir, names[0]), "rb") as handle:
+                data = handle.read()
+            self.assertNotIn(b"Bcc:", data)
+            self.assertNotIn(b"secret@localhost", data)
+            self.assertIn(b"To:", data)
+            self.assertIn(b"bob@localhost", data)

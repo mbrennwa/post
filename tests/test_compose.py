@@ -17,6 +17,7 @@ from post.mail.compose import (
     build_forward_subject,
     build_reply_all_recipients,
     build_reply_references,
+    envelope_recipient_addresses,
     is_plain_wrapper_html,
     normalize_in_reply_to,
     normalize_references_header,
@@ -144,8 +145,54 @@ class BuildReplySubjectTests(unittest.TestCase):
     def test_normalizes_locale_reply_prefix(self) -> None:
         self.assertEqual(build_reply_subject("aw: hello"), "Re: hello")
 
+    def test_normalizes_swedish_sv_prefix(self) -> None:
+        self.assertEqual(build_reply_subject("Sv: Hello"), "Re: Hello")
+
+    def test_normalizes_lowercase_sv_prefix(self) -> None:
+        self.assertEqual(build_reply_subject("sv: hello"), "Re: hello")
+
     def test_strips_forward_prefix_when_replying(self) -> None:
         self.assertEqual(build_reply_subject("Fwd: Hello"), "Re: Hello")
+
+
+class EnvelopeRecipientAddressesTests(unittest.TestCase):
+    def test_collects_to_cc_bcc(self) -> None:
+        self.assertEqual(
+            envelope_recipient_addresses(
+                ["Alice <alice@example.com>"],
+                cc=["Bob <bob@example.com>"],
+                bcc=["secret@example.com"],
+            ),
+            ["alice@example.com", "bob@example.com", "secret@example.com"],
+        )
+
+    def test_dedups_casefold_across_fields(self) -> None:
+        self.assertEqual(
+            envelope_recipient_addresses(
+                ["Alice <alice@example.com>"],
+                cc=["ALICE@example.com"],
+                bcc=["alice@EXAMPLE.com"],
+            ),
+            ["alice@example.com"],
+        )
+
+    def test_email_as_display_name(self) -> None:
+        self.assertEqual(
+            envelope_recipient_addresses(
+                ["alice@example.com <alice@example.com>"],
+            ),
+            ["alice@example.com"],
+        )
+
+    def test_skips_empty_items(self) -> None:
+        self.assertEqual(
+            envelope_recipient_addresses(
+                ["Alice <alice@example.com>", "  ", ""],
+                cc=None,
+                bcc=None,
+            ),
+            ["alice@example.com"],
+        )
 
 
 class ExtractReplyAddressTests(unittest.TestCase):
@@ -233,6 +280,19 @@ class QuotePlainReplyTests(unittest.TestCase):
         original = {"from": "Carol <carol@example.com>", "date_received": "today"}
         body = quote_plain_reply(original, ">> Already quoted")
         self.assertIn(">>> Already quoted", body)
+
+    def test_space_separated_quote_markers_not_collapsed(self) -> None:
+        # Unsupported: only the contiguous leading ``>`` run is deepened.
+        original = {"from": "Bob <bob@example.com>", "date_received": "today"}
+        body = quote_plain_reply(original, "> > Original")
+        self.assertIn(">> > Original", body)
+
+    def test_signature_lines_prefixed_like_ordinary_text(self) -> None:
+        original = {"from": "Bob <bob@example.com>", "date_received": "today"}
+        body = quote_plain_reply(original, "Thanks\n-- \nBob\n> -- \nAlice")
+        lines = body.splitlines()
+        self.assertIn("> -- ", lines)
+        self.assertIn(">> -- ", lines)
 
 
 class BodyTextForQuotingTests(unittest.TestCase):
@@ -363,6 +423,9 @@ class BuildForwardSubjectTests(unittest.TestCase):
 
     def test_normalizes_locale_forward_prefix(self) -> None:
         self.assertEqual(build_forward_subject("WG: Hello"), "Fwd: Hello")
+
+    def test_normalizes_french_tr_prefix(self) -> None:
+        self.assertEqual(build_forward_subject("TR: Hello"), "Fwd: Hello")
 
     def test_strips_reply_prefix_when_forwarding(self) -> None:
         self.assertEqual(build_forward_subject("Re: Hello"), "Fwd: Hello")
