@@ -569,7 +569,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._reader_pane.set_margin_start(16)
         self._reader_pane.set_margin_end(16)
         self._reader_pane.set_margin_top(_SIDEBAR_TOP_INSET)
-        self._reader_pane.set_margin_bottom(12)
 
         self._inner_paned.set_start_child(self._message_stack)
         self._inner_paned.set_end_child(self._reader_pane)
