@@ -205,10 +205,6 @@ class SaveDraftOfflineQueueTests(unittest.TestCase):
 class CorrespondentsCacheOnlyTests(unittest.TestCase):
     def test_correspondents_without_folder_cache_are_empty(self) -> None:
         service = MailService(registry=mock.Mock())
-        account = mock.Mock()
-        account.from_address = "me@example.com"
-        account.email = "me@example.com"
-        service.get_account = mock.Mock(return_value=account)
         service._folder_tree_cache = {}
         service._build_folder_index_unlocked = mock.Mock(
             side_effect=AssertionError("must not open folders for correspondents")
@@ -224,10 +220,6 @@ class CorrespondentsCacheOnlyTests(unittest.TestCase):
         from post.mail.eds import _FolderMessageIndex
 
         service = MailService(registry=mock.Mock())
-        account = mock.Mock()
-        account.from_address = "me@example.com"
-        account.email = "me@example.com"
-        service.get_account = mock.Mock(return_value=account)
         service._folder_tree_cache = {
             "acct-1": [
                 {
@@ -257,3 +249,38 @@ class CorrespondentsCacheOnlyTests(unittest.TestCase):
         result = service._build_correspondents_index_unlocked("acct-1")
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].email, "alice@example.com")
+
+    def test_correspondents_include_own_from_address(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = MailService(registry=mock.Mock())
+        service._folder_tree_cache = {
+            "acct-1": [
+                {
+                    "full_name": "Sent",
+                    "display_name": "Sent",
+                    "flags": 4096,
+                }
+            ]
+        }
+        service._folder_indexes = {
+            ("acct-1", "Sent"): _FolderMessageIndex(
+                messages=[
+                    {
+                        "uid": "1",
+                        "from": "Me <me@example.com>",
+                        "to": "Alice <alice@example.com>",
+                        "sort_date": 100,
+                    }
+                ],
+                unread=0,
+                total=1,
+            )
+        }
+        service._build_folder_index_unlocked = mock.Mock(
+            side_effect=AssertionError("must not open folders for correspondents")
+        )
+
+        result = service._build_correspondents_index_unlocked("acct-1")
+        emails = {item.email for item in result}
+        self.assertEqual(emails, {"me@example.com", "alice@example.com"})
