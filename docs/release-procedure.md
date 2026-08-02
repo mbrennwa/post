@@ -9,11 +9,16 @@ any redactions) in the release issue or PR.
 
 ## 1. Version
 
-1. Set `[project].version` in `pyproject.toml`.
+1. Set `[project].version` in `pyproject.toml` (also `src/post/__init__.py`
+   `__version__` fallback).
 2. Match `debian/changelog` upstream version to that value.
-3. Choose the Git tag `v<version>` (same string as the project version).
+3. Match `rpm/post.spec` `Version:` (and add a `%changelog` entry).
+4. Choose the Git tag `v<version>` (same string as the project version).
+   Example: version `1.0.0.dev1` → tag `v1.0.0.dev1`.
    - Trailing `.devN` → GitHub Release is marked **prerelease** (see CI).
    - Otherwise → normal (final) release.
+5. Refresh install examples in `README.md` and `tools/howto-build-*.txt`
+   so package filenames match.
 
 ## 2. Privacy prune (#115) — hard gate
 
@@ -29,8 +34,9 @@ any other public project surface before tagging.
 - Tokens, credentials, internal URLs, or debug dumps with personal data.
 
 **Allowed:** public maintainer contact in packaging metadata
-(`mbrennwa@gmail.com`); intentional placeholders; demo/`example.com` landing
-screenshots (`./scripts/prepare-demo-screenshot.sh`).
+(`mbrennwa@gmail.com`, `matthias@brennwald.org`); intentional git authorship
+emails; intentional placeholders; demo/`example.com` landing screenshots
+(`./scripts/prepare-demo-screenshot.sh`).
 
 ### Checklist
 
@@ -43,9 +49,9 @@ screenshots (`./scripts/prepare-demo-screenshot.sh`).
    It must exit 0. It scans issues **and** PRs (bodies + comments) for
    `user-attachments` media, non-placeholder emails, and known brand/org
    strings; walks the repo tree for the same; refuses image files under
-   `.github/issue-assets/`; and checks git history for private author emails
-   and deleted issue-asset screenshots. Use `SKIP_HISTORY=1` only when you
-   intentionally want tracker/tree checks alone.
+   `.github/issue-assets/`; and checks git history for deleted issue-asset
+   screenshots (commit author emails are allowed). Use `SKIP_HISTORY=1` only
+   when you intentionally want tracker/tree checks alone.
 
 2. Scrub anything the audit reports:
    - **Issues / PRs / comments:** remove `<img … user-attachments …>` tags;
@@ -61,10 +67,11 @@ screenshots (`./scripts/prepare-demo-screenshot.sh`).
 
 3. Spot-check release drafts and wiki/Pages content the same way.
 
-4. If private blobs or non-public author emails remain in **git history**,
+4. If private **blobs** (e.g. issue-asset screenshots) remain in **git history**,
    rewrite before making the repo public (deleting a file on `main` alone does
    not remove it from old commits). That requires `git filter-repo` (or
    equivalent) and a force-push — coordinate with anyone who has clones.
+   Commit author emails are not treated as a privacy failure.
 
 **Do not tag until step 1 exits 0 and remaining manual items are done.**
 

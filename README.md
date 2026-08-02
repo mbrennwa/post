@@ -45,7 +45,7 @@ On Debian 12+, Ubuntu 24.04+, or similar DEB-based distros:
 **From a release `.deb`** (see [GitHub Releases](https://github.com/mbrennwa/post/releases)):
 
 ```bash
-sudo apt install ./dist/post_0.1.0_all.deb
+sudo apt install ./dist/post_1.0.0.dev1_all.deb
 post
 ```
 
@@ -54,7 +54,7 @@ On Fedora:
 **From a release `.rpm`** (see [GitHub Releases](https://github.com/mbrennwa/post/releases)):
 
 ```bash
-sudo dnf install ./dist/post-0.1.0-1.noarch.rpm
+sudo dnf install ./dist/post-1.0.0.dev1-1.noarch.rpm
 post
 ```
 
