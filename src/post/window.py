@@ -1193,9 +1193,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._move_selected_messages("archive")
 
     def _on_settings_clicked(self, *_args) -> None:
-        if self._settings_dialog is not None:
-            self._settings_dialog.present()
-            return
+        existing = self._settings_dialog
+        if existing is not None:
+            # #235: never re-present a previously hidden Settings instance.
+            if existing.get_mapped():
+                existing.present()
+                return
+            existing.destroy()
+            self._settings_dialog = None
         dialog = SettingsWindow(
             parent=self,
             mail=self._mail,
