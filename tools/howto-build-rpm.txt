@@ -20,7 +20,7 @@ Build machine prerequisites (Fedora):
 
 Install on a target system (dnf pulls in [tool.rpm].dnf_requires automatically):
 
-  sudo dnf install ./dist/post-1.0.0.dev1-1.noarch.rpm
+  sudo dnf install ./dist/post-1.0.0.dev2-1.noarch.rpm
   post
 
 Published packages: push a tag v<version> (matching pyproject.toml); GitHub Actions

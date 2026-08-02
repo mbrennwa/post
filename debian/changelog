@@ -1,3 +1,9 @@
+post (1.0.0.dev2) unstable; urgency=medium
+
+  * Bump to 1.0.0.dev2 for Release_testing-2 WIP.
+
+ -- Matthias Brennwald <mbrennwa@gmail.com>  Sun, 02 Aug 2026 11:16:00 +0200
+
 post (1.0.0.dev1) unstable; urgency=medium
 
   * Bump to 1.0.0.dev1 for Release_testing-1.
