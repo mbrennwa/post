@@ -29,6 +29,39 @@ from post.preferences import (
 from post.reader.html import build_reader_document
 from post.wrap_label import WrappingLabel, configure_ellipsize_label, set_label_wrap_mode
 
+# Browser chrome — meaningless for HTML loaded into the reading pane.
+_READER_CONTEXT_MENU_BLOCKLIST = frozenset(
+    {
+        WebKit.ContextMenuAction.GO_BACK,
+        WebKit.ContextMenuAction.GO_FORWARD,
+        WebKit.ContextMenuAction.STOP,
+        WebKit.ContextMenuAction.RELOAD,
+    }
+)
+
+
+def strip_reader_context_menu(menu: WebKit.ContextMenu) -> None:
+    """Remove WebKit navigation actions and tidy leftover separators."""
+    for item in list(menu.get_items()):
+        if item.is_separator():
+            continue
+        if item.get_stock_action() in _READER_CONTEXT_MENU_BLOCKLIST:
+            menu.remove(item)
+
+    items = list(menu.get_items())
+    previous_was_separator = True  # drop leading separators too
+    for item in items:
+        if item.is_separator():
+            if previous_was_separator:
+                menu.remove(item)
+            previous_was_separator = True
+        else:
+            previous_was_separator = False
+
+    items = list(menu.get_items())
+    if items and items[-1].is_separator():
+        menu.remove(items[-1])
+
 
 class _ClampingBoxLayout(Gtk.BoxLayout):
     """BoxLayout that never reports natural size below minimum.
@@ -147,6 +180,7 @@ class MessageReaderPane(Gtk.Box):
         settings.set_enable_html5_database(False)
         settings.set_enable_html5_local_storage(False)
         self._web_view.connect("decide-policy", self._on_web_view_decide_policy)
+        self._web_view.connect("context-menu", self._on_web_view_context_menu)
         self._web_view.set_vexpand(True)
         self._web_view.set_hexpand(True)
         self._reader_body_stack.add_named(self._web_view, "content")
@@ -428,6 +462,15 @@ class MessageReaderPane(Gtk.Box):
     def _uri_opens_externally(uri: str) -> bool:
         lower = uri.lower()
         return lower.startswith(("http://", "https://", "mailto:"))
+
+    def _on_web_view_context_menu(
+        self,
+        _web_view: WebKit.WebView,
+        context_menu: WebKit.ContextMenu,
+        _hit_test_result: WebKit.HitTestResult,
+    ) -> bool:
+        strip_reader_context_menu(context_menu)
+        return False
 
     def _on_web_view_decide_policy(
         self,
