@@ -3,7 +3,7 @@
 
 """Post — a simple GNOME mail client."""
 
-__version__ = "0.1.0"
+__version__ = "1.0.0.dev1"
 
 _PROJECT_HOMEPAGE = "https://mbrennwa.github.io/post"
 _ISSUE_TRACKER_URL = "https://github.com/mbrennwa/post/issues"

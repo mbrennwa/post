@@ -1,3 +1,9 @@
+post (1.0.0.dev1) unstable; urgency=medium
+
+  * Bump to 1.0.0.dev1 for Release_testing-1.
+
+ -- Matthias Brennwald <mbrennwa@gmail.com>  Sun, 02 Aug 2026 10:36:00 +0200
+
 post (0.1.0) unstable; urgency=medium
 
   * .deb installer for Debian/Ubuntu.

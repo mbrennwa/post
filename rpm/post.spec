@@ -1,5 +1,5 @@
 Name:           post
-Version:        0.1.0
+Version:        1.0.0.dev1
 Release:        1
 Summary:        Post — simple GNOME mail client
 License:        GPL-3.0-or-later
@@ -112,5 +112,8 @@ fi
 /usr/share/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg
 
 %changelog
+* Sun Aug 02 2026 Matthias Brennwald <mbrennwa@gmail.com> - 1.0.0.dev1-1
+- Bump to 1.0.0.dev1 for Release_testing-1.
+
 * Sat Aug 01 2026 Matthias Brennwald <mbrennwa@gmail.com> - 0.1.0-1
 - Initial RPM package.

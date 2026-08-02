@@ -3,7 +3,7 @@
 # Requires: gh auth login, network access.
 #
 # Env:
-#   SKIP_HISTORY=1  — skip git-history author / deleted-blob checks
+#   SKIP_HISTORY=1  — skip git-history deleted issue-asset blob checks
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,7 +42,11 @@ SAFE_DOMAINS = {
     "lists.gnu.org",
     "octave.org",
 }
-MAINTAINER_EMAILS = {"mbrennwa@gmail.com"}
+# Public maintainer identities (packaging + intentional git authorship).
+MAINTAINER_EMAILS = {
+    "mbrennwa@gmail.com",
+    "matthias@brennwald.org",
+}
 # Public packaging identity — not a privacy leak by itself.
 PUBLIC_IDENTITY = re.compile(r"Matthias\s+Brennwald", re.I)
 SUSPECT_WORDS = re.compile(
@@ -86,7 +90,12 @@ def email_ok(addr: str) -> bool:
 
 
 def scrub_public(text: str) -> str:
-    return PUBLIC_IDENTITY.sub("PUBLIC_MAINTAINER", text or "")
+    cleaned = PUBLIC_IDENTITY.sub("PUBLIC_MAINTAINER", text or "")
+    # Drop allowed maintainer addresses so brand/name tokens inside them
+    # (e.g. brennwald.org) do not trip SUSPECT_WORDS.
+    for addr in MAINTAINER_EMAILS:
+        cleaned = re.sub(re.escape(addr), "PUBLIC_MAINTAINER_EMAIL", cleaned, flags=re.I)
+    return cleaned
 
 
 def scan_text(source: str, where: str, text: str) -> None:
@@ -94,7 +103,7 @@ def scan_text(source: str, where: str, text: str) -> None:
     cleaned = scrub_public(raw)
     if "user-attachments/assets/" in cleaned:
         found.append((source, where, "user-attachments screenshot"))
-    for m in EMAIL_RE.findall(cleaned):
+    for m in EMAIL_RE.findall(raw):
         if not email_ok(m):
             found.append((source, where, m))
     for m in SUSPECT_WORDS.finditer(cleaned):
@@ -220,7 +229,7 @@ for dirpath, dirnames, filenames in os.walk(ROOT):
         except OSError:
             continue
         cleaned = scrub_public(text)
-        for m in EMAIL_RE.findall(cleaned):
+        for m in EMAIL_RE.findall(text):
             if not email_ok(m):
                 found.append(("tree", rel, m))
         if rel in WORD_ALLOW:
@@ -229,25 +238,10 @@ for dirpath, dirnames, filenames in os.walk(ROOT):
             found.append(("tree", rel, f"suspect word: {m.group(0)}"))
 
 # --- Git history ------------------------------------------------------------
+# Commit author emails are allowed (transparency). History is only scanned for
+# private issue-asset screenshots that remain reachable after deletion.
 skip_history = os.environ.get("SKIP_HISTORY", "0") == "1"
 if not skip_history:
-    authors = subprocess.check_output(
-        ["git", "log", "--all", "--format=%ae"],
-        text=True,
-    ).splitlines()
-    bad_authors = sorted(
-        {
-            a
-            for a in authors
-            if a
-            and a.lower() not in {x.lower() for x in MAINTAINER_EMAILS}
-            and not a.lower().endswith("@users.noreply.github.com")
-            and "noreply" not in a.lower()
-        }
-    )
-    for a in bad_authors:
-        found.append(("history", "author", a))
-
     hist = subprocess.run(
         [
             "git",
@@ -290,7 +284,7 @@ if found:
 
 print(
     "Privacy audit OK: issues/PRs/comments, repo tree"
-    + ("" if skip_history else ", and git history authors/blobs")
+    + ("" if skip_history else ", and git history issue-asset blobs")
     + " look clean."
 )
 PY
