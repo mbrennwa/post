@@ -16,3 +16,6 @@ debian/debhelper-build-stamp
 debian/files
 debian/.build-venv
 debian/post/
+
+# rpm package build outputs
+.rpmbuild/

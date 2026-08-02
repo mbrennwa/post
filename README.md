@@ -25,6 +25,7 @@ Big-picture capabilities for the current tree (refresh on every release — see
 - Desktop mailto: handling
 - Unsubscribe from mailing lists
 - .DEB installer package (Debian 12+ and derived distros)
+- .RPM installer package (Fedora)
 
 **Not yet**
 
@@ -35,7 +36,6 @@ Big-picture capabilities for the current tree (refresh on every release — see
 - Clickable links in plain-text messages
 - Full header details view
 - Desktop notifications for new mail
-- RPM installer package
 
 
 ## Install
@@ -49,6 +49,15 @@ sudo apt install ./dist/post_0.1.0_all.deb
 post
 ```
 
+On Fedora:
+
+**From a release `.rpm`** (see [GitHub Releases](https://github.com/mbrennwa/post/releases)):
+
+```bash
+sudo dnf install ./dist/post-0.1.0-1.noarch.rpm
+post
+```
+
 **From source** — install system dependencies (GObject introspection typelibs and
 related tools — not installable via pip), then run Post:
 
@@ -57,19 +66,21 @@ related tools — not installable via pip), then run Post:
 ./run.sh
 ```
 
-**Build a `.deb` locally:**
+**Build packages locally:**
 
 ```bash
-make deb
-# artifacts in dist/
+make deb        # .deb → dist/ (Debian/Ubuntu build host)
+make rpm        # .rpm → dist/ (Fedora build host)
+make packages   # both (requires both toolchains)
 ```
 
-See `tools/howto-build-deb.txt` for build-machine prerequisites.
+See `tools/howto-build-deb.txt` and `tools/howto-build-rpm.txt` for
+build-machine prerequisites.
 
-The canonical runtime package list lives in **`pyproject.toml`** under
-**`[tool.deb].apt_depends`**. Post uses a venv with
-`--system-site-packages` so PyGObject and GI typelibs from the distro are
-visible to the app.
+Canonical runtime package lists live in **`pyproject.toml`** under
+**`[tool.deb].apt_depends`** (DEB) and **`[tool.rpm].dnf_requires`** (RPM).
+Post uses a venv with `--system-site-packages` so PyGObject and GI typelibs
+from the distro are visible to the app.
 
 ## Development
 

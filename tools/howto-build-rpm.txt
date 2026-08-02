@@ -1,0 +1,30 @@
+Build a post .rpm package
+
+From the repository root:
+
+  make rpm
+
+or:
+
+  ./tools/build-rpm.sh
+
+Version and runtime dependencies are read from pyproject.toml ([project].version and
+[tool.rpm].dnf_requires). Each build overwrites dist/post-<version>-1.noarch.rpm
+(Release is always 1; no dist tag in the filename).
+
+rpm/post.spec Version must match [project].version (update %%changelog when bumping).
+
+Build machine prerequisites (Fedora):
+
+  sudo dnf install rpm-build python3 python3-pip python3-setuptools
+
+Install on a target system (dnf pulls in [tool.rpm].dnf_requires automatically):
+
+  sudo dnf install ./dist/post-0.1.0-1.noarch.rpm
+  post
+
+Published packages: push a tag v<version> (matching pyproject.toml); GitHub Actions
+uploads the .rpm to https://github.com/mbrennwa/post/releases alongside the .deb.
+
+The package installs data/io.github.mbrennwa.Post.desktop and hicolor launcher icons
+from data/icons/hicolor/. Wrappers are shared with the DEB package (debian/wrapper/).

@@ -22,7 +22,7 @@ Install on a target system (apt pulls in [tool.deb].apt_depends automatically):
   post
 
 Published packages: push a tag v<version> (matching pyproject.toml); GitHub Actions
-uploads the .deb to https://github.com/mbrennwa/post/releases
+uploads the .deb (and .rpm) to https://github.com/mbrennwa/post/releases
 
 The package installs data/io.github.mbrennwa.Post.desktop and hicolor launcher icons
 from data/icons/hicolor/.
