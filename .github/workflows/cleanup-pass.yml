@@ -1,0 +1,85 @@
+# Open a dated child issue for the standing cleanup-pass policy (#242).
+
+name: Schedule cleanup pass
+
+on:
+  schedule:
+    # ~monthly (closest reliable cron to the 4–6 week cadence on #242).
+    - cron: "0 9 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  open-child-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open cleanup-pass child issue if needed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PARENT: "242"
+        run: |
+          set -euo pipefail
+          period="$(date -u +%Y-%m)"
+          title="Cleanup pass ${period}"
+
+          # Skip if this month's child already exists (open or closed).
+          existing="$(
+            gh issue list --repo "${GITHUB_REPOSITORY}" --state all \
+              --search "in:title \"${title}\"" --json number,title \
+              | jq --arg t "${title}" '[.[] | select(.title == $t)] | length'
+          )"
+          if [ "${existing}" -gt 0 ]; then
+            echo "Issue already exists: ${title}"
+            exit 0
+          fi
+
+          # Skip if any prior cleanup-pass child is still open.
+          open_json="$(
+            gh issue list --repo "${GITHUB_REPOSITORY}" --state open \
+              --search 'in:title "Cleanup pass"' --json number,title
+          )"
+          open_count="$(
+            printf '%s\n' "${open_json}" \
+              | jq --arg p "Cleanup pass " '[.[] | select(.title | startswith($p))] | length'
+          )"
+          if [ "${open_count}" -gt 0 ]; then
+            echo "An open cleanup-pass child already exists; skipping."
+            printf '%s\n' "${open_json}" | jq .
+            exit 0
+          fi
+
+          body_file="$(mktemp)"
+          cat >"${body_file}" <<EOF
+          Parent: #${PARENT}
+
+          Automated child of the standing cleanup-pass policy. **Close this issue when the pass is done (or as no-op). Do not close #${PARENT}.**
+
+          ## Checklist
+
+          - [ ] Remove unnecessary abstractions
+          - [ ] Delete dead code
+          - [ ] Merge duplicate logic
+          - [ ] Rename confusing APIs
+          - [ ] Simplify data flow
+
+          ## Rules
+
+          - Time-box (e.g. half day / one evening).
+          - Cleanup only — no feature work.
+          - Prefer one theme and small, reviewable PRs.
+          EOF
+
+          url="$(
+            gh issue create --repo "${GITHUB_REPOSITORY}" \
+              --title "${title}" \
+              --label "P1 -- important / not urgent" \
+              --label "Release" \
+              --body-file "${body_file}"
+          )"
+
+          echo "Created ${url}"
+          gh issue comment --repo "${GITHUB_REPOSITORY}" "${PARENT}" \
+            --body "Opened automated child for ${period}: ${url}"
