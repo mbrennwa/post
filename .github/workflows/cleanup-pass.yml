@@ -75,7 +75,7 @@ jobs:
           url="$(
             gh issue create --repo "${GITHUB_REPOSITORY}" \
               --title "${title}" \
-              --label "P1 -- important / not urgent" \
+              --label "P0 -- do next" \
               --label "Release" \
               --body-file "${body_file}"
           )"
