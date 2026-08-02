@@ -18,7 +18,7 @@ Build machine prerequisites (Debian 12+ / Ubuntu 24.04+):
 
 Install on a target system (apt pulls in [tool.deb].apt_depends automatically):
 
-  sudo apt install ./dist/post_1.0.0.dev1_all.deb
+  sudo apt install ./dist/post_1.0.0.dev2_all.deb
   post
 
 Published packages: push a tag v<version> (matching pyproject.toml); GitHub Actions

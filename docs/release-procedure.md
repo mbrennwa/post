@@ -14,7 +14,7 @@ any redactions) in the release issue or PR.
 2. Match `debian/changelog` upstream version to that value.
 3. Match `rpm/post.spec` `Version:` (and add a `%changelog` entry).
 4. Choose the Git tag `v<version>` (same string as the project version).
-   Example: version `1.0.0.dev1` → tag `v1.0.0.dev1`.
+   Example: version `1.0.0.dev2` → tag `v1.0.0.dev2`.
    - Trailing `.devN` → GitHub Release is marked **prerelease** (see CI).
    - Otherwise → normal (final) release.
 5. Refresh install examples in `README.md` and `tools/howto-build-*.txt`
