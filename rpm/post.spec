@@ -19,7 +19,7 @@ Requires:       python3-gobject
 Requires:       gtk4
 Requires:       libadwaita
 Requires:       glib2
-Requires:       webkitgtk6
+Requires:       webkitgtk6.0
 Requires:       evolution-data-server
 Requires:       evolution-ews
 Requires:       librsvg2-tools

@@ -54,7 +54,7 @@ dnf_requires = [
   "gtk4",
   "libadwaita",
   "glib2",
-  "webkitgtk6",
+  "webkitgtk6.0",
   "evolution-data-server",
   "evolution-ews",
   "librsvg2-tools",
