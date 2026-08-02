@@ -11,14 +11,24 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("WebKit", "6.0")
 
-from gi.repository import Gtk
+from gi.repository import Gtk, WebKit
 
 from post.preferences import MESSAGE_APPEARANCE_ADAPT_TEXT
-from post.reader.pane import MessageReaderPane
+from post.reader.pane import MessageReaderPane, strip_reader_context_menu
 
 
 def _noop(*_args: Any, **_kwargs: Any) -> None:
     pass
+
+
+def _menu_actions(menu: WebKit.ContextMenu) -> list[str | int]:
+    actions: list[str | int] = []
+    for item in menu.get_items():
+        if item.is_separator():
+            actions.append("SEP")
+        else:
+            actions.append(int(item.get_stock_action()))
+    return actions
 
 
 def _sample_message(*, seen: bool = True, flagged: bool = False) -> dict[str, Any]:
@@ -172,3 +182,72 @@ class MessageReaderPaneTests(unittest.TestCase):
         )
         self.pane.show_loading()
         self.assertIsNone(self.pane.current_message)
+
+    def test_strip_reader_context_menu_drops_navigation_actions(self) -> None:
+        menu = WebKit.ContextMenu.new()
+        for action in (
+            WebKit.ContextMenuAction.GO_BACK,
+            WebKit.ContextMenuAction.GO_FORWARD,
+            WebKit.ContextMenuAction.STOP,
+            WebKit.ContextMenuAction.RELOAD,
+            WebKit.ContextMenuAction.COPY,
+            WebKit.ContextMenuAction.SELECT_ALL,
+        ):
+            menu.append(WebKit.ContextMenuItem.new_from_stock_action(action))
+
+        strip_reader_context_menu(menu)
+
+        self.assertEqual(
+            _menu_actions(menu),
+            [
+                int(WebKit.ContextMenuAction.COPY),
+                int(WebKit.ContextMenuAction.SELECT_ALL),
+            ],
+        )
+
+    def test_strip_reader_context_menu_collapses_separators(self) -> None:
+        menu = WebKit.ContextMenu.new()
+        menu.append(
+            WebKit.ContextMenuItem.new_from_stock_action(
+                WebKit.ContextMenuAction.GO_BACK
+            )
+        )
+        menu.append(WebKit.ContextMenuItem.new_separator())
+        menu.append(
+            WebKit.ContextMenuItem.new_from_stock_action(WebKit.ContextMenuAction.COPY)
+        )
+        menu.append(WebKit.ContextMenuItem.new_separator())
+        menu.append(
+            WebKit.ContextMenuItem.new_from_stock_action(
+                WebKit.ContextMenuAction.RELOAD
+            )
+        )
+        menu.append(WebKit.ContextMenuItem.new_separator())
+
+        strip_reader_context_menu(menu)
+
+        self.assertEqual(
+            _menu_actions(menu),
+            [int(WebKit.ContextMenuAction.COPY)],
+        )
+
+    def test_web_view_context_menu_handler_strips_navigation(self) -> None:
+        menu = WebKit.ContextMenu.new()
+        menu.append(
+            WebKit.ContextMenuItem.new_from_stock_action(
+                WebKit.ContextMenuAction.GO_BACK
+            )
+        )
+        menu.append(
+            WebKit.ContextMenuItem.new_from_stock_action(WebKit.ContextMenuAction.COPY)
+        )
+        handled = self.pane._on_web_view_context_menu(
+            self.pane._web_view,
+            menu,
+            WebKit.HitTestResult(),
+        )
+        self.assertFalse(handled)
+        self.assertEqual(
+            _menu_actions(menu),
+            [int(WebKit.ContextMenuAction.COPY)],
+        )
