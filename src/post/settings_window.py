@@ -107,6 +107,9 @@ class SettingsDialog(Adw.PreferencesWindow):
         super().__init__(transient_for=parent, modal=True)
         self.set_title("Settings")
         self.set_default_size(760, 520)
+        # #235: hiding and re-presenting this window leaves close broken after the
+        # next About-link open. Destroy on close so each open is a fresh instance.
+        self.set_hide_on_close(False)
         self._parent = parent
         self._mail = mail
         self._set_status = set_status
