@@ -194,6 +194,19 @@ separator.header-divider {{
   min-height: 1px;
   background-color: alpha(@window_fg_color, 0.12);
 }}
+box.calendar-invite {{
+  margin-top: 2px;
+  margin-bottom: 2px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border-top: 1px solid alpha(@window_fg_color, 0.14);
+  border-bottom: 1px solid alpha(@window_fg_color, 0.14);
+  background-color: alpha(@window_fg_color, 0.05);
+}}
+label.calendar-invite-link {{
+  color: @accent_color;
+  cursor: pointer;
+}}
 .message-unread-dot {{
   min-width: 10px;
   min-height: 10px;
@@ -565,6 +578,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_reply_all=self._on_reply_all_clicked,
             on_forward=self._on_forward_clicked,
             on_unsubscribe=self._on_unsubscribe_clicked,
+            on_add_to_calendar=self._on_add_to_calendar_clicked,
             on_attachment_clicked=self._on_reader_attachment_clicked,
             on_attachment_context_menu=self._on_reader_attachment_context_menu,
             on_open_uri=self._open_uri_externally,
@@ -1738,8 +1752,45 @@ class MainWindow(Adw.ApplicationWindow):
                 return self._unsubscribe_action_from_message(window.current_message)
         return None
 
+    @staticmethod
+    def _calendar_invite_from_message(msg: dict | None) -> dict | None:
+        if msg is None:
+            return None
+        invite = msg.get("calendar_invite")
+        return dict(invite) if isinstance(invite, dict) else None
+
+    def _calendar_invite_for_list_key(self, list_key: str) -> dict | None:
+        if list_key == self._current_message_uid:
+            invite = self._calendar_invite_from_message(self._current_message)
+            if invite is not None:
+                return invite
+        location = self._message_location_for_list_key(list_key)
+        if location is None:
+            return None
+        account_uid, folder_name, message_uid = location
+        for window in self._reader_windows:
+            if (
+                window.account_uid == account_uid
+                and window.folder_name == folder_name
+                and window.message_uid == message_uid
+            ):
+                return self._calendar_invite_from_message(window.current_message)
+        return None
+
     def _on_unsubscribe_clicked(self, action: dict[str, str]) -> None:
         self._run_unsubscribe_action(action, list_key=self._current_message_uid)
+
+    def _on_add_to_calendar_clicked(self, invite: dict) -> None:
+        from post.calendar_dialog import present_add_to_calendar
+        from post.mail.io_thread import get_mail_io_thread
+
+        present_add_to_calendar(
+            self,
+            invite,
+            on_success=lambda label: show_toast(self, f"Added to {label}"),
+            on_error=lambda message: show_error_toast(self, message),
+            run_async=lambda worker: get_mail_io_thread().submit(worker),
+        )
 
     def _can_archive_list_key(self, list_key: str | None) -> bool:
         if not list_key:
@@ -2136,10 +2187,16 @@ class MainWindow(Adw.ApplicationWindow):
         open_with_action.connect("activate", self._on_attachment_menu_open_with)
         self.add_action(open_with_action)
 
-        menu = Gio.Menu()
-        menu.append("Save...", "win.attachment-save")
-        menu.append("Open With…", "win.attachment-open-with")
-        self._attachment_popover = Gtk.PopoverMenu.new_from_model(menu)
+        add_cal_action = Gio.SimpleAction.new("attachment-add-to-calendar", None)
+        add_cal_action.connect("activate", self._on_attachment_menu_add_to_calendar)
+        self.add_action(add_cal_action)
+
+        self._attachment_menu_model = Gio.Menu()
+        self._attachment_menu_model.append("Save...", "win.attachment-save")
+        self._attachment_menu_model.append("Open With…", "win.attachment-open-with")
+        self._attachment_popover = Gtk.PopoverMenu.new_from_model(
+            self._attachment_menu_model
+        )
 
     def _setup_message_menu(self) -> None:
         mark_read_action = Gio.SimpleAction.new("message-mark-read", None)
@@ -2185,6 +2242,10 @@ class MainWindow(Adw.ApplicationWindow):
         unsubscribe_action = Gio.SimpleAction.new("message-unsubscribe", None)
         unsubscribe_action.connect("activate", self._on_message_menu_unsubscribe)
         self.add_action(unsubscribe_action)
+
+        add_calendar_action = Gio.SimpleAction.new("message-add-to-calendar", None)
+        add_calendar_action.connect("activate", self._on_message_menu_add_to_calendar)
+        self.add_action(add_calendar_action)
 
         self._outbox_edit_action = Gio.SimpleAction.new("message-outbox-edit", None)
         self._outbox_edit_action.connect("activate", self._on_message_menu_outbox_edit)
@@ -2908,9 +2969,17 @@ class MainWindow(Adw.ApplicationWindow):
         mime_type: str | None,
         name: str,
     ) -> None:
+        from post.mail.calendar_invite import is_calendar_mime
+
         self._context_attachment_index = index
         self._context_attachment_mime = mime_type
         self._context_attachment_name = name
+        menu = Gio.Menu()
+        menu.append("Save...", "win.attachment-save")
+        menu.append("Open With…", "win.attachment-open-with")
+        if is_calendar_mime(mime_type):
+            menu.append("Add to Calendar…", "win.attachment-add-to-calendar")
+        self._attachment_popover.set_menu_model(menu)
         self._ensure_popover_parent(self._attachment_popover, widget)
         rect = Gdk.Rectangle()
         rect.x = int(x)
@@ -2938,6 +3007,17 @@ class MainWindow(Adw.ApplicationWindow):
             self._context_attachment_index,
             self._prompt_open_with_dialog,
         )
+
+    def _on_attachment_menu_add_to_calendar(self, *_args) -> None:
+        invite = None
+        if self._current_message and isinstance(
+            self._current_message.get("calendar_invite"), dict
+        ):
+            invite = dict(self._current_message["calendar_invite"])
+        if invite is None:
+            show_error_toast(self, "No calendar invite details found")
+            return
+        self._on_add_to_calendar_clicked(invite)
 
     def _fetch_attachment(
         self,
@@ -5317,6 +5397,8 @@ class MainWindow(Adw.ApplicationWindow):
                 menu.append("Forward", "win.message-forward")
                 if self._unsubscribe_action_for_list_key(uids[0]) is not None:
                     menu.append("Unsubscribe…", "win.message-unsubscribe")
+                if self._calendar_invite_for_list_key(uids[0]) is not None:
+                    menu.append("Add to Calendar…", "win.message-add-to-calendar")
                 location = self._message_location_for_list_key(uids[0])
                 source_is_sent = False
                 if location is not None:
@@ -5411,6 +5493,13 @@ class MainWindow(Adw.ApplicationWindow):
         action = self._unsubscribe_action_for_list_key(list_key)
         if action is not None:
             self._run_unsubscribe_action(action, list_key=list_key)
+
+    def _on_message_menu_add_to_calendar(self, *_args) -> None:
+        if len(self._context_message_uids) != 1:
+            return
+        invite = self._calendar_invite_for_list_key(self._context_message_uids[0])
+        if invite is not None:
+            self._on_add_to_calendar_clicked(invite)
 
     def _on_message_menu_send_again(self, *_args) -> None:
         if len(self._context_message_uids) != 1:

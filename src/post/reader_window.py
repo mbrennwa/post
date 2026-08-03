@@ -142,6 +142,7 @@ class ReaderWindow(Adw.ApplicationWindow):
             on_reply_all=self._on_reply_all,
             on_forward=self._on_forward,
             on_unsubscribe=self._on_unsubscribe,
+            on_add_to_calendar=self._on_add_to_calendar,
             on_attachment_clicked=self._on_attachment_clicked,
             on_attachment_context_menu=self._on_attachment_context_menu,
             on_open_uri=self._open_uri_externally,
@@ -474,6 +475,17 @@ class ReaderWindow(Adw.ApplicationWindow):
 
         get_mail_io_thread().submit(worker)
 
+    def _on_add_to_calendar(self, invite: dict) -> None:
+        from post.calendar_dialog import present_add_to_calendar
+
+        present_add_to_calendar(
+            self,
+            invite,
+            on_success=lambda label: show_toast(self, f"Added to {label}"),
+            on_error=lambda message: show_error_toast(self, message),
+            run_async=lambda worker: get_mail_io_thread().submit(worker),
+        )
+
     def _archive_after_unsubscribe(self) -> None:
         if not self._get_move_state().get("can_archive"):
             return
@@ -498,14 +510,6 @@ class ReaderWindow(Adw.ApplicationWindow):
         self._on_compose(mode, self._current_message)
 
     def _setup_attachment_menu(self) -> None:
-        menu = Gio.Menu()
-        menu.append("Save As…", "win.save-attachment")
-        menu.append("Open With…", "win.open-with-attachment")
-
-        popover = Gtk.PopoverMenu()
-        popover.set_menu_model(menu)
-        self._attachment_popover = popover
-
         save_action = Gio.SimpleAction.new("save-attachment", None)
         save_action.connect("activate", self._on_attachment_menu_save)
         self.add_action(save_action)
@@ -513,6 +517,17 @@ class ReaderWindow(Adw.ApplicationWindow):
         open_with_action = Gio.SimpleAction.new("open-with-attachment", None)
         open_with_action.connect("activate", self._on_attachment_menu_open_with)
         self.add_action(open_with_action)
+
+        add_cal_action = Gio.SimpleAction.new("add-calendar-attachment", None)
+        add_cal_action.connect("activate", self._on_attachment_menu_add_to_calendar)
+        self.add_action(add_cal_action)
+
+        menu = Gio.Menu()
+        menu.append("Save As…", "win.save-attachment")
+        menu.append("Open With…", "win.open-with-attachment")
+        popover = Gtk.PopoverMenu()
+        popover.set_menu_model(menu)
+        self._attachment_popover = popover
 
     def _on_attachment_context_menu(
         self,
@@ -523,9 +538,17 @@ class ReaderWindow(Adw.ApplicationWindow):
         mime_type: str | None,
         name: str,
     ) -> None:
+        from post.mail.calendar_invite import is_calendar_mime
+
         self._context_attachment_index = index
         self._context_attachment_mime = mime_type
         self._context_attachment_name = name
+        menu = Gio.Menu()
+        menu.append("Save As…", "win.save-attachment")
+        menu.append("Open With…", "win.open-with-attachment")
+        if is_calendar_mime(mime_type):
+            menu.append("Add to Calendar…", "win.add-calendar-attachment")
+        self._attachment_popover.set_menu_model(menu)
         self._attachment_popover.set_parent(widget)
         rect = Gdk.Rectangle()
         rect.x = int(x)
@@ -553,6 +576,17 @@ class ReaderWindow(Adw.ApplicationWindow):
             self._context_attachment_index,
             self._prompt_open_with_dialog,
         )
+
+    def _on_attachment_menu_add_to_calendar(self, *_args) -> None:
+        invite = None
+        if self._current_message and isinstance(
+            self._current_message.get("calendar_invite"), dict
+        ):
+            invite = dict(self._current_message["calendar_invite"])
+        if invite is None:
+            show_error_toast(self, "No calendar invite details found")
+            return
+        self._on_add_to_calendar(invite)
 
     def _fetch_attachment(
         self,
