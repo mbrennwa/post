@@ -17,6 +17,11 @@ gi.require_version("GLib", "2.0")
 from gi.repository import GLib
 
 from post.mail.compose import ComposeAttachment
+from post.mail.network_errors import (
+    is_network_unavailable_error,
+    is_queueable_network_error,
+)
+from post.mail.offline_status import offline_cache_status_text
 from post.mail.send_queue import (
     QueuedOutboundMessage,
     clear_outbound_send_delay,
@@ -24,7 +29,6 @@ from post.mail.send_queue import (
     enqueue_outbound_message,
     has_pending_send_delay,
     is_outbound_ready_to_send,
-    is_queueable_network_error,
     list_pending_delayed_outbound_messages,
     list_queued_for_account,
     list_queued_messages_page,
@@ -59,8 +63,6 @@ class QueueableNetworkErrorTests(unittest.TestCase):
         self.assertFalse(is_queueable_network_error(exc))
 
     def test_camel_offline_service_error(self) -> None:
-        from post.mail.send_queue import is_network_unavailable_error
-
         exc = GLib.Error.new_literal(
             GLib.quark_from_string("camel-service-error-quark"),
             'You must be working online to complete this operation '
@@ -69,18 +71,7 @@ class QueueableNetworkErrorTests(unittest.TestCase):
         )
         self.assertTrue(is_network_unavailable_error(exc))
 
-    def test_offline_status_with_queue(self) -> None:
-        from post.mail.send_queue import offline_status_text
-
-        self.assertEqual(offline_status_text(queued_count=0), "Offline")
-        self.assertEqual(
-            offline_status_text(queued_count=2),
-            "Offline · 2 messages queued",
-        )
-
     def test_offline_cache_status_text(self) -> None:
-        from post.mail.send_queue import offline_cache_status_text
-
         self.assertEqual(
             offline_cache_status_text(account_label="Work", folder_name="Inbox"),
             "Caching mail for offline use · Work · Inbox (bodies for local headers)",

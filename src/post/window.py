@@ -79,20 +79,20 @@ from post.mail.search import (
 from post.mail.search_debug import search_trace, search_trace_timer
 from post.mail.operation_queue import offline_queue_status_text
 from post.mail.send_delay import OutboundSendDelayScheduler
-from post.mail.send_queue import (
+from post.mail.network_errors import is_network_unavailable_error, log_mail_error
+from post.mail.offline_status import (
     OFFLINE_CACHED_LIST_STATUS,
     OFFLINE_MAIL_MESSAGE,
     OFFLINE_SEARCHING_LOCAL_CACHE,
+    offline_cache_status_text,
+)
+from post.mail.send_queue import (
     QueuedOutboundMessage,
-    is_network_unavailable_error,
     list_pending_delayed_outbound_messages,
     list_queued_messages,
     list_queued_outbound_messages,
     load_queued_attachments,
     load_queued_outbound_message,
-    log_mail_error,
-    offline_cache_status_text,
-    offline_status_text,
     read_queued_message,
     remove_queued_outbound_message,
 )

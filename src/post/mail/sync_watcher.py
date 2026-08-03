@@ -23,7 +23,7 @@ from .folders import is_post_local_folder
 from .io_thread import get_mail_io_thread
 from .offline_settings import account_is_user_offline
 from .search_debug import search_trace
-from .send_queue import is_network_unavailable_error, log_mail_error
+from .network_errors import is_network_unavailable_error, log_mail_error
 
 log = logging.getLogger(__name__)
 
