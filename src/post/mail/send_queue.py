@@ -12,7 +12,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from .compose import ComposeAttachment
 from .helpers import format_message_datetime, paginate_messages
@@ -98,6 +98,50 @@ def has_pending_send_delay(
     if now is None:
         now = time.time()
     return message.send_after is not None and message.send_after > now
+
+
+def format_stop_sending_toast(
+    moved_by_account_label: Mapping[str, int] | Sequence[tuple[str, int]],
+) -> str:
+    """Toast after stopping delayed sends and moving messages to Drafts."""
+    items = _merge_account_counts(moved_by_account_label)
+    if not items:
+        return ""
+    total = sum(count for _label, count in items)
+    if total == 1:
+        return f"Moved message to Drafts: {items[0][0]}"
+    parts = [f"{label} ({count})" for label, count in items]
+    return "Moved messages to Drafts: " + ", ".join(parts)
+
+
+def format_stop_sending_error_toast(
+    failed_by_account_label: Mapping[str, int] | Sequence[tuple[str, int]],
+) -> str:
+    """Toast when some delayed messages could not be moved to Drafts."""
+    items = _merge_account_counts(failed_by_account_label)
+    if not items:
+        return "Could not move to Drafts"
+    total = sum(count for _label, count in items)
+    if total == 1:
+        return f"Could not move message to Drafts: {items[0][0]}"
+    parts = [f"{label} ({count})" for label, count in items]
+    return "Could not move messages to Drafts: " + ", ".join(parts)
+
+
+def _merge_account_counts(
+    by_account_label: Mapping[str, int] | Sequence[tuple[str, int]],
+) -> list[tuple[str, int]]:
+    merged: dict[str, int] = {}
+    if isinstance(by_account_label, Mapping):
+        pairs = by_account_label.items()
+    else:
+        pairs = by_account_label
+    for label, count in pairs:
+        if count <= 0:
+            continue
+        key = str(label)
+        merged[key] = merged.get(key, 0) + int(count)
+    return sorted(merged.items(), key=lambda item: item[0].casefold())
 
 
 def outbox_dir() -> str:

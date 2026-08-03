@@ -88,6 +88,9 @@ from post.mail.offline_status import (
 )
 from post.mail.send_queue import (
     QueuedOutboundMessage,
+    format_stop_sending_error_toast,
+    format_stop_sending_toast,
+    has_pending_send_delay,
     list_pending_delayed_outbound_messages,
     list_queued_messages,
     list_queued_outbound_messages,
@@ -589,6 +592,7 @@ class MainWindow(Adw.ApplicationWindow):
             orientation=Gtk.Orientation.HORIZONTAL,
             spacing=8,
             margin_start=12,
+            margin_end=12,
             margin_top=6,
             margin_bottom=6,
         )
@@ -607,6 +611,23 @@ class MainWindow(Adw.ApplicationWindow):
         self._status.set_valign(Gtk.Align.CENTER)
         self._status.set_vexpand(False)
         self._status_bar.append(self._status)
+        self._stop_sending_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=4,
+        )
+        self._stop_sending_box.set_valign(Gtk.Align.CENTER)
+        self._stop_sending_box.set_visible(False)
+        self._stop_sending_count = Gtk.Label(label="")
+        self._stop_sending_count.add_css_class("dim-label")
+        self._stop_sending_count.set_valign(Gtk.Align.CENTER)
+        self._stop_sending_box.append(self._stop_sending_count)
+        self._stop_sending_btn = Gtk.Button(icon_name="process-stop-symbolic")
+        self._stop_sending_btn.set_tooltip_text("Stop Sending")
+        self._stop_sending_btn.add_css_class("flat")
+        self._stop_sending_btn.set_valign(Gtk.Align.CENTER)
+        self._stop_sending_btn.connect("clicked", self._on_stop_sending_clicked)
+        self._stop_sending_box.append(self._stop_sending_btn)
+        self._status_bar.append(self._stop_sending_box)
         outer.append(self._status_bar)
 
         self._toast_overlay = Adw.ToastOverlay()
@@ -642,6 +663,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._flush_operation_queue_idle()
         self._flush_draft_queue_idle()
         self._send_delay_scheduler.reschedule_all()
+        self._update_stop_sending_button()
         return False
 
     def _on_network_available_changed(self, monitor: Gio.NetworkMonitor, *_args) -> None:
@@ -757,11 +779,25 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_outbox_changed(self) -> None:
         self._sidebar.refresh_outbox_rows()
         self._refresh_status_display()
+        self._update_stop_sending_button()
         if (
             self._current_account
             and is_post_outbox_folder(self._current_folder)
         ):
             self._load_messages(self._current_account.uid, POST_OUTBOX_FOLDER)
+
+    def _update_stop_sending_button(self) -> None:
+        count = sum(
+            1
+            for _queue_id, message in list_queued_outbound_messages()
+            if has_pending_send_delay(message)
+        )
+        if count:
+            self._stop_sending_count.set_label(str(count))
+            self._stop_sending_box.set_visible(True)
+        else:
+            self._stop_sending_count.set_label("")
+            self._stop_sending_box.set_visible(False)
 
     def _install_message_list_style(self) -> None:
         provider = Gtk.CssProvider()
@@ -5424,9 +5460,6 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
     def _move_outbox_to_drafts(self, queue_id: str) -> None:
-        if not self._current_account:
-            return
-        account = self._current_account
         self._send_delay_scheduler.cancel(queue_id)
 
         def worker() -> None:
@@ -5435,7 +5468,7 @@ class MainWindow(Adw.ApplicationWindow):
                 queued = load_queued_outbound_message(queue_id)
                 attachments = load_queued_attachments(queue_id, queued)
                 self._mail.save_draft(
-                    account.uid,
+                    queued.account_uid,
                     to=queued.to,
                     cc=queued.cc,
                     bcc=queued.bcc,
@@ -5460,6 +5493,72 @@ class MainWindow(Adw.ApplicationWindow):
             return False
         self._on_outbox_changed()
         self._set_status("Moved queued message to Drafts")
+        return False
+
+    def _on_stop_sending_clicked(self, *_args) -> None:
+        pending = [
+            (queue_id, message)
+            for queue_id, message in list_queued_outbound_messages()
+            if has_pending_send_delay(message)
+        ]
+        if not pending:
+            return
+        for queue_id, _message in pending:
+            self._send_delay_scheduler.cancel(queue_id)
+        queue_ids = [queue_id for queue_id, _message in pending]
+
+        def worker() -> None:
+            moved: dict[str, int] = {}
+            failed: dict[str, int] = {}
+            for queue_id in queue_ids:
+                account_uid = ""
+                try:
+                    queued = load_queued_outbound_message(queue_id)
+                    account_uid = queued.account_uid
+                    attachments = load_queued_attachments(queue_id, queued)
+                    self._mail.save_draft(
+                        queued.account_uid,
+                        to=queued.to,
+                        cc=queued.cc,
+                        bcc=queued.bcc,
+                        subject=queued.subject,
+                        body=queued.body,
+                        body_html=queued.body_html,
+                        in_reply_to=queued.in_reply_to,
+                        references=queued.references,
+                        attachments=attachments or None,
+                    )
+                    remove_queued_outbound_message(queue_id)
+                    moved[account_uid] = moved.get(account_uid, 0) + 1
+                except Exception:
+                    log.exception(
+                        "Failed to move delayed outbox message %s to drafts",
+                        queue_id,
+                    )
+                    key = account_uid or queue_id
+                    failed[key] = failed.get(key, 0) + 1
+            GLib.idle_add(self._on_stop_sending_finished, moved, failed)
+
+        get_mail_io_thread().submit(worker)
+
+    def _on_stop_sending_finished(
+        self,
+        moved: dict[str, int],
+        failed: dict[str, int],
+    ) -> bool:
+        self._on_outbox_changed()
+        if moved:
+            moved_labels = [
+                (self._sidebar.account_display_label(account_uid), count)
+                for account_uid, count in moved.items()
+            ]
+            show_toast(self, format_stop_sending_toast(moved_labels))
+        if failed:
+            failed_labels = [
+                (self._sidebar.account_display_label(account_uid), count)
+                for account_uid, count in failed.items()
+            ]
+            show_error_toast(self, format_stop_sending_error_toast(failed_labels))
         return False
 
     def _move_selected_messages(self, destination: str) -> None:
