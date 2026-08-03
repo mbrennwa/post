@@ -19,7 +19,7 @@ from post.mail.account_status import (
 )
 from post.mail.eds import FlushSendQueueResult, MailService
 from post.mail.send_errors import SendError
-from post.mail.send_queue import (
+from post.mail.network_errors import (
     SIGN_IN_FOLDER_MESSAGE,
     TOKEN_EXPIRED_FOLDER_MESSAGE,
     format_folder_load_error,

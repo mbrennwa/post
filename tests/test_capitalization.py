@@ -25,7 +25,8 @@ _UI_MODULES = (
     "credentials.py",
     "folder_dialogs.py",
     "mail/helpers.py",
-    "mail/send_queue.py",
+    "mail/network_errors.py",
+    "mail/offline_status.py",
     "reader/html.py",
     "mail/accounts.py",
 )
@@ -160,9 +161,8 @@ _STATUS_MESSAGE_FUNCTIONS: dict[str, frozenset[str]] = {
             "format_startup_loading_folders",
         }
     ),
-    "mail/send_queue.py": frozenset(
+    "mail/offline_status.py": frozenset(
         {
-            "offline_status_text",
             "offline_cache_status_text",
         }
     ),
@@ -490,7 +490,7 @@ def _runtime_status_message_samples() -> list[str]:
         format_startup_loading_folders,
     )
     from post.mail.operation_queue import offline_queue_status_text
-    from post.mail.send_queue import offline_cache_status_text, offline_status_text
+    from post.mail.offline_status import offline_cache_status_text
     from post.window import MainWindow
 
     samples = [
@@ -504,9 +504,6 @@ def _runtime_status_message_samples() -> list[str]:
         format_startup_loading_accounts(),
         format_startup_loading_folders(0, 3),
         format_startup_loading_folders(2, 3),
-        offline_status_text(queued_count=0),
-        offline_status_text(queued_count=1),
-        offline_status_text(queued_count=3),
         offline_cache_status_text(account_label="Work", folder_name="Inbox"),
         offline_cache_status_text(account_label="Work", folder_name=""),
         offline_queue_status_text(

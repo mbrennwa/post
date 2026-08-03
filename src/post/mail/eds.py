@@ -96,13 +96,15 @@ from .operation_queue import (
     list_queued_operations,
     remove_queued_operation,
 )
+from .network_errors import (
+    is_network_unavailable_error,
+    is_queueable_network_error,
+    is_sign_in_required_error,
+)
 from .send_queue import (
     QueuedOutboundMessage,
     enqueue_outbound_message,
-    is_network_unavailable_error,
     is_outbound_ready_to_send,
-    is_queueable_network_error,
-    is_sign_in_required_error,
     list_queued_outbound_messages,
     load_queued_attachments,
     load_queued_outbound_message,

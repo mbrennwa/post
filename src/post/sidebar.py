@@ -47,13 +47,13 @@ from post.mail.folders import (
 )
 from post.mail.message_list_state import is_heavy_folder_name
 from post.mail.offline_settings import account_is_user_offline
-from post.mail.send_queue import (
-    count_queued_for_account,
+from post.mail.network_errors import (
     format_folder_load_error,
     is_network_unavailable_error,
     is_sign_in_required_error,
     log_mail_error,
 )
+from post.mail.send_queue import count_queued_for_account
 from post.mail.account_status import account_not_online_badge
 from post.preferences import (
     MIN_SIDEBAR_WIDTH,
