@@ -6016,6 +6016,14 @@ class MailService:
         result["body_html"] = bodies["html"]
         result["attachments"] = extract_attachments(mime)
         result["inline_images"] = extract_inline_images(mime)
+        invite = self._calendar_invite_for_mime(
+            mime,
+            attachments=result["attachments"],
+            bodies=bodies,
+            subject=result.get("subject"),
+        )
+        if invite is not None:
+            result["calendar_invite"] = invite
         if not result.get("message_id") and hasattr(mime, "get_message_id"):
             result["message_id"] = mime.get_message_id()
         if hasattr(mime, "get_header"):
@@ -6032,6 +6040,51 @@ class MailService:
             result["folder_total"] = total
 
         return result
+
+    @staticmethod
+    def _calendar_invite_for_mime(
+        mime: Any,
+        *,
+        attachments: list[dict],
+        bodies: dict[str, str | None],
+        subject: str | None,
+    ) -> dict | None:
+        from .calendar_invite import is_calendar_mime, merge_invite_details
+        from .helpers import get_attachment_data
+
+        ics_text = None
+        attachment_index = None
+        preferred_index = None
+        for meta in attachments:
+            mime_type = meta.get("mime_type")
+            if not is_calendar_mime(mime_type if isinstance(mime_type, str) else None):
+                continue
+            index = meta.get("index")
+            if not isinstance(index, int):
+                continue
+            try:
+                _name, data = get_attachment_data(mime, index)
+            except Exception:
+                continue
+            if not data:
+                continue
+            text = data.decode("utf-8", errors="replace")
+            method = str(meta.get("calendar_method") or "")
+            if preferred_index is None:
+                ics_text = text
+                attachment_index = index
+                preferred_index = index
+            if method.upper() == "REQUEST" or "METHOD:REQUEST" in text.upper():
+                ics_text = text
+                attachment_index = index
+                break
+        return merge_invite_details(
+            subject=subject if isinstance(subject, str) else None,
+            ics_text=ics_text,
+            body_plain=bodies.get("plain"),
+            body_html=bodies.get("html"),
+            attachment_index=attachment_index,
+        )
 
     def _read_attachment_data_unlocked(
         self,

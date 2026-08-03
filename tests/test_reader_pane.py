@@ -44,6 +44,7 @@ def _menu_actions(menu: WebKit.ContextMenu) -> list[str | int]:
 def _make_pane(
     *,
     on_unsubscribe: Any = _noop,
+    on_add_to_calendar: Any = _noop,
     on_new_message_to: Any = _noop,
     on_search_messages_from: Any = _noop,
     can_search_messages: Any = None,
@@ -53,6 +54,7 @@ def _make_pane(
         on_reply_all=_noop,
         on_forward=_noop,
         on_unsubscribe=on_unsubscribe,
+        on_add_to_calendar=on_add_to_calendar,
         on_attachment_clicked=_noop,
         on_attachment_context_menu=_noop,
         on_open_uri=_noop,
@@ -182,10 +184,64 @@ class MessageReaderPaneTests(unittest.TestCase):
         while child is not None:
             children.append(child)
             child = child.get_next_sibling()
-        self.assertGreaterEqual(len(children), 2)
+        self.assertGreaterEqual(len(children), 3)
         self.assertIs(children[0], self.pane._unsubscribe_btn)
-        reply_group = children[1]
+        self.assertIs(children[1], self.pane._toolbar_add_calendar_btn)
+        reply_group = children[2]
         self.assertIs(reply_group.get_first_child(), self.pane._reply_btn)
+
+    def test_calendar_invite_shows_full_link_and_add_button(self) -> None:
+        long_url = (
+            "https://teams.microsoft.com/l/meetup-join/19%3ameeting_VeryLongToken"
+            "Abcdefghijklmnopqrstuvwxyz0123456789/0?context=%7b%22Tid%22%3a%22x%22%7d"
+        )
+        msg = _sample_message()
+        msg["calendar_invite"] = {
+            "title": "Standup with a rather long meeting title for ellipsis",
+            "start": "2026-08-03T10:00:00",
+            "end": "2026-08-03T10:30:00",
+            "meeting_url": long_url,
+        }
+        self.pane.show_message(
+            msg,
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertTrue(self.pane._invite_box.get_visible())
+        self.assertTrue(self.pane._add_to_calendar_btn.get_visible())
+        self.assertTrue(self.pane._toolbar_add_calendar_btn.get_visible())
+        link_text = self.pane._invite_link.get_text()
+        self.assertEqual(link_text, long_url)
+        self.assertTrue(self.pane._invite_link_row.get_visible())
+        self.assertNotIn("Link:", link_text)
+        # Long URL must not inflate the reader pane's horizontal request.
+        minimum, natural, _, _ = self.pane.measure(Gtk.Orientation.HORIZONTAL, -1)
+        self.assertEqual(minimum, 0)
+        self.assertEqual(natural, 0)
+
+    def test_invite_link_menu_copies_url(self) -> None:
+        url = "https://teams.microsoft.com/l/meetup-join/abc"
+        copied: list[str] = []
+        pane = _make_pane()
+        pane.get_clipboard = MagicMock(  # type: ignore[method-assign]
+            return_value=MagicMock(set=lambda text: copied.append(text))
+        )
+        msg = _sample_message()
+        msg["calendar_invite"] = {
+            "title": "Standup",
+            "meeting_url": url,
+        }
+        pane.show_message(
+            msg,
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        pane._on_copy_invite_link()
+        self.assertEqual(copied, [url])
 
     def test_clear_resets_current_message(self) -> None:
         msg = _sample_message()

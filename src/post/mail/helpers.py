@@ -769,6 +769,36 @@ def extract_attachments(mime_msg: Any) -> list[dict[str, Any]]:
     return attachments
 
 
+def extract_attachments_from_email_message(msg: Any) -> list[dict[str, Any]]:
+    """Return attachment metadata from a Python ``email.message`` (tests)."""
+    from post.mail.calendar_invite import (
+        default_calendar_filename,
+        email_part_counts_as_attachment,
+        is_calendar_mime,
+    )
+
+    attachments: list[dict[str, Any]] = []
+    for part in msg.walk():
+        if not email_part_counts_as_attachment(part):
+            continue
+        mime_type = part.get_content_type()
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True) or b""
+        display_name = _decode_attachment_filename(filename)
+        if not display_name and is_calendar_mime(mime_type):
+            display_name = default_calendar_filename(mime_type)
+        attachments.append(
+            {
+                "filename": display_name or "attachment",
+                "mime_type": mime_type,
+                "size": len(payload),
+                "source": "email",
+                "index": len(attachments),
+            }
+        )
+    return attachments
+
+
 def _normalize_content_id(content_id: str) -> str:
     cid = content_id.strip()
     if cid.startswith("<") and cid.endswith(">"):
@@ -1068,20 +1098,37 @@ def _walk_attachment_parts(
     if not _mime_part_is_attachment(part, mime_type):
         return
 
+    from post.mail.calendar_invite import default_calendar_filename, is_calendar_mime
+
     filename = part.get_filename() if hasattr(part, "get_filename") else None
+    display_name = _decode_attachment_filename(filename)
+    if not display_name and is_calendar_mime(mime_type):
+        display_name = default_calendar_filename(mime_type)
+    calendar_method = None
+    if is_calendar_mime(mime_type) and content_type is not None:
+        try:
+            calendar_method = content_type.param("method")
+        except (TypeError, ValueError, AttributeError):
+            calendar_method = None
     size = part.get_size() if hasattr(part, "get_size") else None
-    attachments.append(
-        {
-            "filename": _decode_attachment_filename(filename) or "attachment",
-            "mime_type": mime_type,
-            "size": size if isinstance(size, int) else None,
-        }
-    )
+    meta: dict[str, Any] = {
+        "filename": display_name or "attachment",
+        "mime_type": mime_type,
+        "size": size if isinstance(size, int) else None,
+    }
+    if calendar_method:
+        meta["calendar_method"] = str(calendar_method)
+    attachments.append(meta)
     if parts is not None:
         parts.append(part)
 
 
 def _mime_part_is_attachment(part: Any, mime_type: str) -> bool:
+    from post.mail.calendar_invite import is_calendar_mime
+
+    if is_calendar_mime(mime_type):
+        return True
+
     content_type = part.get_content_type() if hasattr(part, "get_content_type") else None
     if hasattr(part, "get_content_disposition"):
         disposition = part.get_content_disposition()
@@ -1131,6 +1178,12 @@ def _email_collect_attachments(mime_msg: Any, attachments: list[dict[str, Any]])
     import email
     import email.policy
 
+    from post.mail.calendar_invite import (
+        default_calendar_filename,
+        email_part_counts_as_attachment,
+        is_calendar_mime,
+    )
+
     raw_bytes = _mime_message_raw_bytes(mime_msg)
     if raw_bytes is None:
         return
@@ -1138,17 +1191,18 @@ def _email_collect_attachments(mime_msg: Any, attachments: list[dict[str, Any]])
     try:
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
         for part in msg.walk():
-            disposition = part.get_content_disposition()
+            if not email_part_counts_as_attachment(part):
+                continue
+            mime_type = part.get_content_type()
             filename = part.get_filename()
-            if disposition != "attachment" and not filename:
-                continue
-            if disposition == "inline" and part.get_content_type().startswith("text/"):
-                continue
             payload = part.get_payload(decode=True) or b""
+            display_name = _decode_attachment_filename(filename)
+            if not display_name and is_calendar_mime(mime_type):
+                display_name = default_calendar_filename(mime_type)
             attachments.append(
                 {
-                    "filename": _decode_attachment_filename(filename) or "attachment",
-                    "mime_type": part.get_content_type(),
+                    "filename": display_name or "attachment",
+                    "mime_type": mime_type,
                     "size": len(payload),
                     "source": "email",
                     "index": len(attachments),
@@ -1162,6 +1216,8 @@ def _email_attachment_data_by_index(mime_msg: Any, index: int) -> bytes | None:
     import email
     import email.policy
 
+    from post.mail.calendar_invite import email_part_counts_as_attachment
+
     raw_bytes = _mime_message_raw_bytes(mime_msg)
     if raw_bytes is None:
         return None
@@ -1170,11 +1226,7 @@ def _email_attachment_data_by_index(mime_msg: Any, index: int) -> bytes | None:
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
         collected: list[bytes] = []
         for part in msg.walk():
-            disposition = part.get_content_disposition()
-            filename = part.get_filename()
-            if disposition != "attachment" and not filename:
-                continue
-            if disposition == "inline" and part.get_content_type().startswith("text/"):
+            if not email_part_counts_as_attachment(part):
                 continue
             collected.append(part.get_payload(decode=True) or b"")
         if 0 <= index < len(collected):

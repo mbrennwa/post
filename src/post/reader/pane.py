@@ -31,7 +31,12 @@ from post.preferences import (
     get_message_appearance,
 )
 from post.reader.html import build_reader_document
-from post.wrap_label import WrappingLabel, configure_ellipsize_label, set_label_wrap_mode
+from post.wrap_label import (
+    EllipsizingLabel,
+    WrappingLabel,
+    configure_ellipsize_label,
+    set_label_wrap_mode,
+)
 
 # Browser chrome — meaningless for HTML loaded into the reading pane.
 _READER_CONTEXT_MENU_BLOCKLIST = frozenset(
@@ -93,10 +98,12 @@ def prepend_address_context_menu_items(
 
 
 class _ClampingBoxLayout(Gtk.BoxLayout):
-    """BoxLayout that never reports natural size below minimum.
+    """BoxLayout for MessageReaderPane.
 
-    Under tight height-for-width passes, Gtk.BoxLayout can compute
-    natural < minimum for MessageReaderPane (wrapping header + WebKit).
+    - Vertical: never report natural size below minimum (GTK height-for-width
+      quirks with wrapping header + WebKit).
+    - Horizontal: never let long URLs / WebKit force a huge minimum width that
+      pushes the paned end child (and Add to Calendar) past the window edge.
     """
 
     __gtype_name__ = "PostClampingBoxLayout"
@@ -104,6 +111,8 @@ class _ClampingBoxLayout(Gtk.BoxLayout):
     def do_measure(
         self, widget: Gtk.Widget, orientation: Gtk.Orientation, for_size: int
     ) -> tuple[int, int, int, int]:
+        if orientation == Gtk.Orientation.HORIZONTAL:
+            return 0, 0, -1, -1
         minimum, natural, min_baseline, nat_baseline = Gtk.BoxLayout.do_measure(
             self, widget, orientation, for_size
         )
@@ -124,6 +133,7 @@ class MessageReaderPane(Gtk.Box):
         on_reply_all: Callable[[], None],
         on_forward: Callable[[], None],
         on_unsubscribe: Callable[[dict[str, str]], None],
+        on_add_to_calendar: Callable[[dict[str, Any]], None],
         on_attachment_clicked: Callable[[int], None],
         on_attachment_context_menu: Callable[
             [Gtk.Widget, float, float, int, str | None, str], None
@@ -137,10 +147,14 @@ class MessageReaderPane(Gtk.Box):
         layout = _ClampingBoxLayout(orientation=Gtk.Orientation.VERTICAL)
         layout.set_spacing(8)
         self.set_layout_manager(layout)
+        self.set_overflow(Gtk.Overflow.HIDDEN)
+        self.set_hexpand(True)
+        self.set_halign(Gtk.Align.FILL)
         self._on_reply = on_reply
         self._on_reply_all = on_reply_all
         self._on_forward = on_forward
         self._on_unsubscribe = on_unsubscribe
+        self._on_add_to_calendar = on_add_to_calendar
         self._on_attachment_clicked = on_attachment_clicked
         self._on_attachment_context_menu = on_attachment_context_menu
         self._on_open_uri = on_open_uri
@@ -197,6 +211,93 @@ class MessageReaderPane(Gtk.Box):
         self._reader_attachments.set_visible(False)
         self.append(self._reader_attachments)
 
+        self._invite_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._invite_box.add_css_class("calendar-invite")
+        self._invite_box.set_visible(False)
+        self._invite_box.set_margin_top(4)
+        self._invite_box.set_margin_bottom(4)
+        self._invite_box.set_hexpand(True)
+        self._invite_box.set_halign(Gtk.Align.FILL)
+        self._invite_box.set_overflow(Gtk.Overflow.HIDDEN)
+
+        invite_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        invite_header.set_hexpand(True)
+        invite_header.set_halign(Gtk.Align.FILL)
+        invite_header.set_overflow(Gtk.Overflow.HIDDEN)
+
+        self._invite_heading = EllipsizingLabel(label="", xalign=0)
+        self._invite_heading.add_css_class("heading")
+        self._invite_heading.set_halign(Gtk.Align.FILL)
+        self._invite_heading.set_valign(Gtk.Align.CENTER)
+        invite_header.append(self._invite_heading)
+
+        self._add_to_calendar_btn = Gtk.Button(label="Add to Calendar…")
+        self._add_to_calendar_btn.set_halign(Gtk.Align.END)
+        self._add_to_calendar_btn.set_valign(Gtk.Align.CENTER)
+        self._add_to_calendar_btn.set_hexpand(False)
+        self._add_to_calendar_btn.connect(
+            "clicked", lambda *_a: self._emit_add_to_calendar()
+        )
+        invite_header.append(self._add_to_calendar_btn)
+        self._invite_box.append(invite_header)
+
+        self._invite_when = WrappingLabel(label="", xalign=0)
+        self._invite_when.add_css_class("dim-label")
+        self._invite_when.set_wrap(True)
+        set_label_wrap_mode(self._invite_when, Gtk.WrapMode.WORD_CHAR)
+        self._invite_when.set_hexpand(True)
+        self._invite_box.append(self._invite_when)
+        self._invite_where = WrappingLabel(label="", xalign=0)
+        self._invite_where.add_css_class("dim-label")
+        self._invite_where.set_wrap(True)
+        set_label_wrap_mode(self._invite_where, Gtk.WrapMode.WORD_CHAR)
+        self._invite_where.set_hexpand(True)
+        self._invite_box.append(self._invite_where)
+        self._invite_organizer = WrappingLabel(label="", xalign=0)
+        self._invite_organizer.add_css_class("dim-label")
+        self._invite_organizer.set_wrap(True)
+        set_label_wrap_mode(self._invite_organizer, Gtk.WrapMode.WORD_CHAR)
+        self._invite_organizer.set_hexpand(True)
+        self._invite_box.append(self._invite_organizer)
+
+        # "Link: " stays dim; only the URL is accent-colored and clickable.
+        self._invite_link_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self._invite_link_row.set_hexpand(True)
+        self._invite_link_row.set_halign(Gtk.Align.FILL)
+        self._invite_link_row.set_overflow(Gtk.Overflow.HIDDEN)
+        link_prefix = Gtk.Label(label="Link: ", xalign=0)
+        link_prefix.add_css_class("dim-label")
+        link_prefix.set_halign(Gtk.Align.START)
+        link_prefix.set_hexpand(False)
+        self._invite_link_row.append(link_prefix)
+
+        self._invite_link = EllipsizingLabel(label="", xalign=0)
+        self._invite_link.add_css_class("calendar-invite-link")
+        self._invite_link.set_halign(Gtk.Align.FILL)
+        # Selectable labels can refuse to ellipsize in GTK4; copy is via the
+        # invite / link context menus instead.
+        self._invite_link.set_selectable(False)
+        self._invite_link.set_cursor_from_name("pointer")
+        self._invite_join_url: str | None = None
+        link_click = Gtk.GestureClick()
+        link_click.set_button(Gdk.BUTTON_PRIMARY)
+        link_click.connect("pressed", self._on_invite_link_pressed)
+        self._invite_link.add_controller(link_click)
+        link_menu = Gtk.GestureClick()
+        link_menu.set_button(Gdk.BUTTON_SECONDARY)
+        link_menu.connect("pressed", self._on_invite_link_menu_pressed)
+        self._invite_link.add_controller(link_menu)
+        self._invite_link_row.append(self._invite_link)
+        self._invite_box.append(self._invite_link_row)
+
+        # Bubble (not capture) so the link's own secondary-click menu runs first.
+        invite_menu_gesture = Gtk.GestureClick()
+        invite_menu_gesture.set_button(Gdk.BUTTON_SECONDARY)
+        invite_menu_gesture.connect("pressed", self._on_invite_menu_pressed)
+        self._invite_box.add_controller(invite_menu_gesture)
+        self._invite_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
+        self.append(self._invite_box)
+
         self._reader_body_stack = Gtk.Stack()
         self._reader_body_stack.set_vexpand(True)
         self._reader_body_stack.set_hexpand(True)
@@ -223,8 +324,14 @@ class MessageReaderPane(Gtk.Box):
         self._web_view.connect("context-menu", self._on_web_view_context_menu)
         self._web_view.set_vexpand(True)
         self._web_view.set_hexpand(True)
+        self._web_view.set_halign(Gtk.Align.FILL)
+        # Prevent long message URLs from forcing a huge minimum width.
+        self._web_view.set_size_request(1, -1)
         self._reader_body_stack.add_named(self._web_view, "content")
         self._reader_body_stack.set_visible_child_name("empty")
+        self._reader_body_stack.set_hexpand(True)
+        self._reader_body_stack.set_halign(Gtk.Align.FILL)
+        self._reader_body_stack.set_overflow(Gtk.Overflow.HIDDEN)
 
         self.append(self._reader_body_stack)
 
@@ -238,10 +345,19 @@ class MessageReaderPane(Gtk.Box):
         search_action = Gio.SimpleAction.new("address-search-from", None)
         search_action.connect("activate", self._on_address_search_from_activate)
         group.add_action(search_action)
+        copy_invite_action = Gio.SimpleAction.new("copy-invite", None)
+        copy_invite_action.connect("activate", self._on_copy_invite_activate)
+        group.add_action(copy_invite_action)
         self.insert_action_group("reader", group)
+        self._reader_action_group = group
         self._address_new_action = new_action
         self._address_search_action = search_action
+        self._copy_invite_action = copy_invite_action
         self._address_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
+        self._invite_clipboard_text = ""
+        # Popovers are not always in the action widget tree; expose the group
+        # on the invite popover so Copy activates reliably.
+        self._invite_popover.insert_action_group("reader", group)
 
     @property
     def current_message(self) -> dict[str, Any] | None:
@@ -257,6 +373,14 @@ class MessageReaderPane(Gtk.Box):
         )
         self._unsubscribe_btn.set_visible(False)
         outer.append(self._unsubscribe_btn)
+
+        self._toolbar_add_calendar_btn = self._make_message_action_button(
+            "x-office-calendar-symbolic",
+            "Add to Calendar",
+            self._emit_add_to_calendar,
+        )
+        self._toolbar_add_calendar_btn.set_visible(False)
+        outer.append(self._toolbar_add_calendar_btn)
 
         reply_group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         reply_group.add_css_class("linked")
@@ -295,6 +419,8 @@ class MessageReaderPane(Gtk.Box):
 
     def set_actions_sensitive(self, sensitive: bool) -> None:
         self._unsubscribe_btn.set_sensitive(sensitive)
+        self._toolbar_add_calendar_btn.set_sensitive(sensitive)
+        self._add_to_calendar_btn.set_sensitive(sensitive)
         self._reply_btn.set_sensitive(sensitive)
         self._reply_all_btn.set_sensitive(sensitive)
         self._forward_btn.set_sensitive(sensitive)
@@ -315,6 +441,198 @@ class MessageReaderPane(Gtk.Box):
         if kind not in ("post", "open") or not isinstance(url, str) or not url:
             return
         self._on_unsubscribe({"kind": kind, "url": url})
+
+    def _emit_add_to_calendar(self) -> None:
+        msg = self._current_message
+        if msg is None:
+            return
+        invite = msg.get("calendar_invite")
+        if not isinstance(invite, dict):
+            return
+        self._on_add_to_calendar(dict(invite))
+
+    def _on_invite_link_pressed(
+        self, _gesture: Gtk.GestureClick, _n_press: int, _x: float, _y: float
+    ) -> None:
+        url = self._invite_join_url
+        if url:
+            self._on_open_uri(url)
+
+    def _on_invite_link_activate(self, _label: Gtk.Label, uri: str) -> bool:
+        if uri:
+            self._on_open_uri(uri)
+        return True
+
+    def _popup_invite_context_menu(
+        self,
+        widget: Gtk.Widget,
+        x: float,
+        y: float,
+        *,
+        label: str,
+        on_activate: Callable[[], None],
+    ) -> None:
+        popover = Gtk.Popover()
+        popover.set_has_arrow(True)
+        btn = Gtk.Button(label=label)
+        btn.add_css_class("flat")
+        btn.set_halign(Gtk.Align.FILL)
+
+        def on_clicked(*_a) -> None:
+            popover.popdown()
+            on_activate()
+
+        btn.connect("clicked", on_clicked)
+        popover.set_child(btn)
+        popover.set_parent(widget)
+        rect = Gdk.Rectangle()
+        rect.x = int(x)
+        rect.y = int(y)
+        rect.width = 1
+        rect.height = 1
+        popover.set_pointing_to(rect)
+        self._invite_context_popover = popover
+        popover.popup()
+
+    def _on_invite_link_menu_pressed(
+        self,
+        gesture: Gtk.GestureClick,
+        _n_press: int,
+        x: float,
+        y: float,
+    ) -> None:
+        if not self._invite_join_url:
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        widget = gesture.get_widget()
+        if widget is None:
+            return
+        self._popup_invite_context_menu(
+            widget,
+            x,
+            y,
+            label="Copy link",
+            on_activate=self._on_copy_invite_link,
+        )
+
+    def _on_invite_menu_pressed(
+        self,
+        gesture: Gtk.GestureClick,
+        _n_press: int,
+        x: float,
+        y: float,
+    ) -> None:
+        widget = gesture.get_widget()
+        if widget is None:
+            return
+        if not (
+            self._current_message
+            and isinstance(self._current_message.get("calendar_invite"), dict)
+        ):
+            return
+        # Prefer a direct handler popover so Copy does not depend on action
+        # lookup through the popover parent chain.
+        self._popup_invite_context_menu(
+            widget,
+            x,
+            y,
+            label="Copy invite",
+            on_activate=self._on_copy_invite_activate,
+        )
+
+    def _on_copy_invite_link(self, *_args) -> None:
+        url = self._invite_join_url
+        if not url:
+            return
+        self._invite_clipboard_text = url
+        self.get_clipboard().set(self._invite_clipboard_text)
+
+    def _on_copy_invite_activate(self, *_args) -> None:
+        from post.mail.calendar_invite import format_invite_copy_text
+
+        msg = self._current_message
+        if msg is None:
+            return
+        invite = msg.get("calendar_invite")
+        if not isinstance(invite, dict):
+            return
+
+        plain = format_invite_copy_text(invite)
+        if not plain.strip():
+            return
+
+        # Hold the string on the instance so the clipboard content cannot be GC'd
+        # before paste (a common Wayland empty-paste failure mode).
+        self._invite_clipboard_text = plain
+        self.get_clipboard().set(self._invite_clipboard_text)
+
+    def _clear_invite_panel(self) -> None:
+        self._invite_box.set_visible(False)
+        self._toolbar_add_calendar_btn.set_visible(False)
+        self._invite_heading.set_label("")
+        self._invite_heading.set_tooltip_text(None)
+        self._invite_when.set_visible(False)
+        self._invite_where.set_visible(False)
+        self._invite_organizer.set_visible(False)
+        self._invite_join_url = None
+        self._invite_link.set_label("")
+        self._invite_link_row.set_visible(False)
+
+    def _update_invite_panel(self, msg: dict[str, Any] | None) -> None:
+        from post.mail.calendar_invite import format_invite_when, invite_join_url
+
+        invite = msg.get("calendar_invite") if msg else None
+        if not isinstance(invite, dict):
+            self._clear_invite_panel()
+            return
+
+        title = invite.get("title") or msg.get("subject") or "Untitled"
+        heading = f"Invite: {title}"
+        self._invite_heading.set_label(heading)
+        self._invite_heading.set_tooltip_text(heading)
+
+        when = format_invite_when(invite)
+        if when:
+            self._invite_when.set_label(f"When: {when}")
+            self._invite_when.set_visible(True)
+        else:
+            self._invite_when.set_label("When: (set when adding to calendar)")
+            self._invite_when.set_visible(True)
+
+        join_url = invite_join_url(invite)
+        location = invite.get("location")
+        # Avoid duplicating a URL already shown as Link.
+        if (
+            isinstance(location, str)
+            and location
+            and (not join_url or location.rstrip("/") != join_url.rstrip("/"))
+        ):
+            self._invite_where.set_label(f"Where: {location}")
+            self._invite_where.set_visible(True)
+        else:
+            self._invite_where.set_visible(False)
+
+        organizer = invite.get("organizer")
+        if organizer:
+            self._invite_organizer.set_label(f"Organizer: {organizer}")
+            self._invite_organizer.set_visible(True)
+        else:
+            self._invite_organizer.set_visible(False)
+
+        if join_url:
+            self._invite_join_url = join_url
+            self._invite_link.set_use_markup(False)
+            self._invite_link.set_label(join_url)
+            self._invite_link.set_tooltip_text(join_url)
+            self._invite_link_row.set_visible(True)
+        else:
+            self._invite_join_url = None
+            self._invite_link_row.set_visible(False)
+
+        self._invite_box.set_visible(True)
+        # Also show the header calendar action so Add is reachable even if the
+        # invite band is tight.
+        self._toolbar_add_calendar_btn.set_visible(True)
 
     def _clear_address_rows(self) -> None:
         sibling = self._reader_meta.get_next_sibling()
@@ -453,6 +771,7 @@ class MessageReaderPane(Gtk.Box):
         self._set_reader_meta_status("")
         self._clear_attachments()
         self._update_unsubscribe_button(None)
+        self._clear_invite_panel()
         self._message_actions.set_visible(False)
         self.set_actions_sensitive(False)
         self._reader_body_stack.set_visible_child_name("empty")
@@ -474,8 +793,12 @@ class MessageReaderPane(Gtk.Box):
         self._reader_subject.set_label(msg.get("subject") or "(no subject)")
         self._reader_subject.set_visible(True)
         self._show_reader_header(msg)
-        self._show_attachments(msg.get("attachments") or [])
+        self._show_attachments(
+            msg.get("attachments") or [],
+            hide_calendar=isinstance(msg.get("calendar_invite"), dict),
+        )
         self._update_unsubscribe_button(msg)
+        self._update_invite_panel(msg)
         self._message_actions.set_visible(True)
         self.set_actions_sensitive(True)
         self._show_reader_document()
@@ -488,6 +811,7 @@ class MessageReaderPane(Gtk.Box):
         self._set_reader_meta_status("")
         self._clear_attachments()
         self._update_unsubscribe_button(None)
+        self._clear_invite_panel()
         self._message_actions.set_visible(False)
         self.set_actions_sensitive(False)
         self._reader_body_stack.set_visible_child_name("empty")
@@ -501,6 +825,7 @@ class MessageReaderPane(Gtk.Box):
         self._set_reader_meta_status(message)
         self._clear_attachments()
         self._update_unsubscribe_button(None)
+        self._clear_invite_panel()
         self._message_actions.set_visible(False)
         self.set_actions_sensitive(False)
         self._load_error_html(message)
@@ -514,6 +839,7 @@ class MessageReaderPane(Gtk.Box):
         self._set_reader_meta_status(str(error))
         self._clear_attachments()
         self._update_unsubscribe_button(None)
+        self._clear_invite_panel()
         self._message_actions.set_visible(False)
         self.set_actions_sensitive(False)
         self._load_error_html("This message could not be loaded.")
@@ -556,9 +882,24 @@ class MessageReaderPane(Gtk.Box):
             self._reader_attachments.remove(child)
         self._reader_attachments.set_visible(False)
 
-    def _show_attachments(self, attachments: list[dict[str, Any]]) -> None:
+    def _show_attachments(
+        self,
+        attachments: list[dict[str, Any]],
+        *,
+        hide_calendar: bool = False,
+    ) -> None:
+        from post.mail.calendar_invite import is_calendar_mime
+
         self._clear_attachments()
-        if not attachments:
+        visible = []
+        for attachment in attachments:
+            mime_type = attachment.get("mime_type")
+            if hide_calendar and is_calendar_mime(
+                mime_type if isinstance(mime_type, str) else None
+            ):
+                continue
+            visible.append(attachment)
+        if not visible:
             return
 
         heading = Gtk.Label(label="Attachments", xalign=0)
@@ -569,7 +910,7 @@ class MessageReaderPane(Gtk.Box):
         list_column.set_hexpand(True)
         list_column.set_halign(Gtk.Align.FILL)
 
-        for attachment in attachments:
+        for attachment in visible:
             index = attachment.get("index", 0)
             name = attachment.get("filename") or "attachment"
             mime_type = attachment.get("mime_type")

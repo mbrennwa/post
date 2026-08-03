@@ -42,6 +42,36 @@ def configure_ellipsize_label(label: Gtk.Label) -> Gtk.Label:
     return label
 
 
+class EllipsizingLabel(Gtk.Label):
+    """Label that ellipsizes without expanding its parent past the allocated width.
+
+    Plain ``Gtk.Label`` with ``ellipsize=END`` still reports the full text as its
+    natural width, which can grow a reader pane and clip trailing siblings
+    (e.g. an Add button) outside the visible area.
+    """
+
+    __gtype_name__ = "PostEllipsizingLabel"
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if self.get_ellipsize() == Pango.EllipsizeMode.NONE:
+            self.set_ellipsize(Pango.EllipsizeMode.END)
+        self.set_max_width_chars(1)
+        self.set_hexpand(True)
+
+    def do_get_request_mode(self) -> Gtk.SizeRequestMode:
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+    def do_measure(
+        self, orientation: Gtk.Orientation, for_size: int
+    ) -> tuple[int, int, int, int]:
+        if orientation == Gtk.Orientation.HORIZONTAL:
+            # Claim no horizontal size so parents allocate us the remaining
+            # width; ellipsis then applies to that allocation.
+            return 0, 0, -1, -1
+        return Gtk.Label.do_measure(self, orientation, for_size)
+
+
 def configure_pane_scrolled_window(scroll: Gtk.ScrolledWindow) -> Gtk.ScrolledWindow:
     """Keep pane content left-aligned and clip overflow on the right (#229).
 
