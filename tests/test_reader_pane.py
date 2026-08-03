@@ -123,15 +123,21 @@ class MessageReaderPaneTests(unittest.TestCase):
     def test_address_menu_callbacks(self) -> None:
         composed: list[str] = []
         searched: list[str] = []
+        copied: list[str] = []
         pane = _make_pane(
             on_new_message_to=composed.append,
             on_search_messages_from=searched.append,
         )
+        pane.get_clipboard = MagicMock(  # type: ignore[method-assign]
+            return_value=MagicMock(set=lambda text: copied.append(text))
+        )
         pane._context_address = "sender@example.com"
         pane._on_address_new_message_activate()
         pane._on_address_search_from_activate()
+        pane._on_address_copy_activate()
         self.assertEqual(composed, ["sender@example.com"])
         self.assertEqual(searched, ["sender@example.com"])
+        self.assertEqual(copied, ["sender@example.com"])
 
     def test_address_search_action_disabled_when_search_unavailable(self) -> None:
         pane = _make_pane(can_search_messages=lambda: False)
@@ -376,10 +382,12 @@ class MessageReaderPaneTests(unittest.TestCase):
         )
         new_action = Gio.SimpleAction.new("address-new-message", None)
         search_action = Gio.SimpleAction.new("address-search-from", None)
+        copy_action = Gio.SimpleAction.new("address-copy", None)
         prepend_address_context_menu_items(
             menu,
             new_message_action=new_action,
             search_from_action=search_action,
+            copy_address_action=copy_action,
             email="sender@example.com",
         )
         self.assertEqual(
@@ -387,6 +395,7 @@ class MessageReaderPaneTests(unittest.TestCase):
             [
                 "New Message to sender@example.com…",
                 "Search Messages from sender@example.com",
+                "Copy address",
                 "SEP",
                 int(WebKit.ContextMenuAction.COPY),
             ],
@@ -412,6 +421,7 @@ class MessageReaderPaneTests(unittest.TestCase):
             [
                 "New Message to sender@example.com…",
                 "Search Messages from sender@example.com",
+                "Copy address",
                 "SEP",
                 int(WebKit.ContextMenuAction.COPY),
             ],

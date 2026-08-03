@@ -77,12 +77,20 @@ def prepend_address_context_menu_items(
     *,
     new_message_action: Gio.Action,
     search_from_action: Gio.Action,
+    copy_address_action: Gio.Action,
     email: str,
 ) -> None:
-    """Prepend New Message / Search Messages actions for *email*."""
+    """Prepend New Message / Search / Copy address actions for *email*."""
     had_items = bool(list(menu.get_items()))
     if had_items:
         menu.prepend(WebKit.ContextMenuItem.new_separator())
+    # Prepend in reverse so visual order is New Message, Search, Copy.
+    menu.prepend(
+        WebKit.ContextMenuItem.new_from_gaction(
+            copy_address_action,
+            "Copy address",
+        )
+    )
     menu.prepend(
         WebKit.ContextMenuItem.new_from_gaction(
             search_from_action,
@@ -345,6 +353,9 @@ class MessageReaderPane(Gtk.Box):
         search_action = Gio.SimpleAction.new("address-search-from", None)
         search_action.connect("activate", self._on_address_search_from_activate)
         group.add_action(search_action)
+        copy_action = Gio.SimpleAction.new("address-copy", None)
+        copy_action.connect("activate", self._on_address_copy_activate)
+        group.add_action(copy_action)
         copy_invite_action = Gio.SimpleAction.new("copy-invite", None)
         copy_invite_action.connect("activate", self._on_copy_invite_activate)
         group.add_action(copy_invite_action)
@@ -352,11 +363,13 @@ class MessageReaderPane(Gtk.Box):
         self._reader_action_group = group
         self._address_new_action = new_action
         self._address_search_action = search_action
+        self._address_copy_action = copy_action
         self._copy_invite_action = copy_invite_action
         self._address_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
         self._invite_clipboard_text = ""
         # Popovers are not always in the action widget tree; expose the group
-        # on the invite popover so Copy activates reliably.
+        # so Copy (and address actions) activate reliably.
+        self._address_popover.insert_action_group("reader", group)
         self._invite_popover.insert_action_group("reader", group)
 
     @property
@@ -741,6 +754,7 @@ class MessageReaderPane(Gtk.Box):
         menu = Gio.Menu()
         menu.append(f"New Message to {email}…", "reader.address-new-message")
         menu.append(f"Search Messages from {email}", "reader.address-search-from")
+        menu.append("Copy address", "reader.address-copy")
         self._address_popover.set_menu_model(menu)
         self._ensure_popover_parent(self._address_popover, widget)
         rect = Gdk.Rectangle()
@@ -762,6 +776,12 @@ class MessageReaderPane(Gtk.Box):
         if not email:
             return
         self._on_search_messages_from(email)
+
+    def _on_address_copy_activate(self, *_args) -> None:
+        email = self._context_address
+        if not email:
+            return
+        self.get_clipboard().set(email)
 
     def show_loading(self) -> None:
         self._current_message = None
@@ -1006,6 +1026,7 @@ class MessageReaderPane(Gtk.Box):
                 context_menu,
                 new_message_action=self._address_new_action,
                 search_from_action=self._address_search_action,
+                copy_address_action=self._address_copy_action,
                 email=email,
             )
         return False
