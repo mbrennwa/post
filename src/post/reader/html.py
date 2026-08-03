@@ -1054,6 +1054,32 @@ def _effective_reader_dark(app_dark: bool, appearance: MessageAppearance) -> boo
     return app_dark
 
 
+# Plain-text URL shapes for reader linkification (#193). Same character class idea
+# as post.mail.helpers._SEARCH_URL_PATTERN.
+_PLAIN_URL_PATTERN = re.compile(
+    r"https?://[^\s<>'\"\)]+|mailto:[^\s<>'\"\)]+|www\.[^\s<>'\"\)]+",
+    re.IGNORECASE,
+)
+
+
+def linkify_plain_text(text: str) -> str:
+    """Escape *text* and wrap detected URLs in ``<a href>`` anchors."""
+    parts: list[str] = []
+    pos = 0
+    for match in _PLAIN_URL_PATTERN.finditer(text):
+        parts.append(html.escape(text[pos : match.start()]))
+        raw = match.group(0)
+        display = html.escape(raw)
+        if raw.lower().startswith("www."):
+            href = html.escape("https://" + raw, quote=True)
+        else:
+            href = html.escape(raw, quote=True)
+        parts.append(f'<a href="{href}">{display}</a>')
+        pos = match.end()
+    parts.append(html.escape(text[pos:]))
+    return "".join(parts)
+
+
 def build_reader_document(
     *,
     body_html: str | None,
@@ -1090,7 +1116,7 @@ def build_reader_document(
             content = f'<div class="message-body">{content}</div>'
         content = _embed_bracketed_span_literals(content)
     elif body_plain:
-        content = f'<pre class="plain-body">{html.escape(body_plain)}</pre>'
+        content = f'<pre class="plain-body">{linkify_plain_text(body_plain)}</pre>'
     else:
         content = "<p><em>(No message body)</em></p>"
 
