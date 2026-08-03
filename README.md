@@ -15,7 +15,7 @@ Big-picture capabilities for the current tree (refresh on every release — see
 **Implemented**
 
 - IMAP, Gmail, Microsoft 365, and local machine mail (through GNOME Online Accounts)
-- Read mail: accounts/folders, message list, HTML reader (inline + separate window)
+- Read mail: accounts/folders, message list, HTML reader (inline + separate window); clickable links in plain-text messages
 - Search over message headers and bodies
 - Compose: new / reply / reply-all / forward; attachments; drafts; signatures; correspondent autocomplete
 - Outbox with delayed send
@@ -33,7 +33,6 @@ Big-picture capabilities for the current tree (refresh on every release — see
 - Unified inbox (single merged cross-account message list)
 - Drag-and-drop of messages onto folders, arbitrary message move with folder picker
 - Access GNOME address book for compose autocomplete
-- Clickable links in plain-text messages
 - Full header details view
 - Desktop notifications for new mail
 

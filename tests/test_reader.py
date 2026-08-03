@@ -25,6 +25,47 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", doc)
         self.assertNotIn("<script>alert(1)</script>", doc)
 
+    def test_plain_body_linkifies_www_and_http_urls(self) -> None:
+        # Acceptance fixture shaped like today's Gmail "test" message (#193).
+        body = "see www.gasometrix.com\n\nor http://www.gasometrix.com/faq\n"
+        doc = build_reader_document(
+            body_html=None,
+            body_plain=body,
+            allow_remote=False,
+        )
+        self.assertIn(
+            '<a href="https://www.gasometrix.com">www.gasometrix.com</a>',
+            doc,
+        )
+        self.assertIn(
+            '<a href="http://www.gasometrix.com/faq">'
+            "http://www.gasometrix.com/faq</a>",
+            doc,
+        )
+        self.assertIn("see ", doc)
+        self.assertIn("or ", doc)
+
+    def test_plain_body_linkifies_mailto(self) -> None:
+        doc = build_reader_document(
+            body_html=None,
+            body_plain="Write mailto:contact@example.com please",
+            allow_remote=False,
+        )
+        self.assertIn(
+            '<a href="mailto:contact@example.com">mailto:contact@example.com</a>',
+            doc,
+        )
+
+    def test_html_body_prefers_html_over_plain_linkify(self) -> None:
+        doc = build_reader_document(
+            body_html="<p>HTML only</p>",
+            body_plain="see www.gasometrix.com",
+            allow_remote=False,
+        )
+        self.assertIn("<p>HTML only</p>", doc)
+        self.assertNotIn("www.gasometrix.com", doc)
+        self.assertNotIn('<pre class="plain-body">', doc)
+
     def test_blocks_remote_images_when_disabled(self) -> None:
         html = '<p>Hi</p><img src="https://tracker.example/pixel.png">'
         doc = build_reader_document(
