@@ -219,16 +219,25 @@ class MailSidebar:
         if self._on_accounts_loaded is not None:
             self._on_accounts_loaded([account.uid for account in self._accounts])
 
+        present = [account.uid for account in self._accounts]
+        self._register_inbox_accounts(present)
+        ordered_uids = self._resolve_inbox_order(present)
+        ordered_accounts = [
+            self._accounts_by_uid[uid]
+            for uid in ordered_uids
+            if uid in self._accounts_by_uid
+        ]
+
         if len(self._accounts) > 1:
             self._sidebar_box.append(self._make_inbox_section_loading())
             # Seed Inboxes immediately so degraded accounts (expired GOA, etc.)
             # stay visible even if folder-list fails or is cancelled/retried.
-            for account in self._accounts:
+            for account in ordered_accounts:
                 self._add_inbox_row_unavailable(account.uid)
 
         self._folder_loads_pending = len(self._accounts)
         self._startup_folder_total = len(self._accounts)
-        for account in self._accounts:
+        for account in ordered_accounts:
             self._sidebar_box.append(self._make_account_section_loading(account))
             self._start_folder_load(load_id, account)
 
@@ -1845,6 +1854,39 @@ class MailSidebar:
         for uid in order:
             self._inbox_list.append(rows_by_uid[uid])
 
+    def _sort_account_sections(self) -> None:
+        """Reorder per-account expanders to match `_inbox_order` (Inboxes stays first)."""
+        inbox_expander = self._inbox_expander
+        expanders_by_uid: dict[str, Gtk.Expander] = {}
+        child = self._sidebar_box.get_first_child()
+        while child is not None:
+            next_child = child.get_next_sibling()
+            if child is inbox_expander:
+                child = next_child
+                continue
+            if isinstance(child, Gtk.Expander):
+                uid = getattr(child, "account_uid", None)
+                if isinstance(uid, str) and uid:
+                    expanders_by_uid[uid] = child
+                    self._sidebar_box.remove(child)
+            child = next_child
+
+        if not expanders_by_uid:
+            return
+
+        present = list(expanders_by_uid.keys())
+        self._register_inbox_accounts(present)
+        for uid in self._resolve_inbox_order(present):
+            expander = expanders_by_uid.get(uid)
+            if expander is not None:
+                self._sidebar_box.append(expander)
+
+    def _apply_inbox_order(self) -> None:
+        """Refresh Inboxes list + account sections from `_inbox_order` and persist."""
+        self._sort_inbox_list()
+        self._sort_account_sections()
+        self._persist_view_state()
+
     def _move_inbox_row(self, source_uid: str, target_uid: str, *, after: bool) -> None:
         order = self._current_inbox_order_from_list()
         if source_uid not in order or target_uid not in order:
@@ -1855,8 +1897,7 @@ class MailSidebar:
             index += 1
         order.insert(index, source_uid)
         self._inbox_order = order
-        self._sort_inbox_list()
-        self._persist_view_state()
+        self._apply_inbox_order()
 
     def _setup_inbox_row_drag(self, row: Gtk.ListBoxRow) -> None:
         drag_source = Gtk.DragSource()
@@ -1895,8 +1936,7 @@ class MailSidebar:
                     order.remove(source_uid)
                     order.append(source_uid)
                     self._inbox_order = order
-                    self._sort_inbox_list()
-                    self._persist_view_state()
+                    self._apply_inbox_order()
                     return True
                 finally:
                     self._sidebar_selecting = was_selecting
@@ -1921,6 +1961,7 @@ class MailSidebar:
     def _make_account_section_loading(self, account: MailAccount) -> Gtk.Expander:
         expander = Gtk.Expander()
         expander.add_css_class("sidebar-section")
+        expander.account_uid = account.uid
         expander.set_expanded(self._expanded_accounts.get(account.uid, True))
         expander.connect("notify::expanded", self._on_account_expanded, account.uid)
         expander.set_label_widget(self._make_account_header(account))
