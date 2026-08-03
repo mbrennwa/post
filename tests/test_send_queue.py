@@ -27,6 +27,8 @@ from post.mail.send_queue import (
     clear_outbound_send_delay,
     count_queued_for_account,
     enqueue_outbound_message,
+    format_stop_sending_error_toast,
+    format_stop_sending_toast,
     has_pending_send_delay,
     is_outbound_ready_to_send,
     list_pending_delayed_outbound_messages,
@@ -324,6 +326,35 @@ class OutboxAccountFilterTests(unittest.TestCase):
                 self.assertEqual(pending[0][0], delayed_id)
                 self.assertEqual(pending[0][1].subject, "Delayed")
 
+    def test_list_pending_delayed_spans_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                first = persist_outbound_send(
+                    account_uid="account-work",
+                    to=["a@example.com"],
+                    cc=None,
+                    bcc=None,
+                    subject="Work delayed",
+                    body="Body",
+                    send_after=time.time() + 120,
+                )
+                second = persist_outbound_send(
+                    account_uid="account-personal",
+                    to=["b@example.com"],
+                    cc=None,
+                    bcc=None,
+                    subject="Personal delayed",
+                    body="Body",
+                    send_after=time.time() + 180,
+                )
+                pending = list_pending_delayed_outbound_messages()
+                self.assertEqual(len(pending), 2)
+                by_id = {queue_id: message for queue_id, message in pending}
+                self.assertEqual(by_id[first].account_uid, "account-work")
+                self.assertEqual(by_id[second].account_uid, "account-personal")
+                self.assertTrue(has_pending_send_delay(by_id[first]))
+                self.assertTrue(has_pending_send_delay(by_id[second]))
+
     def test_has_pending_send_delay(self) -> None:
         future = time.time() + 120
         delayed = QueuedOutboundMessage(
@@ -404,3 +435,49 @@ class OutboxAccountFilterTests(unittest.TestCase):
             from_label="me@example.com",
         )
         self.assertNotIn("send_after", immediate)
+
+
+class StopSendingToastTests(unittest.TestCase):
+    def test_single_message(self) -> None:
+        self.assertEqual(
+            format_stop_sending_toast({"mbrennwa@gmail.com": 1}),
+            "Moved message to Drafts: mbrennwa@gmail.com",
+        )
+
+    def test_same_account_multiple(self) -> None:
+        self.assertEqual(
+            format_stop_sending_toast([("mbrennwa@gmail.com", 3)]),
+            "Moved messages to Drafts: mbrennwa@gmail.com (3)",
+        )
+
+    def test_multiple_accounts_named(self) -> None:
+        self.assertEqual(
+            format_stop_sending_toast(
+                {
+                    "mbrennwa@gmail.com": 3,
+                    "info@gasometrix.com": 2,
+                }
+            ),
+            "Moved messages to Drafts: info@gasometrix.com (2), "
+            "mbrennwa@gmail.com (3)",
+        )
+
+    def test_error_single_and_multi_account(self) -> None:
+        self.assertEqual(
+            format_stop_sending_error_toast({"mbrennwa@gmail.com": 1}),
+            "Could not move message to Drafts: mbrennwa@gmail.com",
+        )
+        self.assertEqual(
+            format_stop_sending_error_toast({"mbrennwa@gmail.com": 2}),
+            "Could not move messages to Drafts: mbrennwa@gmail.com (2)",
+        )
+        self.assertEqual(
+            format_stop_sending_error_toast(
+                {
+                    "mbrennwa@gmail.com": 3,
+                    "info@gasometrix.com": 2,
+                }
+            ),
+            "Could not move messages to Drafts: info@gasometrix.com (2), "
+            "mbrennwa@gmail.com (3)",
+        )
