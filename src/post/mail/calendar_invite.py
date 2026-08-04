@@ -618,18 +618,31 @@ def build_vevent_ics(invite: dict[str, Any]) -> str:
 
     location = invite.get("location")
     meeting_url = invite.get("meeting_url")
-    if location:
-        lines.append(f"LOCATION:{esc(str(location))}")
-    elif meeting_url:
-        lines.append(f"LOCATION:{esc(str(meeting_url))}")
-    if meeting_url:
-        lines.append(f"URL:{esc(str(meeting_url))}")
+    location_text = str(location).strip() if location else ""
+    meeting_url_text = str(meeting_url).strip() if meeting_url else ""
+    # Prefer the join URL in LOCATION so calendar apps show a Join button.
+    # Keep any non-URL place label for DESCRIPTION when it would otherwise be lost.
+    preserved_location = ""
+    if meeting_url_text:
+        lines.append(f"LOCATION:{esc(meeting_url_text)}")
+        lines.append(f"URL:{esc(meeting_url_text)}")
+        if (
+            location_text
+            and not location_text.lower().startswith(("https://", "http://"))
+            and location_text.rstrip("/") != meeting_url_text.rstrip("/")
+        ):
+            preserved_location = location_text
+    elif location_text:
+        lines.append(f"LOCATION:{esc(location_text)}")
     description = invite.get("description")
+    desc_text = str(description) if description else ""
     desc_parts: list[str] = []
-    if description:
-        desc_parts.append(str(description))
-    if meeting_url and (not description or meeting_url not in str(description)):
-        desc_parts.append(str(meeting_url))
+    if preserved_location and preserved_location not in desc_text:
+        desc_parts.append(preserved_location)
+    if desc_text:
+        desc_parts.append(desc_text)
+    if meeting_url_text and meeting_url_text not in desc_text:
+        desc_parts.append(meeting_url_text)
     if desc_parts:
         lines.append(f"DESCRIPTION:{esc(chr(10).join(desc_parts))}")
     organizer = invite.get("organizer")
