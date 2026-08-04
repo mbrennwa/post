@@ -343,7 +343,40 @@ class BuildVeventTests(unittest.TestCase):
         self.assertIn("UID:test-uid-123", ics)
         self.assertIn("DTSTAMP:", ics)
         self.assertIn("SUMMARY:Sync", ics)
+        self.assertIn("LOCATION:https://zoom.us/j/1", ics)
         self.assertIn("URL:https://zoom.us/j/1", ics)
+
+    def test_teams_label_location_uses_meeting_url(self) -> None:
+        ics = build_vevent_ics(
+            {
+                "title": "Discussion",
+                "start": "2026-08-07T10:00:00",
+                "end": "2026-08-07T11:30:00",
+                "location": "Microsoft Teams Meeting",
+                "meeting_url": "https://teams.microsoft.com/l/meetup-join/abc",
+                "description": "Agenda item one",
+                "uid": "teams-uid-1",
+            }
+        )
+        self.assertIn(
+            "LOCATION:https://teams.microsoft.com/l/meetup-join/abc", ics
+        )
+        self.assertIn("URL:https://teams.microsoft.com/l/meetup-join/abc", ics)
+        self.assertNotIn("LOCATION:Microsoft Teams Meeting", ics)
+        self.assertIn("Microsoft Teams Meeting", ics)
+        self.assertIn("Agenda item one", ics)
+
+    def test_room_only_location_without_meeting_url(self) -> None:
+        ics = build_vevent_ics(
+            {
+                "title": "In person",
+                "start": "2026-08-07T10:00:00",
+                "location": "Conference Room B",
+                "uid": "room-uid-1",
+            }
+        )
+        self.assertIn("LOCATION:Conference Room B", ics)
+        self.assertNotIn("URL:", ics)
 
 
 class WritableCalendarFilterTests(unittest.TestCase):
