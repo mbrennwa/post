@@ -219,6 +219,16 @@ def load_queued_outbound_message(queue_id: str) -> QueuedOutboundMessage:
     return QueuedOutboundMessage.from_dict(data)
 
 
+def try_load_queued_outbound_message(
+    queue_id: str,
+) -> QueuedOutboundMessage | None:
+    """Load a queued message, or None if the outbox file is already gone."""
+    try:
+        return load_queued_outbound_message(queue_id)
+    except FileNotFoundError:
+        return None
+
+
 def new_outbound_queue_id() -> str:
     return f"{int(time.time() * 1_000_000)}-{uuid.uuid4().hex}"
 
