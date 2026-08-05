@@ -110,6 +110,8 @@ def format_stop_sending_toast(
     total = sum(count for _label, count in items)
     if total == 1:
         return f"Moved message to Drafts: {items[0][0]}"
+    if len(items) == 1:
+        return f"Moved {total} messages to Drafts: {items[0][0]}"
     parts = [f"{label} ({count})" for label, count in items]
     return "Moved messages to Drafts: " + ", ".join(parts)
 

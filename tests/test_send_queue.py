@@ -468,7 +468,7 @@ class StopSendingToastTests(unittest.TestCase):
     def test_same_account_multiple(self) -> None:
         self.assertEqual(
             format_stop_sending_toast([("mbrennwa@gmail.com", 3)]),
-            "Moved messages to Drafts: mbrennwa@gmail.com (3)",
+            "Moved 3 messages to Drafts: mbrennwa@gmail.com",
         )
 
     def test_multiple_accounts_named(self) -> None:
