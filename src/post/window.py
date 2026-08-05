@@ -98,6 +98,7 @@ from post.mail.send_queue import (
     load_queued_outbound_message,
     read_queued_message,
     remove_queued_outbound_message,
+    try_load_queued_outbound_message,
 )
 from post.settings_window import SettingsWindow
 from post.mail.helpers import (
@@ -270,6 +271,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._pending_goa_reauth: set[str] = set()
 
         self._mail = MailService.connect()
+        self._stop_sending_in_flight = False
         self._send_delay_scheduler = OutboundSendDelayScheduler(
             self._mail,
             on_outbox_changed=self._on_outbox_changed,
@@ -812,6 +814,7 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             self._stop_sending_count.set_label("")
             self._stop_sending_box.set_visible(False)
+        self._stop_sending_btn.set_sensitive(not self._stop_sending_in_flight)
 
     def _install_message_list_style(self) -> None:
         provider = Gtk.CssProvider()
@@ -5585,6 +5588,8 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _on_stop_sending_clicked(self, *_args) -> None:
+        if self._stop_sending_in_flight:
+            return
         pending = [
             (queue_id, message)
             for queue_id, message in list_queued_outbound_messages()
@@ -5592,6 +5597,8 @@ class MainWindow(Adw.ApplicationWindow):
         ]
         if not pending:
             return
+        self._stop_sending_in_flight = True
+        self._stop_sending_btn.set_sensitive(False)
         for queue_id, _message in pending:
             self._send_delay_scheduler.cancel(queue_id)
         queue_ids = [queue_id for queue_id, _message in pending]
@@ -5602,7 +5609,10 @@ class MainWindow(Adw.ApplicationWindow):
             for queue_id in queue_ids:
                 account_uid = ""
                 try:
-                    queued = load_queued_outbound_message(queue_id)
+                    queued = try_load_queued_outbound_message(queue_id)
+                    if queued is None:
+                        # Already moved/removed by an earlier stop or move.
+                        continue
                     account_uid = queued.account_uid
                     attachments = load_queued_attachments(queue_id, queued)
                     self._mail.save_draft(
@@ -5635,6 +5645,7 @@ class MainWindow(Adw.ApplicationWindow):
         moved: dict[str, int],
         failed: dict[str, int],
     ) -> bool:
+        self._stop_sending_in_flight = False
         self._on_outbox_changed()
         if moved:
             moved_labels = [

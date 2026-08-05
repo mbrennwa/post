@@ -41,6 +41,7 @@ from post.mail.send_queue import (
     queued_to_list_dict,
     read_queued_message,
     remove_queued_outbound_message,
+    try_load_queued_outbound_message,
 )
 
 
@@ -274,6 +275,26 @@ class OutboxAccountFilterTests(unittest.TestCase):
                 self.assertEqual(loaded.subject, "Hello")
                 self.assertEqual(loaded.in_reply_to, "<msg@example.com>")
 
+    def test_try_load_queued_outbound_message_missing_is_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                queue_id = persist_outbound_send(
+                    account_uid="account-1",
+                    to=["user@example.com"],
+                    cc=None,
+                    bcc=None,
+                    subject="Hello",
+                    body="Body text",
+                )
+                loaded = try_load_queued_outbound_message(queue_id)
+                self.assertIsNotNone(loaded)
+                assert loaded is not None
+                self.assertEqual(loaded.subject, "Hello")
+                remove_queued_outbound_message(queue_id)
+                self.assertIsNone(try_load_queued_outbound_message(queue_id))
+                with self.assertRaises(FileNotFoundError):
+                    load_queued_outbound_message(queue_id)
+
     def test_send_after_persisted_and_ready_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
@@ -447,7 +468,7 @@ class StopSendingToastTests(unittest.TestCase):
     def test_same_account_multiple(self) -> None:
         self.assertEqual(
             format_stop_sending_toast([("mbrennwa@gmail.com", 3)]),
-            "Moved messages to Drafts: mbrennwa@gmail.com (3)",
+            "Moved 3 messages to Drafts: mbrennwa@gmail.com",
         )
 
     def test_multiple_accounts_named(self) -> None:
