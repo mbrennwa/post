@@ -382,6 +382,11 @@ def email_part_counts_as_attachment(part: Any) -> bool:
         return False
     if disposition == "inline" and ctype.startswith("text/") and not is_calendar_mime(ctype):
         return False
+    # CID / inline images are shown in the body, not the attachment list (#258).
+    if ctype.startswith("image/") and disposition != "attachment":
+        content_id = part.get("Content-ID")
+        if content_id or disposition == "inline":
+            return False
     return True
 
 

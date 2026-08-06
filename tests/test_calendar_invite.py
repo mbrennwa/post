@@ -229,6 +229,101 @@ class AttachmentExtractionTests(unittest.TestCase):
         self.assertIn("Plain body", bodies["plain"] or "")
         self.assertIn("HTML body", bodies["html"] or "")
 
+    def test_cid_inline_image_excluded_from_attachments(self) -> None:
+        """CID/inline images shown in the body must not appear as attachments (#258)."""
+        png = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f"
+            b"\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        msg = email.message.EmailMessage(policy=email.policy.default)
+        msg["Subject"] = "Signed"
+        msg.make_mixed()
+
+        related = email.message.EmailMessage()
+        related.make_related()
+        html = email.message.EmailMessage()
+        html.set_content(
+            '<p>Hi</p><img src="cid:logo@local">',
+            subtype="html",
+        )
+        related.attach(html)
+        logo = email.message.EmailMessage()
+        logo.set_content(
+            png,
+            maintype="image",
+            subtype="png",
+            disposition="inline",
+            filename="logo.png",
+        )
+        logo["Content-ID"] = "<logo@local>"
+        related.attach(logo)
+        msg.attach(related)
+
+        msg.add_attachment(
+            b"hello notes",
+            maintype="text",
+            subtype="plain",
+            filename="notes.txt",
+        )
+
+        attachments = extract_attachments_from_email_message(msg)
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["filename"], "notes.txt")
+        self.assertEqual(attachments[0]["index"], 0)
+        self.assertFalse(any("logo" in (a["filename"] or "") for a in attachments))
+
+    def test_inline_disposition_image_without_cid_excluded(self) -> None:
+        body = email.message.EmailMessage()
+        body.set_content("Hello")
+        img = email.message.EmailMessage()
+        img.set_content(
+            b"fakepng",
+            maintype="image",
+            subtype="png",
+            disposition="inline",
+            filename="badge.png",
+        )
+
+        mixed = email.message.EmailMessage(policy=email.policy.default)
+        mixed["Subject"] = "Decor"
+        mixed.make_mixed()
+        mixed.attach(body)
+        mixed.attach(img)
+        mixed.add_attachment(
+            b"real",
+            maintype="application",
+            subtype="octet-stream",
+            filename="file.bin",
+        )
+
+        attachments = extract_attachments_from_email_message(mixed)
+        names = [a["filename"] for a in attachments]
+        self.assertNotIn("badge.png", names)
+        self.assertIn("file.bin", names)
+
+    def test_explicit_attachment_image_with_cid_still_listed(self) -> None:
+        msg = email.message.EmailMessage(policy=email.policy.default)
+        msg["Subject"] = "Photo"
+        msg.set_content("See attached")
+        msg.add_attachment(
+            b"fakepng",
+            maintype="image",
+            subtype="png",
+            filename="photo.png",
+        )
+        # Attachments added via add_attachment get disposition=attachment.
+        # Also set Content-ID as some clients do for downloadable images.
+        for part in msg.walk():
+            if part.get_filename() == "photo.png":
+                part["Content-ID"] = "<photo@local>"
+                break
+
+        attachments = extract_attachments_from_email_message(msg)
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["filename"], "photo.png")
+        self.assertEqual(attachments[0]["mime_type"], "image/png")
+
 
 class InviteJoinUrlTests(unittest.TestCase):
     def test_prefers_meeting_url(self) -> None:
