@@ -7,6 +7,7 @@ import unittest
 
 from post.mail.helpers import searchable_body_text
 from post.mail.search import (
+    MessageSearchQuery,
     SearchTerm,
     filter_messages_by_query,
     parse_search_query,
@@ -162,6 +163,10 @@ class ParseSearchQueryTests(unittest.TestCase):
 
 
 class QueryToSexpTests(unittest.TestCase):
+    def test_empty_query_uses_match_all_with_true(self) -> None:
+        # Portable "match everything" for classic Camel and StoreSearch (#277).
+        self.assertEqual(query_to_sexp(MessageSearchQuery(terms=())), "(match-all #t)")
+
     def test_bare_word_searches_headers_and_body(self) -> None:
         query = parse_search_query("Core")
         assert query is not None

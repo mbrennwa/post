@@ -20,7 +20,9 @@ from post.preferences import (
     get_account_user_online,
 )
 
-_DOWNSYNC_EXPRESSION = "(match-all)"
+# Bare "(match-all)" fails CamelStoreSearch (EDS ≥ 3.58): argc must be 1.
+# "(match-all #t)" matches everything on classic FolderSearch and StoreSearch (#277).
+_DOWNSYNC_EXPRESSION = "(match-all #t)"
 
 
 def downsync_expression_for_mode(mode: OfflineBodySyncMode) -> str | None:
