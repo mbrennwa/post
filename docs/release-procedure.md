@@ -1,8 +1,9 @@
 # Release procedure
 
-Run this procedure for **every** release — testing tags (`vX.Y.Z.devN`),
-release candidates, and final versions. Do not skip gates for a “just testing”
-tag: the same public artifacts, issue history, and README are what people see.
+Run this procedure for **every** release — pre-releases (`vX.Y.ZaN`,
+`vX.Y.ZbN`, `vX.Y.ZrcN`, legacy `vX.Y.Z.devN`), and final versions. Do not skip
+gates for a “just testing” tag: the same public artifacts, issue history, and
+README are what people see.
 
 Canonical checklist: follow the sections below in order. Record findings (and
 any redactions) in the release issue or PR.
@@ -14,8 +15,15 @@ any redactions) in the release issue or PR.
 2. Match `debian/changelog` upstream version to that value.
 3. Match `rpm/post.spec` `Version:` (and add a `%changelog` entry).
 4. Choose the Git tag `v<version>` (same string as the project version).
-   Example: version `1.0.0.dev2` → tag `v1.0.0.dev2`.
-   - Trailing `.devN` → GitHub Release is marked **prerelease** (see CI).
+   Example: version `1.0.0a1` → tag `v1.0.0a1`.
+   Use [PEP 440](https://peps.python.org/pep-0440/) pre-release segments:
+   - `.devN` — internal / early WIP (legacy; prefer `aN` once public)
+   - `aN` — public alpha
+   - `bN` — public beta
+   - `rcN` — release candidate
+   - plain `X.Y.Z` — final release
+   - Pre-release segments (`dev` / `a` / `b` / `rc`, …) → GitHub Release is
+     marked **prerelease** (see CI).
    - Otherwise → normal (final) release.
 5. Refresh install examples in `README.md` and `tools/howto-build-*.txt`
    so package filenames match.
@@ -147,7 +155,7 @@ Ensure no package build artifacts are in the working tree before `reuse lint`
 
 4. CI (`.github/workflows/release-deb.yml`) builds the `.deb` and `.rpm` and
    attaches both to the GitHub Release (prerelease flag set automatically for
-   `.devN` versions).
+   PEP 440 pre-releases such as `aN` / `bN` / `rcN` / `.devN`).
 
 ## 8. Post-tag verify
 

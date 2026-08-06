@@ -2,7 +2,7 @@
 
 **Post** is a free and open-source mail app for GNOME. Read and send email with a simple, native desktop experience on Linux, using your accounts from GNOME Online Accounts for IMAP, Gmail, Microsoft 365, and local machine mail. No bloat: no calendars, no to-dos, no newsfeeds, no contacts manager.
 
-Post is in active development. Do not assume it is bulletproof for productive environments.
+Post is in public alpha. Do not assume it is bulletproof for productive environments.
 
 Project site: [mbrennwa.github.io/post](https://mbrennwa.github.io/post)
 
@@ -44,7 +44,7 @@ On Debian 12+, Ubuntu 24.04+, or similar DEB-based distros:
 **From a release `.deb`** (see [GitHub Releases](https://github.com/mbrennwa/post/releases)):
 
 ```bash
-sudo apt install ./dist/post_1.0.0.dev2_all.deb
+sudo apt install ./dist/post_1.0.0a1_all.deb
 post
 ```
 
@@ -53,7 +53,7 @@ On Fedora:
 **From a release `.rpm`** (see [GitHub Releases](https://github.com/mbrennwa/post/releases)):
 
 ```bash
-sudo dnf install ./dist/post-1.0.0.dev2-1.noarch.rpm
+sudo dnf install ./dist/post-1.0.0a1-1.noarch.rpm
 post
 ```
 

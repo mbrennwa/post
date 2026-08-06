@@ -1,6 +1,6 @@
 [project]
 name = "post"
-version = "1.0.0.dev2"
+version = "1.0.0a1"
 description = "A simple GNOME mail client — GTK4 UI on Evolution Data Server"
 readme = "README.md"
 requires-python = ">=3.10"
