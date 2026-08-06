@@ -76,6 +76,23 @@ class DraftDispatchTests(unittest.TestCase):
         self.assertEqual(result, ("file.txt", b"data"))
 
     @mock.patch("post.mail.eds.run_on_mail_thread")
+    def test_read_compose_attachments_uses_mail_thread(
+        self, run_on_mail_thread
+    ) -> None:
+        run_on_mail_thread.return_value = []
+        service = MailService(registry=mock.Mock())
+
+        result = service.read_compose_attachments("acct-1", "INBOX", "1")
+
+        run_on_mail_thread.assert_called_once_with(
+            service._read_compose_attachments_unlocked,
+            "acct-1",
+            "INBOX",
+            "1",
+        )
+        self.assertEqual(result, [])
+
+    @mock.patch("post.mail.eds.run_on_mail_thread")
     def test_toggle_message_seen_uses_mail_thread(self, run_on_mail_thread) -> None:
         run_on_mail_thread.return_value = {"updates": []}
         service = MailService(registry=mock.Mock())

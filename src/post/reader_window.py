@@ -38,7 +38,7 @@ from post.toast import show_error_toast, show_toast
 log = logging.getLogger(__name__)
 
 SetStatus = Callable[[str], None]
-OnCompose = Callable[[str, dict[str, Any]], None]
+OnCompose = Callable[[str, dict[str, Any], MailAccount, str, str], None]
 OnAddressEmail = Callable[[str], None]
 CanSearchMessages = Callable[[], bool]
 OnRequestMove = Callable[[str, str, str, str], None]
@@ -507,7 +507,13 @@ class ReaderWindow(Adw.ApplicationWindow):
     def _open_compose(self, mode: str) -> None:
         if self._current_message is None:
             return
-        self._on_compose(mode, self._current_message)
+        self._on_compose(
+            mode,
+            self._current_message,
+            self._account,
+            self._folder_name,
+            self._message_uid,
+        )
 
     def _setup_attachment_menu(self) -> None:
         save_action = Gio.SimpleAction.new("save-attachment", None)
