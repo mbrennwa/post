@@ -312,7 +312,8 @@ def query_to_sexp(query: MessageSearchQuery) -> str:
     """Compile a Post search query to a Camel folder search S-expression."""
     clauses = [_term_to_sexp(term) for term in query.terms]
     if not clauses:
-        return "(match-all)"
+        # StoreSearch (EDS ≥ 3.58) requires one arg; #t also works on classic Camel (#277).
+        return "(match-all #t)"
     if len(clauses) == 1:
         inner = clauses[0]
     else:

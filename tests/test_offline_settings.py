@@ -36,7 +36,7 @@ class DownsyncExpressionTests(unittest.TestCase):
     def test_enabled_modes_use_match_all(self) -> None:
         self.assertEqual(
             downsync_expression_for_mode(OFFLINE_BODY_SYNC_ALL),
-            "(match-all)",
+            "(match-all #t)",
         )
 
 
@@ -198,7 +198,7 @@ class OfflineDownsyncTimeoutTests(unittest.TestCase):
         with mock.patch.object(offline_sync, "_OFFLINE_DOWNSYNC_TIMEOUT_SECONDS", 0.1):
             started = time.monotonic()
             coordinator._downsync_folder_sync(
-                folder, "(match-all)", account_cancellable
+                folder, "(match-all #t)", account_cancellable
             )
             elapsed = time.monotonic() - started
 
