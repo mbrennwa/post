@@ -168,6 +168,80 @@ def prepended_message_count(
     return 0
 
 
+def _folder_message_identity_key(message: dict[str, Any]) -> str:
+    """Identity for collapsing grow-only duplicates of the same logical mail (#265)."""
+    mid = str(message.get("message_id") or "").strip().strip("<>").lower()
+    if mid:
+        return f"mid:{mid}"
+    subject = str(message.get("subject") or "").strip().lower()
+    sender = str(message.get("from") or "").strip().lower()
+    sort_date = message.get("sort_date")
+    if subject or sender or sort_date not in (None, "", 0):
+        return f"hdr:{sort_date}|{sender}|{subject}"
+    # No usable identity metadata — keep each UID distinct.
+    return f"uid:{message.get('uid') or id(message)}"
+
+
+def dedupe_folder_index_messages(
+    messages: list[dict[str, Any]],
+    *,
+    prefer_uids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Keep one row per logical message when grow-only indexing retained stale UIDs.
+
+    M365 Archive refresh can reintroduce the same Message-Id under a new Graph
+    RestId while Post's grow-only folder-index still holds the old UID. Prefer
+    UIDs present in ``prefer_uids`` (usually the current Camel summary).
+    """
+    if len(messages) < 2:
+        return list(messages)
+    prefer = prefer_uids or set()
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for message in messages:
+        key = _folder_message_identity_key(message)
+        if key not in groups:
+            order.append(key)
+            groups[key] = []
+        groups[key].append(message)
+
+    deduped: list[dict[str, Any]] = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            deduped.append(group[0])
+            continue
+        preferred = [
+            msg
+            for msg in group
+            if str(msg.get("uid") or "") in prefer
+        ]
+        if preferred:
+            # Prefer the last Camel-known UID (newest RestId insertion).
+            deduped.append(preferred[-1])
+            continue
+        # Disk UIDs are inserted before Camel refresh UIDs; keep the last
+        # duplicate so we prefer the newer RestId when Camel prefer set is empty.
+        deduped.append(group[-1])
+    return deduped
+
+
+def folder_index_identity_keys(messages: list[dict[str, Any]]) -> set[str]:
+    return {_folder_message_identity_key(msg) for msg in messages}
+
+
+def folder_index_covers_identities(
+    incoming: list[dict[str, Any]],
+    existing: list[dict[str, Any]],
+) -> bool:
+    """True when ``incoming`` covers every logical message in ``existing`` (#265)."""
+    if not existing:
+        return True
+    return folder_index_identity_keys(incoming).issuperset(
+        folder_index_identity_keys(existing)
+    )
+
+
 def folder_list_ready_to_cache(
     shown: int,
     total: int,

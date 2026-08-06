@@ -36,22 +36,38 @@ def save(
     """Persist folder index metadata.
 
     When ``grow_only`` is True (heavy folders), never replace a larger on-disk
-    index with a smaller Camel summary (#208).
+    index with a smaller Camel summary (#208), unless the smaller list still
+    covers the same logical messages (duplicate RestId collapse, #265).
     """
     if grow_only:
         existing = load(account_uid, folder_name)
         if existing is not None:
             existing_messages, existing_unread, existing_total = existing
             if len(messages) < len(existing_messages):
-                log.warning(
-                    "Refusing to shrink folder index for %s/%s "
+                from post.mail.message_list_state import (
+                    folder_index_covers_identities,
+                )
+
+                if not folder_index_covers_identities(
+                    messages, existing_messages
+                ):
+                    log.warning(
+                        "Refusing to shrink folder index for %s/%s "
+                        "(disk=%d, incoming=%d)",
+                        account_uid,
+                        folder_name,
+                        len(existing_messages),
+                        len(messages),
+                    )
+                    return
+                log.info(
+                    "Replacing folder index for %s/%s after duplicate collapse "
                     "(disk=%d, incoming=%d)",
                     account_uid,
                     folder_name,
                     len(existing_messages),
                     len(messages),
                 )
-                return
             total = max(total, existing_total, len(messages))
             if unread < 0:
                 unread = existing_unread
@@ -115,6 +131,12 @@ def load(
     if not isinstance(unread, int) or not isinstance(total, int):
         return None
 
+    from post.mail.message_list_state import dedupe_folder_index_messages
+
+    # Collapse stale RestId duplicates written by grow-only indexing (#265).
+    messages = dedupe_folder_index_messages(
+        [msg for msg in messages if isinstance(msg, dict)]
+    )
     return messages, unread, total
 
 
