@@ -77,6 +77,7 @@ class HeavyFolderIncompleteDeltaTests(unittest.TestCase):
 
         mail = MailService.__new__(MailService)
         mail._lock = mock.MagicMock()
+        mail._accounts_by_uid = {"acct": mock.Mock(backend="imapx")}
         mail._heavy_index_sessions = {}
         mail._folder_indexes = {
             ("acct", "Archive"): _FolderMessageIndex(
@@ -146,6 +147,7 @@ class HeavyFolderIndexInteractiveYieldTests(unittest.TestCase):
 
         mail = MailService.__new__(MailService)
         mail._lock = mock.MagicMock()
+        mail._accounts_by_uid = {"acct": mock.Mock(backend="imapx")}
         mail._heavy_index_sessions = {}
         mail._folder_indexes = {
             ("acct", "Archive"): _FolderMessageIndex(
@@ -210,6 +212,7 @@ class HeavyFolderPrepareSkipTests(unittest.TestCase):
 
         mail = MailService.__new__(MailService)
         mail._lock = mock.MagicMock()
+        mail._accounts_by_uid = {"acct": mock.Mock(backend="imapx")}
         mail._heavy_index_sessions = {}
         mail._folder_indexes = {
             ("acct", "Archive"): _FolderMessageIndex(
