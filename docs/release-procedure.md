@@ -34,6 +34,13 @@ Private details must be gone from the **issue tracker**, the **git tree**, and
 any other public project surface before tagging. Ongoing monthly cadence is the
 standing privacy-pass policy (#274); historical one-shot scrub: #115.
 
+**Continuous checks** (not a substitute for this gate): `Privacy CI` runs on
+every PR and push to `main` (repo tree + commit messages);
+`Privacy tracker` scans issue/PR bodies and comments as they are written.
+Maintainers can mark `Privacy CI` as a required status check in branch
+protection. The monthly #274 pass and this release gate still run the **full**
+audit (tracker + tree + history).
+
 ### What counts as private
 
 - Real email addresses, names, hostnames, subjects, or message bodies (use
@@ -49,18 +56,20 @@ emails; intentional placeholders; demo/`example.com` landing screenshots
 
 ### Checklist
 
-1. Run the privacy audit (requires `gh` auth + network):
+1. Run the **full** privacy audit (requires `gh` auth + network):
 
    ```bash
    ./scripts/audit-issue-privacy.sh
    ```
 
-   It must exit 0. It scans issues **and** PRs (bodies + comments) for
-   `user-attachments` media, non-placeholder emails, and known brand/org
-   strings; walks the repo tree for the same; refuses image files under
-   `.github/issue-assets/`; and checks git history for deleted issue-asset
-   screenshots (commit author emails are allowed). Use `SKIP_HISTORY=1` only
-   when you intentionally want tracker/tree checks alone.
+   Default `SCOPE=full` must exit 0. It scans issues **and** PRs (bodies +
+   comments) for `user-attachments` media, non-placeholder emails, and known
+   brand/org strings; walks the repo tree for the same; refuses image files
+   under `.github/issue-assets/`; and checks git history for deleted
+   issue-asset screenshots (commit author emails are allowed). Scoped modes
+   for CI: `SCOPE=tree`, `SCOPE=commits`, `SCOPE=issue` (see script header).
+   Use `SKIP_HISTORY=1` only when you intentionally want tracker/tree checks
+   alone.
 
 2. Scrub anything the audit reports:
    - **Issues / PRs / comments:** remove `<img … user-attachments …>` tags;

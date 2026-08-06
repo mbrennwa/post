@@ -27,19 +27,19 @@ class BuildReaderDocumentTests(unittest.TestCase):
 
     def test_plain_body_linkifies_www_and_http_urls(self) -> None:
         # Acceptance fixture shaped like today's Gmail "test" message (#193).
-        body = "see www.gasometrix.com\n\nor http://www.gasometrix.com/faq\n"
+        body = "see www.example.com\n\nor http://www.example.com/faq\n"
         doc = build_reader_document(
             body_html=None,
             body_plain=body,
             allow_remote=False,
         )
         self.assertIn(
-            '<a href="https://www.gasometrix.com">www.gasometrix.com</a>',
+            '<a href="https://www.example.com">www.example.com</a>',
             doc,
         )
         self.assertIn(
-            '<a href="http://www.gasometrix.com/faq">'
-            "http://www.gasometrix.com/faq</a>",
+            '<a href="http://www.example.com/faq">'
+            "http://www.example.com/faq</a>",
             doc,
         )
         self.assertIn("see ", doc)
@@ -59,11 +59,11 @@ class BuildReaderDocumentTests(unittest.TestCase):
     def test_html_body_prefers_html_over_plain_linkify(self) -> None:
         doc = build_reader_document(
             body_html="<p>HTML only</p>",
-            body_plain="see www.gasometrix.com",
+            body_plain="see www.example.com",
             allow_remote=False,
         )
         self.assertIn("<p>HTML only</p>", doc)
-        self.assertNotIn("www.gasometrix.com", doc)
+        self.assertNotIn("www.example.com", doc)
         self.assertNotIn('<pre class="plain-body">', doc)
 
     def test_blocks_remote_images_when_disabled(self) -> None:

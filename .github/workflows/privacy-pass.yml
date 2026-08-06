@@ -59,7 +59,7 @@ jobs:
 
           ## Checklist
 
-          - [ ] Run \`./scripts/audit-issue-privacy.sh\` (exit 0)
+          - [ ] Run \`./scripts/audit-issue-privacy.sh\` (full SCOPE; exit 0) — continuous CI is not a substitute
           - [ ] Scrub GH issues/PRs/comments (redact helper if needed)
           - [ ] Scrub repo files / fixtures / docs; no private images under \`.github/issue-assets/\`
           - [ ] Spot-check recent commit messages for private details
