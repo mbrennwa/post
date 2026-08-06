@@ -391,11 +391,15 @@ def _message_id_hash_from_message_info(info: Any) -> int | None:
     return value
 
 
-def message_info_to_dict(info: Any, *, uid: str | None = None) -> dict[str, Any]:
+def message_info_to_dict(
+    info: Any, *, uid: str | None = None, backend: str | None = None
+) -> dict[str, Any]:
     import gi
 
     gi.require_version("Camel", "1.2")
     from gi.repository import Camel
+
+    from post.mail.message_flags import message_info_is_flagged
 
     date_sent = info.get_date_sent()
     date_recv = info.get_date_received()
@@ -425,7 +429,7 @@ def message_info_to_dict(info: Any, *, uid: str | None = None) -> dict[str, Any]
         "size": info.get_size(),
         "flags": {
             "seen": bool(flags & Camel.MessageFlags.SEEN),
-            "flagged": bool(flags & Camel.MessageFlags.FLAGGED),
+            "flagged": message_info_is_flagged(info, backend=backend),
             "deleted": bool(flags & Camel.MessageFlags.DELETED),
             "attachments": bool(flags & Camel.MessageFlags.ATTACHMENTS),
         },

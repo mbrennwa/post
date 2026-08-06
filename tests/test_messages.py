@@ -728,6 +728,7 @@ class MessageInfoToDictTests(unittest.TestCase):
         info.get_message_id.return_value = 424242
         info.get_headers.return_value = None
         info.get_user_header.return_value = None
+        info.get_user_tag.return_value = None
         return info
 
     def test_formats_camel_cc_address(self) -> None:
@@ -767,6 +768,36 @@ class MessageInfoToDictTests(unittest.TestCase):
         result = message_info_to_dict(info)
         self.assertIsNone(result["message_id"])
         self.assertIsNone(result["message_id_hash"])
+
+    def test_m365_flagged_from_follow_up_not_importance(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        info = self._base_info()
+        # Importance High alone must not count as Flag on M365 (#270).
+        info.get_flags.return_value = Camel.MessageFlags.FLAGGED
+        info.get_user_tag.return_value = None
+        result = message_info_to_dict(info, backend="microsoft365")
+        self.assertFalse(result["flags"]["flagged"])
+
+        info.get_user_tag.side_effect = lambda name: (
+            "follow-up" if name == "follow-up" else None
+        )
+        result = message_info_to_dict(info, backend="microsoft365")
+        self.assertTrue(result["flags"]["flagged"])
+
+    def test_imap_flagged_from_flagged_bit(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        info = self._base_info()
+        info.get_flags.return_value = Camel.MessageFlags.FLAGGED
+        result = message_info_to_dict(info, backend="imapx")
+        self.assertTrue(result["flags"]["flagged"])
 
 
 class EnrichMessageDictFromMimeTests(unittest.TestCase):

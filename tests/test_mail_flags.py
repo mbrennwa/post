@@ -122,6 +122,127 @@ class PersistFolderFlagsTests(unittest.TestCase):
         store.synchronize_sync.assert_called_once_with(False, None)
 
 
+class FollowUpFlagTests(unittest.TestCase):
+    def test_uses_follow_up_flag_for_exchange_backends(self) -> None:
+        self.assertTrue(message_flags.uses_follow_up_flag("microsoft365"))
+        self.assertTrue(message_flags.uses_follow_up_flag("EWS"))
+        self.assertFalse(message_flags.uses_follow_up_flag("imapx"))
+        self.assertFalse(message_flags.uses_follow_up_flag(None))
+
+    def test_message_info_is_flagged_imap_uses_flagged_bit(self) -> None:
+        info = MagicMock()
+        info.get_flags.return_value = Camel.MessageFlags.FLAGGED
+        self.assertTrue(message_flags.message_info_is_flagged(info, backend="imapx"))
+        info.get_flags.return_value = 0
+        self.assertFalse(message_flags.message_info_is_flagged(info, backend="imapx"))
+
+    def test_message_info_is_flagged_m365_uses_follow_up_tags(self) -> None:
+        info = MagicMock()
+        info.get_flags.return_value = Camel.MessageFlags.FLAGGED
+        info.get_user_tag.side_effect = lambda name: {
+            "follow-up": "follow-up",
+            "completed-on": None,
+        }.get(name)
+        self.assertTrue(
+            message_flags.message_info_is_flagged(info, backend="microsoft365")
+        )
+
+        info.get_user_tag.side_effect = lambda name: {
+            "follow-up": "follow-up",
+            "completed-on": "Wed, 06 Aug 2026 12:00:00 +0000",
+        }.get(name)
+        self.assertFalse(
+            message_flags.message_info_is_flagged(info, backend="microsoft365")
+        )
+
+        info.get_user_tag.side_effect = lambda name: None
+        self.assertFalse(
+            message_flags.message_info_is_flagged(info, backend="microsoft365")
+        )
+
+    def test_apply_message_flagged_imap_uses_flagged_bit(self) -> None:
+        folder = MagicMock()
+        info = MagicMock()
+        info.get_flags.return_value = 0
+        folder.get_message_info.return_value = info
+        folder.set_message_flags.return_value = True
+        on_changed = MagicMock()
+
+        changed = message_flags.apply_message_flagged(
+            folder,
+            "42",
+            True,
+            backend="imapx",
+            on_flagged_changed=on_changed,
+        )
+
+        self.assertTrue(changed)
+        folder.set_message_flags.assert_called_once_with(
+            "42",
+            Camel.MessageFlags.FLAGGED,
+            Camel.MessageFlags.FLAGGED,
+        )
+        on_changed.assert_called_once_with(True)
+
+    def test_apply_message_flagged_m365_sets_follow_up_tags(self) -> None:
+        folder = MagicMock()
+        info = MagicMock()
+        info.get_flags.return_value = 0
+        info.get_user_tag.return_value = None
+        info.set_user_tag.return_value = True
+        folder.get_message_info.return_value = info
+        on_changed = MagicMock()
+
+        changed = message_flags.apply_message_flagged(
+            folder,
+            "42",
+            True,
+            backend="microsoft365",
+            on_flagged_changed=on_changed,
+        )
+
+        self.assertTrue(changed)
+        folder.set_message_flags.assert_not_called()
+        info.set_user_tag.assert_any_call("follow-up", "follow-up")
+        info.set_folder_flagged.assert_called_once_with(True)
+        on_changed.assert_called_once_with(True)
+
+    def test_apply_message_flagged_m365_clears_follow_up_tags(self) -> None:
+        folder = MagicMock()
+        tags = {
+            "follow-up": "follow-up",
+            "completed-on": None,
+            "due-by": "Wed, 06 Aug 2026 12:00:00 +0000",
+            "follow-up-start": "Wed, 06 Aug 2026 10:00:00 +0000",
+        }
+        info = MagicMock()
+        info.get_flags.return_value = 0
+        info.get_user_tag.side_effect = lambda name: tags.get(name)
+        info.set_user_tag.side_effect = lambda name, value: tags.__setitem__(
+            name, value
+        ) or True
+        folder.get_message_info.return_value = info
+
+        changed = message_flags.apply_message_flagged(
+            folder,
+            "42",
+            False,
+            backend="ews",
+        )
+
+        self.assertTrue(changed)
+        folder.set_message_flags.assert_not_called()
+        cleared = {
+            call.args[0]
+            for call in info.set_user_tag.call_args_list
+            if call.args[1] is None
+        }
+        self.assertEqual(
+            cleared,
+            {"follow-up", "completed-on", "due-by", "follow-up-start"},
+        )
+
+
 @unittest.skipUnless(
     os.environ.get("POST_EDS_TESTS"),
     "Set POST_EDS_TESTS=1 to run EDS integration tests",
