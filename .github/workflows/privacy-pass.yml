@@ -1,0 +1,86 @@
+# Open a dated child issue for the standing privacy-pass policy (#274).
+
+name: Schedule privacy pass
+
+on:
+  schedule:
+    # Monthly on the 15th (offset from cleanup-pass on the 1st).
+    - cron: "0 9 15 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  open-child-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open privacy-pass child issue if needed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PARENT: "274"
+        run: |
+          set -euo pipefail
+          period="$(date -u +%Y-%m)"
+          title="Privacy pass ${period}"
+
+          # Skip if this month's child already exists (open or closed).
+          existing="$(
+            gh issue list --repo "${GITHUB_REPOSITORY}" --state all \
+              --search "in:title \"${title}\"" --json number,title \
+              | jq --arg t "${title}" '[.[] | select(.title == $t)] | length'
+          )"
+          if [ "${existing}" -gt 0 ]; then
+            echo "Issue already exists: ${title}"
+            exit 0
+          fi
+
+          # Skip if any prior privacy-pass child is still open.
+          open_json="$(
+            gh issue list --repo "${GITHUB_REPOSITORY}" --state open \
+              --search 'in:title "Privacy pass"' --json number,title
+          )"
+          open_count="$(
+            printf '%s\n' "${open_json}" \
+              | jq --arg p "Privacy pass " '[.[] | select(.title | startswith($p))] | length'
+          )"
+          if [ "${open_count}" -gt 0 ]; then
+            echo "An open privacy-pass child already exists; skipping."
+            printf '%s\n' "${open_json}" | jq .
+            exit 0
+          fi
+
+          body_file="$(mktemp)"
+          cat >"${body_file}" <<EOF
+          Parent: #${PARENT}
+
+          Automated child of the standing privacy-pass policy. **Close this issue when the pass is done (or as no-op). Do not close #${PARENT}.**
+
+          ## Checklist
+
+          - [ ] Run \`./scripts/audit-issue-privacy.sh\` (exit 0)
+          - [ ] Scrub GH issues/PRs/comments (redact helper if needed)
+          - [ ] Scrub repo files / fixtures / docs; no private images under \`.github/issue-assets/\`
+          - [ ] Spot-check recent commit messages for private details
+          - [ ] Spot-check screenshots / Pages / release drafts if anything new landed
+
+          ## Rules
+
+          - Time-box (e.g. half day / one evening).
+          - Privacy scrub only — no feature work.
+          - Prefer small, reviewable fixes.
+          - Never commit \`scripts/redact-issue-privacy.local.json\`.
+          EOF
+
+          url="$(
+            gh issue create --repo "${GITHUB_REPOSITORY}" \
+              --title "${title}" \
+              --label "P0 -- do next" \
+              --label "Release" \
+              --body-file "${body_file}"
+          )"
+
+          echo "Created ${url}"
+          gh issue comment --repo "${GITHUB_REPOSITORY}" "${PARENT}" \
+            --body "Opened automated child for ${period}: ${url}"
