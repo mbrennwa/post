@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import gi
 
@@ -17,6 +18,92 @@ from post.mail.camel_util import (
     folder_get_message_info,
     folder_get_unread_count,
 )
+
+# Outlook Flag is Follow Up on these Camel backends; FLAGGED maps to Importance.
+FOLLOW_UP_FLAG_BACKENDS = frozenset({"microsoft365", "ews"})
+
+_FOLLOW_UP_TAG = "follow-up"
+_COMPLETED_ON_TAG = "completed-on"
+_DUE_BY_TAG = "due-by"
+_FOLLOW_UP_START_TAG = "follow-up-start"
+
+
+def uses_follow_up_flag(backend: str | None) -> bool:
+    """Return True when Flag UI should use Follow Up user tags, not FLAGGED."""
+    return (backend or "").lower() in FOLLOW_UP_FLAG_BACKENDS
+
+
+def _user_tag_value(info: Any, name: str) -> str | None:
+    value = info.get_user_tag(name)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def message_info_is_flagged(info: Any, *, backend: str | None = None) -> bool:
+    """Return whether *info* should show as flagged for *backend*."""
+    if uses_follow_up_flag(backend):
+        follow_up = _user_tag_value(info, _FOLLOW_UP_TAG)
+        if not follow_up:
+            return False
+        return _user_tag_value(info, _COMPLETED_ON_TAG) is None
+    return bool(info.get_flags() & Camel.MessageFlags.FLAGGED)
+
+
+def apply_message_flagged(
+    folder: Camel.Folder,
+    message_uid: str,
+    flagged: bool,
+    *,
+    backend: str | None = None,
+    on_flagged_changed: Callable[[bool], None] | None = None,
+) -> bool:
+    """Set or clear the user-facing Flag for *message_uid*.
+
+    On microsoft365/ews this writes Follow Up user tags (Outlook Flag).
+    Elsewhere it toggles ``CAMEL_MESSAGE_FLAGGED`` (IMAP ``\\Flagged``).
+    """
+    if not uses_follow_up_flag(backend):
+        flag_value = Camel.MessageFlags.FLAGGED if flagged else 0
+        return apply_message_flags(
+            folder,
+            message_uid,
+            Camel.MessageFlags.FLAGGED,
+            flag_value,
+            on_flagged_changed=on_flagged_changed,
+        )
+
+    info = folder_get_message_info(folder, message_uid)
+    if info is None:
+        return False
+
+    currently = message_info_is_flagged(info, backend=backend)
+    if currently == flagged:
+        return False
+
+    if flagged:
+        changed = bool(info.set_user_tag(_FOLLOW_UP_TAG, _FOLLOW_UP_TAG))
+        # Clearing completed-on keeps status as active Follow Up, not Complete.
+        if info.get_user_tag(_COMPLETED_ON_TAG) is not None:
+            changed = bool(info.set_user_tag(_COMPLETED_ON_TAG, None)) or changed
+    else:
+        changed = False
+        for tag in (
+            _FOLLOW_UP_TAG,
+            _COMPLETED_ON_TAG,
+            _DUE_BY_TAG,
+            _FOLLOW_UP_START_TAG,
+        ):
+            changed = bool(info.set_user_tag(tag, None)) or changed
+
+    if not changed:
+        return False
+
+    info.set_folder_flagged(True)
+    if on_flagged_changed is not None:
+        on_flagged_changed(flagged)
+    return True
 
 
 def persist_folder_flags(

@@ -67,7 +67,9 @@ from .camel_util import (
 )
 from .message_flags import (
     apply_message_flags as _apply_message_flags,
+    apply_message_flagged as _apply_message_flagged,
     mark_message_seen as _mark_message_seen,
+    message_info_is_flagged as _message_info_is_flagged,
     persist_folder_flags as _persist_folder_flags,
 )
 from .local_delivery import all_recipients_local, can_deliver_locally, deliver_local_message
@@ -4744,12 +4746,15 @@ class MailService:
                 return _FolderMessageIndex(messages=[], unread=unread, total=total)
 
             messages: list[dict] = []
+            backend = self._backend_for_account(account_uid)
             for uid in uids:
                 info = folder_get_message_info(folder, uid)
                 if info is None:
                     continue
                 try:
-                    messages.append(message_info_to_dict(info, uid=uid))
+                    messages.append(
+                        message_info_to_dict(info, uid=uid, backend=backend)
+                    )
                 except (OSError, OverflowError, ValueError):
                     log.debug(
                         "Skipping message %r in %r due to invalid metadata",
@@ -4814,6 +4819,7 @@ class MailService:
     ) -> HeavyFolderIndexProgress:
         state = dict(cursor or {})
         key = (account_uid, folder_name)
+        backend = self._backend_for_account(account_uid)
         # Correlation id for request → arrive → index → list (#208 debug).
         active_pipeline_id = str(state.get("pipeline_id") or "") or None
         log.debug(
@@ -5366,7 +5372,7 @@ class MailService:
                                 try:
                                     _upsert_message_into_folder_index(
                                         by_uid,
-                                        message_info_to_dict(info, uid=uid),
+                                        message_info_to_dict(info, uid=uid, backend=backend),
                                         prefer_uids=set(all_uids_hb),
                                         uid_remaps=uid_remaps,
                                         by_identity=by_identity,
@@ -5620,7 +5626,7 @@ class MailService:
                             try:
                                 _upsert_message_into_folder_index(
                                     by_uid,
-                                    message_info_to_dict(info, uid=uid),
+                                    message_info_to_dict(info, uid=uid, backend=backend),
                                     prefer_uids={str(u) for u in all_uids},
                                     uid_remaps=uid_remaps,
                                     by_identity=by_identity,
@@ -5719,7 +5725,7 @@ class MailService:
                                 try:
                                     _upsert_message_into_folder_index(
                                         by_uid,
-                                        message_info_to_dict(info, uid=uid),
+                                        message_info_to_dict(info, uid=uid, backend=backend),
                                         prefer_uids=camel_prefer,
                                         uid_remaps=uid_remaps,
                                         by_identity=by_identity,
@@ -5979,7 +5985,7 @@ class MailService:
             try:
                 _upsert_message_into_folder_index(
                     by_uid,
-                    message_info_to_dict(info, uid=uid),
+                    message_info_to_dict(info, uid=uid, backend=backend),
                     prefer_uids=camel_prefer,
                     uid_remaps=uid_remaps,
                     by_identity=by_identity,
@@ -6346,7 +6352,13 @@ class MailService:
             folder, account_uid, folder_name, message_uid
         )
 
-        result = message_info_to_dict(info) if info else {"uid": message_uid}
+        result = (
+            message_info_to_dict(
+                info, backend=self._backend_for_account(account_uid)
+            )
+            if info
+            else {"uid": message_uid}
+        )
         enrich_message_dict_from_mime(result, mime)
         bodies = extract_message_bodies(mime)
         result["body_plain"] = bodies["plain"]
@@ -6547,16 +6559,16 @@ class MailService:
         if info is None:
             raise ValueError(f"Message not found: {message_uid}")
 
-        currently_flagged = bool(info.get_flags() & Camel.MessageFlags.FLAGGED)
+        backend = self._backend_for_account(account_uid)
+        currently_flagged = _message_info_is_flagged(info, backend=backend)
         new_flagged = not currently_flagged
-        flag_value = Camel.MessageFlags.FLAGGED if new_flagged else 0
-        changed = self._apply_message_flags_unlocked(
+        changed = self._apply_message_flagged_unlocked(
             folder,
             account_uid,
             folder_name,
             message_uid,
-            Camel.MessageFlags.FLAGGED,
-            flag_value,
+            new_flagged,
+            backend=backend,
         )
         queued = False
         if changed:
@@ -6627,24 +6639,24 @@ class MailService:
         flagged: bool,
     ) -> dict[str, Any]:
         folder = self._require_folder_unlocked(account_uid, folder_name)
+        backend = self._backend_for_account(account_uid)
         updates: list[dict[str, Any]] = []
         changed_uids: list[str] = []
         for message_uid in message_uids:
             info = folder_get_message_info(folder,message_uid)
             if info is None:
                 continue
-            currently_flagged = bool(info.get_flags() & Camel.MessageFlags.FLAGGED)
+            currently_flagged = _message_info_is_flagged(info, backend=backend)
             if currently_flagged == flagged:
                 updates.append({"uid": message_uid, "flags": {"flagged": flagged}})
                 continue
-            flag_value = Camel.MessageFlags.FLAGGED if flagged else 0
-            if self._apply_message_flags_unlocked(
+            if self._apply_message_flagged_unlocked(
                 folder,
                 account_uid,
                 folder_name,
                 message_uid,
-                Camel.MessageFlags.FLAGGED,
-                flag_value,
+                flagged,
+                backend=backend,
             ):
                 changed_uids.append(message_uid)
             updates.append({"uid": message_uid, "flags": {"flagged": flagged}})
@@ -6724,22 +6736,22 @@ class MailService:
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
         folder = self._require_folder_unlocked(account_uid, folder_name)
+        backend = self._backend_for_account(account_uid)
         updates: list[dict[str, Any]] = []
         changed_uids: list[str] = []
         for message_uid in message_uids:
             info = folder_get_message_info(folder,message_uid)
             if info is None:
                 continue
-            currently_flagged = bool(info.get_flags() & Camel.MessageFlags.FLAGGED)
+            currently_flagged = _message_info_is_flagged(info, backend=backend)
             new_flagged = not currently_flagged
-            flag_value = Camel.MessageFlags.FLAGGED if new_flagged else 0
-            if self._apply_message_flags_unlocked(
+            if self._apply_message_flagged_unlocked(
                 folder,
                 account_uid,
                 folder_name,
                 message_uid,
-                Camel.MessageFlags.FLAGGED,
-                flag_value,
+                new_flagged,
+                backend=backend,
             ):
                 changed_uids.append(message_uid)
             updates.append({"uid": message_uid, "flags": {"flagged": new_flagged}})
@@ -7011,7 +7023,9 @@ class MailService:
                 )
 
         source_messages = self._message_dicts_for_uids_unlocked(
-            source_folder, transfer_uids
+            source_folder,
+            transfer_uids,
+            backend=backend or None,
         )
 
         destination_uids: list[str] = []
@@ -7140,6 +7154,7 @@ class MailService:
                         uid_limit=(
                             500 if backend in {"microsoft365", "ews"} else None
                         ),
+                        backend=backend or None,
                     )
                 except Exception:
                     log.debug(
@@ -7414,13 +7429,17 @@ class MailService:
             timer.cancel()
 
     def _message_dicts_for_uids_unlocked(
-        self, folder: Camel.Folder, message_uids: list[str]
+        self,
+        folder: Camel.Folder,
+        message_uids: list[str],
+        *,
+        backend: str | None = None,
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         for message_uid in message_uids:
             info = folder_get_message_info(folder,message_uid)
             if info is not None:
-                messages.append(message_info_to_dict(info))
+                messages.append(message_info_to_dict(info, backend=backend))
         return messages
 
     def _find_moved_uids_in_folder_unlocked(
@@ -7429,6 +7448,7 @@ class MailService:
         source_messages: list[dict[str, Any]],
         *,
         uid_limit: int | None = None,
+        backend: str | None = None,
     ) -> list[str]:
         if not source_messages:
             return []
@@ -7451,7 +7471,7 @@ class MailService:
                 info = folder_get_message_info(folder, uid)
                 if info is None:
                     continue
-                message = message_info_to_dict(info, uid=uid)
+                message = message_info_to_dict(info, uid=uid, backend=backend)
                 fingerprint = (
                     message.get("subject") or "",
                     message.get("from") or "",
@@ -7470,7 +7490,7 @@ class MailService:
             info = folder_get_message_info(folder, uid)
             if info is None:
                 continue
-            message = message_info_to_dict(info, uid=uid)
+            message = message_info_to_dict(info, uid=uid, backend=backend)
             dated.append(
                 (float(message.get("sort_date") or 0), str(uid), message)
             )
@@ -7486,6 +7506,34 @@ class MailService:
                 if len(found) >= len(fingerprints):
                     break
         return found
+
+    def _backend_for_account(self, account_uid: str) -> str | None:
+        account = self._accounts_by_uid.get(account_uid)
+        if account is None:
+            return None
+        return account.backend
+
+    def _apply_message_flagged_unlocked(
+        self,
+        folder: Camel.Folder,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        flagged: bool,
+        *,
+        backend: str | None = None,
+    ) -> bool:
+        if backend is None:
+            backend = self._backend_for_account(account_uid)
+        return _apply_message_flagged(
+            folder,
+            message_uid,
+            flagged,
+            backend=backend,
+            on_flagged_changed=lambda value: self._update_cached_message_flags(
+                account_uid, folder_name, message_uid, flagged=value
+            ),
+        )
 
     def _apply_message_flags_unlocked(
         self,
