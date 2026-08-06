@@ -2192,6 +2192,47 @@ class MainWindow(Adw.ApplicationWindow):
             if message.get("uid") != uid
         ]
 
+    def _remap_folder_message_uids(self, remaps: dict[str, str]) -> None:
+        """Rewrite list keys when heavy-folder indexing remaps RestId A→B (#267)."""
+        if not remaps:
+            return
+
+        def _map(uid: str | None) -> str | None:
+            if uid is None:
+                return None
+            return remaps.get(uid, uid)
+
+        for old_uid, new_uid in remaps.items():
+            if not old_uid or not new_uid or old_uid == new_uid:
+                continue
+            existing = self._message_list_view.get_message(old_uid)
+            if existing is None:
+                continue
+            updated = dict(existing)
+            updated["uid"] = new_uid
+            self._message_list_view.upsert_message(
+                updated,
+                folder_name=self._current_folder or "",
+                replace_uid=old_uid,
+            )
+            self._upsert_message_in_folder_cache(updated, old_uid)
+
+        mapped_current = _map(self._current_message_uid)
+        if (
+            mapped_current
+            and mapped_current != self._current_message_uid
+        ):
+            self._current_message_uid = mapped_current
+            set_active_message_uid(mapped_current)
+
+        self._pending_restore_message_uid = _map(
+            self._pending_restore_message_uid
+        )
+        if self._context_message_uids:
+            self._context_message_uids = [
+                remaps.get(uid, uid) for uid in self._context_message_uids
+            ]
+
     def _setup_undo_action(self) -> None:
         self._undo_move_action = Gio.SimpleAction.new("undo-move", None)
         self._undo_move_action.set_enabled(False)
@@ -3682,6 +3723,10 @@ class MainWindow(Adw.ApplicationWindow):
             return False
         if self._current_folder != folder_name:
             return False
+
+        remaps = getattr(progress, "uid_remaps", None) or {}
+        if remaps:
+            self._remap_folder_message_uids(remaps)
 
         messages = progress.messages
         indexed = len(messages)

@@ -200,7 +200,10 @@ class ReadMessageUnavailableTests(unittest.TestCase):
         self.assertIn("Could not load message", str(ctx.exception))
         self.assertFalse(isinstance(ctx.exception, MessageNotAvailableError))
 
-    def test_online_recovers_via_alternate_folder_index_uid(self) -> None:
+    def test_online_index_only_stale_uid_soft_fails_without_alternate_crawl(
+        self,
+    ) -> None:
+        """Dual RestIds are remapped by indexing (#267); recovery no longer crawls."""
         from post.mail.eds import _FolderMessageIndex
 
         service = MailService(registry=MagicMock())
@@ -226,33 +229,32 @@ class ReadMessageUnavailableTests(unittest.TestCase):
             total=2,
         )
         folder = MagicMock()
-        live_mime = MagicMock(name="live_mime")
-
-        def get_message_sync(uid: str, _cancel: object) -> object:
-            if uid == "stale-uid":
-                raise _graph_item_not_found_error("stale-uid")
-            if uid == "live-uid":
-                return live_mime
-            raise _invalid_uid_error(uid)
-
-        folder.get_message_sync.side_effect = get_message_sync
+        folder.get_message_sync.side_effect = _graph_item_not_found_error(
+            "stale-uid"
+        )
         folder.get_message_cached.return_value = None
         folder.get_message_info.return_value = None
-        folder.synchronize_message_sync.return_value = True
+        folder.synchronize_message_sync.side_effect = _graph_item_not_found_error(
+            "stale-uid"
+        )
         folder.dup_uids.return_value = ["live-uid"]
         folder.get_uids.return_value = ["live-uid"]
 
-        mime = service._get_message_mime_sync(
-            folder, "account", "Archive", "stale-uid"
-        )
+        with self.assertRaises(RuntimeError) as ctx:
+            service._get_message_mime_sync(
+                folder, "account", "Archive", "stale-uid"
+            )
 
-        self.assertIs(mime, live_mime)
-        self.assertFalse(
+        self.assertIn("Could not load message", str(ctx.exception))
+        self.assertFalse(isinstance(ctx.exception, MessageNotAvailableError))
+        # Stale row stays until identity upsert remaps; no alternate crawl.
+        self.assertTrue(
             any(
                 str(m.get("uid")) == "stale-uid"
                 for m in service._folder_indexes[("account", "Archive")].messages
             )
         )
+
     @patch("post.mail.eds.MailService._get_store_unlocked")
     def test_read_message_offline_not_cached(
         self,
