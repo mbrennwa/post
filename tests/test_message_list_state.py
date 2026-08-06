@@ -240,6 +240,49 @@ class MessageBatchRangesTests(unittest.TestCase):
             )
         )
 
+    def test_message_flag_patches_detects_seen_and_flagged(self) -> None:
+        from post.mail.message_list_state import (
+            message_flag_patches,
+            message_lists_equivalent_for_ui,
+        )
+
+        current = [
+            {
+                "uid": "1",
+                "subject": "A",
+                "flags": {"seen": False, "flagged": False},
+            },
+            {
+                "uid": "2",
+                "subject": "B",
+                "flags": {"seen": True, "flagged": False},
+            },
+        ]
+        refreshed = [
+            {
+                "uid": "1",
+                "subject": "A",
+                "flags": {"seen": True, "flagged": True},
+            },
+            {
+                "uid": "2",
+                "subject": "B",
+                "flags": {"seen": True, "flagged": False},
+            },
+        ]
+        self.assertTrue(
+            message_lists_equivalent_for_ui(
+                current,
+                refreshed,
+                current_total=2,
+                refreshed_total=2,
+            )
+        )
+        self.assertEqual(
+            message_flag_patches(current, refreshed),
+            [("1", {"seen": True, "flagged": True})],
+        )
+
 
     def test_empty(self) -> None:
         self.assertEqual(message_batch_ranges(0), [])

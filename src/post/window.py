@@ -59,10 +59,12 @@ from post.mail.message_list_state import (
     MESSAGE_LIST_UI_BIND_CAP,
     MESSAGE_LIST_UI_BIND_MORE,
     is_heavy_folder_name,
+    message_flag_patches,
     message_list_fingerprint,
     message_lists_equivalent_for_ui,
     prepended_message_count,
 )
+from post.mail.message_flags import FOLLOW_UP_FLAG_BACKENDS
 from post.mail.search import (
     MessageSearchQuery,
     SearchFilterProgress,
@@ -288,6 +290,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._mail.set_sync_setup_cancel_callback(self._sync_watcher.cancel_setup)
         self._folder_count_poll_timer_id: int | None = None
         self._folder_count_poll_deferred_id: int | None = None
+        self._open_folder_poll_timer_id: int | None = None
         self._current_account: MailAccount | None = None
         self._current_folder: str | None = None
         self._current_message_uid: str | None = None
@@ -1726,9 +1729,11 @@ class MainWindow(Adw.ApplicationWindow):
         if not self._sync_watcher.running:
             self._sync_watcher.start()
         self._start_folder_count_poll()
+        self._start_open_folder_poll()
 
     def _stop_sync_watcher(self) -> None:
         self._stop_folder_count_poll()
+        self._stop_open_folder_poll()
         if self._sync_watcher.running:
             self._sync_watcher.stop()
 
@@ -1756,6 +1761,43 @@ class MainWindow(Adw.ApplicationWindow):
             self._folder_count_poll_timer_id = None
             return False
         self._sidebar.refresh_all_folder_counts()
+        return True
+
+    def _start_open_folder_poll(self) -> None:
+        """Poll the open folder on Graph backends that lack live push (#270)."""
+        if self._open_folder_poll_timer_id is not None:
+            return
+        self._open_folder_poll_timer_id = GLib.timeout_add_seconds(
+            30, self._on_open_folder_poll_tick
+        )
+
+    def _stop_open_folder_poll(self) -> None:
+        timer_id = self._open_folder_poll_timer_id
+        if timer_id is not None:
+            GLib.source_remove(timer_id)
+            self._open_folder_poll_timer_id = None
+
+    def _on_open_folder_poll_tick(self) -> bool:
+        if not self._sync_watcher.running:
+            self._open_folder_poll_timer_id = None
+            return False
+        account = self._current_account
+        folder_name = self._current_folder
+        if account is None or folder_name is None:
+            return True
+        if (account.backend or "").lower() not in FOLLOW_UP_FLAG_BACKENDS:
+            return True
+        if (
+            not self._network_available
+            or not self._account_server_sync_enabled(account.uid)
+            or is_heavy_folder_name(folder_name)
+            or is_post_outbox_folder(folder_name)
+            or self._search_query is not None
+            or self._message_sync_in_progress
+            or self._message_list_populating
+        ):
+            return True
+        self._sync_current_folder_messages(account.uid, folder_name)
         return True
 
     def _on_sync_folder_changed(self, account_uid: str, folder_name: str) -> None:
@@ -5309,6 +5351,10 @@ class MainWindow(Adw.ApplicationWindow):
             current_total=self._message_total,
             refreshed_total=total,
         ):
+            # Same UID/subject set — still apply seen/flagged changes from the
+            # server (OWA Follow Up / read toggles) without a full rebind (#270).
+            if self._reconcile_refreshed_message_flags(messages):
+                self._update_message_toolbar()
             GLib.idle_add(self._on_messages_sync_finished, load_id, False)
             return False
 
@@ -5494,6 +5540,28 @@ class MainWindow(Adw.ApplicationWindow):
                     f"{shown} messages in {label} / {folder_name}"
                 )
             )
+
+    def _reconcile_refreshed_message_flags(self, refreshed: list[dict]) -> bool:
+        """Apply seen/flagged patches when a refresh kept the same message set."""
+        patches = message_flag_patches(self._current_folder_messages or [], refreshed)
+        if not patches:
+            return False
+        for list_key, flags in patches:
+            self._message_list_view.update_message_flags(list_key, flags)
+            self._update_message_flags_in_folder_cache(list_key, flags)
+            if (
+                list_key == self._current_message_uid
+                and self._current_message is not None
+            ):
+                current_flags = dict(self._current_message.get("flags") or {})
+                current_flags.update(flags)
+                self._current_message["flags"] = current_flags
+                self._reader_pane.update_message_flags(dict(flags))
+            location = self._message_location_for_list_key(list_key)
+            reader_uid = location[2] if location is not None else list_key
+            for window in self._reader_windows:
+                window.notify_flags_updated(reader_uid, dict(flags))
+        return True
 
     def _update_message_flags_in_folder_cache(
         self, uid: str, flags: dict

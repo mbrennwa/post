@@ -135,6 +135,8 @@ def message_lists_equivalent_for_ui(
     """Cheap equality for deciding whether to rebind the message list.
 
     Full fingerprints of multi-thousand folders stall the GTK main thread.
+    Flag/seen-only changes are intentionally treated as equivalent here; callers
+    must reconcile those fields separately (see ``message_flag_patches``).
     """
     if current_total != refreshed_total:
         return False
@@ -151,6 +153,40 @@ def message_lists_equivalent_for_ui(
     ) == message_list_fingerprint(refreshed[:sample]) and message_list_fingerprint(
         current[-sample:]
     ) == message_list_fingerprint(refreshed[-sample:])
+
+
+def message_flag_patches(
+    current: list[dict[str, Any]],
+    refreshed: list[dict[str, Any]],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return ``(uid, flag_patch)`` for messages whose seen/flagged changed.
+
+    Used when a folder refresh keeps the same UID/subject set (so the list is
+    not rebound) but Outlook-style Follow Up / read state still moved (#270).
+    """
+    by_uid: dict[str, dict[str, Any]] = {}
+    for message in refreshed:
+        uid = message.get("uid")
+        if uid:
+            by_uid[str(uid)] = message
+
+    patches: list[tuple[str, dict[str, Any]]] = []
+    for message in current:
+        uid = message.get("uid")
+        if not uid:
+            continue
+        new_message = by_uid.get(str(uid))
+        if new_message is None:
+            continue
+        old_flags = message.get("flags") or {}
+        new_flags = new_message.get("flags") or {}
+        patch: dict[str, Any] = {}
+        for key in ("seen", "flagged"):
+            if old_flags.get(key) != new_flags.get(key):
+                patch[key] = new_flags.get(key)
+        if patch:
+            patches.append((str(uid), patch))
+    return patches
 
 
 def prepended_message_count(
