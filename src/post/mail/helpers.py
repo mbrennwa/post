@@ -1129,6 +1129,14 @@ def _mime_part_is_attachment(part: Any, mime_type: str) -> bool:
     if is_calendar_mime(mime_type):
         return True
 
+    disposition_name = part.get_disposition() if hasattr(part, "get_disposition") else None
+    disposition_lower = str(disposition_name).lower() if disposition_name else None
+    if mime_type.startswith("image/") and disposition_lower != "attachment":
+        content_id = part.get_content_id() if hasattr(part, "get_content_id") else None
+        if content_id or disposition_lower == "inline":
+            # CID / inline images are shown in the body, not the attachment list (#258).
+            return False
+
     content_type = part.get_content_type() if hasattr(part, "get_content_type") else None
     if hasattr(part, "get_content_disposition"):
         disposition = part.get_content_disposition()
@@ -1136,8 +1144,7 @@ def _mime_part_is_attachment(part: Any, mime_type: str) -> bool:
             if disposition.is_attachment(content_type):
                 return True
 
-    disposition_name = part.get_disposition() if hasattr(part, "get_disposition") else None
-    if disposition_name and str(disposition_name).lower() == "attachment":
+    if disposition_lower == "attachment":
         return True
 
     filename = part.get_filename() if hasattr(part, "get_filename") else None
