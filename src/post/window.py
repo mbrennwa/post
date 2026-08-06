@@ -1955,7 +1955,11 @@ class MainWindow(Adw.ApplicationWindow):
             return
         if self._current_message is not None:
             self._present_compose_window(
-                account, mode=mode, reply_to=self._current_message
+                account,
+                mode=mode,
+                reply_to=self._current_message,
+                source_folder_name=folder_name,
+                source_message_uid=message_uid,
             )
             return
 
@@ -1978,7 +1982,13 @@ class MainWindow(Adw.ApplicationWindow):
                 log.exception("Failed to load message for compose")
                 error = exc
             GLib.idle_add(
-                self._on_compose_message_loaded, account, msg, error, mode
+                self._on_compose_message_loaded,
+                account,
+                msg,
+                error,
+                mode,
+                folder_name,
+                message_uid,
             )
 
         get_mail_io_thread().submit(worker)
@@ -1989,6 +1999,8 @@ class MainWindow(Adw.ApplicationWindow):
         msg: dict | None,
         error: Exception | None,
         mode: str,
+        folder_name: str,
+        message_uid: str,
     ) -> bool:
         if error is not None:
             if isinstance(error, MessageNotAvailableError):
@@ -2002,7 +2014,13 @@ class MainWindow(Adw.ApplicationWindow):
             return False
         self._current_message = msg
         self._set_message_actions_sensitive(True)
-        self._present_compose_window(account, mode=mode, reply_to=msg)
+        self._present_compose_window(
+            account,
+            mode=mode,
+            reply_to=msg,
+            source_folder_name=folder_name,
+            source_message_uid=message_uid,
+        )
         return False
 
     def _present_compose_window(
@@ -2014,6 +2032,8 @@ class MainWindow(Adw.ApplicationWindow):
         draft_folder_name: str | None = None,
         draft_message_uid: str | None = None,
         draft_message: dict | None = None,
+        source_folder_name: str | None = None,
+        source_message_uid: str | None = None,
         outbox_queue_id: str | None = None,
         mailto: MailtoCompose | None = None,
     ) -> None:
@@ -2031,6 +2051,8 @@ class MainWindow(Adw.ApplicationWindow):
             draft_folder_name=draft_folder_name,
             draft_message_uid=draft_message_uid,
             draft_message=draft_message,
+            source_folder_name=source_folder_name,
+            source_message_uid=source_message_uid,
             outbox_queue_id=outbox_queue_id,
             mailto=mailto,
         )
@@ -6773,10 +6795,21 @@ class MainWindow(Adw.ApplicationWindow):
         )
         window.present()
 
-    def _on_reader_window_compose(self, mode: str, msg: dict) -> None:
-        if not self._current_account:
-            return
-        self._present_compose_window(self._current_account, mode=mode, reply_to=msg)
+    def _on_reader_window_compose(
+        self,
+        mode: str,
+        msg: dict,
+        account: MailAccount,
+        folder_name: str,
+        message_uid: str,
+    ) -> None:
+        self._present_compose_window(
+            account,
+            mode=mode,
+            reply_to=msg,
+            source_folder_name=folder_name,
+            source_message_uid=message_uid,
+        )
 
     def _on_reader_window_request_move(
         self,

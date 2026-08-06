@@ -127,6 +127,7 @@ from .compose import (
     build_plain_mime_message,
     new_outbound_mime_identifiers,
     normalize_references_header,
+    read_compose_attachments_from_message,
 )
 from .correspondents import Correspondent, collect_correspondents
 from .folders import (
@@ -5850,6 +5851,20 @@ class MailService:
             attachment_index,
         )
 
+    def read_compose_attachments(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+    ) -> list[ComposeAttachment]:
+        """Load all attachment payloads for compose (e.g. forward) in one MIME fetch."""
+        return run_on_mail_thread(
+            self._read_compose_attachments_unlocked,
+            account_uid,
+            folder_name,
+            message_uid,
+        )
+
     def toggle_message_seen(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
@@ -6103,6 +6118,20 @@ class MailService:
         mime = self._get_message_mime_sync(folder, folder_name, message_uid)
 
         return get_attachment_data(mime, attachment_index)
+
+    def _read_compose_attachments_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+    ) -> list[ComposeAttachment]:
+        store = self._get_store_unlocked(account_uid)
+        folder = store.get_folder_sync(folder_name, 0, None)
+        if folder is None:
+            raise ValueError(f"Folder not found: {folder_name}")
+
+        mime = self._get_message_mime_sync(folder, folder_name, message_uid)
+        return read_compose_attachments_from_message(mime)
 
     def _mark_message_read_unlocked(
         self, account_uid: str, folder_name: str, message_uid: str

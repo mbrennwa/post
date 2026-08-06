@@ -418,6 +418,8 @@ class ComposeWindow(Adw.Window):
         draft_folder_name: str | None = None,
         draft_message_uid: str | None = None,
         draft_message: dict[str, Any] | None = None,
+        source_folder_name: str | None = None,
+        source_message_uid: str | None = None,
         outbox_queue_id: str | None = None,
         mailto: MailtoCompose | None = None,
     ) -> None:
@@ -439,6 +441,8 @@ class ComposeWindow(Adw.Window):
         self._draft_folder_name = draft_folder_name
         self._draft_message_uid = draft_message_uid
         self._draft_message = draft_message
+        self._source_folder_name = source_folder_name
+        self._source_message_uid = source_message_uid
         self._outbox_queue_id = outbox_queue_id
         self._mailto = mailto
         self._saving_draft = False
@@ -635,6 +639,8 @@ class ComposeWindow(Adw.Window):
         GLib.idle_add(self._set_initial_focus)
         if self._mode in ("draft", "send-again"):
             GLib.idle_add(self._begin_load_draft_attachments)
+        elif self._mode == "forward":
+            GLib.idle_add(self._begin_load_forward_attachments)
 
     def _on_attach_clicked(self, *_args) -> None:
         if self._saving_draft:
@@ -781,6 +787,39 @@ class ComposeWindow(Adw.Window):
                         data=data,
                     )
                 )
+            GLib.idle_add(self._on_draft_attachments_loaded, loaded)
+
+        get_mail_io_thread().submit(worker)
+        return False
+
+    def _begin_load_forward_attachments(self) -> bool:
+        if self._mode != "forward" or self._reply_to is None:
+            return False
+        attachments_meta = self._reply_to.get("attachments") or []
+        if not attachments_meta:
+            return False
+        folder_name = self._source_folder_name
+        message_uid = self._source_message_uid
+        if not folder_name or not message_uid:
+            return False
+
+        account_uid = self._account.uid
+
+        def worker() -> None:
+            try:
+                loaded = self._mail.read_compose_attachments(
+                    account_uid,
+                    folder_name,
+                    message_uid,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Could not load forward attachments for %s/%s: %s",
+                    folder_name,
+                    message_uid,
+                    exc,
+                )
+                loaded = []
             GLib.idle_add(self._on_draft_attachments_loaded, loaded)
 
         get_mail_io_thread().submit(worker)
