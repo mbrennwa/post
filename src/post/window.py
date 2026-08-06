@@ -30,6 +30,7 @@ from post.mail import MailService
 from post.mail.eds import (
     MailAccount,
     MessageNotAvailableError,
+    MessageUnavailableReason,
     OfflineSyncProgress,
     _log_heavy_pipeline,
 )
@@ -2004,7 +2005,8 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> bool:
         if error is not None:
             if isinstance(error, MessageNotAvailableError):
-                self._remove_vanished_message(error.message_uid)
+                if error.reason == MessageUnavailableReason.VANISHED:
+                    self._remove_vanished_message(error.message_uid)
                 show_error_toast(self, error.user_message())
                 return False
             action = "forward" if mode == "forward" else "reply"
@@ -6681,7 +6683,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._inflight_message_read_id = None
 
         if isinstance(error, MessageNotAvailableError):
-            self._remove_vanished_message(uid)
+            if error.reason == MessageUnavailableReason.VANISHED:
+                self._remove_vanished_message(uid)
             self._show_message_unavailable_reader(error.user_message())
             show_error_toast(self, error.user_message())
             return False

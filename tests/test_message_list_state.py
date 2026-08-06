@@ -9,7 +9,9 @@ from collections import OrderedDict
 from post.mail.message_list_state import (
     FolderListSnapshot,
     MESSAGE_LIST_UI_BATCH_SIZE,
+    dedupe_folder_index_messages,
     folder_cache_matches,
+    folder_index_covers_identities,
     folder_list_ready_to_cache,
     message_batch_ranges,
     message_list_fingerprint,
@@ -246,6 +248,97 @@ class MessageBatchRangesTests(unittest.TestCase):
             message_batch_ranges(1200, batch_size=500),
             [(0, 500), (500, 1000), (1000, 1200)],
         )
+
+
+class DedupeFolderIndexMessagesTests(unittest.TestCase):
+    def test_prefers_camel_uid_for_same_message_id(self) -> None:
+        stale = {
+            "uid": "old-rest-id",
+            "message_id": "<msg@example.com>",
+            "subject": "Hello",
+            "from": "a@b.c",
+            "sort_date": 100,
+        }
+        live = {
+            "uid": "new-rest-id",
+            "message_id": "<msg@example.com>",
+            "subject": "Hello",
+            "from": "a@b.c",
+            "sort_date": 100,
+        }
+        deduped = dedupe_folder_index_messages(
+            [stale, live],
+            prefer_uids={"new-rest-id"},
+        )
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["uid"], "new-rest-id")
+
+    def test_prefers_last_uid_when_camel_set_empty(self) -> None:
+        stale = {
+            "uid": "old-rest-id",
+            "message_id": "<msg@example.com>",
+            "subject": "Hello",
+            "from": "a@b.c",
+            "sort_date": 100,
+        }
+        live = {
+            "uid": "new-rest-id",
+            "message_id": "<msg@example.com>",
+            "subject": "Hello",
+            "from": "a@b.c",
+            "sort_date": 100,
+        }
+        deduped = dedupe_folder_index_messages([stale, live], prefer_uids=set())
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["uid"], "new-rest-id")
+
+    def test_covers_identities_after_duplicate_collapse(self) -> None:
+        existing = [
+            {
+                "uid": "old",
+                "message_id": "<a@x>",
+                "subject": "A",
+                "from": "a",
+                "sort_date": 1,
+            },
+            {
+                "uid": "new",
+                "message_id": "<a@x>",
+                "subject": "A",
+                "from": "a",
+                "sort_date": 1,
+            },
+        ]
+        incoming = [
+            {
+                "uid": "new",
+                "message_id": "<a@x>",
+                "subject": "A",
+                "from": "a",
+                "sort_date": 1,
+            },
+        ]
+        self.assertTrue(folder_index_covers_identities(incoming, existing))
+
+    def test_refuses_partial_summary_as_cover(self) -> None:
+        existing = [
+            {
+                "uid": "1",
+                "message_id": "<a@x>",
+                "subject": "A",
+                "from": "a",
+                "sort_date": 1,
+            },
+            {
+                "uid": "2",
+                "message_id": "<b@x>",
+                "subject": "B",
+                "from": "b",
+                "sort_date": 2,
+            },
+        ]
+        incoming = [existing[0]]
+        self.assertFalse(folder_index_covers_identities(incoming, existing))
 
 
 if __name__ == "__main__":
