@@ -699,6 +699,22 @@ class DecodeAttachmentFilenameTests(unittest.TestCase):
 
 
 class MessageInfoToDictTests(unittest.TestCase):
+    def _base_info(self) -> MagicMock:
+        info = MagicMock()
+        info.get_uid.return_value = "1"
+        info.get_subject.return_value = "Hi"
+        info.get_from.return_value = "Alice <alice@example.com>"
+        info.get_to.return_value = "Bob <bob@example.com>"
+        info.get_cc.return_value = None
+        info.get_date_sent.return_value = 1_700_000_000
+        info.get_date_received.return_value = 1_700_000_100
+        info.get_flags.return_value = 0
+        info.get_size.return_value = 100
+        info.get_message_id.return_value = 424242
+        info.get_headers.return_value = None
+        info.get_user_header.return_value = None
+        return info
+
     def test_formats_camel_cc_address(self) -> None:
         import gi
 
@@ -707,32 +723,35 @@ class MessageInfoToDictTests(unittest.TestCase):
 
         cc = Camel.InternetAddress.new()
         cc.add("Carol", "carol@example.com")
-        info = MagicMock()
-        info.get_uid.return_value = "1"
-        info.get_subject.return_value = "Hi"
-        info.get_from.return_value = "Alice <alice@example.com>"
-        info.get_to.return_value = "Bob <bob@example.com>"
+        info = self._base_info()
         info.get_cc.return_value = cc
-        info.get_date_sent.return_value = 1_700_000_000
-        info.get_date_received.return_value = 1_700_000_100
-        info.get_flags.return_value = 0
-        info.get_size.return_value = 100
         result = message_info_to_dict(info)
         self.assertEqual(result["cc"], "Carol <carol@example.com>")
 
     def test_decodes_rfc2047_subject_bytes(self) -> None:
-        info = MagicMock()
-        info.get_uid.return_value = "1"
+        info = self._base_info()
         info.get_subject.return_value = b"=?ISO-8859-1?Q?Gr=FC=DFe?="
-        info.get_from.return_value = "Alice <alice@example.com>"
-        info.get_to.return_value = "Bob <bob@example.com>"
-        info.get_cc.return_value = None
-        info.get_date_sent.return_value = 1_700_000_000
-        info.get_date_received.return_value = 1_700_000_100
-        info.get_flags.return_value = 0
-        info.get_size.return_value = 100
         result = message_info_to_dict(info)
         self.assertEqual(result["subject"], "Grüße")
+
+    def test_stores_rfc_message_id_not_camel_hash(self) -> None:
+        info = self._base_info()
+        headers = MagicMock()
+        headers.get_length.return_value = 1
+        headers.get_name.return_value = "Message-ID"
+        headers.get_value.return_value = "<real-id@example.com>"
+        info.get_headers.return_value = headers
+        info.get_message_id.return_value = 999001
+        result = message_info_to_dict(info)
+        self.assertEqual(result["message_id"], "<real-id@example.com>")
+        self.assertEqual(result["message_id_hash"], 999001)
+
+    def test_hash_zero_omitted(self) -> None:
+        info = self._base_info()
+        info.get_message_id.return_value = 0
+        result = message_info_to_dict(info)
+        self.assertIsNone(result["message_id"])
+        self.assertIsNone(result["message_id_hash"])
 
 
 class EnrichMessageDictFromMimeTests(unittest.TestCase):

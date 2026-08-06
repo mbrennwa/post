@@ -15,8 +15,12 @@ from post.mail.message_list_state import (
     folder_list_ready_to_cache,
     message_batch_ranges,
     message_list_fingerprint,
+    normalize_folder_index_by_uid,
     prepended_message_count,
+    prune_stale_folder_index_uids,
     touch_lru_cache,
+    upsert_folder_index_by_identity,
+    _folder_message_identity_key,
 )
 
 
@@ -339,6 +343,143 @@ class DedupeFolderIndexMessagesTests(unittest.TestCase):
         ]
         incoming = [existing[0]]
         self.assertFalse(folder_index_covers_identities(incoming, existing))
+
+
+class FolderIndexIdentityUpsertTests(unittest.TestCase):
+    def test_rfc_message_id_identity(self) -> None:
+        self.assertEqual(
+            _folder_message_identity_key(
+                {"uid": "1", "message_id": "<Msg@Example.COM>"}
+            ),
+            "mid:msg@example.com",
+        )
+
+    def test_hash_zero_does_not_merge(self) -> None:
+        a = {"uid": "a", "message_id": "0", "subject": "Same", "from": "x"}
+        b = {"uid": "b", "message_id_hash": 0, "subject": "Same", "from": "x"}
+        self.assertTrue(_folder_message_identity_key(a).startswith("uid:"))
+        self.assertTrue(_folder_message_identity_key(b).startswith("uid:"))
+        self.assertNotEqual(
+            _folder_message_identity_key(a),
+            _folder_message_identity_key(b),
+        )
+
+    def test_legacy_decimal_hash_merges(self) -> None:
+        stale = {"uid": "old", "message_id": "424242"}
+        live = {"uid": "new", "message_id_hash": 424242}
+        self.assertEqual(
+            _folder_message_identity_key(stale),
+            _folder_message_identity_key(live),
+        )
+
+    def test_missing_mid_stays_uid_distinct(self) -> None:
+        a = {
+            "uid": "1",
+            "subject": "Newsletter",
+            "from": "news@x",
+            "sort_date": 1,
+        }
+        b = {
+            "uid": "2",
+            "subject": "Newsletter",
+            "from": "news@x",
+            "sort_date": 1,
+        }
+        self.assertNotEqual(
+            _folder_message_identity_key(a),
+            _folder_message_identity_key(b),
+        )
+
+    def test_upsert_replaces_stale_restid(self) -> None:
+        by_uid = {
+            "old-rest-id": {
+                "uid": "old-rest-id",
+                "message_id": "<msg@example.com>",
+                "subject": "Hello",
+            }
+        }
+        replaced = upsert_folder_index_by_identity(
+            by_uid,
+            {
+                "uid": "new-rest-id",
+                "message_id": "<msg@example.com>",
+                "subject": "Hello",
+            },
+            prefer_uids={"new-rest-id"},
+        )
+        self.assertEqual(replaced, "old-rest-id")
+        self.assertEqual(set(by_uid), {"new-rest-id"})
+        self.assertEqual(by_uid["new-rest-id"]["uid"], "new-rest-id")
+
+    def test_normalize_collapses_seed_duplicates(self) -> None:
+        messages = [
+            {
+                "uid": "old",
+                "message_id": "<a@x>",
+                "subject": "A",
+                "sort_date": 1,
+            },
+            {
+                "uid": "new",
+                "message_id": "<a@x>",
+                "subject": "A",
+                "sort_date": 1,
+            },
+        ]
+        by_uid = normalize_folder_index_by_uid(
+            messages, prefer_uids={"new"}
+        )
+        self.assertEqual(set(by_uid), {"new"})
+
+    def test_prune_drops_stale_when_alternate_live(self) -> None:
+        by_uid = {
+            "old": {"uid": "old", "message_id": "<a@x>"},
+            "new": {"uid": "new", "message_id": "<a@x>"},
+            "other": {"uid": "other", "message_id": "<b@x>"},
+        }
+        removed = prune_stale_folder_index_uids(by_uid, {"new", "other"})
+        self.assertEqual(removed, ["old"])
+        self.assertEqual(set(by_uid), {"new", "other"})
+
+    def test_prune_keeps_unique_when_camel_partial(self) -> None:
+        by_uid = {
+            "only": {"uid": "only", "message_id": "<a@x>"},
+        }
+        removed = prune_stale_folder_index_uids(by_uid, {"something-else"})
+        self.assertEqual(removed, [])
+        self.assertIn("only", by_uid)
+
+    def test_normalize_large_index_is_linear(self) -> None:
+        # Regression: O(n²) identity scan froze Archive open (#267).
+        import time
+
+        messages = [
+            {
+                "uid": f"uid-{i}",
+                "message_id": f"<msg-{i}@example.com>",
+                "subject": f"S{i}",
+                "sort_date": i,
+            }
+            for i in range(8_000)
+        ]
+        # Inject a few RestId duplicates that must collapse.
+        messages.append(
+            {
+                "uid": "uid-dup",
+                "message_id": "<msg-1@example.com>",
+                "subject": "S1",
+                "sort_date": 1,
+            }
+        )
+        started = time.perf_counter()
+        by_uid = normalize_folder_index_by_uid(
+            messages, prefer_uids={"uid-1"}
+        )
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(by_uid), 8_000)
+        self.assertIn("uid-1", by_uid)
+        self.assertNotIn("uid-dup", by_uid)
 
 
 if __name__ == "__main__":

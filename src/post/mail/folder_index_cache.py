@@ -37,7 +37,7 @@ def save(
 
     When ``grow_only`` is True (heavy folders), never replace a larger on-disk
     index with a smaller Camel summary (#208), unless the smaller list still
-    covers the same logical messages (duplicate RestId collapse, #265).
+    covers the same logical messages (RestId remap collapse, #267).
     """
     if grow_only:
         existing = load(account_uid, folder_name)
@@ -61,7 +61,7 @@ def save(
                     )
                     return
                 log.info(
-                    "Replacing folder index for %s/%s after duplicate collapse "
+                    "Replacing folder index for %s/%s after RestId collapse "
                     "(disk=%d, incoming=%d)",
                     account_uid,
                     folder_name,
@@ -131,11 +131,16 @@ def load(
     if not isinstance(unread, int) or not isinstance(total, int):
         return None
 
-    from post.mail.message_list_state import dedupe_folder_index_messages
+    from post.mail.helpers import sort_messages_newest_first
+    from post.mail.message_list_state import normalize_folder_index_by_uid
 
-    # Collapse stale RestId duplicates written by grow-only indexing (#265).
-    messages = dedupe_folder_index_messages(
-        [msg for msg in messages if isinstance(msg, dict)]
+    # One-shot normalize for legacy grow-only caches that still hold dual RestIds.
+    messages = sort_messages_newest_first(
+        list(
+            normalize_folder_index_by_uid(
+                [msg for msg in messages if isinstance(msg, dict)]
+            ).values()
+        )
     )
     return messages, unread, total
 

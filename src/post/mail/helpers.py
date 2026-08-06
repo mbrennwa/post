@@ -327,6 +327,70 @@ def format_message_datetime(unix_time: float | int | None) -> str | None:
         return None
 
 
+def _rfc_message_id_from_message_info(info: Any) -> str | None:
+    """Return the RFC 5322 Message-ID header from Camel summary metadata.
+
+    ``MessageInfo.get_message_id()`` is Camel's uint summary hash, not the
+    header string — callers must not treat that hash as a Message-ID (#267).
+    """
+    headers = None
+    getter = getattr(info, "get_headers", None)
+    if callable(getter):
+        try:
+            headers = getter()
+        except (TypeError, ValueError, AttributeError):
+            headers = None
+    if headers is not None:
+        get_length = getattr(headers, "get_length", None)
+        get_name = getattr(headers, "get_name", None)
+        get_value = getattr(headers, "get_value", None)
+        if (
+            callable(get_length)
+            and callable(get_name)
+            and callable(get_value)
+        ):
+            try:
+                length = get_length()
+            except (TypeError, ValueError):
+                length = None
+            if isinstance(length, int) and length > 0:
+                for index in range(length):
+                    try:
+                        name = get_name(index)
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    if not isinstance(name, str) or name.lower() != "message-id":
+                        continue
+                    try:
+                        return _decode_header_value(get_value(index))
+                    except (TypeError, ValueError, IndexError):
+                        return None
+    user_header = getattr(info, "get_user_header", None)
+    if callable(user_header):
+        for name in ("Message-ID", "Message-Id", "message-id"):
+            try:
+                value = user_header(name)
+            except (TypeError, ValueError):
+                continue
+            if value:
+                return _decode_header_value(value)
+    return None
+
+
+def _message_id_hash_from_message_info(info: Any) -> int | None:
+    """Return Camel's non-zero summary Message-ID hash, if available."""
+    getter = getattr(info, "get_message_id", None)
+    if not callable(getter):
+        return None
+    try:
+        value = getter()
+    except (TypeError, ValueError):
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value == 0:
+        return None
+    return value
+
+
 def message_info_to_dict(info: Any, *, uid: str | None = None) -> dict[str, Any]:
     import gi
 
@@ -352,9 +416,9 @@ def message_info_to_dict(info: Any, *, uid: str | None = None) -> dict[str, Any]
         "from": format_recipient_header(info.get_from()),
         "to": format_recipient_header(info.get_to()),
         "cc": format_recipient_header(info.get_cc()),
-        "message_id": _decode_header_value(info.get_message_id())
-        if hasattr(info, "get_message_id")
-        else None,
+        # RFC Message-ID header string (not Camel's uint hash — see #267).
+        "message_id": _rfc_message_id_from_message_info(info),
+        "message_id_hash": _message_id_hash_from_message_info(info),
         "sort_date": sort_date,
         "date_sent": format_message_datetime(date_sent),
         "date_received": format_message_datetime(date_recv),
