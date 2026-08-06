@@ -60,6 +60,8 @@ path = [
     ".github/workflows/pages.yml",
     ".github/workflows/cleanup-pass.yml",
     ".github/workflows/privacy-pass.yml",
+    ".github/workflows/privacy-ci.yml",
+    ".github/workflows/privacy-tracker.yml",
     ".github/issue-assets/README.md",
     ".github/issue-assets/*.png",
     "Makefile",

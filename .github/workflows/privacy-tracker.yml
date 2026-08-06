@@ -1,0 +1,83 @@
+# Scan issue/PR bodies and comments for private details as they are written (#274).
+
+name: Privacy tracker
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created, edited]
+  pull_request:
+    types: [opened, edited, reopened]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    # Skip common bot actors to cut noise.
+    if: >
+      github.actor != 'dependabot[bot]' &&
+      github.actor != 'github-actions[bot]' &&
+      github.actor != 'renovate[bot]'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve issue/PR number
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          case "${EVENT_NAME}" in
+            issues)
+              echo "number=${{ github.event.issue.number }}" >> "${GITHUB_OUTPUT}"
+              ;;
+            issue_comment)
+              echo "number=${{ github.event.issue.number }}" >> "${GITHUB_OUTPUT}"
+              ;;
+            pull_request)
+              echo "number=${{ github.event.pull_request.number }}" >> "${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "Unsupported event: ${EVENT_NAME}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Audit issue/PR
+        id: audit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ steps.target.outputs.number }}
+        run: |
+          set -euo pipefail
+          set +e
+          SCOPE=issue ISSUE="${ISSUE}" ./scripts/audit-issue-privacy.sh
+          status=$?
+          set -e
+          echo "exit_code=${status}" >> "${GITHUB_OUTPUT}"
+          exit "${status}"
+
+      - name: Comment on failure (no private details)
+        if: failure() && steps.audit.outputs.exit_code != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUMBER: ${{ steps.target.outputs.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          body="$(cat <<EOF
+          Privacy check failed on this issue/PR. Scrub personal details per \`docs/release-procedure.md\` §2 and the standing policy (#274). See the Actions log for match categories (the log may contain private strings — do not paste them back here): ${RUN_URL}
+          EOF
+          )"
+          # Avoid duplicate spam: skip if the same bot already commented on this run URL.
+          if gh api "repos/${GITHUB_REPOSITORY}/issues/${NUMBER}/comments" --paginate \
+            --jq '.[].body' | grep -Fq "${RUN_URL}"; then
+            echo "Failure comment for this run already present."
+            exit 0
+          fi
+          gh issue comment "${NUMBER}" --repo "${GITHUB_REPOSITORY}" --body "${body}"

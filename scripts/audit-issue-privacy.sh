@@ -1,21 +1,46 @@
 #!/usr/bin/env bash
-# Scan GitHub issues/PRs/comments and the local tree for private-mail leaks
-# (#274 standing policy; historical #115).
-# Requires: gh auth login, network access.
+# Scan for private-mail leaks (#274 standing policy; historical #115).
 #
 # Env:
+#   SCOPE=full|tree|commits|issue  (default: full)
+#     full    — tracker + tree + history (needs gh)
+#     tree    — repo tree + issue-assets; history unless SKIP_HISTORY=1
+#     commits — git commit subject+body for COMMIT_RANGE (not author emails)
+#     issue   — one issue/PR number via ISSUE=N (needs gh)
 #   SKIP_HISTORY=1  — skip git-history deleted issue-asset blob checks
+#   COMMIT_RANGE    — git rev range for SCOPE=commits
+#                     (default: origin/main...HEAD, else HEAD~20..HEAD)
+#   ISSUE           — issue/PR number for SCOPE=issue
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-if ! command -v gh >/dev/null; then
-  echo "error: gh CLI required" >&2
+SCOPE="${SCOPE:-full}"
+export SCOPE
+export SKIP_HISTORY="${SKIP_HISTORY:-0}"
+export COMMIT_RANGE="${COMMIT_RANGE:-}"
+export ISSUE="${ISSUE:-}"
+
+case "${SCOPE}" in
+  full|issue)
+    if ! command -v gh >/dev/null; then
+      echo "error: gh CLI required for SCOPE=${SCOPE}" >&2
+      exit 1
+    fi
+    ;;
+  tree|commits)
+    ;;
+  *)
+    echo "error: unknown SCOPE=${SCOPE} (want full|tree|commits|issue)" >&2
+    exit 1
+    ;;
+esac
+
+if [ "${SCOPE}" = "issue" ] && [ -z "${ISSUE}" ]; then
+  echo "error: SCOPE=issue requires ISSUE=<number>" >&2
   exit 1
 fi
-
-export SKIP_HISTORY="${SKIP_HISTORY:-0}"
 
 python3 << 'PY'
 from __future__ import annotations
@@ -28,6 +53,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(".").resolve()
+SCOPE = os.environ.get("SCOPE", "full")
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 SAFE_DOMAINS = {
     "example.com",
@@ -37,6 +63,7 @@ SAFE_DOMAINS = {
     "company.com",
     "github.com",
     "users.noreply.github.com",
+    "cursor.com",
     "x.com",
     # Public mailing-list examples used in unsubscribe tests / docs
     "gnu.org",
@@ -115,10 +142,18 @@ def gh_api(args: list[str]) -> object:
     return json.loads(subprocess.check_output(["gh", "api", *args], text=True))
 
 
+def repo_owner_name() -> tuple[str, str]:
+    url = subprocess.check_output(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+        text=True,
+    ).strip()
+    owner, name = url.split("/", 1)
+    return owner, name
 
 
 def fetch_tracker() -> list[tuple[str, dict]]:
     """Return (label, node) for all issues and PRs with bodies/comments."""
+    owner, name = repo_owner_name()
     out: list[tuple[str, dict]] = []
     for kind, states in (
         ("issues", "OPEN"),
@@ -132,7 +167,7 @@ def fetch_tracker() -> list[tuple[str, dict]]:
             after = f', after: "{cursor}"' if cursor else ""
             query = f"""
             query {{
-              repository(owner: "mbrennwa", name: "post") {{
+              repository(owner: "{owner}", name: "{name}") {{
                 {kind}(first: 50{after}, states: {states}) {{
                   pageInfo {{ hasNextPage endCursor }}
                   nodes {{
@@ -169,80 +204,118 @@ def fetch_tracker() -> list[tuple[str, dict]]:
     return unique
 
 
-# --- GitHub tracker ---------------------------------------------------------
-for label, node in fetch_tracker():
-    scan_text(label, "title", node.get("title") or "")
-    scan_text(label, "body", node.get("body") or "")
-    for c in (node.get("comments") or {}).get("nodes") or []:
-        author = ((c.get("author") or {}) or {}).get("login") or "?"
-        scan_text(label, f"comment:{author}", c.get("body") or "")
+def fetch_one_issue(number: int) -> tuple[str, dict]:
+    """Fetch a single issue or PR (with comments) by number."""
+    owner, name = repo_owner_name()
+    query = f"""
+    query {{
+      repository(owner: "{owner}", name: "{name}") {{
+        issueOrPullRequest(number: {number}) {{
+          __typename
+          ... on Issue {{
+            number
+            title
+            body
+            comments(first: 100) {{
+              nodes {{ body author {{ login }} }}
+            }}
+          }}
+          ... on PullRequest {{
+            number
+            title
+            body
+            comments(first: 100) {{
+              nodes {{ body author {{ login }} }}
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+    data = gh_api(["graphql", "-f", f"query={query}"])
+    if "errors" in data:
+        print(json.dumps(data["errors"], indent=2), file=sys.stderr)
+        raise SystemExit("graphql error")
+    node = data["data"]["repository"]["issueOrPullRequest"]
+    if not node:
+        raise SystemExit(f"error: issue/PR #{number} not found")
+    return (f"#{node['number']}", node)
 
-# --- Repo tree --------------------------------------------------------------
-assets = ROOT / ".github" / "issue-assets"
-if assets.is_dir():
-    for p in sorted(assets.iterdir()):
-        if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+
+def scan_tracker_nodes(nodes: list[tuple[str, dict]]) -> None:
+    for label, node in nodes:
+        scan_text(label, "title", node.get("title") or "")
+        scan_text(label, "body", node.get("body") or "")
+        for c in (node.get("comments") or {}).get("nodes") or []:
+            author = ((c.get("author") or {}) or {}).get("login") or "?"
+            scan_text(label, f"comment:{author}", c.get("body") or "")
+
+
+def scan_tree() -> None:
+    assets = ROOT / ".github" / "issue-assets"
+    if assets.is_dir():
+        for p in sorted(assets.iterdir()):
+            if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+                found.append(
+                    (
+                        "tree",
+                        str(p.relative_to(ROOT)),
+                        "private screenshot file (delete; use README stub only)",
+                    )
+                )
+
+    local_map = ROOT / "scripts" / "redact-issue-privacy.local.json"
+    if local_map.is_file():
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", str(local_map.relative_to(ROOT))],
+            capture_output=True,
+            text=True,
+        )
+        if tracked.returncode == 0:
             found.append(
                 (
                     "tree",
-                    str(p.relative_to(ROOT)),
-                    "private screenshot file (delete; use README stub only)",
+                    str(local_map.relative_to(ROOT)),
+                    "local redaction map is tracked (must be gitignored)",
                 )
             )
 
-local_map = ROOT / "scripts" / "redact-issue-privacy.local.json"
-if local_map.is_file():
-    tracked = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", str(local_map.relative_to(ROOT))],
-        capture_output=True,
-        text=True,
-    )
-    if tracked.returncode == 0:
-        found.append(
-            (
-                "tree",
-                str(local_map.relative_to(ROOT)),
-                "local redaction map is tracked (must be gitignored)",
-            )
-        )
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        kept = []
+        for d in dirnames:
+            if d in TREE_SKIP_DIRS:
+                continue
+            if d.startswith(".") and d not in DOTDIR_ALLOW:
+                continue
+            kept.append(d)
+        dirnames[:] = kept
+        rel_dir = Path(dirpath).relative_to(ROOT)
+        if any(part in TREE_SKIP_DIRS for part in rel_dir.parts):
+            continue
+        for name in filenames:
+            path = Path(dirpath) / name
+            rel = str(path.relative_to(ROOT))
+            if path.suffix.lower() in TREE_SKIP_SUFFIXES:
+                continue
+            if rel.endswith(".local.json"):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            cleaned = scrub_public(text)
+            for m in EMAIL_RE.findall(text):
+                if not email_ok(m):
+                    found.append(("tree", rel, m))
+            if rel in WORD_ALLOW:
+                continue
+            for m in SUSPECT_WORDS.finditer(cleaned):
+                found.append(("tree", rel, f"suspect word: {m.group(0)}"))
 
-for dirpath, dirnames, filenames in os.walk(ROOT):
-    kept = []
-    for d in dirnames:
-        if d in TREE_SKIP_DIRS:
-            continue
-        if d.startswith(".") and d not in DOTDIR_ALLOW:
-            continue
-        kept.append(d)
-    dirnames[:] = kept
-    rel_dir = Path(dirpath).relative_to(ROOT)
-    if any(part in TREE_SKIP_DIRS for part in rel_dir.parts):
-        continue
-    for name in filenames:
-        path = Path(dirpath) / name
-        rel = str(path.relative_to(ROOT))
-        if path.suffix.lower() in TREE_SKIP_SUFFIXES:
-            continue
-        if rel.endswith(".local.json"):
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        cleaned = scrub_public(text)
-        for m in EMAIL_RE.findall(text):
-            if not email_ok(m):
-                found.append(("tree", rel, m))
-        if rel in WORD_ALLOW:
-            continue
-        for m in SUSPECT_WORDS.finditer(cleaned):
-            found.append(("tree", rel, f"suspect word: {m.group(0)}"))
 
-# --- Git history ------------------------------------------------------------
-# Commit author emails are allowed (transparency). History is only scanned for
-# private issue-asset screenshots that remain reachable after deletion.
-skip_history = os.environ.get("SKIP_HISTORY", "0") == "1"
-if not skip_history:
+def scan_history() -> None:
+    # Commit author emails are allowed (transparency). History is only scanned for
+    # private issue-asset screenshots that remain reachable after deletion.
     hist = subprocess.run(
         [
             "git",
@@ -271,6 +344,75 @@ if not skip_history:
                 )
             )
 
+
+def resolve_commit_range() -> str:
+    explicit = (os.environ.get("COMMIT_RANGE") or "").strip()
+    if explicit:
+        return explicit
+    probe = subprocess.run(
+        ["git", "rev-parse", "--verify", "origin/main"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode == 0:
+        return "origin/main...HEAD"
+    return "HEAD~20..HEAD"
+
+
+def scan_commits() -> None:
+    # Commit author emails are allowed; only subject + body are scanned.
+    rev_range = resolve_commit_range()
+    log = subprocess.run(
+        ["git", "log", "--format=%H%n%s%n%b%n--END--", rev_range],
+        capture_output=True,
+        text=True,
+    )
+    if log.returncode != 0:
+        print(log.stderr or log.stdout, file=sys.stderr)
+        raise SystemExit(f"error: git log failed for range {rev_range!r}")
+    chunks = log.stdout.split("--END--\n")
+    for chunk in chunks:
+        chunk = chunk.strip("\n")
+        if not chunk.strip():
+            continue
+        lines = chunk.splitlines()
+        if not lines:
+            continue
+        sha = lines[0][:12]
+        subject = lines[1] if len(lines) > 1 else ""
+        body = "\n".join(lines[2:]) if len(lines) > 2 else ""
+        scan_text("commit", f"{sha} subject", subject)
+        if body.strip():
+            scan_text("commit", f"{sha} body", body)
+
+
+skip_history = os.environ.get("SKIP_HISTORY", "0") == "1"
+ok_parts: list[str] = []
+
+if SCOPE == "full":
+    scan_tracker_nodes(fetch_tracker())
+    ok_parts.append("issues/PRs/comments")
+    scan_tree()
+    ok_parts.append("repo tree")
+    if not skip_history:
+        scan_history()
+        ok_parts.append("git history issue-asset blobs")
+elif SCOPE == "tree":
+    scan_tree()
+    ok_parts.append("repo tree")
+    if not skip_history:
+        scan_history()
+        ok_parts.append("git history issue-asset blobs")
+elif SCOPE == "commits":
+    scan_commits()
+    ok_parts.append("commit messages")
+elif SCOPE == "issue":
+    number = int(os.environ["ISSUE"])
+    scan_tracker_nodes([fetch_one_issue(number)])
+    ok_parts.append(f"#{number}")
+else:
+    raise SystemExit(f"error: unknown SCOPE={SCOPE}")
+
 if found:
     print("Privacy audit FAILED — review and redact:", file=sys.stderr)
     for source, where, detail in sorted(set(found)):
@@ -283,9 +425,5 @@ if found:
         )
     sys.exit(1)
 
-print(
-    "Privacy audit OK: issues/PRs/comments, repo tree"
-    + ("" if skip_history else ", and git history issue-asset blobs")
-    + " look clean."
-)
+print("Privacy audit OK: " + ", ".join(ok_parts) + " look clean.")
 PY

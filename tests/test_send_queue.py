@@ -476,10 +476,10 @@ class StopSendingToastTests(unittest.TestCase):
             format_stop_sending_toast(
                 {
                     "mbrennwa@gmail.com": 3,
-                    "info@gasometrix.com": 2,
+                    "info@example.com": 2,
                 }
             ),
-            "Moved messages to Drafts: info@gasometrix.com (2), "
+            "Moved messages to Drafts: info@example.com (2), "
             "mbrennwa@gmail.com (3)",
         )
 
@@ -496,9 +496,9 @@ class StopSendingToastTests(unittest.TestCase):
             format_stop_sending_error_toast(
                 {
                     "mbrennwa@gmail.com": 3,
-                    "info@gasometrix.com": 2,
+                    "info@example.com": 2,
                 }
             ),
-            "Could not move messages to Drafts: info@gasometrix.com (2), "
+            "Could not move messages to Drafts: info@example.com (2), "
             "mbrennwa@gmail.com (3)",
         )
