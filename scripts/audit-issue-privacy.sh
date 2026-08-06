@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Scan GitHub issues/PRs/comments and the local tree for private-mail leaks (#115).
+# Scan GitHub issues/PRs/comments and the local tree for private-mail leaks
+# (#274 standing policy; historical #115).
 # Requires: gh auth login, network access.
 #
 # Env:

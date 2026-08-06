@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Redaction helper for #115 privacy pruning (issues, PRs, comments).
+"""Redaction helper for privacy pruning (#274; historical #115).
 
 Sensitive address/word maps live in an untracked local file so they are not
 committed:

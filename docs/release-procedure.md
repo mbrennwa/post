@@ -28,10 +28,11 @@ any redactions) in the release issue or PR.
 5. Refresh install examples in `README.md` and `tools/howto-build-*.txt`
    so package filenames match.
 
-## 2. Privacy prune (#115) — hard gate
+## 2. Privacy prune (#274) — hard gate
 
 Private details must be gone from the **issue tracker**, the **git tree**, and
-any other public project surface before tagging.
+any other public project surface before tagging. Ongoing monthly cadence is the
+standing privacy-pass policy (#274); historical one-shot scrub: #115.
 
 ### What counts as private
 

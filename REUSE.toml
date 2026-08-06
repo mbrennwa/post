@@ -59,6 +59,7 @@ path = [
     ".github/workflows/release-deb.yml",
     ".github/workflows/pages.yml",
     ".github/workflows/cleanup-pass.yml",
+    ".github/workflows/privacy-pass.yml",
     ".github/issue-assets/README.md",
     ".github/issue-assets/*.png",
     "Makefile",
