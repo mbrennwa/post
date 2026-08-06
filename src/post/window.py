@@ -106,6 +106,7 @@ from post.mail.helpers import (
     flag_menu_items,
     flag_menu_label,
     format_from_search_query,
+    message_matches_bulk_archive_scope,
     perform_one_click_unsubscribe,
     read_menu_items,
     read_menu_label,
@@ -471,6 +472,8 @@ class MainWindow(Adw.ApplicationWindow):
             on_folder_tree_changed=self._on_sidebar_folder_tree_changed,
             on_folder_contents_changed=self._on_sidebar_folder_contents_changed,
             on_move_started=self._on_sidebar_move_started,
+            on_bulk_archive_finished=self._on_sidebar_bulk_archive_finished,
+            on_bulk_archive_error=self._on_sidebar_bulk_archive_error,
             on_move_undo_available=self._on_sidebar_move_undo_available,
             on_account_online_changed=self._on_account_online_changed,
             on_goa_reauth_requested=self._on_goa_reauth_requested,
@@ -1386,8 +1389,135 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> None:
         self._refresh_folder_view(account_uid, folder_name)
 
-    def _on_sidebar_move_started(self, account_uid: str, folder_name: str) -> None:
+    def _on_sidebar_move_started(
+        self, account_uid: str, folder_name: str, scope: str = "all"
+    ) -> None:
         self._clear_move_undo()
+        self._suppress_sync_list_reload = (account_uid, folder_name)
+        if (
+            self._current_account is None
+            or self._current_folder is None
+            or self._current_account.uid != account_uid
+            or self._current_folder != folder_name
+        ):
+            return
+
+        messages = list(self._current_folder_messages or [])
+        if scope == "all":
+            list_keys = [
+                self._message_list_key(message)
+                for message in messages
+                if self._message_list_key(message)
+            ]
+            # Clear everything visible even if the folder-message cache is empty.
+            self._message_list_view.clear()
+            self._current_folder_messages = []
+            if self._message_total >= 0:
+                self._message_total = 0
+        else:
+            list_keys = [
+                self._message_list_key(message)
+                for message in messages
+                if self._message_list_key(message)
+                and message_matches_bulk_archive_scope(message, scope)
+            ]
+            if not list_keys:
+                return
+            self._message_list_view.remove_uids(list_keys)
+            moved_keys = set(list_keys)
+            self._current_folder_messages = [
+                message
+                for message in messages
+                if self._message_list_key(message) not in moved_keys
+            ]
+            if self._message_total >= 0:
+                self._message_total = max(0, self._message_total - len(list_keys))
+
+        cleared_current = any(
+            key == self._current_message_uid for key in list_keys
+        ) or (scope == "all" and self._current_message_uid is not None)
+        if cleared_current:
+            self._clear_reader()
+            set_active_message_uid(None)
+            self._restore_message_folder = None
+
+        if self._message_list_view.item_count() == 0 and folder_name:
+            self._message_empty_label.set_label(f"No Messages in {folder_name}")
+            self._message_stack.set_visible_child_name("empty")
+        self._update_message_toolbar()
+
+    def _on_sidebar_bulk_archive_finished(
+        self,
+        account_uid: str,
+        folder_name: str,
+        result: dict | None,
+        status_label: str,
+    ) -> None:
+        suppress_key = (account_uid, folder_name)
+        archived_count = int((result or {}).get("archived_count") or 0)
+        if result is None or archived_count <= 0:
+            if self._suppress_sync_list_reload == suppress_key:
+                self._suppress_sync_list_reload = None
+            if (
+                self._current_account
+                and self._current_folder
+                and self._current_account.uid == account_uid
+                and self._current_folder == folder_name
+            ):
+                self._load_messages(account_uid, folder_name, sync=False)
+            return
+
+        self._update_sidebar_from_move_result(account_uid, result)
+        if (
+            self._current_account
+            and self._current_folder
+            and self._current_account.uid == account_uid
+            and self._current_folder == folder_name
+            and self._message_list_view.item_count() == 0
+        ):
+            self._message_empty_label.set_label(f"No Messages in {folder_name}")
+            self._message_stack.set_visible_child_name("empty")
+
+        dest_folder = result.get("destination_folder")
+        dest_uids = result.get("destination_uids") or []
+        if dest_folder and dest_uids:
+            self._register_move_undo(
+                status_label,
+                account_uid=account_uid,
+                source_folder=folder_name,
+                dest_folder=dest_folder,
+                dest_uids=dest_uids,
+            )
+            self._set_status(f"{status_label}  ·  Ctrl+Z to undo")
+        else:
+            # Still confirm success when Graph/Camel omit destination UIDs
+            # (Undo requires those UIDs; status-only was easy to miss after
+            # optimistic clear — #261).
+            show_toast(
+                self,
+                status_label,
+                priority=Adw.ToastPriority.HIGH,
+                timeout=10,
+            )
+            self._set_status(status_label)
+
+        if self._suppress_sync_list_reload == suppress_key:
+            self._suppress_sync_list_reload = None
+        self._update_message_toolbar()
+
+    def _on_sidebar_bulk_archive_error(
+        self, account_uid: str, folder_name: str, _error: Exception
+    ) -> None:
+        suppress_key = (account_uid, folder_name)
+        if self._suppress_sync_list_reload == suppress_key:
+            self._suppress_sync_list_reload = None
+        if (
+            self._current_account
+            and self._current_folder
+            and self._current_account.uid == account_uid
+            and self._current_folder == folder_name
+        ):
+            self._load_messages(account_uid, folder_name, sync=False)
 
     def _on_sidebar_move_undo_available(
         self,

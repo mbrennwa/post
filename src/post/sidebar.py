@@ -79,7 +79,9 @@ OnFolderTreeReady = Callable[[], None]
 OnSendOutbox = Callable[[], None]
 OnFolderTreeChanged = Callable[[str, str | None], None]
 OnFolderContentsChanged = Callable[[str, str], None]
-OnMoveStarted = Callable[[str, str], None]
+OnMoveStarted = Callable[[str, str, str], None]
+OnBulkArchiveFinished = Callable[[str, str, dict | None, str], None]
+OnBulkArchiveError = Callable[[str, str, Exception], None]
 OnMoveUndoAvailable = Callable[[str, str, dict, str], None]
 OnAccountOnlineChanged = Callable[[str, bool], None]
 OnGoaReauthRequested = Callable[[str], None]
@@ -104,6 +106,8 @@ class MailSidebar:
         on_folder_tree_changed: OnFolderTreeChanged | None = None,
         on_folder_contents_changed: OnFolderContentsChanged | None = None,
         on_move_started: OnMoveStarted | None = None,
+        on_bulk_archive_finished: OnBulkArchiveFinished | None = None,
+        on_bulk_archive_error: OnBulkArchiveError | None = None,
         on_move_undo_available: OnMoveUndoAvailable | None = None,
         on_account_online_changed: OnAccountOnlineChanged | None = None,
         on_goa_reauth_requested: OnGoaReauthRequested | None = None,
@@ -121,6 +125,8 @@ class MailSidebar:
         self._on_folder_tree_changed = on_folder_tree_changed
         self._on_folder_contents_changed = on_folder_contents_changed
         self._on_move_started = on_move_started
+        self._on_bulk_archive_finished = on_bulk_archive_finished
+        self._on_bulk_archive_error = on_bulk_archive_error
         self._on_move_undo_available = on_move_undo_available
         self._on_account_online_changed = on_account_online_changed
         self._on_goa_reauth_requested = on_goa_reauth_requested
@@ -1084,7 +1090,7 @@ class MailSidebar:
             return
         status_label = f"Archived {read_count} read {noun}"
         if self._on_move_started is not None:
-            self._on_move_started(account_uid, folder_name)
+            self._on_move_started(account_uid, folder_name, "read")
         self._set_status(f"Archiving {read_count} read {noun}…")
         self._run_folder_operation(
             lambda: self._mail.archive_read_messages(account_uid, folder_name),
@@ -1094,6 +1100,9 @@ class MailSidebar:
             ),
             error_heading="Could not archive messages",
             folder_transfer=True,
+            on_error=lambda error: self._after_bulk_archive_error(
+                account_uid, folder_name, error
+            ),
         )
 
     def _on_archive_read_unflagged_activate(self, *_args) -> None:
@@ -1132,7 +1141,7 @@ class MailSidebar:
             return
         status_label = f"Archived {read_unflagged_count} read and unflagged {noun}"
         if self._on_move_started is not None:
-            self._on_move_started(account_uid, folder_name)
+            self._on_move_started(account_uid, folder_name, "read_unflagged")
         self._set_status(
             f"Archiving {read_unflagged_count} read and unflagged {noun}…"
         )
@@ -1146,6 +1155,9 @@ class MailSidebar:
             ),
             error_heading="Could not archive messages",
             folder_transfer=True,
+            on_error=lambda error: self._after_bulk_archive_error(
+                account_uid, folder_name, error
+            ),
         )
 
     def _on_archive_all_activate(self, *_args) -> None:
@@ -1169,7 +1181,7 @@ class MailSidebar:
             return
         status_label = f"Archived {total} {noun}"
         if self._on_move_started is not None:
-            self._on_move_started(account_uid, folder_name)
+            self._on_move_started(account_uid, folder_name, "all")
         self._set_status(f"Archiving {total} {noun}…")
         self._run_folder_operation(
             lambda: self._mail.archive_all_messages(account_uid, folder_name),
@@ -1179,6 +1191,9 @@ class MailSidebar:
             ),
             error_heading="Could not archive messages",
             folder_transfer=True,
+            on_error=lambda error: self._after_bulk_archive_error(
+                account_uid, folder_name, error
+            ),
         )
 
     def _on_send_now_activate(self, *_args) -> None:
@@ -1222,6 +1237,7 @@ class MailSidebar:
         on_success: Callable[[object], None],
         error_heading: str,
         folder_transfer: bool = False,
+        on_error: Callable[[Exception], None] | None = None,
     ) -> None:
         def worker() -> None:
             error: Exception | None = None
@@ -1241,6 +1257,7 @@ class MailSidebar:
                 success_status,
                 on_success,
                 error_heading,
+                on_error,
             )
 
         if folder_transfer:
@@ -1254,8 +1271,11 @@ class MailSidebar:
         success_status: str,
         on_success: Callable[[object], None],
         error_heading: str,
+        on_error: Callable[[Exception], None] | None = None,
     ) -> bool:
         if error is not None:
+            if on_error is not None:
+                on_error(error)
             parent = self._dialog_parent(self._widget)
             if parent is not None:
                 show_error(parent, error_heading, str(error))
@@ -1307,19 +1327,26 @@ class MailSidebar:
         result: object,
         status_label: str,
     ) -> None:
-        self._after_folder_contents_changed(account_uid, folder_name)
-        if not isinstance(result, dict):
-            return
-        archived_count = int(result.get("archived_count") or 0)
+        # Do not refresh_folder_view / sync-reload: optimistic UI already cleared
+        # matching rows; a Graph refresh would keep stale Inbox rows visible (#261).
+        move_result = result if isinstance(result, dict) else None
+        archived_count = (
+            int(move_result.get("archived_count") or 0) if move_result else 0
+        )
         if archived_count <= 0:
-            # Overwrite the premature success flash from _on_folder_operation_finished.
             self._set_status("No messages were archived")
-            return
-        self._set_status(status_label)
-        if self._on_move_undo_available is not None:
-            self._on_move_undo_available(
-                account_uid, folder_name, result, status_label
+        else:
+            self._set_status(status_label)
+        if self._on_bulk_archive_finished is not None:
+            self._on_bulk_archive_finished(
+                account_uid, folder_name, move_result, status_label
             )
+
+    def _after_bulk_archive_error(
+        self, account_uid: str, folder_name: str, error: Exception
+    ) -> None:
+        if self._on_bulk_archive_error is not None:
+            self._on_bulk_archive_error(account_uid, folder_name, error)
 
     def _attach_refresh_menu(
         self,

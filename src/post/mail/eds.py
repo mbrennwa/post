@@ -3144,7 +3144,9 @@ class MailService:
     def _archive_read_messages_unlocked(
         self, account_uid: str, folder_name: str
     ) -> dict[str, Any]:
-        index = self._build_folder_index_unlocked(account_uid, folder_name)
+        index = self._build_folder_index_unlocked(
+            account_uid, folder_name, sync=False
+        )
         read_uids = [
             message["uid"]
             for message in index.messages
@@ -3165,13 +3167,17 @@ class MailService:
     def _count_read_unflagged_messages_unlocked(
         self, account_uid: str, folder_name: str
     ) -> int:
-        index = self._build_folder_index_unlocked(account_uid, folder_name)
+        index = self._build_folder_index_unlocked(
+            account_uid, folder_name, sync=False
+        )
         return len(_read_unflagged_uids(index))
 
     def _archive_read_unflagged_messages_unlocked(
         self, account_uid: str, folder_name: str
     ) -> dict[str, Any]:
-        index = self._build_folder_index_unlocked(account_uid, folder_name)
+        index = self._build_folder_index_unlocked(
+            account_uid, folder_name, sync=False
+        )
         uids = _read_unflagged_uids(index)
         if not uids:
             return {
@@ -3186,7 +3192,9 @@ class MailService:
     def _archive_all_messages_unlocked(
         self, account_uid: str, folder_name: str
     ) -> dict[str, Any]:
-        index = self._build_folder_index_unlocked(account_uid, folder_name)
+        index = self._build_folder_index_unlocked(
+            account_uid, folder_name, sync=False
+        )
         all_uids = [
             message["uid"]
             for message in index.messages
@@ -7068,7 +7076,9 @@ class MailService:
                             len(transfer_uids),
                         )
                         moved_uids = gone
-                        destination_uids = []
+                        # Keep destination_uids from batches that already returned
+                        # them — clearing here disabled Undo after Archive All on
+                        # M365 when a later batch hangs (#189/#261).
                     else:
                         log.warning(
                             "Transfer timed out after %.1fs for %s (%s → %s); "
@@ -7435,21 +7445,44 @@ class MailService:
         uids = folder_get_uids(folder)
         if not uids:
             return []
-        if uid_limit is not None and uid_limit >= 0:
-            uids = uids[:uid_limit]
 
+        if uid_limit is None:
+            for uid in uids:
+                info = folder_get_message_info(folder, uid)
+                if info is None:
+                    continue
+                message = message_info_to_dict(info, uid=uid)
+                fingerprint = (
+                    message.get("subject") or "",
+                    message.get("from") or "",
+                    message.get("sort_date") or 0,
+                )
+                if fingerprint in fingerprints:
+                    found.append(str(uid))
+                    if len(found) >= len(fingerprints):
+                        break
+            return found
+
+        # Graph/EWS: Camel UID order is not newest-first. Score by date, then
+        # match only among the newest *uid_limit* headers (#189/#261).
+        dated: list[tuple[float, str, dict[str, Any]]] = []
         for uid in uids:
             info = folder_get_message_info(folder, uid)
             if info is None:
                 continue
             message = message_info_to_dict(info, uid=uid)
+            dated.append(
+                (float(message.get("sort_date") or 0), str(uid), message)
+            )
+        dated.sort(key=lambda item: item[0], reverse=True)
+        for _sort_date, uid, message in dated[:uid_limit]:
             fingerprint = (
                 message.get("subject") or "",
                 message.get("from") or "",
                 message.get("sort_date") or 0,
             )
             if fingerprint in fingerprints:
-                found.append(str(uid))
+                found.append(uid)
                 if len(found) >= len(fingerprints):
                     break
         return found

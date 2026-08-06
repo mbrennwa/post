@@ -531,6 +531,20 @@ def message_is_read_unflagged(msg: dict[str, Any]) -> bool:
     return bool(flags.get("seen", True)) and not bool(flags.get("flagged"))
 
 
+def message_matches_bulk_archive_scope(msg: dict[str, Any], scope: str) -> bool:
+    """Return True when *msg* should be archived for sidebar bulk-archive *scope*.
+
+    Scopes: ``all``, ``read``, ``read_unflagged``.
+    """
+    if scope == "all":
+        return True
+    if scope == "read":
+        return not message_is_unread(msg)
+    if scope == "read_unflagged":
+        return message_is_read_unflagged(msg)
+    return False
+
+
 def message_has_attachments(msg: dict[str, Any]) -> bool:
     flags = msg.get("flags") or {}
     return bool(flags.get("attachments"))
