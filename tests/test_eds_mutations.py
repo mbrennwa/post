@@ -711,6 +711,62 @@ class TransferBusyStateTests(unittest.TestCase):
         self.assertIn("not_responding", states)
         self.assertEqual(service.get_account_transfer_state("acct-1"), "idle")
 
+    def test_timeout_soft_success_keeps_earlier_batch_destination_uids(self) -> None:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import Gio, GLib
+
+        from post.mail import eds as eds_mod
+
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        service._accounts_by_uid["acct-1"] = mock.Mock(backend="microsoft365")
+        dest = mock.Mock()
+        dest.get_full_name.return_value = "Archive"
+        source = mock.Mock()
+
+        batch_uids = [f"src-{i}" for i in range(eds_mod._TRANSFER_MESSAGE_BATCH_SIZE + 1)]
+
+        def transfer(batch, *_args, **_kwargs):
+            if len(batch) == 1:
+                raise GLib.Error.new_literal(
+                    Gio.io_error_quark(),
+                    "Operation was cancelled",
+                    Gio.IOErrorEnum.CANCELLED,
+                )
+            return True, [f"dest-{uid}" for uid in batch]
+
+        source.transfer_messages_to_sync.side_effect = transfer
+        service._open_folder_unlocked = mock.Mock(return_value=source)
+        service._transfer_uids_in_folder = mock.Mock(return_value=batch_uids)
+        service._message_dicts_for_uids_unlocked = mock.Mock(return_value=[])
+        service._uids_missing_from_folder_unlocked = mock.Mock(
+            return_value=batch_uids
+        )
+        service._finalize_folder_transfer_unlocked = mock.Mock()
+        service._prune_folder_summary_uids_unlocked = mock.Mock()
+        service._remove_messages_from_cache = mock.Mock()
+        service._find_moved_uids_in_folder_unlocked = mock.Mock(return_value=[])
+        service._merge_moved_messages_into_dest_cache_unlocked = mock.Mock(
+            return_value=(-1, -1)
+        )
+
+        result = service._transfer_messages_unlocked(
+            "acct-1",
+            "Inbox",
+            batch_uids,
+            dest,
+            op_type="archive",
+        )
+
+        self.assertEqual(result["moved_uids"], batch_uids)
+        self.assertEqual(
+            result["destination_uids"],
+            [f"dest-{uid}" for uid in batch_uids[:-1]],
+        )
+
 
 class RemoveMessagesFromCacheTests(unittest.TestCase):
     def test_merge_dest_cache_preserves_existing_rows_without_dest_uids(self) -> None:
@@ -819,6 +875,9 @@ class ArchiveCountTests(unittest.TestCase):
 
         result = service._archive_read_messages_unlocked("acct-1", "INBOX")
         self.assertEqual(result["archived_count"], 1)
+        service._build_folder_index_unlocked.assert_called_once_with(
+            "acct-1", "INBOX", sync=False
+        )
         service._archive_messages_unlocked.assert_called_once_with(
             "acct-1", "INBOX", ["opaque-1"]
         )
@@ -843,3 +902,56 @@ class ArchiveCountTests(unittest.TestCase):
 
         result = service._archive_all_messages_unlocked("acct-1", "INBOX")
         self.assertEqual(result["archived_count"], 0)
+        service._build_folder_index_unlocked.assert_called_once_with(
+            "acct-1", "INBOX", sync=False
+        )
+
+    def test_archive_read_unflagged_uses_local_index(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = MailService(registry=mock.Mock())
+        service._build_folder_index_unlocked = mock.Mock(
+            return_value=_FolderMessageIndex(
+                messages=[
+                    {"uid": "r1", "flags": {"seen": True, "flagged": False}},
+                    {"uid": "r2", "flags": {"seen": True, "flagged": True}},
+                    {"uid": "u1", "flags": {"seen": False, "flagged": False}},
+                ],
+                unread=1,
+                total=3,
+            )
+        )
+        service._archive_messages_unlocked = mock.Mock(
+            return_value={"moved_uids": ["r1"]}
+        )
+
+        result = service._archive_read_unflagged_messages_unlocked("acct-1", "INBOX")
+        self.assertEqual(result["archived_count"], 1)
+        service._build_folder_index_unlocked.assert_called_once_with(
+            "acct-1", "INBOX", sync=False
+        )
+        service._archive_messages_unlocked.assert_called_once_with(
+            "acct-1", "INBOX", ["r1"]
+        )
+
+    def test_count_read_unflagged_uses_local_index(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = MailService(registry=mock.Mock())
+        service._build_folder_index_unlocked = mock.Mock(
+            return_value=_FolderMessageIndex(
+                messages=[
+                    {"uid": "r1", "flags": {"seen": True, "flagged": False}},
+                    {"uid": "r2", "flags": {"seen": True, "flagged": True}},
+                ],
+                unread=0,
+                total=2,
+            )
+        )
+        self.assertEqual(
+            service._count_read_unflagged_messages_unlocked("acct-1", "INBOX"),
+            1,
+        )
+        service._build_folder_index_unlocked.assert_called_once_with(
+            "acct-1", "INBOX", sync=False
+        )

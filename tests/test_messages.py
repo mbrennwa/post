@@ -30,6 +30,7 @@ from post.mail.helpers import (
     message_is_flagged,
     message_is_read_unflagged,
     message_is_unread,
+    message_matches_bulk_archive_scope,
     paginate_messages,
     read_menu_items,
     read_menu_label,
@@ -335,6 +336,20 @@ class MessageFlagTests(unittest.TestCase):
         self.assertFalse(
             message_is_read_unflagged({"flags": {"seen": False, "flagged": False}})
         )
+
+    def test_bulk_archive_scope_matching(self) -> None:
+        unread = {"uid": "1", "flags": {"seen": False, "flagged": False}}
+        read = {"uid": "2", "flags": {"seen": True, "flagged": False}}
+        flagged = {"uid": "3", "flags": {"seen": True, "flagged": True}}
+        self.assertTrue(message_matches_bulk_archive_scope(unread, "all"))
+        self.assertTrue(message_matches_bulk_archive_scope(read, "all"))
+        self.assertFalse(message_matches_bulk_archive_scope(unread, "read"))
+        self.assertTrue(message_matches_bulk_archive_scope(read, "read"))
+        self.assertTrue(message_matches_bulk_archive_scope(flagged, "read"))
+        self.assertTrue(message_matches_bulk_archive_scope(read, "read_unflagged"))
+        self.assertFalse(message_matches_bulk_archive_scope(flagged, "read_unflagged"))
+        self.assertFalse(message_matches_bulk_archive_scope(unread, "read_unflagged"))
+        self.assertFalse(message_matches_bulk_archive_scope(read, "unknown"))
 
 
 class MessageMenuItemsTests(unittest.TestCase):
