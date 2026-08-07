@@ -94,6 +94,7 @@ path = [
     "docs/.nojekyll",
     "pyproject.toml",
     ".gitignore",
+    ".cursor/skills/**",
     "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post-sketch.svg",
     "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post_old.svg",
 ]
