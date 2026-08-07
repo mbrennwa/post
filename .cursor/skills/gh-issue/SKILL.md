@@ -10,14 +10,14 @@ description: >-
 
 # GitHub issue workflow
 
-Phased workflow for working a GH issue. Human gates (discuss, refine plan, manual test) stay interactive — do not skip them or auto-advance phases.
+Phased workflow for working a GH issue. After Analyze, switch into Plan automatically (do not ask). Other human gates (refine plan, manual test) stay interactive — do not skip them or auto-advance past them.
 
 ## Triggers
 
 | Phrase | Phase |
 |--------|--------|
-| `analyze #<n>` / `analyze issue <n>` | Analyze |
-| `plan` (after analyze/discuss) | Plan |
+| `analyze #<n>` / `analyze issue <n>` | Analyze → then Plan (auto) |
+| `plan` (if planning separately) | Plan |
 | `implement` (after plan approved) | Implement |
 | `ship` (after manual testing) | Ship |
 
@@ -42,24 +42,25 @@ If the issue number is missing and not clear from conversation, ask once.
    - **Root cause** — why it happens (or why the feature is missing), with file/symbol pointers
    - **Options** — 1–3 approaches with trade-offs
    - **Open questions** — anything blocking a good plan
-4. Stop. Wait for discussion before planning.
+4. Immediately switch to Plan mode via `SwitchMode` (`target_mode_id: plan`) — do not ask the user, do not wait for `plan`. Then continue into Phase: Plan in the same turn when possible.
 
 ## Phase: Plan
 
-**Goal:** Agreed implementation plan on a dedicated branch. Prefer Plan mode when available.
+**Goal:** Agreed implementation plan on a dedicated branch, in Plan mode.
 
-1. Confirm the chosen approach from discussion
-2. Update the GH issue with analysis + discussion details (before or right as planning starts):
+1. If not already in Plan mode (e.g. user said `plan` without a prior auto-switch), switch via `SwitchMode` (`target_mode_id: plan`) without asking
+2. Pick a recommended approach from the analysis (note trade-offs); refine with the user if open questions block a coherent plan
+3. Update the GH issue with analysis + planning details (before or right as planning starts):
    - Comment via `gh issue comment <n> --body "$(cat <<'EOF' … EOF)"`
-   - Include: root-cause summary, options considered, chosen approach (and why), key discussion decisions, remaining open questions
+   - Include: root-cause summary, options considered, chosen approach (and why), key decisions, remaining open questions
    - Do not close the issue
-3. Ensure `main` is current; create/checkout `issue-<n>/<short-slug>`
-4. Write a concise plan:
+4. Ensure `main` is current; create/checkout `issue-<n>/<short-slug>`
+5. Write a concise plan:
    - Scope / non-goals
    - Steps (ordered)
    - Files likely touched
    - Test plan (what the user should verify manually)
-5. Stop for refinement. Do not implement until the user says `implement` (or clearly approves).
+6. Stop for refinement. Do not implement until the user says `implement` (or clearly approves).
 
 ## Phase: Implement
 
