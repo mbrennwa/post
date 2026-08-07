@@ -8,12 +8,14 @@ Detection only — never writes calendars or opens handlers.
 
 from __future__ import annotations
 
+import os
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import unquote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _CALENDAR_MIME_TYPES = frozenset(
     {
@@ -21,6 +23,34 @@ _CALENDAR_MIME_TYPES = frozenset(
         "application/ics",
         "text/x-vcalendar",
     }
+)
+
+# Small Windows Outlook TZID → IANA map (common European / US names).
+_WINDOWS_TZID_ALIASES: dict[str, str] = {
+    "UTC": "UTC",
+    "GMT Standard Time": "Europe/London",
+    "Greenwich Standard Time": "Atlantic/Reykjavik",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Central Europe Standard Time": "Europe/Budapest",
+    "Central European Standard Time": "Europe/Warsaw",
+    "Romance Standard Time": "Europe/Paris",
+    "GTB Standard Time": "Europe/Bucharest",
+    "FLE Standard Time": "Europe/Helsinki",
+    "E. Europe Standard Time": "Europe/Chisinau",
+    "Eastern Standard Time": "America/New_York",
+    "Central Standard Time": "America/Chicago",
+    "Mountain Standard Time": "America/Denver",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "US Eastern Standard Time": "America/Indianapolis",
+    "US Mountain Standard Time": "America/Phoenix",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "China Standard Time": "Asia/Shanghai",
+    "India Standard Time": "Asia/Kolkata",
+}
+
+_TZID_VENDOR_PREFIXES = (
+    "freeassociation.sourceforge.net/",
+    "/freeassociation.sourceforge.net/",
 )
 
 _MEETING_URL_RE = re.compile(
@@ -81,22 +111,124 @@ def _unescape_ics_text(value: str) -> str:
     )
 
 
+def _extract_tzid(params: str) -> str | None:
+    for part in params.split(";"):
+        part = part.strip()
+        if part.upper().startswith("TZID="):
+            return part.split("=", 1)[1].strip().strip('"') or None
+    return None
+
+
+def _normalize_tzid(tzid: str) -> str:
+    key = tzid.strip().strip('"')
+    for prefix in _TZID_VENDOR_PREFIXES:
+        if key.lower().startswith(prefix.lower()):
+            key = key[len(prefix) :]
+            break
+    return _WINDOWS_TZID_ALIASES.get(key, key)
+
+
+def _zoneinfo_for_tzid(tzid: str) -> ZoneInfo | None:
+    key = _normalize_tzid(tzid)
+    try:
+        return ZoneInfo(key)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return None
+
+
+def _viewer_tzinfo() -> tzinfo:
+    """Timezone used for display and for interpreting floating / local times."""
+    name = os.environ.get("TZ")
+    if name:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, KeyError, ValueError):
+            pass
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def viewer_tzinfo() -> tzinfo:
+    """Public alias: viewer local timezone (honours ``TZ`` when set)."""
+    return _viewer_tzinfo()
+
+
+def to_utc_iso(dt: datetime) -> str:
+    """Serialize *dt* as UTC ISO seconds; naive values are viewer-local."""
+    return _as_utc(dt).isoformat(timespec="seconds")
+
+
+def _parse_iso_datetime_string(text: str) -> datetime | None:
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Convert *dt* to UTC; naive values are treated as viewer-local."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_viewer_tzinfo())
+    return dt.astimezone(timezone.utc)
+
+
+def _to_display_local(dt: datetime) -> datetime:
+    """Convert *dt* to the viewer’s local zone; naive stays as local wall time."""
+    local_tz = _viewer_tzinfo()
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=local_tz)
+    return dt.astimezone(local_tz)
+
+
+def _zone_label(dt: datetime) -> str:
+    """Human label for the zone used to display *dt* (already localized)."""
+    abbr = (dt.strftime("%Z") or "").strip()
+    tz = dt.tzinfo
+    key = getattr(tz, "key", None) if tz is not None else None
+    if not key:
+        env_tz = os.environ.get("TZ")
+        if env_tz and ("/" in env_tz or env_tz.upper() == "UTC"):
+            key = env_tz
+    if not key and dt.tzinfo is not None:
+        offset = dt.utcoffset()
+        if offset is not None:
+            total = int(offset.total_seconds())
+            sign = "+" if total >= 0 else "-"
+            total = abs(total)
+            key = f"UTC{sign}{total // 3600:02d}:{total % 3600 // 60:02d}"
+    if abbr and key:
+        return f"{abbr} ({key})"
+    return abbr or key or ""
+
+
+def _format_local_clock(dt: datetime) -> str:
+    """``YYYY-MM-DD HH:MM`` (or with non-zero seconds)."""
+    date_part = dt.strftime("%Y-%m-%d")
+    if dt.second:
+        return f"{date_part} {dt.strftime('%H:%M:%S')}"
+    return f"{date_part} {dt.strftime('%H:%M')}"
+
+
 def _parse_ics_datetime(value: str, params: str) -> datetime | date | None:
     raw = value.strip()
     if not raw:
         return None
-    tzid = None
-    for part in params.split(";"):
-        part = part.strip()
-        if part.upper().startswith("TZID="):
-            tzid = part.split("=", 1)[1].strip().strip('"')
+    tzid = _extract_tzid(params)
     try:
         if raw.endswith("Z") and "T" in raw:
             return datetime.strptime(raw, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
         if "T" in raw:
             dt = datetime.strptime(raw, "%Y%m%dT%H%M%S")
             if tzid:
-                # Keep naive wall time; calendar backends interpret floating times.
+                zone = _zoneinfo_for_tzid(tzid)
+                if zone is not None:
+                    # DST-aware: wall time in named zone → absolute UTC.
+                    return dt.replace(tzinfo=zone).astimezone(timezone.utc)
+                # Unknown TZID: keep naive floating (do not invent UTC).
                 return dt.replace(tzinfo=None)
             return dt
         return datetime.strptime(raw, "%Y%m%d").date()
@@ -181,8 +313,12 @@ def parse_ics_invite(ics_text: str) -> dict[str, Any] | None:
 
     start = None
     end = None
+    event_tzid: str | None = None
     if "DTSTART" in props:
         start = _parse_ics_datetime(props["DTSTART"][1], props["DTSTART"][0])
+        raw_tzid = _extract_tzid(props["DTSTART"][0])
+        if raw_tzid and _zoneinfo_for_tzid(raw_tzid) is not None:
+            event_tzid = _normalize_tzid(raw_tzid)
     if "DTEND" in props:
         end = _parse_ics_datetime(props["DTEND"][1], props["DTEND"][0])
     elif "DURATION" in props and isinstance(start, datetime):
@@ -230,6 +366,7 @@ def parse_ics_invite(ics_text: str) -> dict[str, Any] | None:
         "start": start_iso,
         "end": end_iso,
         "all_day": all_day,
+        "tzid": event_tzid,
         "location": location or None,
         "organizer": organizer or None,
         "description": description or None,
@@ -347,6 +484,7 @@ def merge_invite_details(
             "start": None,
             "end": None,
             "all_day": False,
+            "tzid": None,
             "location": None,
             "organizer": None,
             "description": None,
@@ -467,38 +605,15 @@ def calendar_invite_from_email_message(
 def format_invite_when(invite: dict[str, Any]) -> str | None:
     """Human-readable when line for the reader panel.
 
-    Uses a space instead of ``T``, omits seconds. Same-day ranges render as
-    ``YYYY-MM-DD HH:MM – HH:MM``.
+    Converts aware timestamps to the viewer’s local zone (DST-aware). Naive
+    times are treated as already local. Appends a zone label such as
+    ``CEST (Europe/Zurich)``. Same-day ranges render as
+    ``YYYY-MM-DD HH:MM – HH:MM …``. All-day events omit the zone label.
     """
     start = invite.get("start")
     end = invite.get("end")
     if not start:
         return None
-
-    def _display(value: Any) -> str:
-        text = str(value).strip()
-        # Drop timezone suffix for display (Z or ±HH:MM).
-        if text.endswith("Z"):
-            text = text[:-1]
-        for sep in ("+", "-"):
-            # Only strip offset after the date/time portion.
-            idx = text.find(sep, 10)
-            if idx != -1 and "T" in text[:idx]:
-                text = text[:idx]
-                break
-        text = text.replace("T", " ", 1)
-        # Omit seconds when they are zero; keep non-zero seconds.
-        if " " in text:
-            date_part, _, time_part = text.partition(" ")
-            pieces = time_part.split(":")
-            if len(pieces) >= 3:
-                seconds = pieces[2].split(".")[0]  # drop fractional seconds
-                if seconds == "00":
-                    time_part = f"{pieces[0]}:{pieces[1]}"
-                else:
-                    time_part = f"{pieces[0]}:{pieces[1]}:{seconds}"
-            return f"{date_part} {time_part}"
-        return text
 
     if invite.get("all_day"):
         start_d = str(start).strip()[:10]
@@ -507,16 +622,27 @@ def format_invite_when(invite: dict[str, Any]) -> str | None:
             return f"{start_d} – {end_d} (all day)"
         return f"{start_d} (all day)"
 
-    start_disp = _display(start)
-    if not end:
-        return start_disp
+    start_dt = _parse_iso_datetime_string(str(start))
+    if start_dt is None:
+        return str(start).strip()
 
-    end_disp = _display(end)
+    start_local = _to_display_local(start_dt)
+    zone = _zone_label(start_local)
+    start_disp = _format_local_clock(start_local)
+
+    end_dt = _parse_iso_datetime_string(str(end)) if end else None
+    if end_dt is None:
+        return f"{start_disp} {zone}".rstrip() if zone else start_disp
+
+    end_local = _to_display_local(end_dt)
+    end_disp = _format_local_clock(end_local)
     start_date, _, start_time = start_disp.partition(" ")
     end_date, _, end_time = end_disp.partition(" ")
     if start_date and end_date and start_date == end_date and start_time and end_time:
-        return f"{start_date} {start_time} – {end_time}"
-    return f"{start_disp} – {end_disp}"
+        when = f"{start_date} {start_time} – {end_time}"
+    else:
+        when = f"{start_disp} – {end_disp}"
+    return f"{when} {zone}".rstrip() if zone else when
 
 
 def format_invite_copy_text(invite: dict[str, Any]) -> str:
@@ -563,10 +689,10 @@ def build_vevent_ics(invite: dict[str, Any]) -> str:
     """Build a VEVENT string suitable for ``ECal.Client.create_object``.
 
     Includes UID and DTSTAMP. Returns a single VEVENT component (not a
-    surrounding VCALENDAR), which is what EDS expects.
+    surrounding VCALENDAR), which is what EDS expects. Timed events are
+    always written as UTC (``…Z``).
     """
     import uuid
-    from datetime import datetime, timezone
 
     def esc(value: str) -> str:
         return (
@@ -583,24 +709,13 @@ def build_vevent_ics(invite: dict[str, Any]) -> str:
         raise ValueError("Invite is missing a start time")
 
     def to_ics_stamp(iso_value: str, all_day: bool) -> str:
-        # Accept date or datetime ISO strings.
         cleaned = iso_value.strip()
         if all_day or "T" not in cleaned:
             return cleaned[:10].replace("-", "")
-        # Normalize to UTC-ish compact form when Z present; else local compact.
-        cleaned = cleaned.replace("-", "").replace(":", "")
-        if cleaned.endswith("Z"):
-            return cleaned
-        if "+" in cleaned[10:] or cleaned.count("-") > 0:
-            # Drop timezone offset for local write; calendar apps interpret as floating.
-            for sep in ("+", "-"):
-                idx = cleaned.find(sep, 10)
-                if idx != -1:
-                    cleaned = cleaned[:idx]
-                    break
-        if len(cleaned) >= 15:
-            return cleaned[:15]
-        return cleaned
+        dt = _parse_iso_datetime_string(cleaned)
+        if dt is None:
+            raise ValueError(f"Invalid invite datetime: {iso_value!r}")
+        return _as_utc(dt).strftime("%Y%m%dT%H%M%SZ")
 
     all_day = bool(invite.get("all_day"))
     dtstart = to_ics_stamp(str(start), all_day)
