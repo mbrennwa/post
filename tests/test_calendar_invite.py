@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import email.message
 import email.policy
+import os
+import time
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -28,6 +31,21 @@ from post.mail.calendar_write import (
     list_writable_calendars,
 )
 from post.mail.helpers import extract_attachments_from_email_message
+
+
+@contextmanager
+def fixed_timezone(tz_name: str):
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = tz_name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
 
 
 _SAMPLE_ICS = """BEGIN:VCALENDAR
@@ -68,6 +86,39 @@ class ParseIcsInviteTests(unittest.TestCase):
         self.assertIn("teams.microsoft.com", invite["meeting_url"] or "")
         self.assertEqual(invite["method"], "REQUEST")
         self.assertEqual(invite["source"], "ics")
+        self.assertIsNone(invite.get("tzid"))
+
+    def test_tzid_london_converts_to_utc_summer(self) -> None:
+        ics = """BEGIN:VCALENDAR
+BEGIN:VEVENT
+SUMMARY:London meet
+DTSTART;TZID=Europe/London:20260730T100000
+DTEND;TZID=Europe/London:20260730T110000
+END:VEVENT
+END:VCALENDAR
+"""
+        invite = parse_ics_invite(ics)
+        assert invite is not None
+        # BST (UTC+1) → 09:00Z / 10:00Z
+        self.assertEqual(invite["start"], "2026-07-30T09:00:00+00:00")
+        self.assertEqual(invite["end"], "2026-07-30T10:00:00+00:00")
+        self.assertEqual(invite["tzid"], "Europe/London")
+
+    def test_tzid_london_converts_to_utc_winter(self) -> None:
+        ics = """BEGIN:VCALENDAR
+BEGIN:VEVENT
+SUMMARY:London winter
+DTSTART;TZID=Europe/London:20260115T100000
+DTEND;TZID=Europe/London:20260115T110000
+END:VEVENT
+END:VCALENDAR
+"""
+        invite = parse_ics_invite(ics)
+        assert invite is not None
+        # GMT (UTC+0)
+        self.assertEqual(invite["start"], "2026-01-15T10:00:00+00:00")
+        self.assertEqual(invite["end"], "2026-01-15T11:00:00+00:00")
+        self.assertEqual(invite["tzid"], "Europe/London")
 
     def test_duration_without_dtend(self) -> None:
         ics = """BEGIN:VCALENDAR
@@ -384,32 +435,82 @@ class FormatInviteCopyTextTests(unittest.TestCase):
 
 
 class FormatInviteWhenTests(unittest.TestCase):
-    def test_same_day_replaces_t_and_omits_repeated_date(self) -> None:
-        text = format_invite_when(
-            {
-                "start": "2026-07-30T14:00:00+00:00",
-                "end": "2026-07-30T15:00:00+00:00",
-            }
-        )
-        self.assertEqual(text, "2026-07-30 14:00 – 15:00")
+    def test_utc_shows_zurich_local_summer_with_zone_label(self) -> None:
+        with fixed_timezone("Europe/Zurich"):
+            text = format_invite_when(
+                {
+                    "start": "2026-07-30T14:00:00+00:00",
+                    "end": "2026-07-30T15:00:00+00:00",
+                }
+            )
+        self.assertEqual(text, "2026-07-30 16:00 – 17:00 CEST (Europe/Zurich)")
+
+    def test_utc_shows_zurich_local_winter_with_zone_label(self) -> None:
+        with fixed_timezone("Europe/Zurich"):
+            text = format_invite_when(
+                {
+                    "start": "2026-01-15T14:00:00+00:00",
+                    "end": "2026-01-15T15:00:00+00:00",
+                }
+            )
+        self.assertEqual(text, "2026-01-15 15:00 – 16:00 CET (Europe/Zurich)")
+
+    def test_london_tzid_invite_displays_in_zurich_summer(self) -> None:
+        ics = """BEGIN:VCALENDAR
+BEGIN:VEVENT
+SUMMARY:London meet
+DTSTART;TZID=Europe/London:20260730T100000
+DTEND;TZID=Europe/London:20260730T110000
+END:VEVENT
+END:VCALENDAR
+"""
+        invite = parse_ics_invite(ics)
+        assert invite is not None
+        with fixed_timezone("Europe/Zurich"):
+            text = format_invite_when(invite)
+        # 10:00 BST = 09:00Z = 11:00 CEST
+        self.assertEqual(text, "2026-07-30 11:00 – 12:00 CEST (Europe/Zurich)")
+
+    def test_london_tzid_invite_displays_in_zurich_winter(self) -> None:
+        ics = """BEGIN:VCALENDAR
+BEGIN:VEVENT
+SUMMARY:London winter
+DTSTART;TZID=Europe/London:20260115T100000
+DTEND;TZID=Europe/London:20260115T110000
+END:VEVENT
+END:VCALENDAR
+"""
+        invite = parse_ics_invite(ics)
+        assert invite is not None
+        with fixed_timezone("Europe/Zurich"):
+            text = format_invite_when(invite)
+        # 10:00 GMT = 10:00Z = 11:00 CET
+        self.assertEqual(text, "2026-01-15 11:00 – 12:00 CET (Europe/Zurich)")
 
     def test_shows_nonzero_seconds(self) -> None:
-        text = format_invite_when(
-            {
-                "start": "2026-07-30T14:00:30",
-                "end": "2026-07-30T15:00:05",
-            }
+        with fixed_timezone("Europe/Zurich"):
+            text = format_invite_when(
+                {
+                    "start": "2026-07-30T14:00:30",
+                    "end": "2026-07-30T15:00:05",
+                }
+            )
+        self.assertEqual(
+            text, "2026-07-30 14:00:30 – 15:00:05 CEST (Europe/Zurich)"
         )
-        self.assertEqual(text, "2026-07-30 14:00:30 – 15:00:05")
 
     def test_different_days_keep_both_dates(self) -> None:
-        text = format_invite_when(
-            {
-                "start": "2026-07-30T22:00:00",
-                "end": "2026-07-31T01:00:00",
-            }
+        with fixed_timezone("Europe/Zurich"):
+            text = format_invite_when(
+                {
+                    "start": "2026-07-30T22:00:00",
+                    "end": "2026-07-31T01:00:00",
+                }
+            )
+        self.assertEqual(
+            text,
+            "2026-07-30 22:00 – 2026-07-31 01:00 CEST (Europe/Zurich)",
         )
-        self.assertEqual(text, "2026-07-30 22:00 – 2026-07-31 01:00")
 
     def test_all_day(self) -> None:
         self.assertEqual(
@@ -423,16 +524,43 @@ class BuildVeventTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_vevent_ics({"title": "X", "meeting_url": "https://zoom.us/j/1"})
 
-    def test_builds_minimal_event(self) -> None:
+    def test_writes_utc_z_from_offset_iso(self) -> None:
         ics = build_vevent_ics(
             {
                 "title": "Sync",
-                "start": "2026-07-30T14:00:00",
-                "end": "2026-07-30T15:00:00",
-                "meeting_url": "https://zoom.us/j/1",
-                "uid": "test-uid-123",
+                "start": "2026-07-30T14:00:00+00:00",
+                "end": "2026-07-30T15:00:00+00:00",
+                "uid": "utc-uid-1",
             }
         )
+        self.assertIn("DTSTART:20260730T140000Z", ics)
+        self.assertIn("DTEND:20260730T150000Z", ics)
+
+    def test_naive_local_converts_to_utc_z(self) -> None:
+        with fixed_timezone("Europe/Zurich"):
+            ics = build_vevent_ics(
+                {
+                    "title": "Local",
+                    "start": "2026-07-30T16:00:00",
+                    "end": "2026-07-30T17:00:00",
+                    "uid": "local-uid-1",
+                }
+            )
+        # 16:00 CEST = 14:00Z
+        self.assertIn("DTSTART:20260730T140000Z", ics)
+        self.assertIn("DTEND:20260730T150000Z", ics)
+
+    def test_builds_minimal_event(self) -> None:
+        with fixed_timezone("Europe/Zurich"):
+            ics = build_vevent_ics(
+                {
+                    "title": "Sync",
+                    "start": "2026-07-30T14:00:00",
+                    "end": "2026-07-30T15:00:00",
+                    "meeting_url": "https://zoom.us/j/1",
+                    "uid": "test-uid-123",
+                }
+            )
         self.assertIn("BEGIN:VEVENT", ics)
         self.assertNotIn("BEGIN:VCALENDAR", ics)
         self.assertIn("UID:test-uid-123", ics)
@@ -440,19 +568,21 @@ class BuildVeventTests(unittest.TestCase):
         self.assertIn("SUMMARY:Sync", ics)
         self.assertIn("LOCATION:https://zoom.us/j/1", ics)
         self.assertIn("URL:https://zoom.us/j/1", ics)
+        self.assertIn("DTSTART:20260730T120000Z", ics)
 
     def test_teams_label_location_uses_meeting_url(self) -> None:
-        ics = build_vevent_ics(
-            {
-                "title": "Discussion",
-                "start": "2026-08-07T10:00:00",
-                "end": "2026-08-07T11:30:00",
-                "location": "Microsoft Teams Meeting",
-                "meeting_url": "https://teams.microsoft.com/l/meetup-join/abc",
-                "description": "Agenda item one",
-                "uid": "teams-uid-1",
-            }
-        )
+        with fixed_timezone("Europe/Zurich"):
+            ics = build_vevent_ics(
+                {
+                    "title": "Discussion",
+                    "start": "2026-08-07T10:00:00",
+                    "end": "2026-08-07T11:30:00",
+                    "location": "Microsoft Teams Meeting",
+                    "meeting_url": "https://teams.microsoft.com/l/meetup-join/abc",
+                    "description": "Agenda item one",
+                    "uid": "teams-uid-1",
+                }
+            )
         self.assertIn(
             "LOCATION:https://teams.microsoft.com/l/meetup-join/abc", ics
         )
@@ -462,14 +592,15 @@ class BuildVeventTests(unittest.TestCase):
         self.assertIn("Agenda item one", ics)
 
     def test_room_only_location_without_meeting_url(self) -> None:
-        ics = build_vevent_ics(
-            {
-                "title": "In person",
-                "start": "2026-08-07T10:00:00",
-                "location": "Conference Room B",
-                "uid": "room-uid-1",
-            }
-        )
+        with fixed_timezone("Europe/Zurich"):
+            ics = build_vevent_ics(
+                {
+                    "title": "In person",
+                    "start": "2026-08-07T10:00:00",
+                    "location": "Conference Room B",
+                    "uid": "room-uid-1",
+                }
+            )
         self.assertIn("LOCATION:Conference Room B", ics)
         self.assertNotIn("URL:", ics)
 

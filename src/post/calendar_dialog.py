@@ -16,6 +16,7 @@ gi.require_version("Adw", "1")
 
 from gi.repository import Adw, GLib, Gtk
 
+from post.mail.calendar_invite import to_utc_iso, viewer_tzinfo
 from post.mail.calendar_write import (
     CalendarTarget,
     add_invite_to_calendar,
@@ -162,7 +163,7 @@ class AddToCalendarDialog:
                 if self._on_error:
                     self._on_error("Enter a valid start date/time (YYYY-MM-DD HH:MM)")
                 return
-            invite["start"] = start_dt.isoformat(timespec="seconds")
+            invite["start"] = to_utc_iso(start_dt)
             invite["all_day"] = False
             if end_text:
                 end_dt = _parse_user_datetime(end_text)
@@ -170,11 +171,9 @@ class AddToCalendarDialog:
                     if self._on_error:
                         self._on_error("Enter a valid end date/time (YYYY-MM-DD HH:MM)")
                     return
-                invite["end"] = end_dt.isoformat(timespec="seconds")
+                invite["end"] = to_utc_iso(end_dt)
             else:
-                invite["end"] = (start_dt + timedelta(hours=1)).isoformat(
-                    timespec="seconds"
-                )
+                invite["end"] = to_utc_iso(start_dt + timedelta(hours=1))
 
         def worker() -> None:
             error: Exception | None = None
@@ -200,6 +199,7 @@ class AddToCalendarDialog:
 
 
 def _parse_user_datetime(text: str) -> datetime | None:
+    """Parse dialog input as viewer-local wall time (naive → local tz)."""
     text = text.strip()
     if not text:
         return None
@@ -211,10 +211,16 @@ def _parse_user_datetime(text: str) -> datetime | None:
         "%Y-%m-%d",
     ):
         try:
-            return datetime.strptime(text, fmt)
+            dt = datetime.strptime(text, fmt)
+            return dt.replace(tzinfo=viewer_tzinfo())
         except ValueError:
             continue
-    return _parse_iso_datetime(text)
+    parsed = _parse_iso_datetime(text)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=viewer_tzinfo())
+    return parsed
 
 
 def present_add_to_calendar(
