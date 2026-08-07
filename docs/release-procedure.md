@@ -10,8 +10,9 @@ any redactions) in the release issue or PR.
 
 ## 1. Version
 
-1. Set `[project].version` in `pyproject.toml` (also `src/post/__init__.py`
-   `__version__` fallback).
+1. Set `[project].version` in `pyproject.toml` (canonical). Keep
+   `src/post/__init__.py` `__version__` in sync as a last-resort fallback only
+   (About prefers pyproject when present).
 2. Match `debian/changelog` upstream version to that value.
 3. Match `rpm/post.spec` `Version:` (and add a `%changelog` entry).
 4. Choose the Git tag `v<version>` (same string as the project version).
