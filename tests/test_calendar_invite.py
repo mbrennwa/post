@@ -201,6 +201,130 @@ END:VCALENDAR
         self.assertEqual(invite["title"], "Fallback title")
         self.assertIn("zoom.us", invite["meeting_url"] or "")
 
+    def test_quoted_outlook_teams_link_ignored_on_reply(self) -> None:
+        html = (
+            "<div>Hello, the samples are on the way.</div>"
+            '<div id="appendonsend"></div><hr>'
+            '<div id="divRplyFwdMsg">'
+            "Microsoft Teams meeting "
+            '<a href="https://teams.microsoft.com/meet/219697379367806">Join</a>'
+            "</div>"
+        )
+        invite = merge_invite_details(
+            subject="Re: project sync",
+            body_html=html,
+            body_plain=(
+                "Hello, the samples are on the way.\n\n"
+                "On Tue, Alice wrote:\n"
+                "> Join https://teams.microsoft.com/meet/219697379367806\n"
+            ),
+        )
+        self.assertIsNone(invite)
+
+    def test_forward_subject_keeps_quoted_meeting_link(self) -> None:
+        html = (
+            "<div>FYI</div>"
+            '<div id="appendonsend"></div><hr>'
+            '<div id="divRplyFwdMsg">'
+            '<a href="https://teams.microsoft.com/meet/219697379367806">Join</a>'
+            "</div>"
+        )
+        invite = merge_invite_details(subject="Fwd: project sync", body_html=html)
+        assert invite is not None
+        self.assertEqual(invite["source"], "meeting_link")
+        self.assertIn("teams.microsoft.com", invite["meeting_url"] or "")
+
+    def test_new_meeting_link_above_quote_still_detected(self) -> None:
+        html = (
+            '<div>Join <a href="https://meet.google.com/abc-defg-hij">Meet</a></div>'
+            '<div id="appendonsend"></div><hr>'
+            "<div>old thread</div>"
+        )
+        invite = merge_invite_details(subject="Re: standup", body_html=html)
+        assert invite is not None
+        self.assertEqual(invite["source"], "meeting_link")
+        self.assertIn("meet.google.com", invite["meeting_url"] or "")
+
+    def test_plain_reply_ignores_quoted_meeting_link(self) -> None:
+        invite = merge_invite_details(
+            subject="Re: sync",
+            body_plain=(
+                "Thanks, that works.\n\n"
+                "On Mon, Alice wrote:\n"
+                "> Join https://zoom.us/j/999\n"
+            ),
+        )
+        self.assertIsNone(invite)
+
+    def test_ics_reply_method_is_not_an_invite(self) -> None:
+        ics = """BEGIN:VCALENDAR
+METHOD:REPLY
+BEGIN:VEVENT
+SUMMARY:Project sync
+DTSTART:20260730T140000Z
+DTEND:20260730T150000Z
+URL:https://teams.microsoft.com/l/meetup-join/abc
+END:VEVENT
+END:VCALENDAR
+"""
+        self.assertIsNone(
+            merge_invite_details(
+                subject="Accepted: Project sync",
+                ics_text=ics,
+                body_plain="Join https://teams.microsoft.com/l/meetup-join/abc",
+            )
+        )
+
+    def test_ics_cancel_method_is_not_an_invite(self) -> None:
+        ics = """BEGIN:VCALENDAR
+METHOD:CANCEL
+BEGIN:VEVENT
+SUMMARY:Project sync
+DTSTART:20260730T140000Z
+END:VEVENT
+END:VCALENDAR
+"""
+        self.assertIsNone(merge_invite_details(subject="Canceled: Project sync", ics_text=ics))
+
+    def test_ics_counter_method_is_not_an_invite(self) -> None:
+        ics = """BEGIN:VCALENDAR
+METHOD:COUNTER
+BEGIN:VEVENT
+SUMMARY:Project sync
+DTSTART:20260730T160000Z
+END:VEVENT
+END:VCALENDAR
+"""
+        self.assertIsNone(merge_invite_details(subject="New time proposed", ics_text=ics))
+
+    def test_ics_publish_is_addable(self) -> None:
+        ics = """BEGIN:VCALENDAR
+METHOD:PUBLISH
+BEGIN:VEVENT
+SUMMARY:Holiday
+DTSTART:20261224T000000Z
+END:VEVENT
+END:VCALENDAR
+"""
+        invite = merge_invite_details(subject="Holiday", ics_text=ics)
+        assert invite is not None
+        self.assertEqual(invite["source"], "ics")
+        self.assertEqual((invite["method"] or "").upper(), "PUBLISH")
+        self.assertEqual(invite["title"], "Holiday")
+
+    def test_ics_missing_method_is_addable(self) -> None:
+        ics = """BEGIN:VCALENDAR
+BEGIN:VEVENT
+SUMMARY:Project sync
+DTSTART:20260730T140000Z
+END:VEVENT
+END:VCALENDAR
+"""
+        invite = merge_invite_details(subject="Project sync", ics_text=ics)
+        assert invite is not None
+        self.assertEqual(invite["source"], "ics")
+        self.assertIsNone(invite["method"])
+
 
 class AttachmentExtractionTests(unittest.TestCase):
     def test_multipart_alternative_calendar_without_filename(self) -> None:

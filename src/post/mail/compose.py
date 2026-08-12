@@ -17,6 +17,8 @@ gi.require_version("Gio", "2.0")
 
 from gi.repository import Gio
 
+from .subject_prefixes import strip_subject_prefixes as _strip_subject_prefixes
+
 _ADDRESS_SPLIT = re.compile(r",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)")
 _HEADER_NEWLINES = re.compile(r"[\r\n]+")
 # Line break not followed by WSP is header injection, not an RFC 5322 fold.
@@ -222,59 +224,6 @@ def draft_addresses_to_internet_address(addresses: list[str]) -> Any | None:
                 _sanitize_header_field(item.strip(), field="Recipient address"),
             )
     return container if container.length() > 0 else None
-
-
-# Reply / forward subject prefixes (case-insensitive).
-# Strategy: strip known localized reply/forward prefixes (stacked), then always
-# re-prefix with English ``Re:`` / ``Fwd:``. No account/UI locale chooses the
-# outgoing prefix; the lists are pragmatic MUA coverage, not full i18n.
-# Mixed stacks like "AW: Re: Fwd: topic" collapse cleanly.
-_REPLY_SUBJECT_PREFIXES = (
-    "re",
-    "aw",
-    "sv",
-    "antw",
-    "antwort",
-    "res",
-    "rif",
-    "rif.",
-    "odp",
-    "ynt",
-)
-_FORWARD_SUBJECT_PREFIXES = (
-    "fwd",
-    "fw",
-    "wg",
-    "vl",
-    "vs",
-    "tr",
-    "enc",
-    "rv",
-)
-_SUBJECT_PREFIXES = tuple(
-    sorted(
-        {*_REPLY_SUBJECT_PREFIXES, *_FORWARD_SUBJECT_PREFIXES},
-        key=len,
-        reverse=True,
-    )
-)
-
-
-def _strip_subject_prefixes(subject: str) -> str:
-    """Remove stacked reply/forward prefixes from the start of a subject."""
-    text = subject
-    while True:
-        stripped = text.lstrip()
-        lowered = stripped.lower()
-        matched = False
-        for prefix in _SUBJECT_PREFIXES:
-            token = f"{prefix}:"
-            if lowered.startswith(token):
-                text = stripped[len(token) :]
-                matched = True
-                break
-        if not matched:
-            return stripped
 
 
 def build_reply_subject(subject: str) -> str:

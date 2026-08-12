@@ -17,6 +17,9 @@ from typing import Any
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .quote_history import unquoted_html, unquoted_plain
+from .subject_prefixes import subject_looks_like_forward
+
 _CALENDAR_MIME_TYPES = frozenset(
     {
         "text/calendar",
@@ -73,6 +76,9 @@ _TEAMS_PROP_KEYS = (
     "X-MICROSOFT-SKYPETEAMSMEETINGURL",
     "X-MICROSOFT-SKYPETEAMSMEETINGURL2",
 )
+
+# iTIP methods that are not "add this event" (RSVP / cancel / counter-propose).
+_NON_ADDABLE_ICS_METHODS = frozenset({"REPLY", "CANCEL", "COUNTER"})
 
 _ICS_PROP_RE = re.compile(
     r"^([A-Z0-9\-]+)((?:;[^:]*)?):(.*)$",
@@ -456,6 +462,33 @@ def invite_join_url(invite: dict[str, Any]) -> str | None:
     return None
 
 
+def _ics_method(ics_text: str | None) -> str:
+    """Return the ICS METHOD value, uppercased, or empty when absent."""
+    if not ics_text:
+        return ""
+    match = re.search(
+        r"^METHOD:\s*(.*)$",
+        unfold_ics(ics_text),
+        re.MULTILINE | re.IGNORECASE,
+    )
+    return match.group(1).strip().upper() if match else ""
+
+
+def _meeting_url_from_bodies(
+    *,
+    subject: str | None,
+    body_plain: str | None,
+    body_html: str | None,
+) -> str | None:
+    """Find a meeting URL, ignoring quoted history unless *subject* is a forward."""
+    if subject_looks_like_forward(subject):
+        return find_meeting_url_in_html(body_html) or find_meeting_url(body_plain)
+    if body_html:
+        # HTML present: do not fall back to the full plain body (quoted links).
+        return find_meeting_url_in_html(unquoted_html(body_html))
+    return find_meeting_url(unquoted_plain(body_plain))
+
+
 def merge_invite_details(
     *,
     subject: str | None = None,
@@ -467,7 +500,12 @@ def merge_invite_details(
     """Build a ``calendar_invite`` dict from ICS and/or meeting links.
 
     Never invents start/end times when only a meeting link is present.
+    Ignores quoted reply history for meeting links unless the subject is a
+    forward. ICS ``REPLY`` / ``CANCEL`` / ``COUNTER`` are not addable invites.
     """
+    if _ics_method(ics_text) in _NON_ADDABLE_ICS_METHODS:
+        return None
+
     invite: dict[str, Any] | None = None
     if ics_text:
         invite = parse_ics_invite(ics_text)
@@ -476,7 +514,11 @@ def merge_invite_details(
     if invite and invite.get("meeting_url"):
         meeting_url = invite["meeting_url"]
     if not meeting_url:
-        meeting_url = find_meeting_url_in_html(body_html) or find_meeting_url(body_plain)
+        meeting_url = _meeting_url_from_bodies(
+            subject=subject,
+            body_plain=body_plain,
+            body_html=body_html,
+        )
 
     if invite is None and meeting_url:
         invite = {

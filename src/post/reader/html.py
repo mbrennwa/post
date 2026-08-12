@@ -10,6 +10,7 @@ import html
 import re
 from html.parser import HTMLParser
 
+from post.mail.quote_history import split_html_at_quote_history
 from post.preferences import (
     MESSAGE_APPEARANCE_ACCEPT_SENDER,
     MESSAGE_APPEARANCE_ADAPT_TEXT,
@@ -414,59 +415,11 @@ _NAMED_CSS_COLORS: dict[str, tuple[int, int, int]] = {
     "yellow": (255, 255, 0),
     "yellowgreen": (154, 205, 50),
 }
-_QUOTE_HISTORY_REGEXES = (
-    re.compile(
-        r'\bid\s*=\s*["\']mail-editor-reference-message-container["\']',
-        re.IGNORECASE,
-    ),
-    re.compile(r'\bid\s*=\s*["\']geary-quote["\']', re.IGNORECASE),
-    re.compile(
-        r'\bclass\s*=\s*["\'][^"\']*\bgmail_quote\b[^"\']*["\']',
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\bclass\s*=\s*['\"][^'\"]*\bgmail_quote\b[^'\"]*['\"]",
-        re.IGNORECASE,
-    ),
-    re.compile(r'\bclass\s*=\s*["\'][^"\']*\bpost_quote\b[^"\']*["\']', re.IGNORECASE),
-    re.compile(
-        r"\bclass\s*=\s*['\"][^'\"]*\bpost_quote\b[^'\"]*['\"]",
-        re.IGNORECASE,
-    ),
-    re.compile(r'\bid\s*=\s*["\']appendonsend["\']', re.IGNORECASE),
-    re.compile(r"<blockquote\b", re.IGNORECASE),
-)
-
-
-def _quote_history_boundary_start(body_html: str, match: re.Match[str]) -> int:
-    """Return the index where quoted history begins for a marker match."""
-    if match.group(0).lstrip().lower().startswith("<blockquote"):
-        return match.start()
-    boundary = body_html.rfind("<", 0, match.start())
-    if boundary == -1:
-        return match.start()
-    return boundary
-
-
-def _split_html_at_quote_history(body_html: str) -> tuple[str, str | None]:
-    """Split HTML into content before quoted history and the quoted suffix."""
-    cut = len(body_html)
-    for pattern in _QUOTE_HISTORY_REGEXES:
-        match = pattern.search(body_html)
-        if match is not None:
-            cut = min(cut, _quote_history_boundary_start(body_html, match))
-    if cut >= len(body_html):
-        return body_html, None
-    prefix = body_html[:cut]
-    quoted = body_html[cut:]
-    if not quoted.strip():
-        return body_html, None
-    return prefix, quoted
 
 
 def _html_for_adaptation_detection(body_html: str) -> str:
     """Return the portion of HTML whose colors drive the adapt decision."""
-    prefix, _quoted = _split_html_at_quote_history(body_html)
+    prefix, _quoted = split_html_at_quote_history(body_html)
     return prefix
 
 
@@ -1033,7 +986,7 @@ def _effective_message_appearance(
 ) -> MessageAppearance:
     if appearance == MESSAGE_APPEARANCE_ACCEPT_SENDER or body_html is None:
         return appearance
-    prefix, quoted = _split_html_at_quote_history(body_html)
+    prefix, quoted = split_html_at_quote_history(body_html)
     if quoted is not None:
         if not prefix.strip():
             return appearance
