@@ -7574,16 +7574,22 @@ class MailService:
         seen: bool | None = None,
         flagged: bool | None = None,
     ) -> None:
+        # Copy-on-write: never mutate flags dicts that may still be referenced by
+        # MessageListItem rows. In-place updates make the context menu read the
+        # new value while the list flag icon stays stale until rebind (#289).
         index = self._folder_indexes.get((account_uid, folder_name))
         if index is None:
             return
-        for message in index.messages:
+        for position, message in enumerate(index.messages):
             if message.get("uid") == message_uid:
-                flags = message.setdefault("flags", {})
+                merged = dict(message.get("flags") or {})
                 if seen is not None:
-                    flags["seen"] = seen
+                    merged["seen"] = seen
                 if flagged is not None:
-                    flags["flagged"] = flagged
+                    merged["flagged"] = flagged
+                updated = dict(message)
+                updated["flags"] = merged
+                index.messages[position] = updated
                 break
 
     def _update_cached_folder_counts(

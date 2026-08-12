@@ -85,6 +85,13 @@ class MessageListItem(GObject.Object):
         self.message = message
 
 
+def _copy_message_for_list(message: dict[str, Any]) -> dict[str, Any]:
+    """Shallow-copy a message so list rows do not alias folder-cache dicts (#289)."""
+    copied = dict(message)
+    copied["flags"] = dict(message.get("flags") or {})
+    return copied
+
+
 class VirtualMessageList(Gtk.ScrolledWindow):
     """Scrollable virtual list of mail header rows."""
 
@@ -250,7 +257,9 @@ class VirtualMessageList(Gtk.ScrolledWindow):
     def set_messages(self, messages: Iterable[dict[str, Any]], *, folder_name: str) -> None:
         at_top = self._is_scrolled_to_top()
         self._folder_name = folder_name
-        items = [MessageListItem(message) for message in messages]
+        items = [
+            MessageListItem(_copy_message_for_list(message)) for message in messages
+        ]
         self._list_key_positions.clear()
         self._selection.unselect_all()
         count = self._store.get_n_items()
@@ -268,7 +277,9 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         *,
         folder_name: str,
     ) -> None:
-        items = [MessageListItem(message) for message in messages]
+        items = [
+            MessageListItem(_copy_message_for_list(message)) for message in messages
+        ]
         if not items:
             return
         at_top = self._is_scrolled_to_top()
@@ -285,7 +296,9 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         *,
         folder_name: str,
     ) -> None:
-        items = [MessageListItem(message) for message in messages]
+        items = [
+            MessageListItem(_copy_message_for_list(message)) for message in messages
+        ]
         if not items:
             return
         self._folder_name = folder_name
@@ -324,7 +337,7 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         if not uid:
             return
         self._folder_name = folder_name
-        message = dict(message)
+        message = _copy_message_for_list(message)
 
         if replace_uid:
             replace_position = self._list_key_positions.get(replace_uid)
