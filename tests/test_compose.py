@@ -38,6 +38,7 @@ from post.mail.compose import (
     read_compose_attachments_from_message,
     split_compose_body_at_quote,
 )
+from post.mail.subject_prefixes import subject_looks_like_forward
 from post.mail.helpers import (
     _QuotableHtmlParser,
     _mime_message_raw_bytes,
@@ -153,6 +154,19 @@ class BuildReplySubjectTests(unittest.TestCase):
 
     def test_strips_forward_prefix_when_replying(self) -> None:
         self.assertEqual(build_reply_subject("Fwd: Hello"), "Re: Hello")
+
+
+class SubjectLooksLikeForwardTests(unittest.TestCase):
+    def test_fwd_and_locale_prefixes(self) -> None:
+        self.assertTrue(subject_looks_like_forward("Fwd: meeting"))
+        self.assertTrue(subject_looks_like_forward("FW: meeting"))
+        self.assertTrue(subject_looks_like_forward("WG: meeting"))
+        self.assertFalse(subject_looks_like_forward("Re: meeting"))
+        self.assertFalse(subject_looks_like_forward("AW: meeting"))
+        self.assertFalse(subject_looks_like_forward("meeting"))
+        self.assertFalse(subject_looks_like_forward("Re: Fwd: meeting"))
+        self.assertTrue(subject_looks_like_forward("Fwd: Re: meeting"))
+        self.assertFalse(subject_looks_like_forward(None))
 
 
 class EnvelopeRecipientAddressesTests(unittest.TestCase):
