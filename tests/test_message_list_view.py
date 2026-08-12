@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 import gi
 
@@ -12,7 +13,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import GLib, Gtk
 
-from post.message_list_view import VirtualMessageList
+from post.message_list_view import MessageListItem, VirtualMessageList
 
 
 def _msg(uid: str, *, seen: bool = True, flagged: bool = False) -> dict:
@@ -22,6 +23,17 @@ def _msg(uid: str, *, seen: bool = True, flagged: bool = False) -> dict:
         "from": "sender@example.com",
         "flags": {"seen": seen, "flagged": flagged},
     }
+
+
+def _fake_list_item() -> SimpleNamespace:
+    return SimpleNamespace(
+        subject_label=Gtk.Label(),
+        date_label=Gtk.Label(),
+        meta_label=Gtk.Label(),
+        unread_dot=Gtk.Box(),
+        attach_icon=Gtk.Image(),
+        flag_icon=Gtk.Image(),
+    )
 
 
 class UpdateMessageFlagsTests(unittest.TestCase):
@@ -58,6 +70,57 @@ class UpdateMessageFlagsTests(unittest.TestCase):
         self.assertIsNotNone(message)
         assert message is not None
         self.assertEqual(message["flags"], {"seen": False, "flagged": True})
+
+    def test_set_messages_does_not_alias_source_flags_dict(self) -> None:
+        source = _msg("1", flagged=False)
+        self.message_list.set_messages([source], folder_name="INBOX")
+
+        source["flags"]["flagged"] = True
+
+        message = self.message_list.get_message("1")
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertFalse(message["flags"]["flagged"])
+        self.assertIsNot(message["flags"], source["flags"])
+
+    def test_inplace_flag_mutation_does_not_refresh_flag_icon(self) -> None:
+        """Document #289: mutating flags without set_message leaves the icon stale."""
+        self.message_list.set_messages([_msg("1", flagged=False)], folder_name="INBOX")
+        item = self.message_list._store.get_item(0)
+        self.assertIsInstance(item, MessageListItem)
+        assert isinstance(item, MessageListItem)
+
+        list_item = _fake_list_item()
+        self.message_list._populate_list_item_row(list_item, item)
+        self.assertFalse(list_item.flag_icon.get_visible())
+
+        item.message["flags"]["flagged"] = True
+        self.assertTrue(item.message["flags"]["flagged"])
+        self.assertFalse(list_item.flag_icon.get_visible())
+
+    def test_update_message_flags_refreshes_flag_icon_visibility(self) -> None:
+        self.message_list.set_messages([_msg("1", flagged=False)], folder_name="INBOX")
+        item = self.message_list._store.get_item(0)
+        self.assertIsInstance(item, MessageListItem)
+        assert isinstance(item, MessageListItem)
+
+        list_item = _fake_list_item()
+        self.message_list._populate_list_item_row(list_item, item)
+
+        def on_message_changed(
+            store_item: MessageListItem,
+            _pspec: object,
+        ) -> None:
+            self.message_list._populate_list_item_row(list_item, store_item)
+
+        item.connect("notify::message", on_message_changed)
+        self.assertFalse(list_item.flag_icon.get_visible())
+
+        self.message_list.update_message_flags("1", {"flagged": True})
+        self.assertTrue(list_item.flag_icon.get_visible())
+
+        self.message_list.update_message_flags("1", {"flagged": False})
+        self.assertFalse(list_item.flag_icon.get_visible())
 
 
 class PrependMessagesTests(unittest.TestCase):

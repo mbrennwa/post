@@ -5543,7 +5543,16 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _reconcile_refreshed_message_flags(self, refreshed: list[dict]) -> bool:
         """Apply seen/flagged patches when a refresh kept the same message set."""
-        patches = message_flag_patches(self._current_folder_messages or [], refreshed)
+        current = self._current_folder_messages or []
+        # Prefer list-store rows as the baseline so we still call set_message
+        # when the folder-cache dict already matches the server but the bound
+        # list item was left without notify::message (#289).
+        baseline: list[dict] = []
+        for message in current:
+            list_key = self._message_list_key(message)
+            store_message = self._message_list_view.get_message(list_key)
+            baseline.append(store_message if store_message is not None else message)
+        patches = message_flag_patches(baseline, refreshed)
         if not patches:
             return False
         for list_key, flags in patches:
@@ -5568,11 +5577,15 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> None:
         if self._current_folder_messages is None:
             return
-        for message in self._current_folder_messages:
+        for position, message in enumerate(self._current_folder_messages):
             if self._message_list_key(message) == uid:
+                # Replace the row (and flags dict) so we do not mutate a dict
+                # still held by MessageListItem without set_message (#289).
                 merged = dict(message.get("flags") or {})
                 merged.update(flags)
-                message["flags"] = merged
+                updated = dict(message)
+                updated["flags"] = merged
+                self._current_folder_messages[position] = updated
                 break
 
     def _mark_message_read(self, uid: str) -> None:
