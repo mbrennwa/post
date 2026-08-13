@@ -20,6 +20,7 @@ from post.mail.message_list_state import (
     prune_stale_folder_index_uids,
     touch_lru_cache,
     upsert_folder_index_by_identity,
+    find_folder_index_sibling_uids,
     _folder_message_identity_key,
 )
 
@@ -431,6 +432,40 @@ class FolderIndexIdentityUpsertTests(unittest.TestCase):
         self.assertNotEqual(
             _folder_message_identity_key(a),
             _folder_message_identity_key(b),
+        )
+
+    def test_sibling_uids_prefer_live(self) -> None:
+        messages = [
+            {
+                "uid": "stale-uid",
+                "message_id": "<msg@example.com>",
+                "subject": "Hello",
+            },
+            {
+                "uid": "other",
+                "message_id": "<other@example.com>",
+            },
+            {
+                "uid": "live-uid",
+                "message_id": "<msg@example.com>",
+                "subject": "Hello",
+            },
+        ]
+        self.assertEqual(
+            find_folder_index_sibling_uids(
+                messages, "stale-uid", prefer_uids={"live-uid"}
+            ),
+            ["live-uid"],
+        )
+
+    def test_sibling_uids_skip_uid_identity(self) -> None:
+        messages = [
+            {"uid": "src-1", "subject": "Hi", "from": "a", "sort_date": 1},
+            {"uid": "src-2", "subject": "Hi", "from": "a", "sort_date": 1},
+        ]
+        self.assertEqual(
+            find_folder_index_sibling_uids(messages, "src-1"),
+            [],
         )
 
     def test_upsert_replaces_stale_restid(self) -> None:

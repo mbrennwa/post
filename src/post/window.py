@@ -68,12 +68,14 @@ from post.mail.message_flags import FOLLOW_UP_FLAG_BACKENDS
 from post.mail.search import (
     MessageSearchQuery,
     SearchFilterProgress,
+    annotate_search_match,
     filter_messages_by_query,
     filter_search_matches_for_folder,
     format_search_filter_progress,
     format_search_result_meta,
     format_search_target_label,
     group_list_keys_by_location,
+    make_search_row_key,
     parse_search_query,
     parse_search_row_key,
     query_requires_body_scan,
@@ -2364,32 +2366,65 @@ class MainWindow(Adw.ApplicationWindow):
             if message.get("uid") != uid
         ]
 
+    def _remap_list_key(self, list_key: str | None, remaps: dict[str, str]) -> str | None:
+        if list_key is None:
+            return None
+        if list_key in remaps:
+            return remaps[list_key]
+        parsed = parse_search_row_key(list_key)
+        if parsed is not None:
+            account_uid, folder_name, message_uid = parsed
+            if message_uid in remaps:
+                return make_search_row_key(
+                    account_uid, folder_name, remaps[message_uid]
+                )
+        return list_key
+
     def _remap_folder_message_uids(self, remaps: dict[str, str]) -> None:
-        """Rewrite list keys when heavy-folder indexing remaps RestId A→B (#267)."""
+        """Rewrite list keys when RestId A→B remaps (#267 / #294).
+
+        Search rows are keyed by ``account\\0folder\\0uid``, so a raw RestId
+        lookup would miss them.
+        """
         if not remaps:
             return
 
-        def _map(uid: str | None) -> str | None:
-            if uid is None:
-                return None
-            return remaps.get(uid, uid)
+        def _lookup_existing(old_uid: str) -> tuple[str | None, dict | None]:
+            existing = self._message_list_view.get_message(old_uid)
+            if existing is not None:
+                return old_uid, existing
+            for message in self._current_folder_messages or []:
+                if str(message.get("uid") or "") != old_uid:
+                    continue
+                list_key = self._message_list_key(message)
+                found = self._message_list_view.get_message(list_key)
+                return list_key, found if found is not None else dict(message)
+            return None, None
 
         for old_uid, new_uid in remaps.items():
             if not old_uid or not new_uid or old_uid == new_uid:
                 continue
-            existing = self._message_list_view.get_message(old_uid)
+            list_key, existing = _lookup_existing(old_uid)
             if existing is None:
                 continue
             updated = dict(existing)
             updated["uid"] = new_uid
+            account_uid = updated.get("_search_account_uid")
+            folder_name = updated.get("_search_folder")
+            if account_uid and folder_name:
+                updated = annotate_search_match(
+                    updated,
+                    account_uid=str(account_uid),
+                    folder_name=str(folder_name),
+                )
             self._message_list_view.upsert_message(
                 updated,
-                folder_name=self._current_folder or "",
-                replace_uid=old_uid,
+                folder_name=str(folder_name or self._current_folder or ""),
+                replace_uid=list_key or old_uid,
             )
             self._upsert_message_in_folder_cache(updated, old_uid)
 
-        mapped_current = _map(self._current_message_uid)
+        mapped_current = self._remap_list_key(self._current_message_uid, remaps)
         if (
             mapped_current
             and mapped_current != self._current_message_uid
@@ -2397,12 +2432,13 @@ class MainWindow(Adw.ApplicationWindow):
             self._current_message_uid = mapped_current
             set_active_message_uid(mapped_current)
 
-        self._pending_restore_message_uid = _map(
-            self._pending_restore_message_uid
+        self._pending_restore_message_uid = self._remap_list_key(
+            self._pending_restore_message_uid, remaps
         )
         if self._context_message_uids:
             self._context_message_uids = [
-                remaps.get(uid, uid) for uid in self._context_message_uids
+                self._remap_list_key(uid, remaps) or uid
+                for uid in self._context_message_uids
             ]
 
     def _setup_undo_action(self) -> None:
@@ -6952,6 +6988,12 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         assert msg is not None
+
+        previous_uid = str(msg.get("_previous_uid") or "")
+        recovered_uid = str(msg.get("uid") or "")
+        if previous_uid and recovered_uid and previous_uid != recovered_uid:
+            self._remap_folder_message_uids({previous_uid: recovered_uid})
+            uid = self._remap_list_key(uid, {previous_uid: recovered_uid}) or uid
 
         self._current_message_uid = uid
         set_active_message_uid(uid)

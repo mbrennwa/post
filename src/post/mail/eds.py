@@ -146,6 +146,7 @@ from .folders import (
 from post.preferences import get_account_user_online
 from .message_list_state import (
     HEAVY_FOLDER_INDEX_BATCH_SIZE,
+    find_folder_index_sibling_uids,
     folder_index_covers_identities,
     is_heavy_folder_name,
     is_trash_or_junk_folder_name,
@@ -583,6 +584,8 @@ class MailService:
     _folder_indexes: dict[tuple[str, str], _FolderMessageIndex] = field(
         default_factory=dict, init=False
     )
+    # Set when Graph RestId recovery fetches a live sibling UID (#294).
+    _recovered_read_uid: str | None = field(default=None, init=False, repr=False)
     _correspondent_indexes: dict[str, list[Correspondent]] = field(
         default_factory=dict, init=False
     )
@@ -4506,6 +4509,216 @@ class MailService:
             log.debug("get_message_cached failed for %s", api_uid, exc_info=True)
             return None
 
+    def _try_fetch_message_uid(
+        self,
+        folder: Camel.Folder,
+        message_uid: str,
+    ) -> Any | None:
+        """Fetch MIME for ``message_uid`` without recursive recovery (#294)."""
+        if camel_uid_is_binary(message_uid):
+            return self._try_message_cached(folder, message_uid)
+        api_uid = camel_uid_to_api(message_uid)
+        cached = self._try_message_cached(folder, api_uid)
+        if cached is not None:
+            return cached
+        try:
+            mime = folder.get_message_sync(api_uid, None)
+        except GLib.Error as exc:
+            if not self._is_missing_message_error(exc):
+                raise
+            mime = None
+            if self._is_graph_item_not_found_error(exc):
+                return None
+        if mime is not None:
+            return mime
+        try:
+            folder.synchronize_message_sync(api_uid, None)
+        except Exception as sync_exc:
+            if self._is_graph_item_not_found_error(sync_exc):
+                return None
+            log.debug(
+                "synchronize_message_sync failed for alternate UID %s",
+                message_uid,
+                exc_info=True,
+            )
+        try:
+            mime = folder.get_message_sync(api_uid, None)
+        except GLib.Error as retry_exc:
+            if not self._is_missing_message_error(retry_exc):
+                raise
+            return self._try_message_cached(folder, api_uid)
+        if mime is not None:
+            return mime
+        return self._try_message_cached(folder, api_uid)
+
+    def _folder_index_row(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+    ) -> dict | None:
+        for message in self._folder_index_messages(account_uid, folder_name):
+            if str(message.get("uid") or "") == message_uid:
+                return message
+        return None
+
+    def _remap_folder_index_uid(
+        self,
+        account_uid: str,
+        folder_name: str,
+        old_uid: str,
+        new_uid: str,
+    ) -> None:
+        """Replace RestId ``old_uid`` with ``new_uid`` in the folder-index (#294)."""
+        if not old_uid or not new_uid or old_uid == new_uid:
+            return
+        messages = self._folder_index_messages(account_uid, folder_name)
+        by_uid: dict[str, dict] = {}
+        for message in messages:
+            uid = str(message.get("uid") or "")
+            if uid:
+                by_uid[uid] = dict(message)
+        old_row = by_uid.get(old_uid)
+        incoming = dict(old_row) if old_row is not None else {"uid": new_uid}
+        incoming["uid"] = new_uid
+        incoming.pop("moved_provisional", None)
+        upsert_folder_index_by_identity(
+            by_uid,
+            incoming,
+            prefer_uids={new_uid},
+        )
+        by_uid.pop(old_uid, None)
+        sorted_messages = self._sorted_folder_messages(by_uid)
+        key = (account_uid, folder_name)
+        existing = self._folder_indexes.get(key)
+        unread = existing.unread if existing is not None else 0
+        total = existing.total if existing is not None else len(sorted_messages)
+        if existing is not None:
+            existing.messages = sorted_messages
+        else:
+            self._folder_indexes[key] = _FolderMessageIndex(
+                messages=sorted_messages,
+                unread=unread,
+                total=total,
+            )
+        folder_index_cache.save(
+            account_uid,
+            folder_name,
+            sorted_messages,
+            unread,
+            total,
+            grow_only=is_heavy_folder_name(folder_name),
+        )
+
+    def _drop_stale_folder_index_uid(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+    ) -> None:
+        """Remove a Graph-confirmed-dead RestId from the folder-index (#294)."""
+        messages = self._folder_index_messages(account_uid, folder_name)
+        row = next(
+            (
+                message
+                for message in messages
+                if str(message.get("uid") or "") == message_uid
+            ),
+            None,
+        )
+        key = (account_uid, folder_name)
+        existing = self._folder_indexes.get(key)
+        unread = existing.unread if existing is not None else 0
+        total = existing.total if existing is not None else len(messages)
+        if (
+            row is not None
+            and unread >= 0
+            and not (row.get("flags") or {}).get("seen", False)
+        ):
+            unread = max(0, unread - 1)
+        if total >= 0:
+            total = max(0, total - 1)
+        else:
+            total = max(0, len(messages) - 1)
+        self._remove_messages_from_cache(
+            account_uid, folder_name, [message_uid], unread, total
+        )
+
+    def _recover_stale_graph_restid(
+        self,
+        folder: Camel.Folder,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+    ) -> Any | None:
+        """Fetch a live sibling / dest UID after Graph ErrorItemNotFound (#294)."""
+        index_messages = self._folder_index_messages(account_uid, folder_name)
+        prefer: set[str] = set()
+        try:
+            prefer = set(folder_get_uids(folder))
+        except Exception:
+            log.debug("Could not list Camel UIDs while recovering %s", message_uid)
+        siblings = find_folder_index_sibling_uids(
+            index_messages,
+            message_uid,
+            prefer_uids=prefer,
+        )
+        for sibling in siblings:
+            mime = self._try_fetch_message_uid(folder, sibling)
+            if mime is None:
+                continue
+            log.info(
+                "Recovered message %s in %r via live RestId %s",
+                message_uid,
+                folder_name,
+                sibling,
+            )
+            self._remap_folder_index_uid(
+                account_uid, folder_name, message_uid, sibling
+            )
+            self._recovered_read_uid = sibling
+            return mime
+
+        row = self._folder_index_row(account_uid, folder_name, message_uid)
+        if row is not None and row.get("moved_provisional"):
+            backend = self._backend_for_account(account_uid)
+            uid_limit = (
+                500 if (backend or "").lower() in {"microsoft365", "ews"} else None
+            )
+            try:
+                dest_uids = self._find_moved_uids_in_folder_unlocked(
+                    folder,
+                    [row],
+                    uid_limit=uid_limit,
+                    backend=backend,
+                )
+            except Exception:
+                log.debug(
+                    "Could not resolve destination UID for provisional %s in %r",
+                    message_uid,
+                    folder_name,
+                    exc_info=True,
+                )
+                dest_uids = []
+            for dest_uid in dest_uids:
+                if not dest_uid or dest_uid == message_uid:
+                    continue
+                mime = self._try_fetch_message_uid(folder, dest_uid)
+                if mime is None:
+                    continue
+                log.info(
+                    "Recovered provisional message %s in %r as %s",
+                    message_uid,
+                    folder_name,
+                    dest_uid,
+                )
+                self._remap_folder_index_uid(
+                    account_uid, folder_name, message_uid, dest_uid
+                )
+                self._recovered_read_uid = dest_uid
+                return mime
+        return None
+
     def _recover_online_message_mime(
         self,
         folder: Camel.Folder,
@@ -4521,7 +4734,10 @@ class MailService:
         Camel may report INVALID_UID when the folder summary is mid-refresh even
         though the body is cached or the UID is still in Camel (#265). Listed
         messages soft-fail so the row stays; only truly unknown UIDs are vanished.
-        Stale Graph RestIds are remapped by identity-keyed indexing (#267).
+
+        Graph ``ErrorItemNotFound`` means that RestId is gone (#294). Remap to a
+        same-identity live UID (or resolve ``moved_provisional``), otherwise drop
+        the stale index row and raise vanished.
         """
         cached = self._try_message_cached(folder, api_uid)
         if cached is not None:
@@ -4533,6 +4749,9 @@ class MailService:
             )
             return cached
 
+        graph_gone = bool(
+            cause is not None and self._is_graph_item_not_found_error(cause)
+        )
         camel_known = folder_get_message_info(folder, message_uid) is not None
         index_known = self._folder_index_has_uid(
             account_uid, folder_name, message_uid
@@ -4555,6 +4774,7 @@ class MailService:
                         message_uid,
                         folder_name,
                     )
+                    graph_gone = True
                     cause = sync_exc
                 else:
                     log.warning(
@@ -4577,6 +4797,8 @@ class MailService:
                 if not self._is_missing_message_error(retry_exc):
                     raise
                 mime = None
+                if self._is_graph_item_not_found_error(retry_exc):
+                    graph_gone = True
                 cause = retry_exc
             if mime is not None:
                 return mime
@@ -4584,7 +4806,26 @@ class MailService:
             if cached is not None:
                 return cached
 
-            # Still listed / known: keep the row and let the user retry.
+            if graph_gone:
+                recovered = self._recover_stale_graph_restid(
+                    folder, account_uid, folder_name, message_uid
+                )
+                if recovered is not None:
+                    return recovered
+                log.info(
+                    "Dropping Graph-gone RestId %s from %r folder-index",
+                    message_uid,
+                    folder_name,
+                )
+                self._drop_stale_folder_index_uid(
+                    account_uid, folder_name, message_uid
+                )
+                err = MessageNotAvailableError(message_uid, folder_name)
+                if cause is not None:
+                    raise err from cause
+                raise err
+
+            # Still listed / known: keep the row and let the user retry (#265).
             err = RuntimeError(
                 f"Could not load message {message_uid} in {folder_name!r}"
             )
@@ -4605,6 +4846,7 @@ class MailService:
     ) -> Any:
         offline = not self._network_available
         mime = None
+        self._recovered_read_uid = None
         api_uid = camel_uid_to_api(message_uid)
         try:
             mime = folder.get_message_sync(api_uid, None)
@@ -6351,14 +6593,25 @@ class MailService:
         mime = self._get_message_mime_sync(
             folder, account_uid, folder_name, message_uid
         )
+        actual_uid = self._recovered_read_uid or message_uid
+        if actual_uid != message_uid:
+            remapped_info = folder_get_message_info(folder, actual_uid)
+            if remapped_info is not None:
+                info = remapped_info
+                was_unread = not (
+                    info.get_flags() & Camel.MessageFlags.SEEN
+                )
 
         result = (
             message_info_to_dict(
                 info, backend=self._backend_for_account(account_uid)
             )
             if info
-            else {"uid": message_uid}
+            else {"uid": actual_uid}
         )
+        result["uid"] = actual_uid
+        if actual_uid != message_uid:
+            result["_previous_uid"] = message_uid
         enrich_message_dict_from_mime(result, mime)
         bodies = extract_message_bodies(mime)
         result["body_plain"] = bodies["plain"]
@@ -6382,7 +6635,7 @@ class MailService:
 
         if was_unread and mark_seen:
             unread, total = self._mark_message_seen_unlocked(
-                folder, account_uid, folder_name, message_uid
+                folder, account_uid, folder_name, actual_uid
             )
             result.setdefault("flags", {})["seen"] = True
             result["folder_unread"] = unread
