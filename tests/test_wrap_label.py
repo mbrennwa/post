@@ -10,13 +10,17 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Pango", "1.0")
 
-from gi.repository import Gtk, Pango
+from gi.repository import GLib, Gtk, Pango
 
+from post.preferences import MIN_MESSAGE_LIST_WIDTH
 from post.wrap_label import (
     WrappingLabel,
     configure_ellipsize_label,
     configure_pane_scrolled_window,
 )
+
+_STATUS_ICON_PX = 48
+_STATUS_MARGIN_PX = 24
 
 _LONG_LINE = (
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -156,6 +160,71 @@ class WrappingLabelTests(unittest.TestCase):
         row.append(attachment)
         minimum, natural, _, _ = row.measure(Gtk.Orientation.HORIZONTAL, 649)
         self.assertGreaterEqual(natural, minimum)
+
+    def test_centered_status_box_collapses_wrapping_label(self) -> None:
+        # WrappingLabel claims 0 width; CENTER parents size to the icon (#293).
+        label, window = self._realize_status_note(box_halign=Gtk.Align.CENTER)
+        try:
+            self.assertLessEqual(label.get_width(), _STATUS_ICON_PX)
+        finally:
+            window.destroy()
+
+    def test_fill_status_box_gives_wrapping_label_pane_width(self) -> None:
+        label, window = self._realize_status_note(box_halign=Gtk.Align.FILL)
+        try:
+            pane_width = label.get_parent().get_parent().get_width()
+            self.assertGreater(pane_width, _STATUS_ICON_PX)
+            self.assertGreater(label.get_width(), _STATUS_ICON_PX)
+            self.assertEqual(
+                label.get_width(),
+                pane_width - (2 * _STATUS_MARGIN_PX),
+            )
+        finally:
+            window.destroy()
+
+    def _realize_status_note(
+        self, *, box_halign: Gtk.Align
+    ) -> tuple[WrappingLabel, Gtk.Window]:
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            halign=box_halign,
+            valign=Gtk.Align.CENTER,
+        )
+        if box_halign == Gtk.Align.FILL:
+            box.set_hexpand(True)
+        box.set_margin_start(_STATUS_MARGIN_PX)
+        box.set_margin_end(_STATUS_MARGIN_PX)
+        icon = Gtk.Box()
+        icon.set_size_request(_STATUS_ICON_PX, _STATUS_ICON_PX)
+        icon.set_halign(Gtk.Align.CENTER)
+        box.append(icon)
+        label = WrappingLabel(
+            label="No Messages in INBOX",
+            wrap=True,
+            wrap_mode=Gtk.WrapMode.WORD,
+        )
+        if box_halign == Gtk.Align.FILL:
+            label.set_halign(Gtk.Align.FILL)
+            label.set_hexpand(True)
+            label.set_justify(Gtk.Justification.CENTER)
+        box.append(label)
+
+        stack = Gtk.Stack()
+        stack.set_size_request(MIN_MESSAGE_LIST_WIDTH, -1)
+        stack.set_hexpand(True)
+        stack.add_named(box, "empty")
+        stack.set_visible_child_name("empty")
+
+        window = Gtk.Window()
+        window.set_default_size(MIN_MESSAGE_LIST_WIDTH, 400)
+        window.set_child(stack)
+        window.present()
+        context = GLib.MainContext.default()
+        for _ in range(50):
+            if not context.iteration(False):
+                break
+        return label, window
 
     def test_pane_scrolled_window_pins_horizontal_adjustment(self) -> None:
         scroll = Gtk.ScrolledWindow()
