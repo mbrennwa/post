@@ -498,26 +498,35 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self._message_stack.set_transition_duration(150)
 
+        # FILL + hexpand so WrappingLabel (0 natural width) gets the list pane,
+        # not the 48px icon. CENTER on the box collapses the note (#293).
         loading_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
             spacing=12,
-            halign=Gtk.Align.CENTER,
+            halign=Gtk.Align.FILL,
             valign=Gtk.Align.CENTER,
         )
+        loading_box.set_hexpand(True)
         loading_box.set_margin_start(24)
         loading_box.set_margin_end(24)
         self._message_loading_spinner = Gtk.Spinner()
         self._message_loading_spinner.set_size_request(32, 32)
+        self._message_loading_spinner.set_halign(Gtk.Align.CENTER)
         loading_box.append(self._message_loading_spinner)
         self._message_loading_progress = Gtk.ProgressBar()
         self._message_loading_progress.set_show_text(False)
         self._message_loading_progress.set_visible(False)
+        self._message_loading_progress.set_halign(Gtk.Align.FILL)
+        self._message_loading_progress.set_hexpand(True)
         loading_box.append(self._message_loading_progress)
         self._message_loading_label = WrappingLabel(
             label="Loading Messages…",
             wrap=True,
-            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+            wrap_mode=Gtk.WrapMode.WORD,
         )
+        self._message_loading_label.set_halign(Gtk.Align.FILL)
+        self._message_loading_label.set_hexpand(True)
+        self._message_loading_label.set_justify(Gtk.Justification.CENTER)
         self._message_loading_label.add_css_class("dim-label")
         loading_box.append(self._message_loading_label)
         self._message_stack.add_named(loading_box, "loading")
@@ -540,20 +549,25 @@ class MainWindow(Adw.ApplicationWindow):
         empty_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
             spacing=12,
-            halign=Gtk.Align.CENTER,
+            halign=Gtk.Align.FILL,
             valign=Gtk.Align.CENTER,
         )
+        empty_box.set_hexpand(True)
         empty_box.set_margin_start(24)
         empty_box.set_margin_end(24)
         empty_icon = Gtk.Image.new_from_icon_name("mail-read-symbolic")
         empty_icon.set_pixel_size(48)
+        empty_icon.set_halign(Gtk.Align.CENTER)
         empty_icon.add_css_class("dim-label")
         empty_box.append(empty_icon)
         self._message_empty_label = WrappingLabel(
             label="No Messages",
             wrap=True,
-            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+            wrap_mode=Gtk.WrapMode.WORD,
         )
+        self._message_empty_label.set_halign(Gtk.Align.FILL)
+        self._message_empty_label.set_hexpand(True)
+        self._message_empty_label.set_justify(Gtk.Justification.CENTER)
         self._message_empty_label.add_css_class("dim-label")
         empty_box.append(self._message_empty_label)
         self._message_stack.add_named(empty_box, "empty")
@@ -561,13 +575,15 @@ class MainWindow(Adw.ApplicationWindow):
         error_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
             spacing=12,
-            halign=Gtk.Align.CENTER,
+            halign=Gtk.Align.FILL,
             valign=Gtk.Align.CENTER,
         )
+        error_box.set_hexpand(True)
         error_box.set_margin_start(24)
         error_box.set_margin_end(24)
         error_icon = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
         error_icon.set_pixel_size(48)
+        error_icon.set_halign(Gtk.Align.CENTER)
         error_icon.add_css_class("warning")
         error_box.append(error_icon)
         self._message_error_label = WrappingLabel(
@@ -575,9 +591,12 @@ class MainWindow(Adw.ApplicationWindow):
             wrap=True,
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
         )
+        self._message_error_label.set_halign(Gtk.Align.FILL)
+        self._message_error_label.set_hexpand(True)
         self._message_error_label.set_justify(Gtk.Justification.CENTER)
         error_box.append(self._message_error_label)
         retry_btn = Gtk.Button(label="Try Again")
+        retry_btn.set_halign(Gtk.Align.CENTER)
         retry_btn.connect("clicked", self._on_refresh)
         error_box.append(retry_btn)
         self._message_stack.add_named(error_box, "error")
