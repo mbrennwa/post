@@ -215,7 +215,7 @@ _ADAPT_TEXT_CSS = """
 .message-body .post-painted :where(
   p, div, span, li, td, th, font, blockquote, pre,
   h1, h2, h3, h4, h5, h6
-):not(.post-keep-color) {
+):not(.post-keep-color):not(.post-forced-contrast) {
   color: inherit !important;
 }
 """
@@ -580,6 +580,18 @@ def _declarations_have_meaningful_background(declarations: dict[str, str]) -> bo
     return _declarations_background_value(declarations) is not None
 
 
+def _element_painted_background_value(
+    attrs: dict[str, str], merged: dict[str, str]
+) -> str | None:
+    value = _declarations_background_value(merged)
+    if value is not None:
+        return value
+    bgcolor = attrs.get("bgcolor", "")
+    if _bgcolor_attr_is_meaningful(bgcolor):
+        return bgcolor
+    return None
+
+
 def _parse_css_color_rgb(value: str) -> tuple[int, int, int] | None:
     candidate = _normalize_css_declaration_value(value).lower()
     if not candidate:
@@ -867,17 +879,21 @@ class _AdaptationClassMarker(HTMLParser):
                 extra_classes.append("post-keep-color")
             else:
                 extra_classes.append("post-adapt-text")
+        contrast_color: str | None = None
+        if self_painted and not has_sender_color:
+            background = _element_painted_background_value(attrs_dict, merged)
+            if background is not None:
+                extra_classes.append("post-forced-contrast")
+                contrast_color = _contrasting_text_color(background)
         updated_attrs = attrs
         if extra_classes:
             updated_attrs = _add_classes_to_attrs(updated_attrs, extra_classes)
-        if self_painted and not inside_painted and not _declarations_have_text_color(merged):
-            background = _declarations_background_value(merged)
-            if background is not None:
-                updated_attrs = _append_style_declaration(
-                    updated_attrs,
-                    "color",
-                    _contrasting_text_color(background),
-                )
+        if contrast_color is not None:
+            updated_attrs = _append_style_declaration(
+                updated_attrs,
+                "color",
+                contrast_color,
+            )
         self._parts.append(_format_start_tag(tag, updated_attrs))
         if tag_lower in _VOID_HTML_ELEMENTS:
             return
@@ -963,14 +979,15 @@ def _style_blocks_have_text_without_background(body_html: str) -> bool:
 def html_message_needs_adaptation(body_html: str) -> bool:
     """Return True when any element needs adapt-text or adapt-background treatment."""
     content = _html_for_adaptation_detection(body_html)
-    if not html_has_explicit_text_color(content):
+    if not html_has_explicit_text_color(content) and not html_has_explicit_background_color(
+        content
+    ):
         return False
     if _style_blocks_have_text_without_background(content):
         return True
     for shell_background in ("#1e1e1e", "#ffffff"):
-        if "post-adapt-text" in mark_adaptation_classes(
-            content, shell_background=shell_background
-        ):
+        marked = mark_adaptation_classes(content, shell_background=shell_background)
+        if "post-adapt-text" in marked or "post-forced-contrast" in marked:
             return True
     return False
 
