@@ -212,7 +212,6 @@ box.calendar-invite {{
 }}
 label.calendar-invite-link {{
   color: @accent_color;
-  cursor: pointer;
 }}
 .message-unread-dot {{
   min-width: 10px;
