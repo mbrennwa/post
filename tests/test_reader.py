@@ -268,7 +268,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("background: #1e1e1e", doc)
         self.assertNotIn("message-body", doc)
 
-    def test_adapt_skipped_for_bgcolor_and_font_color(self) -> None:
+    def test_adapt_text_keeps_font_color_on_bgcolor_table(self) -> None:
         doc = build_reader_document(
             body_html=(
                 '<table bgcolor="#ffffff"><tr><td>'
@@ -280,8 +280,10 @@ class BuildReaderDocumentTests(unittest.TestCase):
             dark=True,
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
-        self.assertNotIn("message-body", doc)
-        self.assertNotIn("color: inherit !important", doc)
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("post-forced-contrast", doc)
+        self.assertIn("post-keep-color", doc)
+        self.assertIn('color="#000000"', doc)
 
     def test_adapt_skipped_for_colors_in_style_block(self) -> None:
         doc = build_reader_document(
@@ -297,7 +299,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn('name="color-scheme" content="dark"', doc)
         self.assertNotIn('name="color-scheme" content="light"', doc)
 
-    def test_adapt_text_skipped_for_background_only(self) -> None:
+    def test_adapt_text_applies_for_background_only(self) -> None:
         doc = build_reader_document(
             body_html='<div style="background-color:#ffffff"><p>Hello</p></div>',
             body_plain=None,
@@ -305,8 +307,10 @@ class BuildReaderDocumentTests(unittest.TestCase):
             dark=True,
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
-        self.assertNotIn("message-body", doc)
-        self.assertNotIn("color: inherit !important", doc)
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("post-forced-contrast", doc)
+        self.assertIn("color:#1e1e1e", doc.replace(" ", ""))
+        self.assertIn("color: inherit !important", doc)
 
     def test_adapt_text_skipped_for_body_text_and_bgcolor_attrs(self) -> None:
         doc = build_reader_document(
@@ -419,7 +423,8 @@ class BuildReaderDocumentTests(unittest.TestCase):
         )
         self.assertIn('<div class="message-body">', doc)
         self.assertIn('class="post-adapt-text"', doc)
-        self.assertIn('class="post-painted"', doc)
+        self.assertIn("post-painted", doc)
+        self.assertIn("post-forced-contrast", doc)
         self.assertIn("color: inherit !important", doc)
         self.assertIn('name="color-scheme" content="dark"', doc)
 
@@ -467,8 +472,46 @@ class BuildReaderDocumentTests(unittest.TestCase):
             dark=True,
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
-        self.assertNotIn("message-body", doc)
-        self.assertNotIn("color: inherit !important", doc)
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("post-forced-contrast", doc)
+        self.assertIn("post-keep-color", doc)
+        self.assertIn("color:#000000", doc.replace(" ", ""))
+
+    def test_adapt_text_dark_shell_on_white_card_without_body_color(self) -> None:
+        """Newsletter card: light page + white table, unstyled copy, gray footer (#296)."""
+        body_html = (
+            "<!doctype html><html><head><style>"
+            "@media all { .apple-link a { color: inherit !important; } }"
+            "</style></head>"
+            '<body style="background-color: #f6f6f6; margin: 0; padding: 0;">'
+            '<table class="body" style="width: 100%; background-color: #f6f6f6;">'
+            "<tr><td>"
+            '<table class="main" style="width: 100%; background: #ffffff; '
+            'border-radius: 3px;">'
+            "<tr><td><p>Greetings Example User!</p>"
+            "<p>Your agent found 1 new listing.</p></td></tr>"
+            "</table>"
+            '<table class="footer" style="width: 100%;">'
+            '<tr><td style="color: #999999; font-size: 12px; text-align: center;">'
+            '<span class="apple-link">Example Sender</span></td></tr>'
+            "</table>"
+            "</td></tr></table></body></html>"
+        )
+        doc = build_reader_document(
+            body_html=body_html,
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("post-forced-contrast", doc)
+        self.assertIn('class="main post-painted post-forced-contrast"', doc)
+        self.assertIn("color:#1e1e1e", doc.replace(" ", ""))
+        self.assertIn("post-keep-color", doc)
+        self.assertIn("color: #999999", doc)
+        self.assertIn('name="color-scheme" content="dark"', doc)
+        self.assertIn("color: inherit !important", doc)
 
     def test_adapt_text_handles_class_based_white_boxes(self) -> None:
         doc = build_reader_document(
