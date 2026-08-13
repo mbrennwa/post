@@ -21,17 +21,20 @@ def show_toast(
     *,
     priority: Adw.ToastPriority = Adw.ToastPriority.NORMAL,
     timeout: int = 5,
-) -> None:
-    """Show a non-blocking toast on the given window."""
+) -> Adw.Toast | None:
+    """Show a non-blocking toast on the given window.
+
+    ``timeout=0`` keeps the toast until it is dismissed (or replaced).
+    """
     if not message:
-        return
+        return None
 
     overlay = _toast_overlay_for(parent)
     toast = Adw.Toast.new(message)
     toast.set_priority(priority)
-    if timeout > 0:
-        toast.set_timeout(timeout)
+    toast.set_timeout(timeout)
     overlay.add_toast(toast)
+    return toast
 
 
 def show_error_toast(

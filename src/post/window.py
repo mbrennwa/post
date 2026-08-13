@@ -313,6 +313,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._context_message_uids: list[str] = []
         self._pending_move_undo: dict | None = None
         self._undo_toast: Adw.Toast | None = None
+        self._bulk_archive_progress_toast: Adw.Toast | None = None
         self._settings_dialog: SettingsWindow | None = None
         self._compose_windows: list[ComposeWindow] = []
         self._reader_windows: list[ReaderWindow] = []
@@ -1413,11 +1414,30 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> None:
         self._refresh_folder_view(account_uid, folder_name)
 
+    def _dismiss_bulk_archive_progress_toast(self) -> None:
+        toast = self._bulk_archive_progress_toast
+        if toast is None:
+            return
+        self._bulk_archive_progress_toast = None
+        toast.dismiss()
+
     def _on_sidebar_move_started(
-        self, account_uid: str, folder_name: str, scope: str = "all"
+        self,
+        account_uid: str,
+        folder_name: str,
+        scope: str = "all",
+        progress_label: str = "",
     ) -> None:
         self._clear_move_undo()
         self._suppress_sync_list_reload = (account_uid, folder_name)
+        if progress_label:
+            self._dismiss_bulk_archive_progress_toast()
+            self._bulk_archive_progress_toast = show_toast(
+                self,
+                progress_label,
+                priority=Adw.ToastPriority.HIGH,
+                timeout=0,
+            )
         if (
             self._current_account is None
             or self._current_folder is None
@@ -1477,6 +1497,7 @@ class MainWindow(Adw.ApplicationWindow):
         result: dict | None,
         status_label: str,
     ) -> None:
+        self._dismiss_bulk_archive_progress_toast()
         suppress_key = (account_uid, folder_name)
         archived_count = int((result or {}).get("archived_count") or 0)
         if result is None or archived_count <= 0:
@@ -1505,23 +1526,23 @@ class MainWindow(Adw.ApplicationWindow):
         dest_folder = result.get("destination_folder")
         dest_uids = result.get("destination_uids") or []
         if dest_folder and dest_uids:
-            self._register_move_undo(
-                status_label,
+            # Arm Undo immediately; present the toast on idle so dismissing the
+            # in-progress toast cannot swallow the Undo button (#261).
+            self._arm_move_undo(
                 account_uid=account_uid,
                 source_folder=folder_name,
                 dest_folder=dest_folder,
                 dest_uids=dest_uids,
             )
+            GLib.idle_add(self._show_move_undo_toast, status_label)
             self._set_status(f"{status_label}  ·  Ctrl+Z to undo")
         else:
             # Still confirm success when Graph/Camel omit destination UIDs
             # (Undo requires those UIDs; status-only was easy to miss after
             # optimistic clear — #261).
-            show_toast(
-                self,
+            GLib.idle_add(
+                self._show_bulk_archive_done_toast,
                 status_label,
-                priority=Adw.ToastPriority.HIGH,
-                timeout=10,
             )
             self._set_status(status_label)
 
@@ -1532,6 +1553,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_sidebar_bulk_archive_error(
         self, account_uid: str, folder_name: str, _error: Exception
     ) -> None:
+        self._dismiss_bulk_archive_progress_toast()
         suppress_key = (account_uid, folder_name)
         if self._suppress_sync_list_reload == suppress_key:
             self._suppress_sync_list_reload = None
@@ -6230,6 +6252,48 @@ class MainWindow(Adw.ApplicationWindow):
         self._undo_message_move(undo)
         return True
 
+    def _arm_move_undo(
+        self,
+        *,
+        account_uid: str,
+        source_folder: str,
+        dest_folder: str,
+        dest_uids: list[str],
+    ) -> bool:
+        if not dest_uids:
+            log.warning("Move succeeded but destination UIDs are unknown; undo disabled")
+            return False
+        self._pending_move_undo = {
+            "account_uid": account_uid,
+            "source_folder": source_folder,
+            "dest_folder": dest_folder,
+            "dest_uids": dest_uids,
+        }
+        self._undo_move_action.set_enabled(True)
+        return True
+
+    def _show_move_undo_toast(self, label: str) -> bool:
+        if self._pending_move_undo is None:
+            return False
+        toast = Adw.Toast.new(label)
+        toast.set_button_label("Undo")
+        toast.set_action_name("win.undo-move")
+        toast.set_priority(Adw.ToastPriority.HIGH)
+        toast.set_timeout(10)
+        toast.connect("dismissed", self._on_move_undo_dismissed)
+        self._undo_toast = toast
+        self._toast_overlay.add_toast(toast)
+        return False
+
+    def _show_bulk_archive_done_toast(self, status_label: str) -> bool:
+        show_toast(
+            self,
+            status_label,
+            priority=Adw.ToastPriority.HIGH,
+            timeout=10,
+        )
+        return False
+
     def _register_move_undo(
         self,
         label: str,
@@ -6239,26 +6303,14 @@ class MainWindow(Adw.ApplicationWindow):
         dest_folder: str,
         dest_uids: list[str],
     ) -> None:
-        if not dest_uids:
-            log.warning("Move succeeded but destination UIDs are unknown; undo disabled")
+        if not self._arm_move_undo(
+            account_uid=account_uid,
+            source_folder=source_folder,
+            dest_folder=dest_folder,
+            dest_uids=dest_uids,
+        ):
             return
-
-        self._pending_move_undo = {
-            "account_uid": account_uid,
-            "source_folder": source_folder,
-            "dest_folder": dest_folder,
-            "dest_uids": dest_uids,
-        }
-        self._undo_move_action.set_enabled(True)
-
-        toast = Adw.Toast.new(label)
-        toast.set_button_label("Undo")
-        toast.set_action_name("win.undo-move")
-        toast.set_priority(Adw.ToastPriority.HIGH)
-        toast.set_timeout(10)
-        toast.connect("dismissed", self._on_move_undo_dismissed)
-        self._undo_toast = toast
-        self._toast_overlay.add_toast(toast)
+        self._show_move_undo_toast(label)
 
     def _on_move_undo_dismissed(self, _toast: Adw.Toast) -> None:
         self._undo_toast = None

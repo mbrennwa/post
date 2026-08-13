@@ -79,7 +79,7 @@ OnFolderTreeReady = Callable[[], None]
 OnSendOutbox = Callable[[], None]
 OnFolderTreeChanged = Callable[[str, str | None], None]
 OnFolderContentsChanged = Callable[[str, str], None]
-OnMoveStarted = Callable[[str, str, str], None]
+OnMoveStarted = Callable[[str, str, str, str], None]
 OnBulkArchiveFinished = Callable[[str, str, dict | None, str], None]
 OnBulkArchiveError = Callable[[str, str, Exception], None]
 OnMoveUndoAvailable = Callable[[str, str, dict, str], None]
@@ -1089,9 +1089,10 @@ class MailSidebar:
         ):
             return
         status_label = f"Archived {read_count} read {noun}"
+        progress_label = f"Archiving {read_count} read {noun}…"
         if self._on_move_started is not None:
-            self._on_move_started(account_uid, folder_name, "read")
-        self._set_status(f"Archiving {read_count} read {noun}…")
+            self._on_move_started(account_uid, folder_name, "read", progress_label)
+        self._set_status(progress_label)
         self._run_folder_operation(
             lambda: self._mail.archive_read_messages(account_uid, folder_name),
             success_status=status_label,
@@ -1140,11 +1141,14 @@ class MailSidebar:
         ):
             return
         status_label = f"Archived {read_unflagged_count} read and unflagged {noun}"
-        if self._on_move_started is not None:
-            self._on_move_started(account_uid, folder_name, "read_unflagged")
-        self._set_status(
+        progress_label = (
             f"Archiving {read_unflagged_count} read and unflagged {noun}…"
         )
+        if self._on_move_started is not None:
+            self._on_move_started(
+                account_uid, folder_name, "read_unflagged", progress_label
+            )
+        self._set_status(progress_label)
         self._run_folder_operation(
             lambda: self._mail.archive_read_unflagged_messages(
                 account_uid, folder_name
@@ -1180,9 +1184,10 @@ class MailSidebar:
         ):
             return
         status_label = f"Archived {total} {noun}"
+        progress_label = f"Archiving {total} {noun}…"
         if self._on_move_started is not None:
-            self._on_move_started(account_uid, folder_name, "all")
-        self._set_status(f"Archiving {total} {noun}…")
+            self._on_move_started(account_uid, folder_name, "all", progress_label)
+        self._set_status(progress_label)
         self._run_folder_operation(
             lambda: self._mail.archive_all_messages(account_uid, folder_name),
             success_status=status_label,
