@@ -27,6 +27,7 @@ from post.mail.calendar_invite import (
 )
 from post.mail.calendar_write import (
     CalendarTarget,
+    _source_is_selected,
     _source_is_writable,
     list_writable_calendars,
 )
@@ -753,27 +754,45 @@ class WritableCalendarFilterTests(unittest.TestCase):
         self.assertFalse(_source_is_writable(holiday))
         self.assertTrue(_source_is_writable(work))
 
-    def test_list_writable_calendars_filters(self) -> None:
-        work = MagicMock()
-        work.get_enabled.return_value = True
-        work.get_writable.return_value = True
-        work.get_display_name.return_value = "Work"
-        work.get_uid.return_value = "work-uid"
-        work.get_parent.return_value = None
-        work.get_extension.return_value = None
-        work.has_extension.return_value = False
+    def test_source_is_selected_uses_calendar_checkbox(self) -> None:
+        checked = MagicMock()
+        checked.get_extension.return_value.get_selected.return_value = True
+        unchecked = MagicMock()
+        unchecked.get_extension.return_value.get_selected.return_value = False
+        unknown = SimpleNamespace(get_extension=lambda _name: None)
+        self.assertTrue(_source_is_selected(checked))
+        self.assertFalse(_source_is_selected(unchecked))
+        self.assertTrue(_source_is_selected(unknown))
 
-        birthdays = MagicMock()
-        birthdays.get_enabled.return_value = True
-        birthdays.get_writable.return_value = True
-        birthdays.get_display_name.return_value = "Birthdays"
-        birthdays.get_uid.return_value = "bday-uid"
-        birthdays.get_parent.return_value = None
-        birthdays.get_extension.return_value = None
-        birthdays.has_extension.return_value = False
+    def test_list_writable_calendars_filters(self) -> None:
+        def _source(
+            *,
+            uid: str,
+            name: str,
+            selected: bool | None = True,
+            writable: bool = True,
+        ) -> MagicMock:
+            source = MagicMock()
+            source.get_writable.return_value = writable
+            source.get_display_name.return_value = name
+            source.get_uid.return_value = uid
+            source.get_parent.return_value = None
+            source.has_extension.return_value = False
+            if selected is None:
+                source.get_extension.return_value = None
+            else:
+                source.get_extension.return_value.get_selected.return_value = selected
+                source.get_extension.return_value.get_backend_name.return_value = ""
+            return source
+
+        work = _source(uid="work-uid", name="Work", selected=True)
+        family = _source(uid="family-uid", name="Familie", selected=False)
+        birthdays = _source(uid="bday-uid", name="Birthdays", selected=True)
+        disabled = _source(uid="disabled-uid", name="Old job", selected=True)
 
         registry = MagicMock()
-        registry.list_sources.return_value = [work, birthdays]
+        registry.list_sources.return_value = [work, family, birthdays, disabled]
+        registry.check_enabled.side_effect = lambda source: source is not disabled
 
         fake_eds = MagicMock()
         fake_eds.SOURCE_EXTENSION_CALENDAR = "Calendar"

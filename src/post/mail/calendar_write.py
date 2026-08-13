@@ -65,6 +65,36 @@ def _source_backend_name(source: Any) -> str:
     return ""
 
 
+def _source_is_selected(source: Any) -> bool:
+    """True when the calendar is checked in Evolution (EDS selected).
+
+    If the Calendar extension has no ``get_selected``, keep the source so
+    odd or mocked sources are not dropped.
+    """
+    try:
+        ext = source.get_extension("Calendar")
+        if ext is not None and hasattr(ext, "get_selected"):
+            return bool(ext.get_selected())
+    except Exception:
+        pass
+    return True
+
+
+def _source_is_effectively_enabled(registry: Any, source: Any) -> bool:
+    """True when the source and its ancestors are enabled."""
+    try:
+        if hasattr(registry, "check_enabled"):
+            return bool(registry.check_enabled(source))
+    except Exception:
+        pass
+    try:
+        if hasattr(source, "get_enabled"):
+            return bool(source.get_enabled())
+    except Exception:
+        pass
+    return True
+
+
 def _source_is_writable(source: Any) -> bool:
     try:
         if hasattr(source, "get_writable") and not source.get_writable():
@@ -89,7 +119,7 @@ def _source_is_writable(source: Any) -> bool:
 
 
 def list_writable_calendars(registry: Any | None = None) -> list[CalendarTarget]:
-    """Return writable EDS calendars suitable for adding events."""
+    """Return writable EDS calendars that are checked in Evolution."""
     import gi
 
     gi.require_version("EDataServer", "1.2")
@@ -100,11 +130,10 @@ def list_writable_calendars(registry: Any | None = None) -> list[CalendarTarget]
 
     targets: list[CalendarTarget] = []
     for source in registry.list_sources(EDS.SOURCE_EXTENSION_CALENDAR):
-        try:
-            if hasattr(source, "get_enabled") and not source.get_enabled():
-                continue
-        except Exception:
-            pass
+        if not _source_is_effectively_enabled(registry, source):
+            continue
+        if not _source_is_selected(source):
+            continue
         if not _source_is_writable(source):
             continue
         uid = source.get_uid()
