@@ -248,6 +248,46 @@ def _folder_message_identity_key(message: dict[str, Any]) -> str:
     return f"uid:{message.get('uid') or id(message)}"
 
 
+def find_folder_index_sibling_uids(
+    messages: list[dict[str, Any]],
+    message_uid: str,
+    *,
+    prefer_uids: set[str] | None = None,
+) -> list[str]:
+    """Return other index UIDs that share ``message_uid``'s logical identity.
+
+    ``uid:`` keys are distinct by construction and never match a sibling.
+    When ``prefer_uids`` is set (e.g. Camel's live UID set), those UIDs come
+    first so a Graph RestId remap can fetch a fetchable id (#294).
+    """
+    target: dict[str, Any] | None = None
+    for message in messages:
+        if str(message.get("uid") or "") == message_uid:
+            target = message
+            break
+    if target is None:
+        return []
+    key = _folder_message_identity_key(target)
+    if key.startswith("uid:"):
+        return []
+    siblings: list[str] = []
+    seen: set[str] = set()
+    for message in messages:
+        uid = str(message.get("uid") or "")
+        if not uid or uid == message_uid or uid in seen:
+            continue
+        if _folder_message_identity_key(message) != key:
+            continue
+        seen.add(uid)
+        siblings.append(uid)
+    if not siblings:
+        return []
+    prefer = prefer_uids or set()
+    preferred = [uid for uid in siblings if uid in prefer]
+    rest = [uid for uid in siblings if uid not in prefer]
+    return preferred + rest
+
+
 def upsert_folder_index_by_identity(
     by_uid: dict[str, dict[str, Any]],
     message: dict[str, Any],

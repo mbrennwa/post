@@ -170,7 +170,10 @@ class ReadMessageUnavailableTests(unittest.TestCase):
         self.assertIs(mime, recovered)
         folder.synchronize_message_sync.assert_called_once_with("53054", None)
 
-    def test_online_graph_item_not_found_index_only_keeps_row(self) -> None:
+    @patch("post.mail.eds.folder_index_cache.save")
+    def test_online_graph_item_not_found_index_only_vanishes(
+        self, _save: MagicMock
+    ) -> None:
         from post.mail.eds import _FolderMessageIndex
 
         service = MailService(registry=MagicMock())
@@ -192,18 +195,23 @@ class ReadMessageUnavailableTests(unittest.TestCase):
         folder.dup_uids.return_value = []
         folder.get_uids.return_value = []
 
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(MessageNotAvailableError) as ctx:
             service._get_message_mime_sync(
                 folder, "account", "Archive", "stale-uid"
             )
 
-        self.assertIn("Could not load message", str(ctx.exception))
-        self.assertFalse(isinstance(ctx.exception, MessageNotAvailableError))
+        self.assertEqual(ctx.exception.reason, MessageUnavailableReason.VANISHED)
+        self.assertFalse(
+            any(
+                str(m.get("uid")) == "stale-uid"
+                for m in service._folder_indexes[("account", "Archive")].messages
+            )
+        )
 
-    def test_online_index_only_stale_uid_soft_fails_without_alternate_crawl(
-        self,
+    @patch("post.mail.eds.folder_index_cache.save")
+    def test_online_index_only_stale_uid_fetches_live_sibling(
+        self, _save: MagicMock
     ) -> None:
-        """Dual RestIds are remapped by indexing (#267); recovery no longer crawls."""
         from post.mail.eds import _FolderMessageIndex
 
         service = MailService(registry=MagicMock())
@@ -228,10 +236,15 @@ class ReadMessageUnavailableTests(unittest.TestCase):
             unread=0,
             total=2,
         )
+        recovered = MagicMock(name="recovered_mime")
         folder = MagicMock()
-        folder.get_message_sync.side_effect = _graph_item_not_found_error(
-            "stale-uid"
-        )
+
+        def get_sync(uid, _cancellable):
+            if uid == "live-uid":
+                return recovered
+            raise _graph_item_not_found_error(str(uid))
+
+        folder.get_message_sync.side_effect = get_sync
         folder.get_message_cached.return_value = None
         folder.get_message_info.return_value = None
         folder.synchronize_message_sync.side_effect = _graph_item_not_found_error(
@@ -240,19 +253,104 @@ class ReadMessageUnavailableTests(unittest.TestCase):
         folder.dup_uids.return_value = ["live-uid"]
         folder.get_uids.return_value = ["live-uid"]
 
-        with self.assertRaises(RuntimeError) as ctx:
+        mime = service._get_message_mime_sync(
+            folder, "account", "Archive", "stale-uid"
+        )
+
+        self.assertIs(mime, recovered)
+        self.assertEqual(service._recovered_read_uid, "live-uid")
+        uids = {
+            str(m.get("uid"))
+            for m in service._folder_indexes[("account", "Archive")].messages
+        }
+        self.assertIn("live-uid", uids)
+        self.assertNotIn("stale-uid", uids)
+
+    @patch("post.mail.eds.folder_index_cache.save")
+    def test_provisional_row_resolves_destination_uid(
+        self, _save: MagicMock
+    ) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        service._folder_indexes[("account", "Archive")] = _FolderMessageIndex(
+            messages=[
+                {
+                    "uid": "inbox-rest-id",
+                    "subject": "Hello",
+                    "from": "a@b.c",
+                    "sort_date": 1,
+                    "moved_provisional": True,
+                }
+            ],
+            unread=0,
+            total=1,
+        )
+        recovered = MagicMock(name="dest_mime")
+        folder = MagicMock()
+
+        def get_sync(uid, _cancellable):
+            if uid == "archive-rest-id":
+                return recovered
+            raise _graph_item_not_found_error(str(uid))
+
+        folder.get_message_sync.side_effect = get_sync
+        folder.get_message_cached.return_value = None
+        folder.get_message_info.return_value = None
+        folder.synchronize_message_sync.side_effect = _graph_item_not_found_error()
+        folder.dup_uids.return_value = ["archive-rest-id"]
+        folder.get_uids.return_value = ["archive-rest-id"]
+        service._find_moved_uids_in_folder_unlocked = MagicMock(
+            return_value=["archive-rest-id"]
+        )
+
+        mime = service._get_message_mime_sync(
+            folder, "account", "Archive", "inbox-rest-id"
+        )
+
+        self.assertIs(mime, recovered)
+        self.assertEqual(service._recovered_read_uid, "archive-rest-id")
+        row = service._folder_indexes[("account", "Archive")].messages[0]
+        self.assertEqual(row["uid"], "archive-rest-id")
+        self.assertFalse(row.get("moved_provisional"))
+
+    @patch("post.mail.eds.folder_index_cache.save")
+    def test_provisional_row_vanishes_when_dest_unresolved(
+        self, _save: MagicMock
+    ) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        service._folder_indexes[("account", "Archive")] = _FolderMessageIndex(
+            messages=[
+                {
+                    "uid": "inbox-rest-id",
+                    "subject": "Hello",
+                    "moved_provisional": True,
+                }
+            ],
+            unread=0,
+            total=1,
+        )
+        folder = MagicMock()
+        folder.get_message_sync.side_effect = _graph_item_not_found_error()
+        folder.get_message_cached.return_value = None
+        folder.get_message_info.return_value = None
+        folder.synchronize_message_sync.side_effect = _graph_item_not_found_error()
+        folder.dup_uids.return_value = []
+        folder.get_uids.return_value = []
+        service._find_moved_uids_in_folder_unlocked = MagicMock(return_value=[])
+
+        with self.assertRaises(MessageNotAvailableError) as ctx:
             service._get_message_mime_sync(
-                folder, "account", "Archive", "stale-uid"
+                folder, "account", "Archive", "inbox-rest-id"
             )
 
-        self.assertIn("Could not load message", str(ctx.exception))
-        self.assertFalse(isinstance(ctx.exception, MessageNotAvailableError))
-        # Stale row stays until identity upsert remaps; no alternate crawl.
-        self.assertTrue(
-            any(
-                str(m.get("uid")) == "stale-uid"
-                for m in service._folder_indexes[("account", "Archive")].messages
-            )
+        self.assertEqual(ctx.exception.reason, MessageUnavailableReason.VANISHED)
+        self.assertEqual(
+            service._folder_indexes[("account", "Archive")].messages, []
         )
 
     @patch("post.mail.eds.MailService._get_store_unlocked")

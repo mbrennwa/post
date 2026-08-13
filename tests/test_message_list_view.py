@@ -237,6 +237,42 @@ class UpsertMessageTests(unittest.TestCase):
         self.assertEqual(self.message_list.get_message("2"), replacement)
         self.assertEqual(self.message_list.item_count(), 1)
 
+    def test_upsert_message_replaces_search_row_key(self) -> None:
+        from post.mail.search import annotate_search_match
+
+        original = annotate_search_match(
+            {
+                "uid": "old",
+                "subject": "Hi",
+                "from": "a@b.c",
+                "flags": {"seen": True, "flagged": False},
+            },
+            account_uid="acct",
+            folder_name="Archive",
+        )
+        self.message_list.set_messages([original], folder_name="Archive")
+        updated = annotate_search_match(
+            {
+                "uid": "new",
+                "subject": "Hi",
+                "from": "a@b.c",
+                "flags": {"seen": True, "flagged": False},
+            },
+            account_uid="acct",
+            folder_name="Archive",
+        )
+        self.message_list.upsert_message(
+            updated,
+            folder_name="Archive",
+            replace_uid=original["_search_row_key"],
+        )
+        self.assertIsNone(self.message_list.get_message(original["_search_row_key"]))
+        found = self.message_list.get_message(updated["_search_row_key"])
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found["uid"], "new")
+        self.assertEqual(self.message_list.item_count(), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
