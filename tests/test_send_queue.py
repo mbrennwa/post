@@ -27,6 +27,7 @@ from post.mail.send_queue import (
     clear_outbound_send_delay,
     count_queued_for_account,
     enqueue_outbound_message,
+    format_status_send_now_tooltip,
     format_stop_sending_error_toast,
     format_stop_sending_toast,
     has_pending_send_delay,
@@ -513,6 +514,22 @@ class OutboxAccountFilterTests(unittest.TestCase):
             from_label="me@example.com",
         )
         self.assertNotIn("send_after", immediate)
+
+
+class StatusSendNowTooltipTests(unittest.TestCase):
+    def test_single_and_multiple(self) -> None:
+        self.assertEqual(
+            format_status_send_now_tooltip(1),
+            "Send now (skip delay)",
+        )
+        self.assertEqual(
+            format_status_send_now_tooltip(3),
+            "Send 3 delayed messages now",
+        )
+        self.assertEqual(
+            format_status_send_now_tooltip(0),
+            "Send now (skip delay)",
+        )
 
 
 class StopSendingToastTests(unittest.TestCase):
