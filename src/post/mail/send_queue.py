@@ -130,6 +130,13 @@ def remaining_send_delay_seconds(
     return max(0, math.ceil(send_after - now))
 
 
+def format_status_send_now_tooltip(count: int) -> str:
+    """Status-bar Send now tooltip while messages wait on send delay."""
+    if count <= 1:
+        return "Send now (skip delay)"
+    return f"Send {count} delayed messages now"
+
+
 def format_stop_sending_toast(
     moved_by_account_label: Mapping[str, int] | Sequence[tuple[str, int]],
 ) -> str:

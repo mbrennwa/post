@@ -93,6 +93,7 @@ from post.mail.offline_status import (
 )
 from post.mail.send_queue import (
     QueuedOutboundMessage,
+    format_status_send_now_tooltip,
     format_stop_sending_error_toast,
     format_stop_sending_toast,
     has_pending_send_delay,
@@ -662,7 +663,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._status_bar.append(self._status)
         self._stop_sending_box = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=4,
+            spacing=8,
         )
         self._stop_sending_box.set_valign(Gtk.Align.CENTER)
         self._stop_sending_box.set_visible(False)
@@ -670,10 +671,17 @@ class MainWindow(Adw.ApplicationWindow):
         self._stop_sending_count.add_css_class("dim-label")
         self._stop_sending_count.set_valign(Gtk.Align.CENTER)
         self._stop_sending_box.append(self._stop_sending_count)
+        self._status_send_now_btn = Gtk.Button(icon_name="mail-send-symbolic")
+        self._status_send_now_btn.set_tooltip_text(format_status_send_now_tooltip(1))
+        self._status_send_now_btn.add_css_class("flat")
+        self._status_send_now_btn.set_valign(Gtk.Align.CENTER)
+        self._status_send_now_btn.connect("clicked", self._on_status_send_now_clicked)
+        self._stop_sending_box.append(self._status_send_now_btn)
         self._stop_sending_btn = Gtk.Button(icon_name="process-stop-symbolic")
         self._stop_sending_btn.set_tooltip_text("Stop Sending")
         self._stop_sending_btn.add_css_class("flat")
         self._stop_sending_btn.set_valign(Gtk.Align.CENTER)
+        self._stop_sending_btn.set_margin_start(4)
         self._stop_sending_btn.connect("clicked", self._on_stop_sending_clicked)
         self._stop_sending_box.append(self._stop_sending_btn)
         self._status_bar.append(self._stop_sending_box)
@@ -843,11 +851,16 @@ class MainWindow(Adw.ApplicationWindow):
         )
         if count:
             self._stop_sending_count.set_label(str(count))
+            self._status_send_now_btn.set_tooltip_text(
+                format_status_send_now_tooltip(count)
+            )
             self._stop_sending_box.set_visible(True)
         else:
             self._stop_sending_count.set_label("")
             self._stop_sending_box.set_visible(False)
-        self._stop_sending_btn.set_sensitive(not self._stop_sending_in_flight)
+        sensitive = not self._stop_sending_in_flight
+        self._status_send_now_btn.set_sensitive(sensitive)
+        self._stop_sending_btn.set_sensitive(sensitive)
         self._sync_send_delay_status()
 
     def _send_delay_status_text(self) -> str:
@@ -6003,6 +6016,23 @@ class MainWindow(Adw.ApplicationWindow):
         self._set_status("Moved queued message to Drafts")
         return False
 
+    def _on_status_send_now_clicked(self, *_args) -> None:
+        if self._stop_sending_in_flight:
+            return
+        pending = [
+            queue_id
+            for queue_id, message in list_queued_outbound_messages()
+            if has_pending_send_delay(message)
+        ]
+        if not pending:
+            return
+        for queue_id in pending:
+            self._send_delay_scheduler.send_now(queue_id)
+        if len(pending) == 1:
+            self._set_status("Sending message…")
+        else:
+            self._set_status(f"Sending {len(pending)} messages…")
+
     def _on_stop_sending_clicked(self, *_args) -> None:
         if self._stop_sending_in_flight:
             return
@@ -6014,6 +6044,7 @@ class MainWindow(Adw.ApplicationWindow):
         if not pending:
             return
         self._stop_sending_in_flight = True
+        self._status_send_now_btn.set_sensitive(False)
         self._stop_sending_btn.set_sensitive(False)
         for queue_id, _message in pending:
             self._send_delay_scheduler.cancel(queue_id)
