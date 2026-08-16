@@ -40,7 +40,9 @@ from post.mail.send_queue import (
     persist_outbound_send,
     queued_to_list_dict,
     read_queued_message,
+    remaining_send_delay_seconds,
     remove_queued_outbound_message,
+    soonest_pending_send_after,
     try_load_queued_outbound_message,
 )
 
@@ -407,6 +409,61 @@ class OutboxAccountFilterTests(unittest.TestCase):
         self.assertTrue(has_pending_send_delay(delayed))
         self.assertFalse(has_pending_send_delay(ready))
         self.assertFalse(has_pending_send_delay(immediate))
+
+    def test_soonest_pending_send_after(self) -> None:
+        now = 1_000.0
+        earlier = QueuedOutboundMessage(
+            account_uid="account-1",
+            to=["a@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Soon",
+            body="Body",
+            send_after=now + 10,
+        )
+        later = QueuedOutboundMessage(
+            account_uid="account-1",
+            to=["b@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Later",
+            body="Body",
+            send_after=now + 30,
+        )
+        expired = QueuedOutboundMessage(
+            account_uid="account-1",
+            to=["c@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Expired",
+            body="Body",
+            send_after=now - 1,
+        )
+        immediate = QueuedOutboundMessage(
+            account_uid="account-1",
+            to=["d@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Immediate",
+            body="Body",
+        )
+        self.assertEqual(
+            soonest_pending_send_after(
+                [later, earlier, expired, immediate], now=now
+            ),
+            now + 10,
+        )
+        self.assertIsNone(
+            soonest_pending_send_after([expired, immediate], now=now)
+        )
+
+    def test_remaining_send_delay_seconds(self) -> None:
+        now = 1_000.0
+        self.assertEqual(remaining_send_delay_seconds(now + 30, now=now), 30)
+        self.assertEqual(remaining_send_delay_seconds(now + 30.1, now=now), 31)
+        self.assertEqual(remaining_send_delay_seconds(now + 0.01, now=now), 1)
+        self.assertEqual(remaining_send_delay_seconds(now, now=now), 0)
+        self.assertEqual(remaining_send_delay_seconds(now - 1, now=now), 0)
 
     def test_clear_outbound_send_delay(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

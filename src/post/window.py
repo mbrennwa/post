@@ -102,7 +102,9 @@ from post.mail.send_queue import (
     load_queued_attachments,
     load_queued_outbound_message,
     read_queued_message,
+    remaining_send_delay_seconds,
     remove_queued_outbound_message,
+    soonest_pending_send_after,
     try_load_queued_outbound_message,
 )
 from post.settings_window import SettingsWindow
@@ -138,6 +140,7 @@ from post.preferences import (
     SEARCH_SCOPE_ALL,
     SEARCH_SCOPE_FOLDER,
     SearchScope,
+    format_send_delay_status,
     get_load_remote_content,
     get_message_appearance,
     get_search_scope,
@@ -337,6 +340,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._status_progress_pulse_id: int | None = None
         self._offline_download_status = ""
         self._status_hint = ""
+        self._send_delay_status = ""
+        self._send_delay_tick_id: int | None = None
         self._offline_held_for_load_generation: int | None = None
         self._heavy_index_in_progress: tuple[str, str] | None = None
         self._heavy_bind_catchup_load_id: int | None = None
@@ -822,8 +827,8 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_outbox_changed(self) -> None:
         self._sidebar.refresh_outbox_rows()
-        self._refresh_status_display()
         self._update_stop_sending_button()
+        self._refresh_status_display()
         if (
             self._current_account
             and is_post_outbox_folder(self._current_folder)
@@ -843,6 +848,57 @@ class MainWindow(Adw.ApplicationWindow):
             self._stop_sending_count.set_label("")
             self._stop_sending_box.set_visible(False)
         self._stop_sending_btn.set_sensitive(not self._stop_sending_in_flight)
+        self._sync_send_delay_status()
+
+    def _send_delay_status_text(self) -> str:
+        messages = [
+            message for _queue_id, message in list_queued_outbound_messages()
+        ]
+        send_after = soonest_pending_send_after(messages)
+        if send_after is None:
+            return ""
+        remaining = remaining_send_delay_seconds(send_after)
+        if remaining <= 0:
+            return ""
+        return format_send_delay_status(remaining)
+
+    def _sync_send_delay_status(self) -> None:
+        text = self._send_delay_status_text()
+        if text != self._send_delay_status:
+            self._send_delay_status = text
+            self._refresh_status_display()
+        if text:
+            self._start_send_delay_tick()
+        else:
+            self._stop_send_delay_tick()
+
+    def _start_send_delay_tick(self) -> None:
+        if self._send_delay_tick_id is not None or self._is_closing:
+            return
+        self._send_delay_tick_id = GLib.timeout_add_seconds(
+            1, self._on_send_delay_tick
+        )
+
+    def _stop_send_delay_tick(self) -> None:
+        timer_id = self._send_delay_tick_id
+        if timer_id is None:
+            return
+        GLib.source_remove(timer_id)
+        self._send_delay_tick_id = None
+
+    def _on_send_delay_tick(self) -> bool:
+        if self._is_closing:
+            self._send_delay_tick_id = None
+            self._send_delay_status = ""
+            return False
+        text = self._send_delay_status_text()
+        if text != self._send_delay_status:
+            self._send_delay_status = text
+            self._refresh_status_display()
+        if not text:
+            self._send_delay_tick_id = None
+            return False
+        return True
 
     def _install_message_list_style(self) -> None:
         provider = Gtk.CssProvider()
@@ -1076,6 +1132,7 @@ class MainWindow(Adw.ApplicationWindow):
             window.destroy()
 
     def _finish_close(self) -> bool:
+        self._stop_send_delay_tick()
         self._stop_sync_watcher()
         try:
             self._mail.shutdown_sync()
@@ -2699,7 +2756,7 @@ class MainWindow(Adw.ApplicationWindow):
                 parts.append(OFFLINE_SEARCHING_LOCAL_CACHE)
             self._status.set_label(" · ".join(parts))
             return
-        # Interactive folder load / heavy-folder index beats offline backfill.
+        # Interactive folder load / search beats delay countdown and offline backfill.
         if self._status_hint and (
             self._message_sync_in_progress
             or self._offline_held_for_load_generation is not None
@@ -2707,6 +2764,9 @@ class MainWindow(Adw.ApplicationWindow):
             or self._search_query is not None
         ):
             self._status.set_label(self._status_hint)
+            return
+        if self._send_delay_status:
+            self._status.set_label(self._send_delay_status)
             return
         if self._offline_download_status:
             self._status.set_label(self._offline_download_status)
