@@ -24,6 +24,7 @@ from post.preferences import (
     get_message_appearance,
     get_search_scope,
     get_show_evolution_local,
+    format_send_delay_status,
     get_send_delay_seconds,
     get_sidebar_state,
     get_window_state,
@@ -143,6 +144,32 @@ class PreferencesTests(unittest.TestCase):
                 self.assertEqual(get_send_delay_seconds(), 30)
                 set_send_delay_seconds(0)
                 self.assertEqual(get_send_delay_seconds(), 0)
+
+    def test_format_send_delay_status(self) -> None:
+        self.assertEqual(format_send_delay_status(0), "Message sent")
+        self.assertEqual(
+            format_send_delay_status(1), "Message will be sent in 1 second"
+        )
+        self.assertEqual(
+            format_send_delay_status(30), "Message will be sent in 30 seconds"
+        )
+        self.assertEqual(
+            format_send_delay_status(59), "Message will be sent in 59 seconds"
+        )
+        self.assertEqual(
+            format_send_delay_status(60), "Message will be sent in 1 minute"
+        )
+        self.assertEqual(
+            format_send_delay_status(61),
+            "Message will be sent in 1 minute 1 second",
+        )
+        self.assertEqual(
+            format_send_delay_status(90),
+            "Message will be sent in 1 minute 30 seconds",
+        )
+        self.assertEqual(
+            format_send_delay_status(120), "Message will be sent in 2 minutes"
+        )
 
     def test_window_state_defaults(self) -> None:
         with mock.patch(

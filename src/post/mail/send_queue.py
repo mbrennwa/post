@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -98,6 +99,35 @@ def has_pending_send_delay(
     if now is None:
         now = time.time()
     return message.send_after is not None and message.send_after > now
+
+
+def soonest_pending_send_after(
+    messages: Sequence[QueuedOutboundMessage],
+    *,
+    now: float | None = None,
+) -> float | None:
+    """Return the earliest *send_after* that is still pending, if any."""
+    if now is None:
+        now = time.time()
+    pending = [
+        message.send_after
+        for message in messages
+        if has_pending_send_delay(message, now=now) and message.send_after is not None
+    ]
+    if not pending:
+        return None
+    return min(pending)
+
+
+def remaining_send_delay_seconds(
+    send_after: float,
+    *,
+    now: float | None = None,
+) -> int:
+    """Whole seconds remaining until *send_after*, rounded up."""
+    if now is None:
+        now = time.time()
+    return max(0, math.ceil(send_after - now))
 
 
 def format_stop_sending_toast(
