@@ -15,7 +15,8 @@ Big-picture capabilities for the current tree (refresh on every release — see
 **Implemented**
 
 - IMAP, Gmail, Microsoft 365, and local machine mail (through GNOME Online Accounts)
-- Read mail: accounts/folders, message list, HTML reader (inline + separate window); clickable links in plain-text messages
+- Read mail: accounts/folders, message list, HTML reader (inline + separate window); clickable links in HTML and plain text; destination URL on hover
+- Calendar invites: meeting details and Add to Calendar (Evolution-checked calendars)
 - Search over message headers and bodies
 - Compose: new / reply / reply-all / forward; attachments; drafts; signatures; correspondent autocomplete
 - Outbox with delayed send

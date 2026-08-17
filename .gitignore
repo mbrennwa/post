@@ -19,3 +19,4 @@ debian/post/
 
 # rpm package build outputs
 .rpmbuild/
+.local-rpm/

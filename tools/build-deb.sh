@@ -83,7 +83,6 @@ PY
 dpkg-buildpackage -us -uc
 
 DEB="post_${VERSION}_all.deb"
-rm -rf dist
 mkdir -p dist
 if [ ! -f "../$DEB" ]; then
   echo "ERROR: expected ../$DEB after build" >&2

@@ -126,7 +126,6 @@ if [ -z "$BUILT" ]; then
   exit 1
 fi
 
-rm -rf dist
 mkdir -p dist
 cp -f "$BUILT" "dist/$RPM"
 
