@@ -486,24 +486,36 @@ class MessageReaderPaneTests(unittest.TestCase):
         self.assertEqual(self.pane._link_hover_box.get_margin_start(), 52)
         self.assertEqual(self.pane._link_hover_box.get_margin_top(), 66)
 
+    def test_same_url_does_not_reposition_hover_chip(self) -> None:
+        link = MagicMock()
+        link.context_is_link.return_value = True
+        link.get_link_uri.return_value = "https://example.com/renew"
+        self.pane._on_web_view_mouse_target_changed(self.pane._web_view, link, 0)
+        self.pane._position_link_hover((40, 50))
+        self.pane._on_web_view_mouse_target_changed(self.pane._web_view, link, 0)
+        self.assertEqual(self.pane._link_hover_box.get_margin_start(), 52)
+        self.assertEqual(self.pane._link_hover_box.get_margin_top(), 66)
+
     def test_reader_link_hover_origin_stays_below_right(self) -> None:
         self.assertEqual(
             reader_link_hover_origin(40, 50, 80, 24, 400, 300),
             (52, 66),
         )
 
-    def test_reader_link_hover_origin_flips_at_edges(self) -> None:
+    def test_reader_link_hover_origin_clamps_without_horizontal_flip(self) -> None:
         x, y = reader_link_hover_origin(380, 280, 80, 24, 400, 300)
-        self.assertLess(x, 380)
-        self.assertLess(y, 280)
-        self.assertGreaterEqual(x, 8)
-        self.assertGreaterEqual(y, 8)
+        self.assertEqual(x, 312)
+        self.assertEqual(y, 240)
+        x, _ = reader_link_hover_origin(40, 50, 350, 24, 400, 300)
+        self.assertEqual(x, 42)
 
     def test_apply_reader_link_hover_skips_redundant_set(self) -> None:
         box = MagicMock()
         box.get_visible.return_value = True
         label = MagicMock()
         label.get_label.return_value = "https://example.com/renew"
-        apply_reader_link_hover(box, label, "https://example.com/renew")
+        self.assertFalse(
+            apply_reader_link_hover(box, label, "https://example.com/renew")
+        )
         label.set_label.assert_not_called()
         box.set_visible.assert_not_called()

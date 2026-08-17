@@ -101,11 +101,13 @@ def apply_reader_link_hover(
     motion, so the tooltip hover timeout never fires. A non-targetable OSD
     overlay is updated from ``mouse-target-changed`` instead.
 
-    Returns whether the overlay is shown.
+    Returns True only when the URL is newly shown or changed. Same-URL
+    updates return False so the chip is not repositioned (nested markup
+    inside a button would otherwise make it flicker).
     """
     if text:
         if box.get_visible() and label.get_label() == text:
-            return True
+            return False
         label.set_label(text)
         box.set_visible(True)
         return True
@@ -151,14 +153,17 @@ def reader_link_hover_origin(
     view_w: float,
     view_h: float,
 ) -> tuple[float, float]:
-    """Place a hover chip near the pointer, flipping to stay in view."""
+    """Place a hover chip below-right of the pointer, clamped to the view.
+
+    Do not flip to the opposite side of the pointer. That jump, combined with
+    a changing measured chip width, flickers left/right while hovering one
+    button.
+    """
     x = pointer_x + _LINK_HOVER_OFFSET_X
     y = pointer_y + _LINK_HOVER_OFFSET_Y
     if view_w <= 0 or view_h <= 0:
         return (x, y)
     pad = _LINK_HOVER_PAD
-    if x + chip_w + pad > view_w:
-        x = pointer_x - chip_w - _LINK_HOVER_OFFSET_X
     if y + chip_h + pad > view_h:
         y = pointer_y - chip_h - _LINK_HOVER_OFFSET_Y
     max_x = view_w - chip_w - pad
@@ -456,10 +461,6 @@ class MessageReaderPane(Gtk.Box):
         body_overlay.set_hexpand(True)
         body_overlay.set_halign(Gtk.Align.FILL)
         body_overlay.add_overlay(self._link_hover_box)
-        hover_motion = Gtk.EventControllerMotion()
-        hover_motion.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        hover_motion.connect("motion", self._on_link_hover_motion)
-        body_overlay.add_controller(hover_motion)
         self._link_hover_overlay = body_overlay
         self._reader_body_stack.add_named(body_overlay, "content")
         self._reader_body_stack.set_visible_child_name("empty")
@@ -1167,12 +1168,6 @@ class MessageReaderPane(Gtk.Box):
         )
         self._link_hover_box.set_margin_start(max(0, int(round(x))))
         self._link_hover_box.set_margin_top(max(0, int(round(y))))
-
-    def _on_link_hover_motion(
-        self, _controller: Gtk.EventControllerMotion, x: float, y: float
-    ) -> None:
-        if self._link_hover_box.get_visible():
-            self._position_link_hover((x, y))
 
     def _on_web_view_mouse_target_changed(
         self,
