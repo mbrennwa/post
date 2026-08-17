@@ -36,6 +36,12 @@ class _ImmediateMailIoThread:
 
 class RunOutboundSendTests(unittest.TestCase):
     def setUp(self) -> None:
+        delay_patcher = mock.patch(
+            "post.compose_window.get_send_delay_seconds",
+            return_value=0,
+        )
+        delay_patcher.start()
+        self.addCleanup(delay_patcher.stop)
         self.request = OutboundSendRequest(
             account_uid="acct-1",
             to=["user@example.com"],

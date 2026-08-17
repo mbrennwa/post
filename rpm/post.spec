@@ -21,6 +21,7 @@ Requires:       libadwaita
 Requires:       glib2
 Requires:       webkitgtk6.0
 Requires:       evolution-data-server
+Requires:       libecal2.0
 Requires:       evolution-ews
 Requires:       librsvg2-tools
 Requires:       desktop-file-utils
@@ -112,7 +113,7 @@ fi
 /usr/share/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg
 
 %changelog
-* Thu Aug 06 2026 Matthias Brennwald <mbrennwa@gmail.com> - 1.0.0a1-1
+* Mon Aug 17 2026 Matthias Brennwald <mbrennwa@gmail.com> - 1.0.0a1-1
 - Bump to 1.0.0a1 (public alpha).
 
 * Sun Aug 02 2026 Matthias Brennwald <mbrennwa@gmail.com> - 1.0.0.dev2-1
