@@ -1,3 +1,9 @@
+post (1.0.0a2) unstable; urgency=medium
+
+  * Bump to 1.0.0a2 for post-alpha-1 WIP.
+
+ -- Matthias Brennwald <mbrennwa@gmail.com>  Mon, 17 Aug 2026 08:25:00 +0200
+
 post (1.0.0a1) unstable; urgency=medium
 
   * Bump to 1.0.0a1 (public alpha).

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-__version__ = "1.0.0a1"
+__version__ = "1.0.0a2"
 
 _PROJECT_HOMEPAGE = "https://mbrennwa.github.io/post"
 _ISSUE_TRACKER_URL = "https://github.com/mbrennwa/post/issues"
