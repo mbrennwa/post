@@ -14,8 +14,9 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("WebKit", "6.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gio", "2.0")
+gi.require_version("Graphene", "1.0")
 
-from gi.repository import Gdk, Gio, Gtk, WebKit
+from gi.repository import Gdk, Gio, Graphene, Gtk, WebKit
 
 from post.mail.helpers import (
     ReaderHeaderRow,
@@ -70,6 +71,101 @@ def strip_reader_context_menu(menu: WebKit.ContextMenu) -> None:
     items = list(menu.get_items())
     if items and items[-1].is_separator():
         menu.remove(items[-1])
+
+
+def reader_link_tooltip_text(
+    hit_test_result: WebKit.HitTestResult | None,
+) -> str | None:
+    """Return the hovered link href for a tooltip, or ``None`` if not on a link.
+
+    Uses the actual ``href``, not HTML ``title``, so a sender cannot spoof the
+    destination with a misleading title attribute.
+    """
+    if hit_test_result is None or not hit_test_result.context_is_link():
+        return None
+    uri = (hit_test_result.get_link_uri() or "").strip()
+    return uri or None
+
+
+_LINK_HOVER_PAD = 8
+_LINK_HOVER_OFFSET_X = 12
+_LINK_HOVER_OFFSET_Y = 16
+
+
+def apply_reader_link_hover(
+    box: Gtk.Widget, label: Gtk.Label, text: str | None
+) -> bool:
+    """Show or hide the on-page hover URL overlay.
+
+    GTK tooltips on WebKitGTK never appear: the view consumes pointer
+    motion, so the tooltip hover timeout never fires. A non-targetable OSD
+    overlay is updated from ``mouse-target-changed`` instead.
+
+    Returns whether the overlay is shown.
+    """
+    if text:
+        if box.get_visible() and label.get_label() == text:
+            return True
+        label.set_label(text)
+        box.set_visible(True)
+        return True
+    if not box.get_visible() and not label.get_label():
+        return False
+    label.set_label("")
+    box.set_visible(False)
+    box.set_margin_start(0)
+    box.set_margin_top(0)
+    return False
+
+
+def pointer_coords_in_widget(widget: Gtk.Widget) -> tuple[float, float] | None:
+    """Return pointer coordinates in *widget* space, or ``None`` if unknown."""
+    native = widget.get_native()
+    if native is None or not isinstance(native, Gtk.Widget):
+        return None
+    surface = native.get_surface()
+    if surface is None:
+        return None
+    seat = widget.get_display().get_default_seat()
+    if seat is None:
+        return None
+    device = seat.get_pointer()
+    if device is None:
+        return None
+    found, surface_x, surface_y, _mask = surface.get_device_position(device)
+    if not found:
+        return None
+    origin_x, origin_y = native.get_surface_transform()
+    native_point = Graphene.Point().init(surface_x - origin_x, surface_y - origin_y)
+    ok, local = native.compute_point(widget, native_point)
+    if not ok or local is None:
+        return None
+    return (local.x, local.y)
+
+
+def reader_link_hover_origin(
+    pointer_x: float,
+    pointer_y: float,
+    chip_w: float,
+    chip_h: float,
+    view_w: float,
+    view_h: float,
+) -> tuple[float, float]:
+    """Place a hover chip near the pointer, flipping to stay in view."""
+    x = pointer_x + _LINK_HOVER_OFFSET_X
+    y = pointer_y + _LINK_HOVER_OFFSET_Y
+    if view_w <= 0 or view_h <= 0:
+        return (x, y)
+    pad = _LINK_HOVER_PAD
+    if x + chip_w + pad > view_w:
+        x = pointer_x - chip_w - _LINK_HOVER_OFFSET_X
+    if y + chip_h + pad > view_h:
+        y = pointer_y - chip_h - _LINK_HOVER_OFFSET_Y
+    max_x = view_w - chip_w - pad
+    max_y = view_h - chip_h - pad
+    x = min(max(x, pad), max(pad, max_x))
+    y = min(max(y, pad), max(pad, max_y))
+    return (x, y)
 
 
 def prepend_address_context_menu_items(
@@ -330,12 +426,42 @@ class MessageReaderPane(Gtk.Box):
         settings.set_enable_html5_local_storage(False)
         self._web_view.connect("decide-policy", self._on_web_view_decide_policy)
         self._web_view.connect("context-menu", self._on_web_view_context_menu)
+        self._web_view.connect(
+            "mouse-target-changed", self._on_web_view_mouse_target_changed
+        )
         self._web_view.set_vexpand(True)
         self._web_view.set_hexpand(True)
         self._web_view.set_halign(Gtk.Align.FILL)
         # Prevent long message URLs from forcing a huge minimum width.
         self._web_view.set_size_request(1, -1)
-        self._reader_body_stack.add_named(self._web_view, "content")
+
+        self._link_hover_label = Gtk.Label(label="", xalign=0)
+        self._link_hover_label.set_ellipsize(3)  # Pango.EllipsizeMode.END
+        self._link_hover_label.set_max_width_chars(80)
+        self._link_hover_label.set_single_line_mode(True)
+        self._link_hover_label.set_can_target(False)
+        self._link_hover_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=0
+        )
+        self._link_hover_box.add_css_class("osd")
+        self._link_hover_box.set_can_target(False)
+        self._link_hover_box.set_halign(Gtk.Align.START)
+        self._link_hover_box.set_valign(Gtk.Align.START)
+        self._link_hover_box.set_visible(False)
+        self._link_hover_box.append(self._link_hover_label)
+
+        body_overlay = Gtk.Overlay()
+        body_overlay.set_child(self._web_view)
+        body_overlay.set_vexpand(True)
+        body_overlay.set_hexpand(True)
+        body_overlay.set_halign(Gtk.Align.FILL)
+        body_overlay.add_overlay(self._link_hover_box)
+        hover_motion = Gtk.EventControllerMotion()
+        hover_motion.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        hover_motion.connect("motion", self._on_link_hover_motion)
+        body_overlay.add_controller(hover_motion)
+        self._link_hover_overlay = body_overlay
+        self._reader_body_stack.add_named(body_overlay, "content")
         self._reader_body_stack.set_visible_child_name("empty")
         self._reader_body_stack.set_hexpand(True)
         self._reader_body_stack.set_halign(Gtk.Align.FILL)
@@ -795,6 +921,7 @@ class MessageReaderPane(Gtk.Box):
         self._message_actions.set_visible(False)
         self.set_actions_sensitive(False)
         self._reader_body_stack.set_visible_child_name("empty")
+        self._clear_link_hover()
 
     def show_message(
         self,
@@ -835,6 +962,7 @@ class MessageReaderPane(Gtk.Box):
         self._message_actions.set_visible(False)
         self.set_actions_sensitive(False)
         self._reader_body_stack.set_visible_child_name("empty")
+        self._clear_link_hover()
 
     def show_unavailable(self, message: str, *, dark: bool) -> None:
         self._current_message = None
@@ -888,6 +1016,7 @@ class MessageReaderPane(Gtk.Box):
             self._show_reader_document()
 
     def _load_error_html(self, message: str) -> None:
+        self._clear_link_hover()
         self._reader_body_stack.set_visible_child_name("content")
         error_color = "#aaaaaa" if self._dark else "#666666"
         self._web_view.load_html(
@@ -988,6 +1117,7 @@ class MessageReaderPane(Gtk.Box):
         self._on_attachment_context_menu(widget, x, y, index, mime_type, name)
 
     def _show_reader_document(self) -> None:
+        self._clear_link_hover()
         if self._current_message is None:
             self._reader_body_stack.set_visible_child_name("empty")
             return
@@ -1007,6 +1137,55 @@ class MessageReaderPane(Gtk.Box):
     def _uri_opens_externally(uri: str) -> bool:
         lower = uri.lower()
         return lower.startswith(("http://", "https://", "mailto:"))
+
+    def _clear_link_hover(self) -> None:
+        apply_reader_link_hover(self._link_hover_box, self._link_hover_label, None)
+
+    def _position_link_hover(
+        self, pointer: tuple[float, float] | None = None
+    ) -> None:
+        if not self._link_hover_box.get_visible():
+            return
+        overlay = self._link_hover_overlay
+        if pointer is None:
+            pointer = pointer_coords_in_widget(overlay)
+        if pointer is None:
+            return
+        _min_w, chip_w, _, _ = self._link_hover_box.measure(
+            Gtk.Orientation.HORIZONTAL, -1
+        )
+        _min_h, chip_h, _, _ = self._link_hover_box.measure(
+            Gtk.Orientation.VERTICAL, -1
+        )
+        x, y = reader_link_hover_origin(
+            pointer[0],
+            pointer[1],
+            chip_w,
+            chip_h,
+            overlay.get_width(),
+            overlay.get_height(),
+        )
+        self._link_hover_box.set_margin_start(max(0, int(round(x))))
+        self._link_hover_box.set_margin_top(max(0, int(round(y))))
+
+    def _on_link_hover_motion(
+        self, _controller: Gtk.EventControllerMotion, x: float, y: float
+    ) -> None:
+        if self._link_hover_box.get_visible():
+            self._position_link_hover((x, y))
+
+    def _on_web_view_mouse_target_changed(
+        self,
+        _web_view: WebKit.WebView,
+        hit_test_result: WebKit.HitTestResult,
+        _modifiers: int,
+    ) -> None:
+        if apply_reader_link_hover(
+            self._link_hover_box,
+            self._link_hover_label,
+            reader_link_tooltip_text(hit_test_result),
+        ):
+            self._position_link_hover()
 
     def _on_web_view_context_menu(
         self,

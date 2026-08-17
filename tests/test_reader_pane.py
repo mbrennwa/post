@@ -18,7 +18,10 @@ from gi.repository import Gio, Gtk, WebKit
 from post.preferences import MESSAGE_APPEARANCE_ADAPT_TEXT
 from post.reader.pane import (
     MessageReaderPane,
+    apply_reader_link_hover,
     prepend_address_context_menu_items,
+    reader_link_hover_origin,
+    reader_link_tooltip_text,
     strip_reader_context_menu,
 )
 
@@ -426,3 +429,81 @@ class MessageReaderPaneTests(unittest.TestCase):
                 int(WebKit.ContextMenuAction.COPY),
             ],
         )
+
+    def test_reader_link_tooltip_text_returns_href(self) -> None:
+        hit = MagicMock()
+        hit.context_is_link.return_value = True
+        hit.get_link_uri.return_value = "https://example.com/renew"
+        self.assertEqual(
+            reader_link_tooltip_text(hit),
+            "https://example.com/renew",
+        )
+
+    def test_reader_link_tooltip_text_passes_mailto(self) -> None:
+        hit = MagicMock()
+        hit.context_is_link.return_value = True
+        hit.get_link_uri.return_value = "mailto:Sender%20%3Csender@example.com%3E"
+        self.assertEqual(
+            reader_link_tooltip_text(hit),
+            "mailto:Sender%20%3Csender@example.com%3E",
+        )
+
+    def test_reader_link_tooltip_text_none_when_not_a_link(self) -> None:
+        hit = MagicMock()
+        hit.context_is_link.return_value = False
+        hit.get_link_uri.return_value = "https://example.com/renew"
+        self.assertIsNone(reader_link_tooltip_text(hit))
+
+    def test_reader_link_tooltip_text_none_when_empty_href(self) -> None:
+        hit = MagicMock()
+        hit.context_is_link.return_value = True
+        hit.get_link_uri.return_value = "  "
+        self.assertIsNone(reader_link_tooltip_text(hit))
+        self.assertIsNone(reader_link_tooltip_text(None))
+
+    def test_mouse_target_changed_sets_and_clears_hover_url(self) -> None:
+        link = MagicMock()
+        link.context_is_link.return_value = True
+        link.get_link_uri.return_value = "https://example.com/renew"
+        self.pane._on_web_view_mouse_target_changed(self.pane._web_view, link, 0)
+        self.assertTrue(self.pane._link_hover_box.get_visible())
+        self.assertEqual(
+            self.pane._link_hover_label.get_label(),
+            "https://example.com/renew",
+        )
+
+        other = MagicMock()
+        other.context_is_link.return_value = False
+        other.get_link_uri.return_value = "https://example.com/renew"
+        self.pane._on_web_view_mouse_target_changed(self.pane._web_view, other, 0)
+        self.assertFalse(self.pane._link_hover_box.get_visible())
+        self.assertEqual(self.pane._link_hover_label.get_label(), "")
+
+    def test_positions_hover_chip_near_pointer(self) -> None:
+        self.pane._link_hover_label.set_label("https://example.com/renew")
+        self.pane._link_hover_box.set_visible(True)
+        self.pane._position_link_hover((40, 50))
+        self.assertEqual(self.pane._link_hover_box.get_margin_start(), 52)
+        self.assertEqual(self.pane._link_hover_box.get_margin_top(), 66)
+
+    def test_reader_link_hover_origin_stays_below_right(self) -> None:
+        self.assertEqual(
+            reader_link_hover_origin(40, 50, 80, 24, 400, 300),
+            (52, 66),
+        )
+
+    def test_reader_link_hover_origin_flips_at_edges(self) -> None:
+        x, y = reader_link_hover_origin(380, 280, 80, 24, 400, 300)
+        self.assertLess(x, 380)
+        self.assertLess(y, 280)
+        self.assertGreaterEqual(x, 8)
+        self.assertGreaterEqual(y, 8)
+
+    def test_apply_reader_link_hover_skips_redundant_set(self) -> None:
+        box = MagicMock()
+        box.get_visible.return_value = True
+        label = MagicMock()
+        label.get_label.return_value = "https://example.com/renew"
+        apply_reader_link_hover(box, label, "https://example.com/renew")
+        label.set_label.assert_not_called()
+        box.set_visible.assert_not_called()
