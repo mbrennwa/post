@@ -310,6 +310,49 @@ class VirtualMessageList(Gtk.ScrolledWindow):
                 self._list_key_positions[item.list_key] = position
             position += 1
 
+    def insert_messages_newest_first(
+        self,
+        messages: Iterable[dict[str, Any]],
+        *,
+        folder_name: str,
+    ) -> None:
+        """Insert rows by ``sort_date`` (newest on top) without rebinding the list."""
+        items = [
+            MessageListItem(_copy_message_for_list(message)) for message in messages
+        ]
+        if not items:
+            return
+        at_top = self._is_scrolled_to_top()
+        self._folder_name = folder_name
+        inserted_at_top = False
+        for item in items:
+            message = item.message
+            if not isinstance(message, dict):
+                continue
+            position = self._newest_first_insert_index(message)
+            if position == 0:
+                inserted_at_top = True
+            self._store.splice(position, 0, [item])
+        self._rebuild_list_key_positions()
+        if at_top and inserted_at_top:
+            self._scroll_to_top_after_layout()
+
+    def _newest_first_insert_index(self, message: dict[str, Any]) -> int:
+        sort_date = message.get("sort_date") or 0
+        lo = 0
+        hi = self._store.get_n_items()
+        while lo < hi:
+            mid = (lo + hi) // 2
+            item = self._store.get_item(mid)
+            mid_date = 0
+            if isinstance(item, MessageListItem) and isinstance(item.message, dict):
+                mid_date = item.message.get("sort_date") or 0
+            if mid_date >= sort_date:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
     def remove_uids(self, uids: Iterable[str]) -> int:
         uid_set = set(uids)
         if not uid_set:

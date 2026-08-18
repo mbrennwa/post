@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import bisect
 import ctypes
 import html
 import os
@@ -696,6 +697,23 @@ def reader_header_rows(msg: dict[str, Any]) -> list[ReaderHeaderRow]:
 
 def sort_messages_newest_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(messages, key=lambda message: message.get("sort_date") or 0, reverse=True)
+
+
+def insert_messages_newest_first(
+    existing: list[dict[str, Any]],
+    batch: list[dict[str, Any]],
+) -> None:
+    """Insert ``batch`` into ``existing``, keeping newest-first by ``sort_date``.
+
+    Mutates ``existing``. Equal dates are placed after existing equals so
+    streaming order among ties stays stable.
+    """
+    for message in batch:
+        bisect.insort(
+            existing,
+            message,
+            key=lambda item: -(item.get("sort_date") or 0),
+        )
 
 
 def paginate_messages(

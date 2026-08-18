@@ -24,6 +24,7 @@ from post.mail.helpers import (
     format_reader_header,
     format_message_list_date,
     format_recipient_header,
+    insert_messages_newest_first,
     mailto_primary_email,
     message_has_attachments,
     message_info_to_dict,
@@ -81,6 +82,35 @@ class SortMessagesNewestFirstTests(unittest.TestCase):
         original = list(messages)
         sort_messages_newest_first(messages)
         self.assertEqual(messages, original)
+
+
+class InsertMessagesNewestFirstTests(unittest.TestCase):
+    def test_inserts_batch_newest_on_top(self) -> None:
+        existing = [
+            {"uid": "inbox-old", "sort_date": 200},
+            {"uid": "inbox-older", "sort_date": 50},
+        ]
+        insert_messages_newest_first(
+            existing,
+            [
+                {"uid": "archive-new", "sort_date": 300},
+                {"uid": "archive-mid", "sort_date": 100},
+            ],
+        )
+        self.assertEqual(
+            [message["uid"] for message in existing],
+            ["archive-new", "inbox-old", "archive-mid", "inbox-older"],
+        )
+
+    def test_equal_dates_stay_after_existing(self) -> None:
+        existing = [{"uid": "a", "sort_date": 100}]
+        insert_messages_newest_first(existing, [{"uid": "b", "sort_date": 100}])
+        self.assertEqual([message["uid"] for message in existing], ["a", "b"])
+
+    def test_empty_batch_is_noop(self) -> None:
+        existing = [{"uid": "1", "sort_date": 1}]
+        insert_messages_newest_first(existing, [])
+        self.assertEqual([message["uid"] for message in existing], ["1"])
 
 
 class FormatReaderHeaderTests(unittest.TestCase):
