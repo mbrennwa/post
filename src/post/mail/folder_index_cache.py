@@ -98,6 +98,28 @@ def has_cache(account_uid: str, folder_name: str) -> bool:
     return _cache_path(account_uid, folder_name).is_file()
 
 
+def cached_folder_names(account_uid: str) -> list[str]:
+    """Return folder names stored on disk for an account (no Camel)."""
+    account_dir = _CACHE_ROOT / account_uid
+    if not account_dir.is_dir():
+        return []
+    names: list[str] = []
+    try:
+        paths = list(account_dir.glob("*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            with path.open(encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            continue
+        name = payload.get("folder_name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
 def load(
     account_uid: str,
     folder_name: str,

@@ -11,7 +11,9 @@ from post.mail.correspondents import (
     collect_correspondents,
     correspondent_matches_prefix,
     current_address_token,
+    folder_feeds_correspondents,
     match_correspondents,
+    merge_correspondents,
 )
 
 
@@ -67,6 +69,41 @@ class CollectCorrespondentsTests(unittest.TestCase):
         )
         self.assertEqual(len(correspondents), 1)
         self.assertEqual(correspondents[0].email, normalize_email("bob@example.com"))
+
+    def test_collects_bcc(self) -> None:
+        correspondents = collect_correspondents(
+            [
+                {
+                    "from": "Me <me@example.com>",
+                    "to": "Alice <alice@example.com>",
+                    "bcc": "Secret <secret@example.com>",
+                    "sort_date": 10,
+                }
+            ]
+        )
+        emails = {item.email for item in correspondents}
+        self.assertIn(normalize_email("secret@example.com"), emails)
+
+    def test_prefers_newer_display(self) -> None:
+        correspondents = collect_correspondents(
+            [
+                {
+                    "from": "Alice <alice@example.com>",
+                    "to": "",
+                    "cc": "",
+                    "sort_date": 1,
+                },
+                {
+                    "from": "Alice Smith <alice@example.com>",
+                    "to": "",
+                    "cc": "",
+                    "sort_date": 9,
+                },
+            ]
+        )
+        self.assertEqual(len(correspondents), 1)
+        self.assertEqual(correspondents[0].display, "Alice Smith <alice@example.com>")
+        self.assertEqual(correspondents[0].last_seen, 9)
 
 
 class CurrentAddressTokenTests(unittest.TestCase):
@@ -171,6 +208,46 @@ class ApplyAddressCompletionTests(unittest.TestCase):
                 "Bob <bob@example.com>",
             ),
             "alice@example.com, Bob <bob@example.com>, ",
+        )
+
+
+class FolderFeedsCorrespondentsTests(unittest.TestCase):
+    def test_includes_inbox_sent_archive_trash(self) -> None:
+        for name in ("INBOX", "Sent", "Sent Items", "Archive", "Trash"):
+            self.assertTrue(folder_feeds_correspondents(name), name)
+
+    def test_skips_junk_drafts_outbox(self) -> None:
+        for name in ("Junk", "Spam", "Drafts", "Draft", ".post/Outbox"):
+            self.assertFalse(folder_feeds_correspondents(name), name)
+
+
+class MergeCorrespondentsTests(unittest.TestCase):
+    def test_keeps_newer_last_seen(self) -> None:
+        older = collect_correspondents(
+            [{"from": "Alice <alice@example.com>", "sort_date": 1}]
+        )
+        newer = collect_correspondents(
+            [{"from": "Alice S. <alice@example.com>", "sort_date": 5}]
+        )
+        merged = merge_correspondents(older, newer)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].display, "Alice S. <alice@example.com>")
+
+    def test_adds_new_email(self) -> None:
+        first = collect_correspondents(
+            [{"from": "Alice <alice@example.com>", "sort_date": 1}]
+        )
+        second = collect_correspondents(
+            [{"from": "Bob <bob@example.com>", "sort_date": 2}]
+        )
+        merged = merge_correspondents(first, second)
+        emails = {item.email for item in merged}
+        self.assertEqual(
+            emails,
+            {
+                normalize_email("alice@example.com"),
+                normalize_email("bob@example.com"),
+            },
         )
 
 
