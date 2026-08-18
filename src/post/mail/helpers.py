@@ -420,6 +420,9 @@ def message_info_to_dict(
         "from": format_recipient_header(info.get_from()),
         "to": format_recipient_header(info.get_to()),
         "cc": format_recipient_header(info.get_cc()),
+        "bcc": format_recipient_header(
+            info.get_bcc() if getattr(type(info), "get_bcc", None) else None
+        ),
         # RFC Message-ID header string (not Camel's uint hash — see #267).
         "message_id": _rfc_message_id_from_message_info(info),
         "message_id_hash": _message_id_hash_from_message_info(info),

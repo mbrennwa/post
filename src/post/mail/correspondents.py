@@ -9,9 +9,19 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .compose import _ADDRESS_SPLIT, normalize_email, parse_address_header
+from .compose import _ADDRESS_SPLIT, normalize_email
+from .folders import (
+    is_drafts_folder_name,
+    is_post_local_folder,
+    is_post_outbox_folder,
+    is_virtual_folder,
+)
+from .message_list_state import is_junk_folder_name
 
 _NAME_FROM_DISPLAY = re.compile(r'^(.+?)\s*<[^>]+>\s*$')
+_ANGLE_EMAIL = re.compile(r"<([^<>\s]+@[^<>\s]+)>")
+_BARE_EMAIL = re.compile(r"^[^,;<>\s]+@[^,;<>\s]+$")
+_CORRESPONDENT_HEADERS = ("from", "to", "cc", "bcc")
 
 
 @dataclass(frozen=True)
@@ -19,6 +29,7 @@ class Correspondent:
     display: str
     email: str
     name: str
+    last_seen: int = 0
 
 
 def _name_from_display(display: str) -> str:
@@ -28,14 +39,69 @@ def _name_from_display(display: str) -> str:
     return match.group(1).strip().strip('"')
 
 
-def _correspondent_from_display(display: str) -> Correspondent | None:
+def _email_and_name_from_display(display: str) -> tuple[str, str]:
+    """Extract lowercase email and display name without Camel (hot harvest path)."""
+    display = display.strip().strip(",")
+    if not display:
+        return "", ""
+    match = _ANGLE_EMAIL.search(display)
+    if match:
+        email = match.group(1).strip().lower()
+        name = display[: match.start()].strip().strip('"')
+        return email, name
+    if _BARE_EMAIL.match(display):
+        return display.lower(), ""
     email = normalize_email(display)
+    if email and "@" in email:
+        return email, _name_from_display(display)
+    return "", ""
+
+
+def _correspondent_from_display(
+    display: str, *, last_seen: int = 0
+) -> Correspondent | None:
+    email, name = _email_and_name_from_display(display)
     if not email or "@" not in email:
         return None
     return Correspondent(
-        display=display,
+        display=display.strip(),
         email=email,
-        name=_name_from_display(display),
+        name=name,
+        last_seen=last_seen,
+    )
+
+
+def folder_feeds_correspondents(folder_name: str | None) -> bool:
+    """False for Junk, Drafts, Outbox, and virtual/local helper folders (#313)."""
+    if not folder_name:
+        return False
+    if is_post_outbox_folder(folder_name) or is_post_local_folder(folder_name):
+        return False
+    if is_virtual_folder(folder_name):
+        return False
+    if is_junk_folder_name(folder_name):
+        return False
+    if is_drafts_folder_name([], folder_name):
+        return False
+    return True
+
+
+def merge_correspondents(
+    existing: list[Correspondent],
+    incoming: list[Correspondent],
+) -> list[Correspondent]:
+    """Dedupe by email, keeping the newest last_seen display string."""
+    by_email: dict[str, Correspondent] = {}
+    for item in existing:
+        by_email[item.email] = item
+    for item in incoming:
+        previous = by_email.get(item.email)
+        if previous is None or item.last_seen > previous.last_seen:
+            by_email[item.email] = item
+    return sorted(
+        by_email.values(),
+        key=lambda item: item.last_seen,
+        reverse=True,
     )
 
 
@@ -44,24 +110,43 @@ def collect_correspondents(
     *,
     exclude_emails: set[str] | None = None,
 ) -> list[Correspondent]:
-    """Collect unique correspondents from message headers, preserving first-seen order."""
+    """Collect unique correspondents from message headers.
+
+    Prefers the display string from the newest ``sort_date``. Same-timestamp
+    duplicates keep the first-seen display.
+    """
     excluded = {email.casefold() for email in (exclude_emails or set()) if email}
-    seen: set[str] = set()
-    correspondents: list[Correspondent] = []
+    by_email: dict[str, Correspondent] = {}
 
     for message in messages:
-        for header in ("from", "to", "cc"):
+        last_seen = message.get("sort_date") or 0
+        if not isinstance(last_seen, int):
+            try:
+                last_seen = int(last_seen)
+            except (TypeError, ValueError):
+                last_seen = 0
+        for header in _CORRESPONDENT_HEADERS:
             raw = message.get(header) or ""
-            for display in parse_address_header(raw):
-                correspondent = _correspondent_from_display(display)
+            if not raw:
+                continue
+            for display in _ADDRESS_SPLIT.split(raw):
+                correspondent = _correspondent_from_display(
+                    display, last_seen=last_seen
+                )
                 if correspondent is None:
                     continue
-                if correspondent.email in excluded or correspondent.email in seen:
+                if correspondent.email in excluded:
                     continue
-                seen.add(correspondent.email)
-                correspondents.append(correspondent)
+                previous = by_email.get(correspondent.email)
+                if previous is not None and correspondent.last_seen <= previous.last_seen:
+                    continue
+                by_email[correspondent.email] = correspondent
 
-    return correspondents
+    return sorted(
+        by_email.values(),
+        key=lambda item: item.last_seen,
+        reverse=True,
+    )
 
 
 def current_address_token(text: str) -> str:

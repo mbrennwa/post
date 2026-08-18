@@ -33,6 +33,7 @@ gi.require_version("Gio", "2.0")
 
 from gi.repository import Camel, EDataServer, GLib, Gio
 
+from . import correspondent_cache
 from . import folder_index_cache
 from . import folder_status_cache
 from . import graph_folder_counts
@@ -132,7 +133,12 @@ from .compose import (
     normalize_references_header,
     read_compose_attachments_from_message,
 )
-from .correspondents import Correspondent, collect_correspondents
+from .correspondents import (
+    Correspondent,
+    collect_correspondents,
+    folder_feeds_correspondents,
+    merge_correspondents,
+)
 from .folders import (
     find_folder_by_type,
     find_trash_folder,
@@ -169,9 +175,6 @@ from .search import (
 from .search_debug import search_trace, search_trace_timer
 
 log = logging.getLogger(__name__)
-
-# Limit autocomplete index size; messages are processed newest-first.
-_MAX_CORRESPONDENTS = 500
 
 # EDS also lists RSS feeds, search folders, etc. as "Mail Account" sources.
 _SKIP_BACKENDS = frozenset({"rss", "vfolder"})
@@ -1470,12 +1473,15 @@ class MailService:
         total: int,
     ) -> None:
         """Install a folder index from disk cache without touching Camel."""
-        with self._lock:
-            self._folder_indexes[(account_uid, folder_name)] = _FolderMessageIndex(
+        self._store_folder_index(
+            account_uid,
+            folder_name,
+            _FolderMessageIndex(
                 messages=list(messages),
                 unread=unread,
                 total=total,
-            )
+            ),
+        )
 
     def get_folder_index_snapshot(
         self,
@@ -1505,6 +1511,7 @@ class MailService:
     def invalidate_correspondent_index(self, account_uid: str) -> None:
         with self._lock:
             self._correspondent_indexes.pop(account_uid, None)
+        correspondent_cache.invalidate(account_uid)
 
     def invalidate_account_connection(self, account_uid: str) -> None:
         """Drop cached Camel store/transport so the next open uses fresh credentials."""
@@ -2716,83 +2723,118 @@ class MailService:
     def get_correspondents(self, account_uid: str) -> list[Correspondent]:
         return run_on_mail_thread(self._get_correspondents_unlocked, account_uid)
 
+    def get_correspondents_cached(self, account_uid: str) -> list[Correspondent]:
+        """Return in-memory correspondents without joining the mail thread."""
+        with self._lock:
+            cached = self._correspondent_indexes.get(account_uid)
+            if cached is None:
+                return []
+            return list(cached)
+
     def _get_correspondents_unlocked(self, account_uid: str) -> list[Correspondent]:
         with self._lock:
             cached = self._correspondent_indexes.get(account_uid)
             if cached is not None:
-                return cached
+                return list(cached)
+        loaded = correspondent_cache.load(account_uid)
+        if loaded:
+            self._remember_correspondents(account_uid, loaded, persist=False)
+            return list(loaded)
         correspondents = self._build_correspondents_index_unlocked(account_uid)
-        with self._lock:
-            self._correspondent_indexes[account_uid] = correspondents
+        if correspondents:
+            self._remember_correspondents(account_uid, correspondents, persist=True)
         return correspondents
 
-    def _folders_for_correspondents_unlocked(
-        self, account_uid: str
-    ) -> list[dict]:
-        """Select Inbox/Sent from the cached folder tree only (no Camel connect)."""
+    def _store_folder_index(
+        self,
+        account_uid: str,
+        folder_name: str,
+        index: _FolderMessageIndex,
+    ) -> None:
+        """Install a folder index and merge correspondents (#313)."""
         with self._lock:
-            folders = self._folder_tree_cache.get(account_uid)
-        if not folders:
+            self._folder_indexes[(account_uid, folder_name)] = index
+        self._merge_correspondents_from_folder(
+            account_uid, folder_name, index.messages
+        )
+
+    def _remember_correspondents(
+        self,
+        account_uid: str,
+        correspondents: list[Correspondent],
+        *,
+        persist: bool,
+    ) -> None:
+        if not correspondents:
+            return
+        with self._lock:
+            self._correspondent_indexes[account_uid] = correspondents
+        if persist:
+            correspondent_cache.save(account_uid, correspondents)
+
+    def _merge_correspondents_from_folder(
+        self,
+        account_uid: str,
+        folder_name: str,
+        messages: list[dict],
+    ) -> None:
+        if not folder_feeds_correspondents(folder_name) or not messages:
+            return
+        incoming = collect_correspondents(messages)
+        if not incoming:
+            return
+        with self._lock:
+            existing = self._correspondent_indexes.get(account_uid)
+        if existing is None:
+            existing = correspondent_cache.load(account_uid)
+        if existing is None:
+            # Not bootstrapped yet — next get_correspondents() harvests all
+            # folder indexes. Do not persist a single-folder partial.
+            return
+        merged = merge_correspondents(existing, incoming)
+        self._remember_correspondents(account_uid, merged, persist=True)
+
+    def _correspondent_folder_names_unlocked(self, account_uid: str) -> list[str]:
+        """Folder names that may feed autocomplete (cached tree / indexes only)."""
+        names: set[str] = set()
+        with self._lock:
+            for folder in self._folder_tree_cache.get(account_uid) or []:
+                full_name = folder.get("full_name")
+                if full_name:
+                    names.add(full_name)
+            for key_account, folder_name in self._folder_indexes:
+                if key_account == account_uid:
+                    names.add(folder_name)
+        for folder_name in folder_index_cache.cached_folder_names(account_uid):
+            names.add(folder_name)
+        return [name for name in names if folder_feeds_correspondents(name)]
+
+    def _messages_for_correspondent_folder(
+        self, account_uid: str, folder_name: str
+    ) -> list[dict]:
+        with self._lock:
+            index = self._folder_indexes.get((account_uid, folder_name))
+        if index is not None:
+            return list(index.messages)
+        cached = folder_index_cache.load(account_uid, folder_name)
+        if cached is None:
             return []
-        selected: list[dict] = []
-        seen: set[str] = set()
-        for folder_type, fallbacks in (
-            (Camel.FolderInfoFlags.TYPE_INBOX, frozenset({"inbox"})),
-            (
-                Camel.FolderInfoFlags.TYPE_SENT,
-                frozenset({"sent", "sent mail", "sent messages"}),
-            ),
-        ):
-            info = find_folder_by_type(
-                folders,
-                folder_type,
-                type_mask=Camel.FOLDER_TYPE_MASK,
-                name_fallbacks=fallbacks,
-            )
-            if info is None:
-                continue
-            full_name = info.get("full_name")
-            if not full_name or full_name in seen:
-                continue
-            seen.add(full_name)
-            selected.append(info)
-        if selected:
-            return selected
-        for folder in folders:
-            if not folder_can_contain_messages(folder):
-                continue
-            full_name = folder.get("full_name")
-            if not full_name or full_name in seen:
-                continue
-            seen.add(full_name)
-            selected.append(folder)
-            if len(selected) >= 3:
-                break
-        return selected
+        return list(cached[0])
 
     def _build_correspondents_index_unlocked(
         self, account_uid: str
     ) -> list[Correspondent]:
-        """Build autocomplete from in-memory / disk folder indexes only (#156, #240)."""
-        folders = self._folders_for_correspondents_unlocked(account_uid)
+        """Build autocomplete from in-memory / disk folder indexes only (#156, #240, #313)."""
+        loaded = correspondent_cache.load(account_uid)
         messages: list[dict] = []
-        for folder in folders:
-            full_name = folder.get("full_name")
-            if not full_name:
-                continue
-            with self._lock:
-                index = self._folder_indexes.get((account_uid, full_name))
-            if index is not None:
-                messages.extend(index.messages)
-                continue
-            cached = folder_index_cache.load(account_uid, full_name)
-            if cached is not None:
-                cached_messages, _unread, _total = cached
-                messages.extend(cached_messages)
-
-        messages.sort(key=lambda message: message.get("sort_date") or 0, reverse=True)
-        correspondents = collect_correspondents(messages)
-        return correspondents[:_MAX_CORRESPONDENTS]
+        for folder_name in self._correspondent_folder_names_unlocked(account_uid):
+            messages.extend(
+                self._messages_for_correspondent_folder(account_uid, folder_name)
+            )
+        harvested = collect_correspondents(messages)
+        if loaded is None:
+            return harvested
+        return merge_correspondents(loaded, harvested)
 
     def list_folders(
         self,
@@ -3229,6 +3271,7 @@ class MailService:
             self._folder_indexes.pop((account_uid, old_name), None)
         self._correspondent_indexes.pop(account_uid, None)
         folder_index_cache.invalidate_account(account_uid)
+        correspondent_cache.invalidate(account_uid)
 
     def _cached_folder_stats_unlocked(
         self, account_uid: str, folder_name: str
@@ -4305,7 +4348,7 @@ class MailService:
                         unread=unread,
                         total=total,
                     )
-                    self._folder_indexes[key] = existing
+                    self._store_folder_index(account_uid, folder_name, existing)
                     source = "disk_cache"
             if existing is not None and existing.messages:
                 log.debug(
@@ -4319,7 +4362,7 @@ class MailService:
             index = self._build_folder_index_unlocked(
                 account_uid, folder_name, sync=False
             )
-            self._folder_indexes[key] = index
+            self._store_folder_index(account_uid, folder_name, index)
             if index.messages:
                 folder_index_cache.save(
                     account_uid,
@@ -4335,7 +4378,7 @@ class MailService:
             index = self._build_folder_index_unlocked(
                 account_uid, folder_name, sync=True
             )
-            self._folder_indexes[key] = index
+            self._store_folder_index(account_uid, folder_name, index)
             if _folder_index_is_cacheable(index):
                 folder_index_cache.save(
                     account_uid,
@@ -4359,13 +4402,13 @@ class MailService:
                 unread=unread,
                 total=total,
             )
-            self._folder_indexes[key] = index
+            self._store_folder_index(account_uid, folder_name, index)
             return index, "disk_cache"
 
         index = self._build_folder_index_unlocked(
             account_uid, folder_name, sync=False
         )
-        self._folder_indexes[key] = index
+        self._store_folder_index(account_uid, folder_name, index)
         if index.messages or index.total:
             if _folder_index_is_cacheable(index):
                 existing = folder_index_cache.load(account_uid, folder_name)
@@ -4386,7 +4429,7 @@ class MailService:
                         unread=unread,
                         total=total,
                     )
-                    self._folder_indexes[key] = index
+                    self._store_folder_index(account_uid, folder_name, index)
                     return index, "disk_cache"
                 folder_index_cache.save(
                     account_uid,
@@ -4405,7 +4448,7 @@ class MailService:
                         unread=unread,
                         total=total,
                     )
-                    self._folder_indexes[key] = index
+                    self._store_folder_index(account_uid, folder_name, index)
                     return index, "disk_cache"
                 if _should_save_heavy_folder_index(index.messages, existing):
                     folder_index_cache.save(
@@ -4478,12 +4521,14 @@ class MailService:
             # Seed memory so later recovery sees the same rows.
             existing = self._folder_indexes.get((account_uid, folder_name))
             if existing is None or not existing.messages:
-                self._folder_indexes[(account_uid, folder_name)] = (
+                self._store_folder_index(
+                    account_uid,
+                    folder_name,
                     _FolderMessageIndex(
                         messages=list(messages),
                         unread=unread,
                         total=total,
-                    )
+                    ),
                 )
         return list(messages)
 
@@ -4595,11 +4640,18 @@ class MailService:
         total = existing.total if existing is not None else len(sorted_messages)
         if existing is not None:
             existing.messages = sorted_messages
+            self._merge_correspondents_from_folder(
+                account_uid, folder_name, sorted_messages
+            )
         else:
-            self._folder_indexes[key] = _FolderMessageIndex(
-                messages=sorted_messages,
-                unread=unread,
-                total=total,
+            self._store_folder_index(
+                account_uid,
+                folder_name,
+                _FolderMessageIndex(
+                    messages=sorted_messages,
+                    unread=unread,
+                    total=total,
+                ),
             )
         folder_index_cache.save(
             account_uid,
@@ -5471,7 +5523,9 @@ class MailService:
                                         unread=pub_unread,
                                         total=pub_total,
                                     )
-                                self._folder_indexes[key] = index_mid
+                                self._store_folder_index(
+                                    account_uid, folder_name, index_mid
+                                )
                             if _should_save_heavy_folder_index(
                                 messages_mid, existing_disk
                             ):
@@ -6084,7 +6138,7 @@ class MailService:
                     index = _FolderMessageIndex(
                         messages=messages, unread=unread, total=total
                     )
-                self._folder_indexes[key] = index
+                self._store_folder_index(account_uid, folder_name, index)
             if is_heavy_folder_name(folder_name):
                 if _should_save_heavy_folder_index(messages, existing_disk):
                     save_total = max(total, len(messages))
@@ -6282,7 +6336,7 @@ class MailService:
                 index = _FolderMessageIndex(
                     messages=messages, unread=unread, total=total
                 )
-            self._folder_indexes[key] = index
+            self._store_folder_index(account_uid, folder_name, index)
 
         if is_heavy_folder_name(folder_name):
             if _should_save_heavy_folder_index(messages, existing_disk):
@@ -7882,7 +7936,7 @@ class MailService:
                     unread=unread,
                     total=total,
                 )
-                self._folder_indexes[key] = index
+                self._store_folder_index(account_uid, dest_name, index)
 
         if index is None:
             # No prior cache — seed from the moved messages only (do not pull a
@@ -7890,7 +7944,7 @@ class MailService:
             if not source_messages and not destination_uids:
                 return -1, -1
             index = _FolderMessageIndex(messages=[], unread=0, total=0)
-            self._folder_indexes[key] = index
+            self._store_folder_index(account_uid, dest_name, index)
 
         by_order = list(source_messages)
         new_messages: list[dict] = []
@@ -7971,6 +8025,9 @@ class MailService:
                 index.total += len(prepend)
             else:
                 index.total = len(index.messages)
+            self._merge_correspondents_from_folder(
+                account_uid, dest_name, prepend
+            )
 
         folder_index_cache.save(
             account_uid,

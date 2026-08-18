@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from post.mail.compose import ComposeAttachment
@@ -203,23 +204,54 @@ class SaveDraftOfflineQueueTests(unittest.TestCase):
 
 
 class CorrespondentsCacheOnlyTests(unittest.TestCase):
-    def test_correspondents_without_folder_cache_are_empty(self) -> None:
+    def setUp(self) -> None:
+        from post.mail import correspondent_cache, folder_index_cache
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        root = self._tmpdir.name
+        self._folder_patch = mock.patch.object(
+            folder_index_cache, "_CACHE_ROOT", Path(root) / "folder-index"
+        )
+        self._corr_patch = mock.patch.object(
+            correspondent_cache,
+            "_CACHE_ROOT",
+            Path(root) / "correspondents",
+        )
+        self._folder_patch.start()
+        self._corr_patch.start()
+
+    def tearDown(self) -> None:
+        self._corr_patch.stop()
+        self._folder_patch.stop()
+        self._tmpdir.cleanup()
+
+    def _service(self) -> MailService:
         service = MailService(registry=mock.Mock())
-        service._folder_tree_cache = {}
         service._build_folder_index_unlocked = mock.Mock(
             side_effect=AssertionError("must not open folders for correspondents")
         )
         service._get_store_unlocked = mock.Mock(
             side_effect=AssertionError("must not connect for correspondents")
         )
+        return service
+
+    def test_correspondents_without_folder_cache_are_empty(self) -> None:
+        service = self._service()
+        service._folder_tree_cache = {}
 
         result = service._build_correspondents_index_unlocked("acct-1")
         self.assertEqual(result, [])
 
+    def test_empty_harvest_is_not_cached(self) -> None:
+        service = self._service()
+        result = service._get_correspondents_unlocked("acct-1")
+        self.assertEqual(result, [])
+        self.assertNotIn("acct-1", service._correspondent_indexes)
+
     def test_correspondents_use_memory_folder_index(self) -> None:
         from post.mail.eds import _FolderMessageIndex
 
-        service = MailService(registry=mock.Mock())
+        service = self._service()
         service._folder_tree_cache = {
             "acct-1": [
                 {
@@ -242,9 +274,6 @@ class CorrespondentsCacheOnlyTests(unittest.TestCase):
                 total=1,
             )
         }
-        service._build_folder_index_unlocked = mock.Mock(
-            side_effect=AssertionError("must not open folders for correspondents")
-        )
 
         result = service._build_correspondents_index_unlocked("acct-1")
         self.assertEqual(len(result), 1)
@@ -253,7 +282,7 @@ class CorrespondentsCacheOnlyTests(unittest.TestCase):
     def test_correspondents_include_own_from_address(self) -> None:
         from post.mail.eds import _FolderMessageIndex
 
-        service = MailService(registry=mock.Mock())
+        service = self._service()
         service._folder_tree_cache = {
             "acct-1": [
                 {
@@ -277,10 +306,217 @@ class CorrespondentsCacheOnlyTests(unittest.TestCase):
                 total=1,
             )
         }
-        service._build_folder_index_unlocked = mock.Mock(
-            side_effect=AssertionError("must not open folders for correspondents")
-        )
 
         result = service._build_correspondents_index_unlocked("acct-1")
         emails = {item.email for item in result}
         self.assertEqual(emails, {"me@example.com", "alice@example.com"})
+
+    def test_correspondents_include_archive(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = self._service()
+        service._folder_indexes = {
+            ("acct-1", "Archive"): _FolderMessageIndex(
+                messages=[
+                    {
+                        "uid": "9",
+                        "from": "Old <old@example.com>",
+                        "sort_date": 1,
+                    }
+                ],
+                unread=0,
+                total=1,
+            )
+        }
+        result = service._build_correspondents_index_unlocked("acct-1")
+        self.assertEqual({item.email for item in result}, {"old@example.com"})
+
+    def test_correspondents_skip_junk(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = self._service()
+        service._folder_indexes = {
+            ("acct-1", "Junk"): _FolderMessageIndex(
+                messages=[
+                    {
+                        "uid": "1",
+                        "from": "Spam <spam@example.com>",
+                        "sort_date": 1,
+                    }
+                ],
+                unread=0,
+                total=1,
+            ),
+            ("acct-1", "INBOX"): _FolderMessageIndex(
+                messages=[
+                    {
+                        "uid": "2",
+                        "from": "Alice <alice@example.com>",
+                        "sort_date": 2,
+                    }
+                ],
+                unread=0,
+                total=1,
+            ),
+        }
+        result = service._build_correspondents_index_unlocked("acct-1")
+        self.assertEqual({item.email for item in result}, {"alice@example.com"})
+
+    def test_empty_cache_then_index_becomes_visible(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = self._service()
+        self.assertEqual(service._get_correspondents_unlocked("acct-1"), [])
+        self.assertNotIn("acct-1", service._correspondent_indexes)
+
+        service._store_folder_index(
+            "acct-1",
+            "INBOX",
+            _FolderMessageIndex(
+                messages=[
+                    {
+                        "uid": "1",
+                        "from": "Alice <alice@example.com>",
+                        "sort_date": 10,
+                    }
+                ],
+                unread=0,
+                total=1,
+            ),
+        )
+        result = service._get_correspondents_unlocked("acct-1")
+        self.assertEqual({item.email for item in result}, {"alice@example.com"})
+        self.assertIn("acct-1", service._correspondent_indexes)
+
+    def test_incremental_merge_after_bootstrap(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = self._service()
+        service._store_folder_index(
+            "acct-1",
+            "INBOX",
+            _FolderMessageIndex(
+                messages=[
+                    {
+                        "uid": "1",
+                        "from": "Alice <alice@example.com>",
+                        "sort_date": 10,
+                    }
+                ],
+                unread=0,
+                total=1,
+            ),
+        )
+        first = service._get_correspondents_unlocked("acct-1")
+        self.assertEqual({item.email for item in first}, {"alice@example.com"})
+
+        service._store_folder_index(
+            "acct-1",
+            "Archive",
+            _FolderMessageIndex(
+                messages=[
+                    {
+                        "uid": "2",
+                        "from": "Bob <bob@example.com>",
+                        "sort_date": 20,
+                    }
+                ],
+                unread=0,
+                total=1,
+            ),
+        )
+        cached = service.get_correspondents_cached("acct-1")
+        self.assertEqual(
+            {item.email for item in cached},
+            {"alice@example.com", "bob@example.com"},
+        )
+
+    def test_more_than_five_hundred_unique_addresses(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = self._service()
+        messages = [
+            {
+                "uid": "old",
+                "from": "Old <old@example.com>",
+                "sort_date": 1,
+            }
+        ]
+        messages.extend(
+            {
+                "uid": str(i),
+                "from": f"User {i} <user{i}@example.com>",
+                "sort_date": i + 10,
+            }
+            for i in range(500)
+        )
+        service._folder_indexes = {
+            ("acct-1", "INBOX"): _FolderMessageIndex(
+                messages=messages, unread=0, total=len(messages)
+            )
+        }
+        result = service._build_correspondents_index_unlocked("acct-1")
+        emails = {item.email for item in result}
+        self.assertGreater(len(emails), 500)
+        self.assertIn("old@example.com", emails)
+
+    def test_accounts_are_isolated(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = self._service()
+        service._folder_indexes = {
+            ("acct-1", "INBOX"): _FolderMessageIndex(
+                messages=[
+                    {
+                        "uid": "1",
+                        "from": "Alice <alice@example.com>",
+                        "sort_date": 1,
+                    }
+                ],
+                unread=0,
+                total=1,
+            ),
+            ("acct-2", "INBOX"): _FolderMessageIndex(
+                messages=[
+                    {
+                        "uid": "1",
+                        "from": "Bob <bob@example.com>",
+                        "sort_date": 1,
+                    }
+                ],
+                unread=0,
+                total=1,
+            ),
+        }
+        one = service._build_correspondents_index_unlocked("acct-1")
+        two = service._build_correspondents_index_unlocked("acct-2")
+        self.assertEqual({item.email for item in one}, {"alice@example.com"})
+        self.assertEqual({item.email for item in two}, {"bob@example.com"})
+
+    def test_disk_cache_skips_folder_harvest(self) -> None:
+        from post.mail import correspondent_cache
+        from post.mail.correspondents import Correspondent
+
+        service = self._service()
+        correspondent_cache.save(
+            "acct-1",
+            [
+                Correspondent(
+                    display="Alice <alice@example.com>",
+                    email="alice@example.com",
+                    name="Alice",
+                    last_seen=10,
+                )
+            ],
+        )
+        service._build_correspondents_index_unlocked = mock.Mock(
+            side_effect=AssertionError(
+                "must not harvest folders when correspondent disk cache exists"
+            )
+        )
+        result = service._get_correspondents_unlocked("acct-1")
+        self.assertEqual({item.email for item in result}, {"alice@example.com"})
+        self.assertEqual(
+            {item.email for item in service.get_correspondents_cached("acct-1")},
+            {"alice@example.com"},
+        )

@@ -17,8 +17,9 @@ import gi
 gi.require_version("Adw", "1")
 gi.require_version("Gio", "2.0")
 gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 
-from gi.repository import Adw, Gio, GLib, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from post.header_bar import add_end_window_controls, apply_header_corner_inset
 from post.icon_utils import apply_window_icon
@@ -399,6 +400,14 @@ _CC_PLACEHOLDER = "Optional"
 _BCC_PLACEHOLDER = "Optional"
 _SUBJECT_PLACEHOLDER = "Subject is required"
 _SIGNATURE_MARK_NAME = "compose-auto-signature"
+_COMPLETION_MATCH_LIMIT = 20
+_COMPLETION_DEBOUNCE_MS = 500
+
+
+@dataclass
+class _AddressCompletionUi:
+    popover: Gtk.Popover
+    listbox: Gtk.ListBox
 
 
 class ComposeWindow(Adw.Window):
@@ -536,8 +545,9 @@ class ComposeWindow(Adw.Window):
 
         self._correspondents: list[Correspondent] = []
         self._correspondents_generation = 0
-        self._completion_model = Gtk.ListStore(str)
-        self._entry_match_cache: dict[int, tuple[str, int, frozenset[str]]] = {}
+        self._completion_timeout_ids: dict[int, int] = {}
+        self._address_completions: dict[int, _AddressCompletionUi] = {}
+        self._applying_completion = False
 
         self._to_entry = Gtk.Entry()
         self._to_entry.set_placeholder_text(_TO_PLACEHOLDER)
@@ -636,6 +646,7 @@ class ComposeWindow(Adw.Window):
         self._update_send_enabled()
         self._update_save_draft_enabled()
         self.connect("close-request", self._on_close_request)
+        self.connect("destroy", self._teardown_address_completions)
         GLib.idle_add(self._set_initial_focus)
         if self._mode in ("draft", "send-again"):
             GLib.idle_add(self._begin_load_draft_attachments)
@@ -867,65 +878,228 @@ class ComposeWindow(Adw.Window):
         return False
 
     def _setup_address_completion(self, entry: Gtk.Entry) -> None:
-        completion = Gtk.EntryCompletion()
-        completion.set_model(self._completion_model)
-        completion.set_text_column(0)
-        completion.set_minimum_key_length(1)
-        completion.set_popup_completion(True)
+        # Gtk.EntryCompletion only pops up from a live changed handler. A
+        # delayed complete() after debounce never shows the list in GTK4.
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        listbox.set_activate_on_single_click(True)
+        listbox.set_can_focus(False)
+        listbox.connect("row-activated", self._on_completion_row_activated, entry)
 
-        def match_func(completion, key, tree_iter, entry) -> bool:
-            token = current_address_token(key)
-            if not token:
-                return False
-            entry_id = id(entry)
-            cached = self._entry_match_cache.get(entry_id)
-            if (
-                cached is None
-                or cached[0] != token
-                or cached[1] != self._correspondents_generation
-            ):
-                matches = match_correspondents(self._correspondents, token, limit=100)
-                cached = (
-                    token,
-                    self._correspondents_generation,
-                    frozenset(match.display for match in matches),
-                )
-                self._entry_match_cache[entry_id] = cached
-            display = completion.get_model().get_value(tree_iter, 0)
-            return display in cached[2]
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_max_content_height(240)
+        scrolled.set_propagate_natural_height(True)
+        scrolled.set_child(listbox)
 
-        completion.set_match_func(match_func, entry)
-        entry.connect("changed", self._on_address_entry_changed, entry)
+        popover = Gtk.Popover()
+        popover.set_autohide(False)
+        popover.set_has_arrow(False)
+        popover.set_can_focus(False)
+        popover.set_position(Gtk.PositionType.BOTTOM)
+        popover.set_child(scrolled)
+        popover.set_parent(entry)
 
-        def on_match_selected(completion, model, tree_iter, entry) -> bool:
-            display = model.get_value(tree_iter, 0)
+        self._address_completions[id(entry)] = _AddressCompletionUi(
+            popover=popover,
+            listbox=listbox,
+        )
+        entry.connect("changed", self._on_address_entry_changed)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_address_key_pressed, entry)
+        entry.add_controller(keys)
+
+        focus = Gtk.EventControllerFocus()
+        focus.connect("leave", self._on_address_focus_leave, entry)
+        entry.add_controller(focus)
+
+    def _teardown_address_completions(self, *_args) -> None:
+        self._cancel_completion_timeouts()
+        for ui in self._address_completions.values():
+            ui.popover.popdown()
+            ui.popover.unparent()
+        self._address_completions.clear()
+
+    def _on_address_entry_changed(self, entry: Gtk.Entry) -> None:
+        if self._applying_completion:
+            return
+        self._hide_completion(entry)
+        if not current_address_token(entry.get_text()):
+            self._cancel_completion_timeout(entry)
+            return
+        self._schedule_completion(entry)
+
+    def _on_address_focus_leave(
+        self, _controller: Gtk.EventControllerFocus, entry: Gtk.Entry
+    ) -> None:
+        GLib.timeout_add(80, self._hide_completion_if_unfocused, entry)
+
+    def _address_entry_is_focused(self, entry: Gtk.Entry) -> bool:
+        focus = self.get_focus()
+        while focus is not None:
+            if focus == entry:
+                return True
+            focus = focus.get_parent()
+        return False
+
+    def _on_address_key_pressed(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        _state: Gdk.ModifierType,
+        entry: Gtk.Entry,
+    ) -> bool:
+        ui = self._address_completions.get(id(entry))
+        if ui is None or not ui.popover.get_visible():
+            if keyval == Gdk.KEY_Escape:
+                self._hide_completion(entry)
+            return False
+        if keyval in (Gdk.KEY_Down, Gdk.KEY_KP_Down):
+            self._move_completion_selection(entry, 1)
+            return True
+        if keyval in (Gdk.KEY_Up, Gdk.KEY_KP_Up):
+            self._move_completion_selection(entry, -1)
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            row = ui.listbox.get_selected_row()
+            if row is not None:
+                self._on_completion_row_activated(ui.listbox, row, entry)
+                return True
+            return False
+        if keyval == Gdk.KEY_Escape:
+            self._hide_completion(entry)
+            return True
+        if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
+            self._hide_completion(entry)
+            return False
+        return False
+
+    def _move_completion_selection(self, entry: Gtk.Entry, delta: int) -> None:
+        ui = self._address_completions.get(id(entry))
+        if ui is None:
+            return
+        rows: list[Gtk.ListBoxRow] = []
+        index = 0
+        while True:
+            row = ui.listbox.get_row_at_index(index)
+            if row is None:
+                break
+            rows.append(row)
+            index += 1
+        if not rows:
+            return
+        selected = ui.listbox.get_selected_row()
+        current = rows.index(selected) if selected in rows else 0
+        next_index = max(0, min(len(rows) - 1, current + delta))
+        ui.listbox.select_row(rows[next_index])
+
+    def _on_completion_row_activated(
+        self,
+        _listbox: Gtk.ListBox,
+        row: Gtk.ListBoxRow,
+        entry: Gtk.Entry,
+    ) -> None:
+        label = row.get_child()
+        if not isinstance(label, Gtk.Label):
+            return
+        display = label.get_text()
+        self._applying_completion = True
+        try:
             entry.set_text(apply_address_completion(entry.get_text(), display))
             entry.set_position(-1)
-            self._entry_match_cache.pop(id(entry), None)
-            return True
+        finally:
+            self._applying_completion = False
+        self._hide_completion(entry)
 
-        completion.connect("match-selected", on_match_selected, entry)
-        entry.set_completion(completion)
+    def _schedule_completion(self, entry: Gtk.Entry) -> None:
+        self._cancel_completion_timeout(entry)
+        key = id(entry)
 
-    def _on_address_entry_changed(self, entry: Gtk.Entry, *_args) -> None:
-        self._entry_match_cache.pop(id(entry), None)
+        def fire() -> bool:
+            self._completion_timeout_ids.pop(key, None)
+            self._run_completion(entry)
+            return False
+
+        self._completion_timeout_ids[key] = GLib.timeout_add(
+            _COMPLETION_DEBOUNCE_MS, fire
+        )
+
+    def _cancel_completion_timeout(self, entry: Gtk.Entry) -> None:
+        pending = self._completion_timeout_ids.pop(id(entry), None)
+        if pending is not None:
+            GLib.source_remove(pending)
+
+    def _cancel_completion_timeouts(self) -> None:
+        for timeout_id in self._completion_timeout_ids.values():
+            GLib.source_remove(timeout_id)
+        self._completion_timeout_ids.clear()
+
+    def _hide_completion(self, entry: Gtk.Entry) -> None:
+        ui = self._address_completions.get(id(entry))
+        if ui is None:
+            return
+        ui.popover.popdown()
+        while True:
+            row = ui.listbox.get_row_at_index(0)
+            if row is None:
+                break
+            ui.listbox.remove(row)
+
+    def _hide_completion_if_unfocused(self, entry: Gtk.Entry) -> bool:
+        if id(entry) not in self._address_completions:
+            return False
+        if entry.get_mapped() and self._address_entry_is_focused(entry):
+            return False
+        self._hide_completion(entry)
+        return False
+
+    def _run_completion(self, entry: Gtk.Entry) -> None:
+        if not entry.get_mapped() or not self._address_entry_is_focused(entry):
+            return
+        peeked = self._mail.get_correspondents_cached(self._selected_account().uid)
+        if peeked:
+            self._correspondents = peeked
+        self._sync_completion_model(entry)
+
+    def _sync_completion_model(self, entry: Gtk.Entry) -> None:
+        ui = self._address_completions.get(id(entry))
+        if ui is None:
+            return
+        token = current_address_token(entry.get_text())
+        if not token:
+            self._hide_completion(entry)
+            return
+        matches = match_correspondents(
+            self._correspondents, token, limit=_COMPLETION_MATCH_LIMIT
+        )
+        self._hide_completion(entry)
+        if not matches:
+            return
+        for item in matches:
+            row = Gtk.ListBoxRow()
+            row.set_can_focus(False)
+            label = Gtk.Label(label=item.display, xalign=0)
+            label.set_ellipsize(3)  # Pango.EllipsizeMode.END
+            label.set_margin_start(8)
+            label.set_margin_end(8)
+            label.set_margin_top(4)
+            label.set_margin_bottom(4)
+            row.set_child(label)
+            ui.listbox.append(row)
+        ui.listbox.select_row(ui.listbox.get_row_at_index(0))
+        width = entry.get_width()
+        if width > 0:
+            ui.popover.set_size_request(width, -1)
+        ui.popover.popup()
 
     def _refresh_address_completions(self) -> None:
-        self._entry_match_cache.clear()
         for entry in (self._to_entry, self._cc_entry, self._bcc_entry):
-            completion = entry.get_completion()
-            if completion is None:
-                continue
-            if current_address_token(entry.get_text()):
-                completion.complete()
-
-    def _set_completion_model(self, model: Gtk.ListStore) -> None:
-        self._completion_model = model
-        self._entry_match_cache.clear()
-        for entry in (self._to_entry, self._cc_entry, self._bcc_entry):
-            completion = entry.get_completion()
-            if completion is not None:
-                completion.set_model(model)
+            if current_address_token(entry.get_text()) and self._address_entry_is_focused(
+                entry
+            ):
+                self._run_completion(entry)
 
     def _on_from_account_changed(self, *_args) -> None:
         if self._mode == "new":
@@ -1070,10 +1244,6 @@ class ComposeWindow(Adw.Window):
         if generation != self._correspondents_generation:
             return False
         self._correspondents = correspondents
-        model = Gtk.ListStore(str)
-        for item in correspondents:
-            model.append([item.display])
-        self._set_completion_model(model)
         self._refresh_address_completions()
         return False
 
@@ -1435,6 +1605,7 @@ class ComposeWindow(Adw.Window):
         if cancellable is not None and not cancellable.is_cancelled():
             cancellable.cancel()
         self._clear_draft_save_timeout()
+        self._cancel_completion_timeouts()
         self._draft_save_generation += 1
         self._saving_draft = False
         self._close_when_saved = False

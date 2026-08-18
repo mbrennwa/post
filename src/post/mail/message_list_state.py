@@ -53,6 +53,13 @@ def is_archive_folder_name(folder_name: str | None) -> bool:
     return "[google mail]/all mail" in lower or "[gmail]/all mail" in lower
 
 
+def is_junk_folder_name(folder_name: str | None) -> bool:
+    """True for Junk / Spam (skipped by compose autocomplete, #313)."""
+    if not folder_name:
+        return False
+    return _folder_leaf_name(folder_name) in _JUNK_LEAVES
+
+
 def is_trash_or_junk_folder_name(folder_name: str | None) -> bool:
     """True for Trash / Junk / Spam (often legitimately under 1000 messages)."""
     if not folder_name:
@@ -358,6 +365,7 @@ def upsert_folder_index_by_identity(
         "from",
         "to",
         "cc",
+        "bcc",
         "message_id",
         "message_id_hash",
         "sort_date",
