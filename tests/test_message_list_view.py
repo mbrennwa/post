@@ -16,13 +16,29 @@ from gi.repository import GLib, Gtk
 from post.message_list_view import MessageListItem, VirtualMessageList
 
 
-def _msg(uid: str, *, seen: bool = True, flagged: bool = False) -> dict:
+def _msg(
+    uid: str,
+    *,
+    seen: bool = True,
+    flagged: bool = False,
+    sort_date: float = 0,
+) -> dict:
     return {
         "uid": uid,
         "subject": f"Message {uid}",
         "from": "sender@example.com",
         "flags": {"seen": seen, "flagged": flagged},
+        "sort_date": sort_date,
     }
+
+
+def _ordered_uids(message_list: VirtualMessageList) -> list[str]:
+    uids: list[str] = []
+    for position in range(message_list.item_count()):
+        item = message_list._store.get_item(position)
+        assert isinstance(item, MessageListItem)
+        uids.append(item.uid)
+    return uids
 
 
 def _fake_list_item() -> SimpleNamespace:
@@ -194,6 +210,97 @@ class AppendMessagesTests(unittest.TestCase):
         self.assertEqual(self.message_list.item_count(), 4)
         self.assertIsNotNone(self.message_list.get_message("3"))
         self.assertIsNotNone(self.message_list.get_message("4"))
+
+
+class InsertMessagesNewestFirstViewTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not Gtk.is_initialized():
+            Gtk.init()
+
+    def setUp(self) -> None:
+        self.message_list = VirtualMessageList()
+        self.message_list.set_messages(
+            [_msg("inbox-old", sort_date=200), _msg("inbox-older", sort_date=50)],
+            folder_name="INBOX",
+        )
+
+    @staticmethod
+    def _pump_main_context() -> None:
+        context = GLib.MainContext.default()
+        while context.iteration(False):
+            pass
+
+    def test_inserts_mixed_batch_by_date(self) -> None:
+        self.message_list.insert_messages_newest_first(
+            [
+                _msg("archive-new", sort_date=300),
+                _msg("archive-mid", sort_date=100),
+            ],
+            folder_name="All Mail",
+        )
+
+        self.assertEqual(
+            _ordered_uids(self.message_list),
+            ["archive-new", "inbox-old", "archive-mid", "inbox-older"],
+        )
+        self.assertIsNotNone(self.message_list.get_message("archive-new"))
+        self.assertIsNotNone(self.message_list.get_message("archive-mid"))
+
+    def test_equal_dates_stay_after_existing(self) -> None:
+        self.message_list.insert_messages_newest_first(
+            [_msg("tie", sort_date=200)],
+            folder_name="INBOX",
+        )
+
+        self.assertEqual(
+            _ordered_uids(self.message_list),
+            ["inbox-old", "tie", "inbox-older"],
+        )
+
+    def test_preserves_selection_when_inserting_before(self) -> None:
+        self.message_list.selection.select_item(1, False)
+
+        self.message_list.insert_messages_newest_first(
+            [_msg("archive-new", sort_date=300)],
+            folder_name="All Mail",
+        )
+
+        self.assertTrue(self.message_list.selection.is_selected(2))
+        self.assertEqual(self.message_list.get_selected_uids(), ["inbox-older"])
+
+    def test_at_top_schedules_scroll_when_newer_hit_arrives(self) -> None:
+        scrolled = {"called": False}
+        original = self.message_list._scroll_to_top_after_layout
+
+        def track_scroll() -> None:
+            scrolled["called"] = True
+            original()
+
+        self.message_list._scroll_to_top_after_layout = track_scroll
+        self.message_list.insert_messages_newest_first(
+            [_msg("archive-new", sort_date=300)],
+            folder_name="All Mail",
+        )
+        self._pump_main_context()
+
+        self.assertTrue(scrolled["called"])
+
+    def test_does_not_scroll_when_not_at_top(self) -> None:
+        scrolled = {"called": False}
+
+        def track_scroll() -> None:
+            scrolled["called"] = True
+
+        self.message_list._is_scrolled_to_top = lambda **_kwargs: False  # type: ignore[method-assign]
+        self.message_list._scroll_to_top_after_layout = track_scroll
+        self.message_list.insert_messages_newest_first(
+            [_msg("archive-new", sort_date=300)],
+            folder_name="All Mail",
+        )
+
+        self.assertFalse(scrolled["called"])
+        self.assertEqual(_ordered_uids(self.message_list)[0], "archive-new")
 
 
 class UpsertMessageTests(unittest.TestCase):

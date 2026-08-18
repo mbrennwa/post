@@ -113,12 +113,14 @@ from post.mail.helpers import (
     flag_menu_items,
     flag_menu_label,
     format_from_search_query,
+    insert_messages_newest_first,
     message_matches_bulk_archive_scope,
     perform_one_click_unsubscribe,
     read_menu_items,
     read_menu_label,
     reader_toggle_button_state,
     should_offer_send_again,
+    sort_messages_newest_first,
     uniform_bool_state,
     write_temp_attachment,
 )
@@ -4474,10 +4476,12 @@ class MainWindow(Adw.ApplicationWindow):
             self._update_search_scope_ui()
             self._message_stack.set_visible_child_name("list")
 
-        self._message_list_view.append_messages(batch, folder_name=folder_name)
+        self._message_list_view.insert_messages_newest_first(
+            batch, folder_name=folder_name
+        )
         if self._current_folder_messages is None:
             self._current_folder_messages = []
-        self._current_folder_messages.extend(batch)
+        insert_messages_newest_first(self._current_folder_messages, batch)
         return False
 
     def _should_use_cached_header_search(
@@ -4580,7 +4584,7 @@ class MainWindow(Adw.ApplicationWindow):
                 load_id,
                 account_uid,
                 folder_name,
-                state["matched"],
+                sort_messages_newest_first(state["matched"]),
                 cached_unread,
                 len(state["matched"]),
                 "disk_cache",
@@ -4861,6 +4865,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_popover.popdown()
         self._message_list_view.clear()
         if seed_matches:
+            seed_matches = sort_messages_newest_first(seed_matches)
             seed_keys = {self._message_list_key(message) for message in seed_matches}
             if (
                 self._current_message_uid
