@@ -928,6 +928,74 @@ class BuildReaderDocumentTests(unittest.TestCase):
             r'class="button[^"]*post-adapt-text"',
         )
 
+    def test_adapt_text_harvests_complex_microsoft_style_selectors(self) -> None:
+        """Complex MS-like selectors still neutralize light cards on dark shell (#320)."""
+        body_html = (
+            "<style>"
+            "table.main { background-color: #ffffff !important; }"
+            "td.content p { color: #323130 !important; }"
+            'div[class~="card"] { background: #faf9f8; }'
+            ".card .title { color: #201f1e; }"
+            "a.ms-button { background-color: #0078d4; color: #ffffff !important; }"
+            "</style>"
+            '<table class="main"><tr><td class="content">'
+            '<div class="card">'
+            '<p class="title">Review These Messages</p>'
+            "<p>We prevented 2 phish messages.</p>"
+            '<a class="ms-button" href="https://example.com/">Review Message</a>'
+            "</div>"
+            "</td></tr></table>"
+        )
+        doc = build_reader_document(
+            body_html=body_html,
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('name="color-scheme" content="dark"', doc)
+        self.assertIn("background-color:transparent!important", doc.replace(" ", ""))
+        self.assertIn("post-adapt-text", doc)
+        self.assertIn("color:#eeeeee!important", doc.replace(" ", ""))
+        self.assertRegex(
+            doc.replace(" ", ""),
+            r'class="ms-button[^"]*post-painted[^"]*post-keep-color"',
+        )
+        self.assertNotRegex(
+            doc.replace(" ", ""),
+            r'class="ms-button[^"]*post-adapt-text"',
+        )
+
+    def test_adapt_text_neutralizes_bare_hex_microsoft_backgrounds(self) -> None:
+        """Microsoft often omits '#' in hex backgrounds (e.g. E5E5E5) (#320)."""
+        body_html = (
+            "<style>td { color: #212121; }</style>"
+            '<table><tr>'
+            '<td style="background-color: E5E5E5;">'
+            "<p>Review These Messages</p>"
+            "</td>"
+            '<td style="background-color: white">'
+            '<p style="color:#201F1E">Card copy</p>'
+            "</td>"
+            "</tr></table>"
+        )
+        doc = build_reader_document(
+            body_html=body_html,
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('name="color-scheme" content="dark"', doc)
+        self.assertIn("background-color:transparent!important", doc.replace(" ", ""))
+        self.assertIn("post-adapt-text", doc)
+        self.assertIn("color:#eeeeee!important", doc.replace(" ", ""))
+        # Bare hex must not remain as an un-neutralized painted keep.
+        self.assertNotRegex(
+            doc,
+            r'style="[^"]*background-color:\s*E5E5E5[^"]*"',
+        )
+
 
 class ResolveCidImagesTests(unittest.TestCase):
     def test_matches_angle_bracket_content_id(self) -> None:
