@@ -22,6 +22,7 @@ from post.mail.calendar_invite import (
     invite_join_url,
     invite_link_label,
     is_calendar_mime,
+    looks_like_calendar_attachment,
     merge_invite_details,
     parse_ics_invite,
 )
@@ -73,6 +74,18 @@ class CalendarMimeTests(unittest.TestCase):
         self.assertTrue(is_calendar_mime("text/x-vcalendar"))
         self.assertFalse(is_calendar_mime("text/plain"))
         self.assertFalse(is_calendar_mime(None))
+
+    def test_looks_like_calendar_attachment(self) -> None:
+        self.assertTrue(looks_like_calendar_attachment("text/calendar", None))
+        self.assertTrue(
+            looks_like_calendar_attachment("application/octet-stream", "reservation.ics")
+        )
+        self.assertTrue(looks_like_calendar_attachment("application/octet-stream", "Invite.VCS"))
+        self.assertFalse(
+            looks_like_calendar_attachment("application/octet-stream", "notes.txt")
+        )
+        self.assertFalse(looks_like_calendar_attachment("application/octet-stream", None))
+        self.assertFalse(looks_like_calendar_attachment(None, None))
 
 
 class ParseIcsInviteTests(unittest.TestCase):
@@ -363,6 +376,65 @@ class AttachmentExtractionTests(unittest.TestCase):
         )
         attachments = extract_attachments_from_email_message(msg)
         self.assertTrue(any(a["filename"] == "invite.ics" for a in attachments))
+
+    def test_octet_stream_ics_filename_is_invite(self) -> None:
+        """Mislabeled .ics (e.g. booking confirmations) must still be detected (#322)."""
+        msg = email.message.EmailMessage(policy=email.policy.default)
+        msg["Subject"] = "Reservation Confirmation"
+        msg.set_content("Your booking is confirmed.")
+        msg.add_attachment(
+            _SAMPLE_ICS.encode(),
+            maintype="application",
+            subtype="octet-stream",
+            filename="reservation-745204C7.ics",
+        )
+        attachments = extract_attachments_from_email_message(msg)
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["filename"], "reservation-745204C7.ics")
+        self.assertFalse(is_calendar_mime(attachments[0]["mime_type"]))
+        self.assertTrue(
+            looks_like_calendar_attachment(
+                attachments[0]["mime_type"], attachments[0]["filename"]
+            )
+        )
+
+        invite = calendar_invite_from_email_message(msg)
+        assert invite is not None
+        self.assertEqual(invite["title"], "Project sync")
+        self.assertEqual(invite["attachment_index"], 0)
+        self.assertEqual(invite["source"], "ics")
+
+    def test_octet_stream_ics_reply_method_not_invite(self) -> None:
+        ics = """BEGIN:VCALENDAR
+METHOD:REPLY
+BEGIN:VEVENT
+SUMMARY:Project sync
+DTSTART:20260730T140000Z
+END:VEVENT
+END:VCALENDAR
+"""
+        msg = email.message.EmailMessage(policy=email.policy.default)
+        msg["Subject"] = "Accepted: Project sync"
+        msg.set_content("Accepted")
+        msg.add_attachment(
+            ics.encode(),
+            maintype="application",
+            subtype="octet-stream",
+            filename="reply.ics",
+        )
+        self.assertIsNone(calendar_invite_from_email_message(msg))
+
+    def test_octet_stream_without_ics_filename_ignored(self) -> None:
+        msg = email.message.EmailMessage(policy=email.policy.default)
+        msg["Subject"] = "Notes"
+        msg.set_content("See file")
+        msg.add_attachment(
+            _SAMPLE_ICS.encode(),
+            maintype="application",
+            subtype="octet-stream",
+            filename="notes.bin",
+        )
+        self.assertIsNone(calendar_invite_from_email_message(msg))
 
     def test_calendar_only_message(self) -> None:
         msg = email.message.EmailMessage(policy=email.policy.default)

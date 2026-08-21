@@ -1038,14 +1038,16 @@ class MessageReaderPane(Gtk.Box):
         *,
         hide_calendar: bool = False,
     ) -> None:
-        from post.mail.calendar_invite import is_calendar_mime
+        from post.mail.calendar_invite import looks_like_calendar_attachment
 
         self._clear_attachments()
         visible = []
         for attachment in attachments:
             mime_type = attachment.get("mime_type")
-            if hide_calendar and is_calendar_mime(
-                mime_type if isinstance(mime_type, str) else None
+            filename = attachment.get("filename")
+            if hide_calendar and looks_like_calendar_attachment(
+                mime_type if isinstance(mime_type, str) else None,
+                filename if isinstance(filename, str) else None,
             ):
                 continue
             visible.append(attachment)
