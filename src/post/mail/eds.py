@@ -6705,7 +6705,7 @@ class MailService:
         bodies: dict[str, str | None],
         subject: str | None,
     ) -> dict | None:
-        from .calendar_invite import is_calendar_mime, merge_invite_details
+        from .calendar_invite import looks_like_calendar_attachment, merge_invite_details
         from .helpers import get_attachment_data
 
         ics_text = None
@@ -6713,7 +6713,11 @@ class MailService:
         preferred_index = None
         for meta in attachments:
             mime_type = meta.get("mime_type")
-            if not is_calendar_mime(mime_type if isinstance(mime_type, str) else None):
+            filename = meta.get("filename")
+            if not looks_like_calendar_attachment(
+                mime_type if isinstance(mime_type, str) else None,
+                filename if isinstance(filename, str) else None,
+            ):
                 continue
             index = meta.get("index")
             if not isinstance(index, int):

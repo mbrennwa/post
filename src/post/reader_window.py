@@ -544,7 +544,7 @@ class ReaderWindow(Adw.ApplicationWindow):
         mime_type: str | None,
         name: str,
     ) -> None:
-        from post.mail.calendar_invite import is_calendar_mime
+        from post.mail.calendar_invite import looks_like_calendar_attachment
 
         self._context_attachment_index = index
         self._context_attachment_mime = mime_type
@@ -552,7 +552,7 @@ class ReaderWindow(Adw.ApplicationWindow):
         menu = Gio.Menu()
         menu.append("Save As…", "win.save-attachment")
         menu.append("Open With…", "win.open-with-attachment")
-        if is_calendar_mime(mime_type):
+        if looks_like_calendar_attachment(mime_type, name):
             menu.append("Add to Calendar…", "win.add-calendar-attachment")
         self._attachment_popover.set_menu_model(menu)
         self._attachment_popover.set_parent(widget)

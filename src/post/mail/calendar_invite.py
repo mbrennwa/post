@@ -94,6 +94,26 @@ def is_calendar_mime(mime_type: str | None) -> bool:
     return base in _CALENDAR_MIME_TYPES
 
 
+_CALENDAR_FILENAME_SUFFIXES = (".ics", ".vcs")
+
+
+def looks_like_calendar_attachment(
+    mime_type: str | None,
+    filename: str | None = None,
+) -> bool:
+    """True when MIME or filename suggests a calendar attachment.
+
+    Many senders attach a real ``.ics`` / ``.vcs`` under a generic type such as
+    ``application/octet-stream``. Filename alone is only a *candidate* signal;
+    callers must still parse and apply METHOD filters before treating the part
+    as an addable invite.
+    """
+    if is_calendar_mime(mime_type):
+        return True
+    name = (filename or "").strip().lower()
+    return any(name.endswith(suffix) for suffix in _CALENDAR_FILENAME_SUFFIXES)
+
+
 def default_calendar_filename(mime_type: str | None) -> str:
     """Filename to use when a calendar part has none."""
     base = (mime_type or "").split(";", 1)[0].strip().lower()
@@ -582,7 +602,8 @@ def extract_ics_text_from_email_message(msg: Any) -> tuple[str | None, int | Non
         if not email_part_counts_as_attachment(part):
             continue
         index += 1
-        if not is_calendar_mime(ctype):
+        filename = part.get_filename() if hasattr(part, "get_filename") else None
+        if not looks_like_calendar_attachment(ctype, filename):
             continue
         payload = part.get_payload(decode=True) or b""
         if not payload:

@@ -230,6 +230,51 @@ class MessageReaderPaneTests(unittest.TestCase):
         self.assertEqual(minimum, 0)
         self.assertEqual(natural, 0)
 
+    def test_invite_hides_mislabeled_ics_attachment(self) -> None:
+        msg = _sample_message()
+        msg["calendar_invite"] = {
+            "title": "Reservation",
+            "start": "2026-08-21T16:30:00",
+            "attachment_index": 0,
+        }
+        msg["attachments"] = [
+            {
+                "index": 0,
+                "filename": "reservation.ics",
+                "mime_type": "application/octet-stream",
+                "size": 128,
+            },
+            {
+                "index": 1,
+                "filename": "notes.txt",
+                "mime_type": "text/plain",
+                "size": 12,
+            },
+        ]
+        self.pane.show_message(
+            msg,
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertTrue(self.pane._invite_box.get_visible())
+        self.assertTrue(self.pane._reader_attachments.get_visible())
+        labels: list[str] = []
+        list_column = self.pane._reader_attachments.get_last_child()
+        assert list_column is not None
+        btn = list_column.get_first_child()
+        while btn is not None:
+            row = btn.get_child()
+            assert row is not None
+            name_label = row.get_last_child()
+            assert name_label is not None
+            labels.append(name_label.get_label() or "")
+            btn = btn.get_next_sibling()
+        self.assertEqual(len(labels), 1)
+        self.assertIn("notes.txt", labels[0])
+        self.assertNotIn("reservation.ics", labels[0])
+
     def test_invite_link_menu_copies_url(self) -> None:
         url = "https://teams.microsoft.com/l/meetup-join/abc"
         copied: list[str] = []
