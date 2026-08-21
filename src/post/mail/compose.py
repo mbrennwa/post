@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import html
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -1001,6 +1002,25 @@ def guess_attachment_mime_type(filename: str, data: bytes) -> str:
     if guessed:
         return guessed
     return "application/octet-stream"
+
+
+def load_attachment_from_path(path: str) -> ComposeAttachment:
+    """Load a local file as a compose attachment.
+
+    Raises:
+        IsADirectoryError: if ``path`` is a directory.
+        OSError: if the file cannot be read.
+    """
+    if os.path.isdir(path):
+        raise IsADirectoryError(path)
+    filename = os.path.basename(path)
+    with open(path, "rb") as handle:
+        data = handle.read()
+    return ComposeAttachment(
+        filename=filename,
+        mime_type=guess_attachment_mime_type(filename, data),
+        data=data,
+    )
 
 
 def read_compose_attachments_from_message(mime_msg: Any) -> list[ComposeAttachment]:
