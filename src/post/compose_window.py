@@ -44,6 +44,7 @@ from post.mail.compose import (
     finalize_body_after_signature_sync,
     format_address_list,
     guess_attachment_mime_type,
+    load_attachment_from_path,
     normalize_signature_text,
     normalize_email,
     parse_address_list,
@@ -88,6 +89,46 @@ log = logging.getLogger(__name__)
 
 ComposeMode = Literal["new", "reply", "reply-all", "forward", "draft", "outbox", "send-again"]
 SetStatus = Callable[[str], None]
+
+_COMPOSE_DROP_HIGHLIGHT_CLASS = "compose-drop-highlight"
+_COMPOSE_DROP_CSS = f"""
+.{_COMPOSE_DROP_HIGHLIGHT_CLASS} {{
+  background-color: alpha(@accent_bg_color, 0.18);
+}}
+"""
+_compose_drop_style_installed = False
+
+
+def _paths_from_drop_value(value: object) -> list[str]:
+    """Extract local filesystem paths from a DropTarget FileList (or single File)."""
+    files: list[Gio.File] = []
+    if isinstance(value, Gdk.FileList):
+        files = list(value.get_files())
+    elif isinstance(value, Gio.File):
+        files = [value]
+    paths: list[str] = []
+    for gfile in files:
+        path = gfile.get_path()
+        if path:
+            paths.append(path)
+    return paths
+
+
+def _install_compose_drop_style() -> None:
+    global _compose_drop_style_installed
+    if _compose_drop_style_installed:
+        return
+    display = Gdk.Display.get_default()
+    if display is None:
+        return
+    provider = Gtk.CssProvider()
+    provider.load_from_string(_COMPOSE_DROP_CSS)
+    Gtk.StyleContext.add_provider_for_display(
+        display,
+        provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+    )
+    _compose_drop_style_installed = True
 
 
 @dataclass(frozen=True)
@@ -639,6 +680,10 @@ class ComposeWindow(Adw.Window):
         self._toast_overlay.set_child(toolbar_view)
         self.set_content(self._toast_overlay)
 
+        _install_compose_drop_style()
+        self._setup_file_drop_target(self._toast_overlay)
+        self._setup_file_drop_target(self._body_view)
+
         self._prefill_fields()
         self._tracking_edits = True
         self._load_correspondents()
@@ -653,6 +698,39 @@ class ComposeWindow(Adw.Window):
         elif self._mode == "forward":
             GLib.idle_add(self._begin_load_forward_attachments)
 
+    def _setup_file_drop_target(self, widget: Gtk.Widget) -> None:
+        drop_target = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+
+        def enter(
+            _target: Gtk.DropTarget, _x: float, _y: float
+        ) -> Gdk.DragAction:
+            if self._saving_draft:
+                return Gdk.DragAction(0)
+            self._toast_overlay.add_css_class(_COMPOSE_DROP_HIGHLIGHT_CLASS)
+            return Gdk.DragAction.COPY
+
+        def leave(_target: Gtk.DropTarget) -> None:
+            self._toast_overlay.remove_css_class(_COMPOSE_DROP_HIGHLIGHT_CLASS)
+
+        def drop(
+            _target: Gtk.DropTarget,
+            value: object,
+            _x: float,
+            _y: float,
+        ) -> bool:
+            self._toast_overlay.remove_css_class(_COMPOSE_DROP_HIGHLIGHT_CLASS)
+            if self._saving_draft:
+                return False
+            paths = _paths_from_drop_value(value)
+            if not paths:
+                return False
+            return self._add_attachments_from_paths(paths) > 0
+
+        drop_target.connect("enter", enter)
+        drop_target.connect("leave", leave)
+        drop_target.connect("drop", drop)
+        widget.add_controller(drop_target)
+
     def _on_attach_clicked(self, *_args) -> None:
         if self._saving_draft:
             return
@@ -665,32 +743,36 @@ class ComposeWindow(Adw.Window):
                 return
             if not files:
                 return
-            added = False
+            paths: list[str] = []
             for gfile in files:
                 path = gfile.get_path()
-                if not path:
-                    continue
-                filename = os.path.basename(path)
-                try:
-                    with open(path, "rb") as handle:
-                        data = handle.read()
-                except OSError as exc:
-                    show_error_toast(self, f"Could not read {filename}: {exc}")
-                    continue
-                mime_type = guess_attachment_mime_type(filename, data)
-                self._attachments.append(
-                    ComposeAttachment(
-                        filename=filename,
-                        mime_type=mime_type,
-                        data=data,
-                    )
-                )
-                added = True
-            if added:
-                self._mark_user_edited()
-                self._refresh_attachments_ui()
+                if path:
+                    paths.append(path)
+            self._add_attachments_from_paths(paths)
 
         dialog.open_multiple(self, None, on_selected)
+
+    def _add_attachments_from_paths(self, paths: list[str]) -> int:
+        """Read local files and append them to the attachment list. Returns count added."""
+        if self._saving_draft:
+            return 0
+        added = 0
+        for path in paths:
+            filename = os.path.basename(path) or path
+            try:
+                attachment = load_attachment_from_path(path)
+            except IsADirectoryError:
+                show_error_toast(self, f"Cannot attach folder: {filename}")
+                continue
+            except OSError as exc:
+                show_error_toast(self, f"Could not read {filename}: {exc}")
+                continue
+            self._attachments.append(attachment)
+            added += 1
+        if added:
+            self._mark_user_edited()
+            self._refresh_attachments_ui()
+        return added
 
     def _refresh_attachments_ui(self) -> None:
         while child := self._attachments_box.get_first_child():
