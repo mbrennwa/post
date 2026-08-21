@@ -265,10 +265,15 @@ _HSLA_COLOR = re.compile(
 _TEXT_ATTR = re.compile(r"""\btext\s*=\s*["']?[^"'\s>]+""", re.IGNORECASE)
 _FONT_COLOR_ATTR = re.compile(r"<font\b[^>]*\bcolor\s*=", re.IGNORECASE)
 # Simple `.class`, `tag.class`, or `tag` selectors (comma lists OK).
-# Skip combinators, attributes, and pseudo-classes.
+# Complex selectors still contribute class tokens via harvest (see #320).
 _STYLE_RULE_BLOCK = re.compile(r"([^{}@]+)\{([^{}]*)\}", re.MULTILINE)
 _SIMPLE_CSS_SELECTOR = re.compile(
     r"^\s*(?:([A-Za-z][\w]*)?\.([A-Za-z_][\w-]*)|([A-Za-z][\w]*))\s*$"
+)
+_CSS_CLASS_TOKEN = re.compile(r"\.([A-Za-z_][\w-]*)")
+_CSS_CLASS_ATTR = re.compile(
+    r"""\[\s*class\s*(?:\*=|\^=|\$=|~=|\|=|=)\s*(["'])([^"']+)\1\s*\]""",
+    re.IGNORECASE,
 )
 _NAMED_CSS_COLORS: dict[str, tuple[int, int, int]] = {
     "aliceblue": (240, 248, 255),
@@ -506,7 +511,7 @@ def _css_background_shorthand_color(value: str) -> str | None:
         if token.startswith("url("):
             continue
         if _css_color_value_is_meaningful(token):
-            return token
+            return _normalize_css_color_token(token)
     return None
 
 
@@ -549,6 +554,26 @@ def _declarations_to_style(declarations: dict[str, str]) -> str:
     return ";".join(f"{name}:{value}" for name, value in declarations.items())
 
 
+def _class_names_from_complex_selector(selector: str) -> set[str]:
+    """Harvest class names from otherwise-complex CSS selectors (#320)."""
+    names: set[str] = {match.group(1).lower() for match in _CSS_CLASS_TOKEN.finditer(selector)}
+    for match in _CSS_CLASS_ATTR.finditer(selector):
+        for part in match.group(2).split():
+            cleaned = part.strip().lower()
+            if cleaned:
+                names.add(cleaned)
+    return names
+
+
+def _merge_class_declarations(
+    class_styles: dict[str, dict[str, str]],
+    class_name: str,
+    declarations: dict[str, str],
+) -> None:
+    key = class_name.lower()
+    class_styles[key] = {**class_styles.get(key, {}), **declarations}
+
+
 def _parse_class_styles(body_html: str) -> dict[str, dict[str, str]]:
     class_styles, _tag_styles = _parse_stylesheet_maps(body_html)
     return class_styles
@@ -557,7 +582,7 @@ def _parse_class_styles(body_html: str) -> dict[str, dict[str, str]]:
 def _parse_stylesheet_maps(
     body_html: str,
 ) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
-    """Parse simple ``.class`` and tag selectors from ``<style>`` blocks."""
+    """Parse ``.class`` / tag selectors; harvest class tokens from complex ones."""
     class_styles: dict[str, dict[str, str]] = {}
     tag_styles: dict[str, dict[str, str]] = {}
     for style_match in _STYLE_BLOCK.finditer(body_html):
@@ -570,15 +595,21 @@ def _parse_stylesheet_maps(
                 continue
             for raw_selector in selector_group.split(","):
                 match = _SIMPLE_CSS_SELECTOR.match(raw_selector)
-                if match is None:
+                if match is not None:
+                    class_name, tag_name = match.group(2), match.group(3)
+                    if class_name is not None:
+                        _merge_class_declarations(
+                            class_styles, class_name, declarations
+                        )
+                    elif tag_name is not None:
+                        key = tag_name.lower()
+                        tag_styles[key] = {
+                            **tag_styles.get(key, {}),
+                            **declarations,
+                        }
                     continue
-                class_name, tag_name = match.group(2), match.group(3)
-                if class_name is not None:
-                    key = class_name.lower()
-                    class_styles[key] = {**class_styles.get(key, {}), **declarations}
-                elif tag_name is not None:
-                    key = tag_name.lower()
-                    tag_styles[key] = {**tag_styles.get(key, {}), **declarations}
+                for class_name in _class_names_from_complex_selector(raw_selector):
+                    _merge_class_declarations(class_styles, class_name, declarations)
     return class_styles, tag_styles
 
 
@@ -623,12 +654,12 @@ def _declarations_background_value(declarations: dict[str, str]) -> str | None:
     if "background-color" in declarations:
         value = declarations["background-color"]
         if _css_color_value_is_meaningful(value):
-            return _normalize_css_declaration_value(value)
+            return _normalize_css_color_token(value)
     if "background" in declarations:
         value = declarations["background"]
         color = _css_background_shorthand_color(value)
         if color is not None:
-            return color
+            return _normalize_css_color_token(color)
     return None
 
 
@@ -644,7 +675,7 @@ def _element_painted_background_value(
         return value
     bgcolor = attrs.get("bgcolor", "")
     if _bgcolor_attr_is_meaningful(bgcolor):
-        return bgcolor
+        return _normalize_css_color_token(bgcolor)
     return None
 
 
@@ -656,6 +687,14 @@ def _parse_css_color_rgb(value: str) -> tuple[int, int, int] | None:
         return _NAMED_CSS_COLORS[candidate]
     if candidate.startswith("#"):
         hex_value = candidate[1:]
+    elif len(candidate) in (3, 6) and all(
+        ch in "0123456789abcdef" for ch in candidate
+    ):
+        # Microsoft mail often omits '#' (e.g. background-color: E5E5E5).
+        hex_value = candidate
+    else:
+        hex_value = ""
+    if hex_value:
         if len(hex_value) == 3:
             hex_value = "".join(ch * 2 for ch in hex_value)
         if len(hex_value) == 6:
@@ -676,6 +715,19 @@ def _parse_css_color_rgb(value: str) -> tuple[int, int, int] | None:
             except ValueError:
                 return None
     return None
+
+
+def _normalize_css_color_token(value: str) -> str:
+    """Normalize a color token; prefix bare 3/6-digit hex with ``#``."""
+    candidate = _normalize_css_declaration_value(value)
+    if not candidate:
+        return candidate
+    lower = candidate.lower()
+    if lower.startswith("#") or lower in _NAMED_CSS_COLORS or "(" in lower:
+        return candidate
+    if len(lower) in (3, 6) and all(ch in "0123456789abcdef" for ch in lower):
+        return f"#{candidate}"
+    return candidate
 
 
 def _relative_luminance(red: int, green: int, blue: int) -> float:
