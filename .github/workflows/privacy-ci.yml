@@ -25,14 +25,20 @@ jobs:
       - name: Audit commit messages
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
+          # Fixed PR base SHA (not a live origin/main tip) so a merge that lands
+          # while this job runs cannot widen origin/main...HEAD into history.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           BEFORE: ${{ github.event.before }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [ "${EVENT_NAME}" = "pull_request" ]; then
-            git fetch origin "${BASE_REF}" --depth=1
-            RANGE="origin/${BASE_REF}...HEAD"
+            if [ -z "${BASE_SHA}" ]; then
+              echo "error: pull_request base sha missing" >&2
+              exit 1
+            fi
+            git rev-parse --verify "${BASE_SHA}^{commit}" >/dev/null
+            RANGE="${BASE_SHA}...HEAD"
           else
             # Push to main: scan commits in this push when before is a real SHA.
             if [ -n "${BEFORE}" ] && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ] \
