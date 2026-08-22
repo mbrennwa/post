@@ -4,7 +4,8 @@
       "id": "adwaita-goa-at",
       "license_file": "LICENSES/LicenseRef-LGPL-3.0-Adwaita-GOA-icon.txt",
       "files": [
-        "data/icons/sources/adwaita-goa-at-symbol.svg"
+        "data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg",
+        "data/icons/sources/app-icon.svg"
       ],
       "header_must_contain": [
         "Adwaita",
