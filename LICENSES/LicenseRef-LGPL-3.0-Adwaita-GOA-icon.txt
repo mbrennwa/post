@@ -16,4 +16,5 @@ file to the Derived Post files list below and in licensing/third_party.json,
 and mark the composed icon with SPDX-License-Identifier:
 GPL-3.0-or-later AND LGPL-3.0-or-later.
 
-Derived Post files: data/icons/sources/adwaita-goa-at-symbol.svg
+Derived Post files: data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg
+data/icons/sources/app-icon.svg

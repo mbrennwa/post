@@ -1,65 +1,36 @@
-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <!--
+  SPDX-FileCopyrightText: 2026 mbrennwa
   SPDX-FileCopyrightText: GNOME Design Team
-  SPDX-License-Identifier: LGPL-3.0-or-later AND LicenseRef-LGPL-3.0-Adwaita-GOA-icon
+  SPDX-License-Identifier: GPL-3.0-or-later AND LGPL-3.0-or-later AND LicenseRef-LGPL-3.0-Adwaita-GOA-icon
 
-  @ glyph from Adwaita goa-panel-symbolic.svg (GNOME Online Accounts panel icon).
+  App icon for Post (#327). Tile/lighting adapted from user SVG
+  data/icons/sources/app-icon.svg.
+  @ glyph from Adwaita goa-panel-symbolic.svg (GNOME Online Accounts).
   Upstream: adwaita-icon-theme, Adwaita/symbolic/legacy/goa-panel-symbolic.svg
   See LICENSES/LicenseRef-LGPL-3.0-Adwaita-GOA-icon.txt
--->
 
-<svg
-   width="128"
-   height="128"
-   viewBox="0 0 128 128"
-   version="1.1"
-   id="svg2"
-   sodipodi:docname="io.github.mbrennwa.Post.svg"
-   inkscape:version="1.4.3 (0d15f75042, 2025-12-25)"
-   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
-   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
-   xmlns="http://www.w3.org/2000/svg"
-   xmlns:svg="http://www.w3.org/2000/svg">
-  <defs
-     id="defs2" />
-  <sodipodi:namedview
-     id="namedview2"
-     pagecolor="#ffffff"
-     bordercolor="#000000"
-     borderopacity="0.25"
-     inkscape:showpageshadow="2"
-     inkscape:pageopacity="0.0"
-     inkscape:pagecheckerboard="0"
-     inkscape:deskcolor="#d1d1d1"
-     inkscape:zoom="4.671875"
-     inkscape:cx="64"
-     inkscape:cy="64"
-     inkscape:window-width="1470"
-     inkscape:window-height="851"
-     inkscape:window-x="0"
-     inkscape:window-y="0"
-     inkscape:window-maximized="1"
-     inkscape:current-layer="svg2" />
-  <g
-     transform="scale(6.4)"
-     id="g2">
-    <circle
-       cx="10"
-       cy="10"
-       r="10"
-       fill="#ff4919"
-       fill-opacity="0.85"
-       id="circle1"
-       style="fill:#de3a3a;fill-opacity:1" />
-    <g
-       transform="translate(1.9974062 2.001546)"
-       fill="#ffffff"
-       fill-opacity="0.899"
-       id="g1">
-      <path
-         d="M 7.7191165,1.3082977 C 5.5308289,1.3998722 3.528987,2.5543598 2.3514331,4.4021942 0.75519321,6.913941 1.0070595,10.177903 2.966378,12.418199 c 1.9658615,2.233753 5.1714244,2.907478 7.869986,1.648334 0.418686,-0.19623 0.601861,-0.693347 0.405602,-1.111971 C 11.045707,12.535937 10.548518,12.352789 10.12656,12.549019 8.105093,13.497465 5.6976493,12.993808 4.2257071,11.312768 2.7504935,9.6350001 2.560776,7.1821227 3.7644979,5.3015829 4.9616782,3.4145024 7.2644505,2.5478183 9.4069448,3.175755 11.55271,3.8004215 13.027923,5.765994 13.024652,7.9997482 v 0.032705 0.8045443 c 0,0.3008863 -0.157007,0.5723383 -0.418686,0.7227811 -0.258408,0.1504436 -0.575693,0.1504436 -0.837372,0 C 11.510186,9.4126058 11.349908,9.1346133 11.349908,8.8369972 v -0.837249 c 0,-1.8412938 -1.5079227,-3.3489957 -3.3494865,-3.3489957 -1.8382923,0 -3.349487,1.5077019 -3.349487,3.3489957 0,1.8380227 1.5111947,3.3489958 3.349487,3.3489958 0.8766235,0 1.6682019,-0.349944 2.2667905,-0.902659 0.186447,0.222394 0.408874,0.415354 0.664011,0.565797 0.778494,0.448059 1.736892,0.448059 2.512115,0 0.778494,-0.451329 1.256058,-1.2787672 1.256058,-2.1748848 v -0.837249 c 0,-2.979429 -1.965861,-5.595832 -4.8247013,-6.4330809 C 9.1747047,1.3638963 8.448546,1.2755926 7.7191165,1.3082977 Z m 0.281305,5.0169527 c 0.9355017,0 1.6747435,0.7391334 1.6747435,1.6744978 0,0.9320934 -0.7392418,1.6744979 -1.6747435,1.6744979 -0.93223,0 -1.6747434,-0.7424045 -1.6747434,-1.6744979 0,-0.9353644 0.7425134,-1.6744978 1.6747434,-1.6744978 z"
-         id="path1"
-         style="stroke-width:0.83731" />
-    </g>
+  Outer tile drop shadow omitted so GNOME can apply contextual shadows (HIG).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff5a4f"/>
+      <stop offset=".55" stop-color="#ed3830"/>
+      <stop offset="1" stop-color="#d8201c"/>
+    </linearGradient>
+    <filter id="glyphShadow" x="-30%" y="-30%" width="170%" height="180%">
+      <feDropShadow dx="0" dy="2.7" stdDeviation="1.15" flood-color="#650805" flood-opacity=".62"/>
+    </filter>
+  </defs>
+
+  <!-- Darker front/base plate for volume; top face with gradient + highlight -->
+  <rect x="12" y="14" width="104" height="104" rx="22" fill="#a91613"/>
+  <rect x="12" y="10" width="104" height="104" rx="22" fill="url(#tile)"/>
+  <path d="M34 11 H94 Q111 11 115 29" fill="none" stroke="#ff8179" stroke-width="2" stroke-linecap="round" opacity=".55"/>
+
+  <!-- Adwaita GOA @ geometry -->
+  <g transform="translate(9 9) scale(5.5) translate(1.9974062 2.001546)" filter="url(#glyphShadow)">
+    <path d="M 7.664062,0.0078125 C 5.050781,0.117188 2.660156,1.496094 1.253906,3.703125 c -1.90625,3 -1.605468,6.898437 0.734375,9.574219 2.347657,2.667968 6.175781,3.472656 9.398438,1.96875 0.5,-0.234375 0.71875,-0.828125 0.484375,-1.328125 -0.234375,-0.5 -0.828125,-0.71875 -1.332032,-0.484375 C 8.125,14.566406 5.25,13.964844 3.492188,11.957031 1.730469,9.953125 1.503906,7.023438 2.941406,4.777344 4.371094,2.523438 7.121094,1.488281 9.679688,2.238281 12.242188,2.984375 14.003906,5.332031 14,8 V 8.039062 9 c 0,0.359375 -0.1875,0.683594 -0.5,0.863281 -0.308594,0.179688 -0.6875,0.179688 -1,0 C 12.191406,9.6875 12,9.355469 12,9 V 8 C 12,5.800781 10.199219,4 8,4 5.804688,4 4,5.800781 4,8 c 0,2.195312 1.804688,4 4,4 1.046875,0 1.992188,-0.417969 2.707031,-1.078125 0.222657,0.265625 0.488281,0.496094 0.792969,0.675781 0.929688,0.535156 2.074219,0.535156 3,0 C 15.429688,11.058594 16,10.070312 16,9 V 8 C 16,4.441406 13.652344,1.316406 10.238281,0.316406 9.402344,0.0742188 8.535156,-0.03125 7.664062,0.0078125 Z M 8,6 c 1.117188,0 2,0.882812 2,2 0,1.113281 -0.882812,2 -2,2 C 6.886719,10 6,9.113281 6,8 6,6.882812 6.886719,6 8,6 Z m 0,0" fill="#fffdf8"/>
   </g>
 </svg>

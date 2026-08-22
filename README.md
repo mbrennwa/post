@@ -107,7 +107,7 @@ POST_LOG_LEVEL=DEBUG ./run.sh
 
 GPL-3.0-or-later — see [LICENSE](LICENSE).
 
-Known third-party code and artwork: EvolutionMCP (MIT) and the Adwaita GNOME Online Accounts `@` glyph (LGPL-3.0-or-later), documented in [LICENSES/](LICENSES/) and [licensing/third_party.json](licensing/third_party.json). The vendored `@` source lives at `data/icons/sources/adwaita-goa-at-symbol.svg`.
+Known third-party code and artwork: EvolutionMCP (MIT) and the Adwaita GNOME Online Accounts `@` glyph (LGPL-3.0-or-later), documented in [LICENSES/](LICENSES/) and [licensing/third_party.json](licensing/third_party.json). The `@` geometry is composed into the app icon at `data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg`.
 
 This project was developed with substantial assistance from AI coding tools. The code was reviewed through iterative development, discussion, testing, and acceptance by the project maintainer.
 

@@ -7,9 +7,11 @@ Files: *
 Copyright: 2026 Matthias Brennwald
 License: GPL-3.0-or-later
 
-Files: data/icons/sources/adwaita-goa-at-symbol.svg
-Copyright: GNOME Design Team
-License: LGPL-3.0-or-later
+Files: data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg
+       data/icons/sources/app-icon.svg
+Copyright: 2026 Matthias Brennwald
+           GNOME Design Team
+License: GPL-3.0-or-later and LGPL-3.0-or-later
 
 Files: debian/*
 Copyright: 2026 Matthias Brennwald
