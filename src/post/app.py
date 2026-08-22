@@ -48,9 +48,29 @@ class PostApplication(Adw.Application):
     def _on_startup(self, *_args) -> None:
         register_bundled_icons()
         Gtk.Window.set_default_icon_name(APP_ICON_NAME)
+        self._install_standard_shortcuts()
         from post.mail.io_thread import get_mail_io_thread
 
         get_mail_io_thread()
+
+    def _install_standard_shortcuts(self) -> None:
+        """GNOME HIG: Ctrl+W closes the focused window; Ctrl+Q quits the app."""
+        # GTK's built-in close action is "window.close" (not "win.close").
+        # "win.*" is only for actions added via Gtk.ApplicationWindow.add_action().
+        self.set_accels_for_action("window.close", ["<Control>w"])
+        quit_action = Gio.SimpleAction.new("quit", None)
+        quit_action.connect("activate", self._on_quit_requested)
+        self.add_action(quit_action)
+        self.set_accels_for_action("app.quit", ["<Control>q"])
+
+    def _on_quit_requested(self, *_args) -> None:
+        # Route through MainWindow.close() so pending send/move/delayed-send
+        # gates run. Do not call application.quit() directly.
+        for win in self.get_windows():
+            if isinstance(win, MainWindow):
+                win.close()
+                return
+        self.quit()
 
     def _on_activate(self, *_args) -> None:
         _ensure_main_window(self)
