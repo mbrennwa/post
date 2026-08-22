@@ -23,7 +23,7 @@ install_desktop_integration() {
   local post_bin="$ROOT/.venv/bin/post"
   local desktop_file="$dest/applications/io.github.mbrennwa.Post.desktop"
   local icon_src="$ROOT/data/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg"
-  local icon_png="$dest/icons/hicolor/128x128/apps/io.github.mbrennwa.Post.png"
+  local repo_png="$ROOT/data/icons/hicolor/128x128/apps/io.github.mbrennwa.Post.png"
   local broken_hicolor_theme="$dest/icons/hicolor/index.theme"
   local stale_svg="$dest/icons/hicolor/scalable/apps/io.github.mbrennwa.Post.svg"
   local stale_adwaita_icon="$dest/icons/Adwaita/scalable/apps/io.github.mbrennwa.Post.svg"
@@ -56,7 +56,9 @@ install_desktop_integration() {
     local png_dir="$dest/icons/hicolor/${size}x${size}/apps"
     local png_installed="$png_dir/io.github.mbrennwa.Post.png"
     mkdir -p "$png_dir"
-    if [[ ! -f "$png_installed" ]] || [[ "$icon_src" -nt "$png_installed" ]]; then
+    if [[ ! -f "$png_installed" ]] \
+      || [[ "$icon_src" -nt "$png_installed" ]] \
+      || [[ "$repo_png" -nt "$png_installed" ]]; then
       icon_changed=1
       rsvg-convert -w "$size" -h "$size" "$icon_src" -o "$png_installed"
     fi
@@ -67,7 +69,7 @@ install_desktop_integration() {
 Name=Post
 GenericName=Email
 Comment=Send and receive email
-Icon=$icon_png
+Icon=io.github.mbrennwa.Post
 StartupWMClass=io.github.mbrennwa.Post
 TryExec=$post_bin
 Exec=$post_bin %u
@@ -81,6 +83,9 @@ EOF
 
   update-desktop-database "$dest/applications" 2>/dev/null || true
   if (( icon_changed )); then
+    if command -v gtk-update-icon-cache >/dev/null; then
+      gtk-update-icon-cache -q -f -t "$dest/icons/hicolor" 2>/dev/null || true
+    fi
     echo "post: icon updated — restart GNOME Shell if the launcher still shows the old icon" >&2
   fi
 }
