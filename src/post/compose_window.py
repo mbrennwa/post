@@ -989,6 +989,7 @@ class ComposeWindow(Adw.Window):
         entry.connect("changed", self._on_address_entry_changed)
 
         keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         keys.connect("key-pressed", self._on_address_key_pressed, entry)
         entry.add_controller(keys)
 
@@ -1045,18 +1046,24 @@ class ComposeWindow(Adw.Window):
             self._move_completion_selection(entry, -1)
             return True
         if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-            row = ui.listbox.get_selected_row()
-            if row is not None:
-                self._on_completion_row_activated(ui.listbox, row, entry)
-                return True
-            return False
+            return self._accept_address_completion(entry)
         if keyval == Gdk.KEY_Escape:
             self._hide_completion(entry)
             return True
         if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
-            self._hide_completion(entry)
+            self._accept_address_completion(entry)
             return False
         return False
+
+    def _accept_address_completion(self, entry: Gtk.Entry) -> bool:
+        ui = self._address_completions.get(id(entry))
+        if ui is None or not ui.popover.get_visible():
+            return False
+        row = ui.listbox.get_selected_row()
+        if row is None:
+            return False
+        self._on_completion_row_activated(ui.listbox, row, entry)
+        return True
 
     def _move_completion_selection(self, entry: Gtk.Entry, delta: int) -> None:
         ui = self._address_completions.get(id(entry))
