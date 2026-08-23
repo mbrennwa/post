@@ -670,11 +670,20 @@ def _signature_prefixes(block: str) -> tuple[str, str]:
 
 def _strip_trailing_signature_block(normalized: str, block: str) -> str | None:
     """Return user text before a trailing signature block, if present."""
+    if not block:
+        return None
     long_prefix = f"\n\n{block}"
-    if normalized in (long_prefix, block):
+    short_prefix = f"\n{block}"
+    if normalized in (long_prefix, short_prefix, block):
         return ""
     if normalized.endswith(long_prefix):
         return normalized[: -len(long_prefix)]
+    if normalized.endswith(short_prefix):
+        return normalized[: -len(short_prefix)]
+    if normalized.endswith(block):
+        user = normalized[: -len(block)]
+        if not user.strip():
+            return user.rstrip("\n")
     return None
 
 
@@ -728,9 +737,40 @@ def strip_signature_suffix(body: str, signature: str | None) -> str | None:
     return None
 
 
+def is_signature_only_compose_body(
+    body: str,
+    *,
+    signatures: list[str | None],
+) -> bool:
+    """Return True when the body contains only auto-managed signature text."""
+    normalized = _normalize_body_for_signature_match(body)
+    if not normalized.strip():
+        return True
+    tried: list[str] = []
+    for signature in signatures:
+        if not signature or signature in tried:
+            continue
+        tried.append(signature)
+        if (
+            extract_user_body_from_auto_signature(
+                body,
+                tracked_signature=signature,
+                previous_signature=signature,
+                known_signatures=[signature],
+            )
+            == ""
+        ):
+            return True
+        stripped = strip_signature_suffix(body, signature)
+        if stripped is not None and not stripped.strip():
+            return True
+    return False
+
+
 def _normalize_body_for_signature_match(body: str) -> str:
-    """Gtk.TextView buffers often end with a trailing newline."""
-    return body.rstrip("\n")
+    """Normalize trailing newlines from the compose body editor."""
+    text = body.replace("\r\n", "\n").replace("\r", "\n")
+    return text.rstrip("\n")
 
 
 def extract_user_body_from_auto_signature(
@@ -760,9 +800,11 @@ def extract_user_body_from_auto_signature(
             quoted_body="",
             signature=signature,
         )
-        if normalized == expected:
-            return ""
         block = format_signature_block(signature)
+        if normalized == expected or (
+            block and normalized in (block, f"\n{block}")
+        ):
+            return ""
         if block:
             user = _strip_trailing_signature_block(normalized, block)
             if user is not None:

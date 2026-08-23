@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+os.environ.setdefault("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1")
+
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -150,11 +152,14 @@ class ComposeFileDropTargetTests(unittest.TestCase):
     def test_drop_targets_installed(self) -> None:
         window = self._open_compose()
         overlay_controllers = list(window._toast_overlay.observe_controllers())
-        body_controllers = list(window._body_view.observe_controllers())
+        body_controllers = list(window._body_view.web_view.observe_controllers())
         self.assertTrue(
             any(isinstance(c, Gtk.DropTarget) for c in overlay_controllers)
         )
         self.assertTrue(any(isinstance(c, Gtk.DropTarget) for c in body_controllers))
+        from post.compose_editor import ComposeBodyEditor
+
+        self.assertIsInstance(window._body_view, ComposeBodyEditor)
         window.destroy()
 
 
