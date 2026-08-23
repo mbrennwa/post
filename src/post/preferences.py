@@ -605,3 +605,26 @@ def set_account_signature(account_uid: str, signature: str) -> None:
         signatures.pop(account_uid, None)
     data["account_signatures"] = signatures
     _save_raw(data)
+
+
+def get_spell_check_languages() -> list[str]:
+    """Return active WebKit spell-check locale codes from preferences."""
+    raw = _load_raw().get("spell_check_languages")
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip() and item not in result:
+            result.append(item.strip())
+    return result
+
+
+def set_spell_check_languages(languages: list[str]) -> None:
+    """Persist active WebKit spell-check locale codes."""
+    data = _load_raw()
+    cleaned: list[str] = []
+    for item in languages:
+        if isinstance(item, str) and item.strip() and item.strip() not in cleaned:
+            cleaned.append(item.strip())
+    data["spell_check_languages"] = cleaned
+    _save_raw(data)
