@@ -21,6 +21,7 @@ gi.require_version("Gdk", "4.0")
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
+from post.compose_editor import ComposeBodyEditor
 from post.header_bar import add_end_window_controls, apply_header_corner_inset
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
@@ -45,11 +46,13 @@ from post.mail.compose import (
     format_address_list,
     guess_attachment_mime_type,
     load_attachment_from_path,
+    merge_user_body_with_signature,
     normalize_signature_text,
     normalize_email,
     parse_address_list,
     parse_draft_address_list,
     is_plain_wrapper_html,
+    is_signature_only_compose_body,
     quote_plain_forward,
     quote_plain_reply,
     replace_new_message_signature,
@@ -440,7 +443,6 @@ _TO_PLACEHOLDER = "Add a recipient in the To field"
 _CC_PLACEHOLDER = "Optional"
 _BCC_PLACEHOLDER = "Optional"
 _SUBJECT_PLACEHOLDER = "Subject is required"
-_SIGNATURE_MARK_NAME = "compose-auto-signature"
 _COMPLETION_MATCH_LIMIT = 20
 _COMPLETION_DEBOUNCE_MS = 500
 
@@ -652,23 +654,15 @@ class ComposeWindow(Adw.Window):
 
         content.append(headers)
 
-        self._body_scrolled = Gtk.ScrolledWindow()
-        self._body_scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self._body_scrolled.set_vexpand(True)
-        self._body_scrolled.set_propagate_natural_height(False)
-
-        self._body_view = Gtk.TextView()
-        self._body_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self._body_view.set_left_margin(10)
-        self._body_view.set_right_margin(10)
-        self._body_view.set_top_margin(10)
-        self._body_view.set_bottom_margin(10)
-        self._body_view.get_buffer().connect("changed", self._on_body_buffer_changed)
+        self._body_view = ComposeBodyEditor()
+        self._body_view.set_vexpand(True)
+        self._body_view.connect_changed(self._on_body_buffer_changed)
         body_focus = Gtk.EventControllerFocus()
         body_focus.connect("enter", self._on_body_focus_in)
-        self._body_view.add_controller(body_focus)
-        self._body_scrolled.set_child(self._body_view)
-        content.append(self._body_scrolled)
+        self._body_view.web_view.add_controller(body_focus)
+        # Keep the name used by focus/scroll helpers and tests (#149 / #167).
+        self._body_scrolled = self._body_view
+        content.append(self._body_view)
 
         self._focus_body_at_start_on_enter = False
 
@@ -682,7 +676,7 @@ class ComposeWindow(Adw.Window):
 
         _install_compose_drop_style()
         self._setup_file_drop_target(self._toast_overlay)
-        self._setup_file_drop_target(self._body_view)
+        self._setup_file_drop_target(self._body_view.web_view)
 
         self._prefill_fields()
         self._tracking_edits = True
@@ -951,9 +945,7 @@ class ComposeWindow(Adw.Window):
         GLib.idle_add(self._scroll_body_to_top_idle)
 
     def _scroll_body_to_top(self) -> None:
-        adj = self._body_scrolled.get_vadjustment()
-        if adj is not None:
-            adj.set_value(adj.get_lower())
+        self._body_view.scroll_to_top()
 
     def _scroll_body_to_top_idle(self) -> bool:
         self._scroll_body_to_top()
@@ -1202,44 +1194,24 @@ class ComposeWindow(Adw.Window):
 
     def _set_body_plain_text(self, text: str) -> None:
         self._tracking_edits = False
-        self._body_view.get_buffer().set_text(text)
+        self._body_view.set_plain(text)
         self._tracking_edits = True
 
     def _known_signatures(self) -> list[str]:
         return list(get_account_signatures().values())
 
     def _clear_signature_mark(self) -> None:
-        buffer = self._body_view.get_buffer()
-        mark = buffer.get_mark(_SIGNATURE_MARK_NAME)
-        if mark is not None:
-            buffer.delete_mark(mark)
+        """No-op: signature tracking no longer uses a Gtk.TextBuffer mark."""
 
     def _place_signature_mark(self) -> None:
-        if self._mode != "new" or self._tracked_signature is None:
-            return
-        buffer = self._body_view.get_buffer()
-        text = buffer.get_text(*buffer.get_bounds(), False)
-        offset = find_auto_signature_offset(
-            text,
-            tracked_signature=self._tracked_signature,
-            known_signatures=self._known_signatures(),
-        )
-        if offset is None:
-            return
-        mark_iter = buffer.get_iter_at_offset(offset)
-        mark = buffer.get_mark(_SIGNATURE_MARK_NAME)
-        if mark is None:
-            buffer.create_mark(_SIGNATURE_MARK_NAME, mark_iter, True)
-        else:
-            buffer.move_mark(mark, mark_iter)
+        """No-op: auto-signature is re-detected from plain text on each edit."""
 
     def _sync_signature_for_account(
         self, *, previous_signature: str | None = None
     ) -> None:
         if self._mode != "new":
             return
-        buffer = self._body_view.get_buffer()
-        current = buffer.get_text(*buffer.get_bounds(), False)
+        current = self._body_view.get_plain()
         new_signature = get_account_signature(self._selected_account().uid)
 
         result = replace_new_message_signature(
@@ -1265,6 +1237,15 @@ class ComposeWindow(Adw.Window):
                     ),
                     normalized or None,
                 )
+            elif not normalize_signature_text(new_signature) and is_signature_only_compose_body(
+                current,
+                signatures=[
+                    previous_signature,
+                    self._tracked_signature,
+                    *self._known_signatures(),
+                ],
+            ):
+                result = ("", None)
 
         self._tracking_edits = False
         try:
@@ -1288,8 +1269,7 @@ class ComposeWindow(Adw.Window):
         if not self._tracking_edits:
             return
         if self._mode == "new" and self._tracked_signature is not None:
-            buffer = self._body_view.get_buffer()
-            text = buffer.get_text(*buffer.get_bounds(), False)
+            text = self._body_view.get_plain()
             if (
                 find_auto_signature_offset(
                     text,
@@ -1534,7 +1514,7 @@ class ComposeWindow(Adw.Window):
                 quoted_body=quoted,
                 signature=signature,
             )
-            self._body_view.get_buffer().set_text(body)
+            self._set_body_plain_text(body)
             self._place_body_cursor_at_start()
         elif self._mode == "forward" and self._reply_to is not None:
             self._subject_entry.set_text(
@@ -1551,7 +1531,7 @@ class ComposeWindow(Adw.Window):
                 quoted_body=quoted,
                 signature=signature,
             )
-            self._body_view.get_buffer().set_text(body)
+            self._set_body_plain_text(body)
             self._place_body_cursor_at_start()
         elif self._mode == "draft" and self._draft_message is not None:
             msg = self._draft_message
@@ -1566,7 +1546,7 @@ class ComposeWindow(Adw.Window):
                 self._bcc_toggle_btn.set_label("Hide Bcc")
             self._subject_entry.set_text(str(msg.get("subject") or ""))
             plain_body = str(msg.get("body_plain") or "")
-            self._body_view.get_buffer().set_text(plain_body)
+            self._set_body_plain_text(plain_body)
             self._place_body_cursor_at_start()
             self._draft_body_html = (msg.get("body_html") or "").strip() or None
             self._draft_body_plain_snapshot = plain_body
@@ -1585,7 +1565,7 @@ class ComposeWindow(Adw.Window):
                 self._bcc_toggle_btn.set_label("Hide Bcc")
             self._subject_entry.set_text(str(msg.get("subject") or ""))
             plain_body = str(msg.get("body_plain") or "")
-            self._body_view.get_buffer().set_text(plain_body)
+            self._set_body_plain_text(plain_body)
             self._place_body_cursor_at_start()
             self._draft_body_html = (msg.get("body_html") or "").strip() or None
             self._draft_body_plain_snapshot = plain_body
@@ -1603,12 +1583,16 @@ class ComposeWindow(Adw.Window):
                 self._bcc_entry.set_can_focus(True)
                 self._bcc_toggle_btn.set_label("Hide Bcc")
             self._subject_entry.set_text(queued.subject)
-            self._body_view.get_buffer().set_text(queued.body)
+            self._set_body_plain_text(queued.body)
             self._place_body_cursor_at_start()
+            self._draft_body_html = (queued.body_html or "").strip() or None
+            self._draft_body_plain_snapshot = queued.body
+            self._quoted_html_source = None
+            self._quoted_plain_expected = ""
             self._attachments = load_queued_attachments(
                 self._outbox_queue_id, queued
             )
-            self._rebuild_attachment_rows()
+            self._refresh_attachments_ui()
         else:
             mailto = self._mailto
             if mailto is not None:
@@ -1637,8 +1621,7 @@ class ComposeWindow(Adw.Window):
             self._place_body_cursor_at_start()
 
     def _place_body_cursor_at_start(self) -> None:
-        buffer = self._body_view.get_buffer()
-        buffer.place_cursor(buffer.get_start_iter())
+        self._body_view.place_cursor_at_start()
 
     def _on_subject_focus_leave(self, *_args) -> None:
         if self._mode == "new":
@@ -1789,7 +1772,7 @@ class ComposeWindow(Adw.Window):
                 quoted_html_source=self._quoted_html_source,
                 quoted_plain_expected=self._quoted_plain_expected,
             )
-        if self._mode in ("draft", "send-again"):
+        if self._mode in ("draft", "send-again", "outbox"):
             if (
                 body_plain == self._draft_body_plain_snapshot
                 and self._draft_body_html
@@ -1820,9 +1803,7 @@ class ComposeWindow(Adw.Window):
         cc_addrs = parse_addresses(self._cc_entry.get_text())
         bcc_addrs = parse_addresses(self._bcc_entry.get_text())
         subject = self._subject_entry.get_text().strip()
-        buffer = self._body_view.get_buffer()
-        start, end = buffer.get_bounds()
-        body = buffer.get_text(start, end, False)
+        body = self._body_view.get_plain()
         body_html = self._resolve_outbound_body_html(body)
 
         in_reply_to = None

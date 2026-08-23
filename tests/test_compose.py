@@ -1396,6 +1396,7 @@ class SignatureComposeTests(unittest.TestCase):
             compose_body_with_signature,
             finalize_body_after_signature_sync,
             find_auto_signature_offset,
+            is_signature_only_compose_body,
             merge_user_body_with_signature,
             replace_new_message_signature,
             sync_new_message_body_signature,
@@ -1526,6 +1527,48 @@ class SignatureComposeTests(unittest.TestCase):
                 known_signatures=[],
             ),
             ("Hello there\n\nBob", "Bob"),
+        )
+        self.assertEqual(
+            replace_new_message_signature(
+                f"\n{signature_a}",
+                new_signature="",
+                tracked_signature=signature_a,
+                previous_signature=signature_a,
+                known_signatures=[signature_a],
+            ),
+            ("", None),
+        )
+        self.assertEqual(
+            replace_new_message_signature(
+                signature_a,
+                new_signature="Bob",
+                tracked_signature=signature_a,
+                previous_signature=signature_a,
+                known_signatures=[signature_a],
+            ),
+            ("\n\nBob", "Bob"),
+        )
+        signature_blank_line = "Best regards\n\nJohn Doe"
+        body_blank_line = compose_body_with_signature(
+            mode="new",
+            quoted_body="",
+            signature=signature_blank_line,
+        )
+        self.assertEqual(
+            replace_new_message_signature(
+                f"Best regards\n\nJohn Doe",
+                new_signature="",
+                tracked_signature=signature_blank_line,
+                previous_signature=signature_blank_line,
+                known_signatures=[signature_blank_line],
+            ),
+            ("", None),
+        )
+        self.assertTrue(
+            is_signature_only_compose_body(
+                body_blank_line,
+                signatures=[signature_blank_line],
+            )
         )
 
     def test_reply_inserts_signature_before_quote(self) -> None:
