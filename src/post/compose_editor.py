@@ -12,11 +12,19 @@ from collections.abc import Callable
 
 import gi
 
+gi.require_version("Gio", "2.0")
 gi.require_version("Gtk", "4.0")
 gi.require_version("WebKit", "6.0")
 gi.require_version("JavaScriptCore", "6.0")
 
-from gi.repository import Gtk, JavaScriptCore, WebKit
+from gi.repository import Gio, GLib, Gtk, JavaScriptCore, WebKit
+
+from post.spell_check import (
+    action_name_for_language,
+    get_active_spell_languages,
+    list_installed_spell_languages,
+    set_spell_language_active,
+)
 
 log = logging.getLogger(__name__)
 
@@ -171,6 +179,8 @@ class ComposeBodyEditor(Gtk.Box):
         self._cursor_offset = 0
         self._changed_handlers: list[Callable[[], None]] = []
         self._suppress_changed = True
+        self._spell_action_group = Gio.SimpleActionGroup.new()
+        self._spell_language_actions: dict[str, Gio.SimpleAction] = {}
 
         self._web_view = WebKit.WebView.new()
         settings = self._web_view.get_settings()
@@ -194,6 +204,9 @@ class ComposeBodyEditor(Gtk.Box):
         self._web_view.connect("decide-policy", self._on_decide_policy)
         self._web_view.connect("load-changed", self._on_load_changed)
         self._web_view.connect("context-menu", self._on_context_menu)
+
+        self._web_view.insert_action_group("compose-spell", self._spell_action_group)
+        self._rebuild_spell_language_actions()
 
         self.append(self._web_view)
         self._load_document(body_plain="")
@@ -331,6 +344,58 @@ class ComposeBodyEditor(Gtk.Box):
         decision.ignore()
         return True
 
+    def _rebuild_spell_language_actions(self) -> None:
+        for action in self._spell_language_actions.values():
+            try:
+                self._spell_action_group.remove_action(action.get_name())
+            except Exception:
+                pass
+        self._spell_language_actions.clear()
+
+        for code, _label in list_installed_spell_languages():
+            name = action_name_for_language(code)
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", self._on_spell_language_activate, code)
+            self._spell_action_group.add_action(action)
+            self._spell_language_actions[code] = action
+
+    def _on_spell_language_activate(
+        self,
+        _action: Gio.SimpleAction,
+        _param: GLib.Variant | None,
+        code: str,
+    ) -> None:
+        active = code in get_active_spell_languages()
+        set_spell_language_active(code, not active)
+
+    def _prepend_spell_language_menu(self, menu: WebKit.ContextMenu) -> None:
+        languages = list_installed_spell_languages()
+        if not languages:
+            return
+
+        active = set(get_active_spell_languages())
+        submenu = WebKit.ContextMenu.new()
+        for code, label in languages:
+            action = self._spell_language_actions.get(code)
+            if action is None:
+                continue
+            prefix = "✓ " if code in active else ""
+            submenu.append(
+                WebKit.ContextMenuItem.new_from_gaction(action, f"{prefix}{label}")
+            )
+
+        if not list(submenu.get_items()):
+            return
+
+        if list(menu.get_items()):
+            menu.prepend(WebKit.ContextMenuItem.new_separator())
+        menu.prepend(
+            WebKit.ContextMenuItem.new_with_submenu(
+                "Spelling Languages",
+                submenu,
+            )
+        )
+
     def _on_context_menu(
         self,
         _web_view: WebKit.WebView,
@@ -354,4 +419,5 @@ class ComposeBodyEditor(Gtk.Box):
                 continue
             if action in remove_actions:
                 menu.remove(item)
+        self._prepend_spell_language_menu(menu)
         return False

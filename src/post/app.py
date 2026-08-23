@@ -52,6 +52,9 @@ class PostApplication(Adw.Application):
         from post.mail.io_thread import get_mail_io_thread
 
         get_mail_io_thread()
+        from post.spell_check import ensure_spell_check_initialized
+
+        ensure_spell_check_initialized()
 
     def _install_standard_shortcuts(self) -> None:
         """GNOME HIG: Ctrl+W closes the focused window; Ctrl+Q quits the app."""
