@@ -35,8 +35,12 @@ from post.mail.compose import (
     quote_html_forward,
     quote_plain_forward,
     quote_plain_reply,
+    compose_html_quote_prefill,
+    html_text_newlines_to_br,
+    prepare_editor_html_for_send,
     read_compose_attachments_from_message,
     split_compose_body_at_quote,
+    split_editor_html_at_quote,
 )
 from post.mail.subject_prefixes import subject_looks_like_forward
 from post.mail.helpers import (
@@ -1766,6 +1770,101 @@ class HtmlForwardReplyTests(unittest.TestCase):
             quoted_plain_expected="",
         )
         self.assertIsNone(html)
+
+    def test_html_text_newlines_to_br(self) -> None:
+        self.assertEqual(html_text_newlines_to_br("a\nb"), "a<br>b")
+        self.assertEqual(
+            html_text_newlines_to_br("<b>a</b>\nworld"),
+            "<b>a</b><br>world",
+        )
+
+    def test_prepare_editor_html_for_send_wraps_and_keeps_breaks(self) -> None:
+        html = prepare_editor_html_for_send("this is bold\nOn date wrote:\n&gt; hallo")
+        self.assertIn("white-space:pre-wrap", html)
+        self.assertIn("this is bold<br>On date wrote:<br>&gt; hallo", html)
+
+    def test_prepare_editor_html_keeps_links(self) -> None:
+        html = prepare_editor_html_for_send(
+            '<a href="https://example.com">click</a>'
+        )
+        self.assertIn('<a href="https://example.com">', html)
+        self.assertIn("click", html)
+
+    def test_restore_stamped_link_hrefs(self) -> None:
+        from post.mail.compose import restore_stamped_link_hrefs
+
+        html = restore_stamped_link_hrefs(
+            '<a data-post-href="https://example.com">click</a>'
+        )
+        self.assertIn('href="https://example.com"', html)
+        self.assertNotIn("data-post-href", html)
+
+    def test_compose_html_quote_prefill_keeps_original_markup(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "date_received": "2026-08-24 11:40:05",
+        }
+        html = compose_html_quote_prefill(
+            mode="reply",
+            reply_to=original,
+            quoted_html_source="<p><b>hallo</b> test</p>",
+            signature=None,
+        )
+        self.assertIn("<b>hallo</b>", html)
+        self.assertIn('class="post_quote"', html)
+        self.assertIn("<div><br></div>", html)
+
+    def test_split_editor_html_at_quote_uses_first_line(self) -> None:
+        quoted = quote_plain_forward(
+            {"from": "Alice <alice@example.com>", "date_received": "2026-06-17"},
+            "Plain fallback",
+        )
+        user_html, quote_html = split_editor_html_at_quote(
+            f"<b>My note</b><br><br>{quoted.lstrip()}",
+            quoted,
+        )
+        self.assertEqual(user_html, "<b>My note</b>")
+        self.assertIsNotNone(quote_html)
+        assert quote_html is not None
+        self.assertTrue(quote_html.startswith("---------- Forwarded message ---------"))
+
+    def test_formatted_user_html_keeps_original_quote(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "to": "Bob <bob@example.com>",
+            "date_received": "2026-06-17",
+            "body_html": "<p>Original</p>",
+        }
+        quoted_plain = quote_plain_forward(original, "Plain fallback")
+        html = build_outbound_html_for_compose(
+            body_plain=f"My note{quoted_plain}",
+            mode="forward",
+            reply_to=original,
+            quoted_html_source=original["body_html"],
+            quoted_plain_expected=quoted_plain,
+            user_html="<b>My note</b>",
+        )
+        assert html is not None
+        self.assertIn("<b>My note</b>", html)
+        self.assertIn("<p>Original</p>", html)
+        self.assertNotIn('style="white-space:pre-wrap"', html)
+
+    def test_formatted_editor_html_used_when_quote_edited(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "to": "Bob <bob@example.com>",
+            "date_received": "2026-06-17",
+        }
+        quoted_plain = quote_plain_forward(original, "Plain fallback")
+        html = build_outbound_html_for_compose(
+            body_plain=f"Hi{quoted_plain}edited",
+            mode="forward",
+            reply_to=original,
+            quoted_html_source="<p>Original</p>",
+            quoted_plain_expected=quoted_plain,
+            formatted_editor_html="<b>Hi</b><br>edited quote",
+        )
+        self.assertEqual(html, "<b>Hi</b><br>edited quote")
 
     def test_is_plain_wrapper_html_matches_synthetic_wrapper(self) -> None:
         plain = "hallo"

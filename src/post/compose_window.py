@@ -21,7 +21,11 @@ gi.require_version("Gdk", "4.0")
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
-from post.compose_editor import ComposeBodyEditor
+from post.compose_editor import (
+    ComposeBodyEditor,
+    editor_html_is_plain_equivalent,
+    normalize_compose_link_url,
+)
 from post.header_bar import add_end_window_controls, apply_header_corner_inset
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
@@ -33,6 +37,8 @@ from post.mail.compose import (
     body_text_for_quoting,
     build_forward_subject,
     build_outbound_html_for_compose,
+    compose_html_quote_prefill,
+    prepare_editor_html_for_send,
     build_reply_all_recipients,
     build_reply_references,
     normalize_in_reply_to,
@@ -55,6 +61,9 @@ from post.mail.compose import (
     is_signature_only_compose_body,
     quote_plain_forward,
     quote_plain_reply,
+    html_body_fragment,
+    split_compose_body_at_quote,
+    split_editor_html_at_quote,
     replace_new_message_signature,
     validate_compose_mime_fields,
 )
@@ -657,6 +666,7 @@ class ComposeWindow(Adw.Window):
         self._body_view = ComposeBodyEditor()
         self._body_view.set_vexpand(True)
         self._body_view.connect_changed(self._on_body_buffer_changed)
+        self._body_view.connect_link_request(self._on_link_request)
         body_focus = Gtk.EventControllerFocus()
         body_focus.connect("enter", self._on_body_focus_in)
         self._body_view.web_view.add_controller(body_focus)
@@ -1197,6 +1207,22 @@ class ComposeWindow(Adw.Window):
         self._body_view.set_plain(text)
         self._tracking_edits = True
 
+    def _set_body_html_fragment(self, fragment: str) -> None:
+        self._tracking_edits = False
+        self._body_view.set_html_fragment(fragment)
+        self._tracking_edits = True
+
+    def _set_body_from_stored(self, plain: str, stored_html: str | None) -> None:
+        html = (stored_html or "").strip() or None
+        if (
+            html
+            and not is_plain_wrapper_html(html, plain)
+            and not editor_html_is_plain_equivalent(html, plain)
+        ):
+            self._set_body_html_fragment(html_body_fragment(html))
+            return
+        self._set_body_plain_text(plain)
+
     def _known_signatures(self) -> list[str]:
         return list(get_account_signatures().values())
 
@@ -1509,12 +1535,21 @@ class ComposeWindow(Adw.Window):
             )
             self._quoted_html_source = body_html_for_quoting(self._reply_to)
             self._quoted_plain_expected = quoted
-            body = compose_body_with_signature(
-                mode=self._mode,
-                quoted_body=quoted,
-                signature=signature,
-            )
-            self._set_body_plain_text(body)
+            if self._quoted_html_source:
+                fragment = compose_html_quote_prefill(
+                    mode=self._mode,
+                    reply_to=self._reply_to,
+                    quoted_html_source=self._quoted_html_source,
+                    signature=signature,
+                )
+                self._set_body_html_fragment(fragment)
+            else:
+                body = compose_body_with_signature(
+                    mode=self._mode,
+                    quoted_body=quoted,
+                    signature=signature,
+                )
+                self._set_body_plain_text(body)
             self._place_body_cursor_at_start()
         elif self._mode == "forward" and self._reply_to is not None:
             self._subject_entry.set_text(
@@ -1526,12 +1561,21 @@ class ComposeWindow(Adw.Window):
             )
             self._quoted_html_source = body_html_for_quoting(self._reply_to)
             self._quoted_plain_expected = quoted
-            body = compose_body_with_signature(
-                mode=self._mode,
-                quoted_body=quoted,
-                signature=signature,
-            )
-            self._set_body_plain_text(body)
+            if self._quoted_html_source:
+                fragment = compose_html_quote_prefill(
+                    mode=self._mode,
+                    reply_to=self._reply_to,
+                    quoted_html_source=self._quoted_html_source,
+                    signature=signature,
+                )
+                self._set_body_html_fragment(fragment)
+            else:
+                body = compose_body_with_signature(
+                    mode=self._mode,
+                    quoted_body=quoted,
+                    signature=signature,
+                )
+                self._set_body_plain_text(body)
             self._place_body_cursor_at_start()
         elif self._mode == "draft" and self._draft_message is not None:
             msg = self._draft_message
@@ -1546,9 +1590,10 @@ class ComposeWindow(Adw.Window):
                 self._bcc_toggle_btn.set_label("Hide Bcc")
             self._subject_entry.set_text(str(msg.get("subject") or ""))
             plain_body = str(msg.get("body_plain") or "")
-            self._set_body_plain_text(plain_body)
+            stored_html = (msg.get("body_html") or "").strip() or None
+            self._set_body_from_stored(plain_body, stored_html)
             self._place_body_cursor_at_start()
-            self._draft_body_html = (msg.get("body_html") or "").strip() or None
+            self._draft_body_html = stored_html
             self._draft_body_plain_snapshot = plain_body
             self._quoted_html_source = None
             self._quoted_plain_expected = ""
@@ -1565,9 +1610,10 @@ class ComposeWindow(Adw.Window):
                 self._bcc_toggle_btn.set_label("Hide Bcc")
             self._subject_entry.set_text(str(msg.get("subject") or ""))
             plain_body = str(msg.get("body_plain") or "")
-            self._set_body_plain_text(plain_body)
+            stored_html = (msg.get("body_html") or "").strip() or None
+            self._set_body_from_stored(plain_body, stored_html)
             self._place_body_cursor_at_start()
-            self._draft_body_html = (msg.get("body_html") or "").strip() or None
+            self._draft_body_html = stored_html
             self._draft_body_plain_snapshot = plain_body
             self._quoted_html_source = None
             self._quoted_plain_expected = ""
@@ -1583,7 +1629,7 @@ class ComposeWindow(Adw.Window):
                 self._bcc_entry.set_can_focus(True)
                 self._bcc_toggle_btn.set_label("Hide Bcc")
             self._subject_entry.set_text(queued.subject)
-            self._set_body_plain_text(queued.body)
+            self._set_body_from_stored(queued.body, (queued.body_html or "").strip() or None)
             self._place_body_cursor_at_start()
             self._draft_body_html = (queued.body_html or "").strip() or None
             self._draft_body_plain_snapshot = queued.body
@@ -1764,6 +1810,39 @@ class ComposeWindow(Adw.Window):
         self._begin_save_draft(close_when_done=False)
 
     def _resolve_outbound_body_html(self, body_plain: str) -> str | None:
+        editor_html = self._body_view.get_html()
+        formatted = not editor_html_is_plain_equivalent(editor_html, body_plain)
+        if formatted:
+            prepared = prepare_editor_html_for_send(editor_html)
+            if self._mode in ("reply", "reply-all", "forward"):
+                if "post_quote" in (editor_html or ""):
+                    return prepared or None
+                user_html: str | None = None
+                quoted_html_source = self._quoted_html_source
+                _user_plain, quoted_plain = split_compose_body_at_quote(
+                    body_plain, self._mode
+                )
+                if (
+                    quoted_plain.strip()
+                    and quoted_plain == self._quoted_plain_expected
+                ):
+                    user_html, quote_in_editor = split_editor_html_at_quote(
+                        editor_html, quoted_plain
+                    )
+                    if quote_in_editor is None:
+                        return prepared or None
+                    user_html = prepare_editor_html_for_send(user_html)
+                else:
+                    return prepared or None
+                return build_outbound_html_for_compose(
+                    body_plain=body_plain,
+                    mode=self._mode,
+                    reply_to=self._reply_to,
+                    quoted_html_source=quoted_html_source,
+                    quoted_plain_expected=self._quoted_plain_expected,
+                    user_html=user_html,
+                )
+            return prepared or None
         if self._mode in ("reply", "reply-all", "forward"):
             return build_outbound_html_for_compose(
                 body_plain=body_plain,
@@ -1781,6 +1860,57 @@ class ComposeWindow(Adw.Window):
                 return self._draft_body_html
             return None
         return None
+
+    def _on_link_request(self, selected_text: str, existing_href: str) -> None:
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("https://")
+        entry.set_hexpand(True)
+        entry.set_activates_default(True)
+        prefill = existing_href.strip() or (
+            selected_text.strip()
+            if selected_text.strip().lower().startswith(("http://", "https://", "mailto:"))
+            else ""
+        )
+        if prefill:
+            entry.set_text(prefill)
+            entry.select_region(0, -1)
+
+        existing = existing_href.strip()
+        dialog = Adw.AlertDialog(
+            heading="Edit Link" if existing else "Insert Link",
+            body="URL for the selected text.",
+            close_response="cancel",
+        )
+        dialog.add_response("cancel", "Cancel")
+        if existing:
+            dialog.add_response("remove", "Remove")
+            dialog.set_response_appearance(
+                "remove", Adw.ResponseAppearance.DESTRUCTIVE
+            )
+        dialog.add_response("insert", "Insert")
+        dialog.set_response_appearance("insert", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("insert")
+        dialog.set_extra_child(entry)
+
+        def on_response(_dialog: Adw.AlertDialog, response: str) -> None:
+            if response == "remove":
+                self._body_view.remove_link()
+                return
+            if response != "insert":
+                return
+            url = normalize_compose_link_url(entry.get_text())
+            if url is None:
+                return
+            self._body_view.apply_link(url)
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+        def _focus_entry() -> bool:
+            entry.grab_focus()
+            return False
+
+        GLib.idle_add(_focus_entry)
 
     def _collect_draft_fields(
         self,

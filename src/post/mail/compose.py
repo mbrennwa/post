@@ -291,6 +291,89 @@ def quote_html_reply(original: dict[str, Any], body_html: str) -> str:
     )
 
 
+def compose_html_quote_prefill(
+    *,
+    mode: str,
+    reply_to: dict[str, Any],
+    quoted_html_source: str,
+    signature: str | None,
+) -> str:
+    """HTML fragment for reply/forward: caret row, optional signature, quoted HTML."""
+    if mode == "forward":
+        quoted = quote_html_forward(reply_to, quoted_html_source)
+    else:
+        quoted = quote_html_reply(reply_to, quoted_html_source)
+    parts = ["<div><br></div>"]
+    block = format_signature_block(signature or "")
+    if block and mode in ("reply", "reply-all"):
+        parts.append(plain_to_simple_html(block))
+        parts.append("<div><br></div>")
+    parts.append(quoted)
+    return "".join(parts)
+
+
+def restore_stamped_link_hrefs(fragment: str) -> str:
+    """Copy data-post-href onto href when WebKit dropped the attribute."""
+
+    def repl(match: re.Match[str]) -> str:
+        attrs = match.group(1)
+        data = re.search(
+            r'data-post-href\s*=\s*["\']([^"\']+)["\']', attrs, re.IGNORECASE
+        )
+        if not data:
+            return match.group(0)
+        url = data.group(1)
+        href = re.search(
+            r'(?:^|\s)href\s*=\s*["\']([^"\']*)["\']', attrs, re.IGNORECASE
+        )
+        if href and href.group(1) not in ("", "about:blank"):
+            return match.group(0)
+        if href:
+            attrs = re.sub(
+                r'(?:^|\s)href\s*=\s*["\'][^"\']*["\']',
+                f' href="{url}"',
+                attrs,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        else:
+            attrs = f'{attrs} href="{url}"'
+        return f"<a{attrs}>"
+
+    restored = re.sub(r"<a\b([^>]*)>", repl, fragment, flags=re.IGNORECASE)
+    return re.sub(
+        r"\s*data-post-href\s*=\s*[\"'][^\"']*[\"']",
+        "",
+        restored,
+        flags=re.IGNORECASE,
+    )
+
+
+def html_text_newlines_to_br(fragment: str) -> str:
+    """Turn text-node newlines into ``<br>`` so recipients keep line breaks."""
+    parts = re.split(r"(<[^>]+>)", fragment)
+    out: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("<"):
+            out.append(part)
+        else:
+            out.append(part.replace("\n", "<br>"))
+    return "".join(out)
+
+
+def prepare_editor_html_for_send(fragment: str) -> str:
+    """Make compose-editor HTML safe to send as text/html (keep line breaks)."""
+    text = (fragment or "").strip()
+    if not text:
+        return ""
+    converted = html_text_newlines_to_br(restore_stamped_link_hrefs(text))
+    if "white-space:pre-wrap" in converted:
+        return converted
+    return f'<div style="white-space:pre-wrap">{converted}</div>'
+
+
 def plain_to_simple_html(plain: str) -> str:
     """Convert plain text into a minimal HTML fragment."""
     text = plain.rstrip("\n")
@@ -341,14 +424,46 @@ def split_compose_body_at_quote(body_plain: str, mode: str) -> tuple[str, str]:
     return body_plain, ""
 
 
+def html_body_fragment(body_html: str) -> str:
+    """Return inner HTML for the compose editor, dropping document wrappers."""
+    return _strip_html_document_wrappers(body_html)
+
+
+def split_editor_html_at_quote(
+    editor_html: str, quoted_plain: str
+) -> tuple[str, str | None]:
+    """Split editor innerHTML into user HTML and the quoted section.
+
+    Returns ``(user_html, quote_html)``. ``quote_html`` is None when the
+    quoted first line is not found in the editor HTML.
+    """
+    html_fragment = editor_html or ""
+    first_line = (quoted_plain or "").lstrip("\n").split("\n", 1)[0]
+    if not first_line:
+        return html_fragment, None
+    marker = html.escape(first_line)
+    idx = html_fragment.find(marker)
+    if idx < 0:
+        return html_fragment, None
+    user_html = html_fragment[:idx]
+    user_html = re.sub(r"(?:<div>\s*</div>\s*)+$", "", user_html, flags=re.IGNORECASE)
+    user_html = re.sub(r"(?:<br\s*/?>|\s)+$", "", user_html, flags=re.IGNORECASE)
+    return user_html, html_fragment[idx:]
+
+
 def build_outbound_html_body(
     *,
     user_plain: str,
     quoted_html: str | None,
+    user_html: str | None = None,
 ) -> str | None:
     """Assemble the outbound text/html body from user text and quoted HTML."""
     parts: list[str] = []
-    if user_plain.strip():
+    if user_html is not None:
+        stripped = user_html.strip()
+        if stripped:
+            parts.append(stripped)
+    elif user_plain.strip():
         parts.append(plain_to_simple_html(user_plain.rstrip()))
     if quoted_html:
         parts.append(quoted_html)
@@ -364,28 +479,39 @@ def build_outbound_html_for_compose(
     reply_to: dict[str, Any] | None,
     quoted_html_source: str | None,
     quoted_plain_expected: str,
+    user_html: str | None = None,
+    formatted_editor_html: str | None = None,
 ) -> str | None:
     """Build text/html for reply/forward using original MIME HTML when unchanged.
 
     Returns None when there is no real HTML quote to preserve (edited quotes,
-    plain-only bodies). Synthetic plain wrappers alone must not become a
-    multipart/alternative HTML part (#157).
+    plain-only bodies) unless ``formatted_editor_html`` is supplied. Synthetic
+    plain wrappers alone must not become a multipart/alternative HTML part
+    (#157).
     """
     if mode not in ("reply", "reply-all", "forward"):
         return None
     user_plain, quoted_plain = split_compose_body_at_quote(body_plain, mode)
-    if not (
+    quote_unchanged = bool(
         quoted_plain.strip()
         and quoted_plain == quoted_plain_expected
         and quoted_html_source
         and reply_to is not None
-    ):
-        return None
-    if mode == "forward":
-        quoted_html = quote_html_forward(reply_to, quoted_html_source)
-    else:
-        quoted_html = quote_html_reply(reply_to, quoted_html_source)
-    return build_outbound_html_body(user_plain=user_plain, quoted_html=quoted_html)
+    )
+    if quote_unchanged:
+        assert reply_to is not None
+        assert quoted_html_source is not None
+        if mode == "forward":
+            quoted_html = quote_html_forward(reply_to, quoted_html_source)
+        else:
+            quoted_html = quote_html_reply(reply_to, quoted_html_source)
+        return build_outbound_html_body(
+            user_plain=user_plain,
+            quoted_html=quoted_html,
+            user_html=user_html,
+        )
+    formatted = (formatted_editor_html or "").strip()
+    return formatted or None
 
 
 def normalize_email(address: str) -> str:
