@@ -5377,6 +5377,8 @@ class MainWindow(Adw.ApplicationWindow):
                     streamed=True,
                     reason="preserve_streamed_results",
                 )
+                if after_list_complete is not None:
+                    after_list_complete()
                 if not sync_pending:
                     self._release_offline_sync_for_folder_work(load_id)
                 return False
@@ -5403,6 +5405,9 @@ class MainWindow(Adw.ApplicationWindow):
                 view="empty",
                 searching=True,
             )
+            # Empty disk cache still needs after_list (background refresh) (#339).
+            if after_list_complete is not None:
+                after_list_complete()
             if not sync_pending:
                 self._release_offline_sync_for_folder_work(load_id)
             return False
