@@ -312,6 +312,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_list_source = ""
         self._message_sync_in_progress = False
         self._message_list_populating = False
+        self._pending_sync_folder_refresh: tuple[str, str] | None = None
         self._context_attachment_index: int | None = None
         self._context_attachment_mime: str | None = None
         self._context_attachment_name: str | None = None
@@ -1423,13 +1424,50 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._sidebar.reload_account(account_uid, on_complete=on_complete)
 
+    def _resolved_sync_folder_name(self, account_uid: str, folder_name: str) -> str:
+        inbox_name = self._sidebar.inbox_folder_for_account(account_uid)
+        if inbox_name and folder_name in (inbox_name, "INBOX"):
+            return inbox_name
+        return folder_name
+
     def _is_viewing_folder(self, account_uid: str, folder_name: str) -> bool:
-        return (
-            self._current_account is not None
-            and self._current_folder is not None
-            and self._current_account.uid == account_uid
-            and self._current_folder == folder_name
+        if (
+            self._current_account is None
+            or self._current_folder is None
+            or self._current_account.uid != account_uid
+        ):
+            return False
+        current = MainWindow._resolved_sync_folder_name(
+            self, account_uid, self._current_folder
         )
+        resolved = MainWindow._resolved_sync_folder_name(
+            self, account_uid, folder_name
+        )
+        return current == resolved
+
+    def _sync_watcher_current_folder(self) -> None:
+        if not self._sync_watcher.running:
+            return
+        account = self._current_account
+        folder = self._current_folder
+        if account is None or folder is None:
+            self._sync_watcher.set_current_folder(None, None)
+            return
+        resolved = self._resolved_sync_folder_name(account.uid, folder)
+        if resolved != folder:
+            self._current_folder = resolved
+            self._message_list_view.set_drag_context(account.uid, resolved)
+        self._sync_watcher.set_current_folder(account.uid, resolved)
+
+    def _maybe_run_pending_sync_folder_refresh(self) -> None:
+        pending = self._pending_sync_folder_refresh
+        if pending is None or self._message_list_populating:
+            return
+        account_uid, folder_name = pending
+        self._pending_sync_folder_refresh = None
+        if not self._is_viewing_folder(account_uid, folder_name):
+            return
+        self._sync_current_folder_messages(account_uid, folder_name)
 
     def _on_sidebar_refresh_folder(self, account_uid: str, folder_name: str) -> None:
         if not self._network_available:
@@ -1683,6 +1721,7 @@ class MainWindow(Adw.ApplicationWindow):
         # the real folder name instead of skipping while cache was empty (#153).
         if self._sync_watcher.running:
             self._sync_watcher.set_accounts(self._sidebar.account_uids())
+        self._sync_watcher_current_folder()
         # Defer the first all-folder count poll until after message list I/O
         # has had a chance to run (#170).
         if self._sync_watcher.running and self._folder_count_poll_deferred_id is None:
@@ -1804,6 +1843,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self._offline_held_for_load_generation = None
         self._mail.hold_offline_body_sync(False)
+        self._sync_watcher_current_folder()
 
     def _on_offline_body_sync_changed(
         self, account_uid: str, mode: OfflineBodySyncMode
@@ -1916,6 +1956,12 @@ class MainWindow(Adw.ApplicationWindow):
         return True
 
     def _on_sync_folder_changed(self, account_uid: str, folder_name: str) -> None:
+        search_trace(
+            "sync_folder_changed",
+            account=account_uid,
+            folder=folder_name,
+            current=self._current_folder,
+        )
         # Heavy-folder header refresh emits Folder::changed. Invalidating the
         # grow-only index (even after leaving the folder) wipes thousands of
         # headers; a reopen then rebuilds from a shrunk Camel summary and may
@@ -1927,7 +1973,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_sync_in_progress
             and self._current_account is not None
             and self._current_account.uid == account_uid
-            and self._current_folder == folder_name
+            and self._is_viewing_folder(account_uid, folder_name)
         ):
             self._sidebar.refresh_folder_row(account_uid, folder_name)
             return
@@ -1940,11 +1986,8 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _refresh_folder_view(self, account_uid: str, folder_name: str) -> None:
         self._sidebar.refresh_folder_row(account_uid, folder_name)
-        if (
-            self._current_account
-            and self._current_folder
-            and self._current_account.uid == account_uid
-            and self._current_folder == folder_name
+        if self._current_account and self._current_folder and self._is_viewing_folder(
+            account_uid, folder_name
         ):
             if self._sync_list_reload_suppressed(account_uid, folder_name):
                 return
@@ -2738,7 +2781,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._current_folder = folder_name
         self._message_list_view.set_drag_context(account.uid, folder_name)
         if self._sync_watcher.running:
-            self._sync_watcher.set_current_folder(account.uid, folder_name)
+            self._sync_watcher_current_folder()
         self._update_search_entry_state()
         selection = (account.uid, folder_name)
         saved_folder = sidebar_state.get("active_folder")
@@ -3660,6 +3703,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_list_view.reset_near_end()
             if on_complete is not None:
                 on_complete()
+            self._maybe_run_pending_sync_folder_refresh()
             return
 
         self._message_list_populating = True
@@ -3682,6 +3726,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._update_message_status(account, folder_name)
             if on_complete is not None:
                 on_complete()
+            self._maybe_run_pending_sync_folder_refresh()
             return False
 
         GLib.idle_add(append_batches, batch_size)
@@ -5518,12 +5563,14 @@ class MainWindow(Adw.ApplicationWindow):
         if self._messages_load_expects_search:
             return False
         if self._message_list_populating:
+            self._pending_sync_folder_refresh = (account_uid, folder_name)
+            self._message_sync_in_progress = False
             return False
 
         if error is not None:
             self._message_sync_in_progress = False
             if account := self._current_account:
-                if self._current_folder == folder_name:
+                if self._is_viewing_folder(account.uid, folder_name):
                     self._update_message_status(account, folder_name)
             return False
 
@@ -5531,7 +5578,7 @@ class MainWindow(Adw.ApplicationWindow):
         account = self._current_account
         if account is None or account.uid != account_uid:
             return False
-        if self._current_folder != folder_name:
+        if not self._is_viewing_folder(account_uid, folder_name):
             return False
 
         if not self._search_query:
