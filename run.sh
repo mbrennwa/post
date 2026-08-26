@@ -90,6 +90,10 @@ EOF
   fi
 }
 
-install_desktop_integration
+# Dev checkout: keep the GNOME launcher owned by main_release.git.
+# Set POST_INSTALL_DESKTOP=1 to opt in when testing launcher changes here.
+if [[ "${POST_INSTALL_DESKTOP:-}" == "1" ]]; then
+  install_desktop_integration
+fi
 
 exec .venv/bin/post "$@"
