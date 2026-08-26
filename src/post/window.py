@@ -397,6 +397,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
         settings_btn.set_tooltip_text("Settings")
+        settings_btn.set_margin_start(8)
         settings_btn.connect("clicked", self._on_settings_clicked)
 
         header_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
