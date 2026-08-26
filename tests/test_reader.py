@@ -996,6 +996,102 @@ class BuildReaderDocumentTests(unittest.TestCase):
             r'style="[^"]*background-color:\s*E5E5E5[^"]*"',
         )
 
+    def test_adapt_text_runs_pipeline_for_body_white_text_on_white_card(self) -> None:
+        """#346: canvas neutralization must run even when only post-keep-color applies."""
+        doc = build_reader_document(
+            body_html=(
+                "<style>body{color:#ffffff}.card{background:#ffffff}</style>"
+                '<table class="card"><tr><td>Verification code body copy</td></tr>'
+                '<tr><td><a style="color:#0070ba" href="#">Help link</a></td></tr>'
+                "</table>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        compact = doc.replace(" ", "")
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("background-color:transparent!important", compact)
+        self.assertIn('name="color-scheme" content="dark"', doc)
+        self.assertIn("color:#0070ba", compact)
+        self.assertIn("post-keep-color", doc)
+        self.assertRegex(
+            doc.replace(" ", ""),
+            r'<tableclass="cardpost-keep-color"[^>]*background-color:transparent!important',
+        )
+
+    def test_adapt_text_runs_pipeline_for_same_element_white_on_white(self) -> None:
+        """#346: same-element white canvas + light text must not skip adaptation."""
+        doc = build_reader_document(
+            body_html='<div style="background:#ffffff;color:#ffffff">Verification code</div>',
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        compact = doc.replace(" ", "")
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("background-color:transparent!important", compact)
+        self.assertIn("post-keep-color", doc)
+        self.assertNotIn('style="background:#ffffff', compact)
+
+    def test_adapt_text_runs_pipeline_for_stylesheet_important_white_card(self) -> None:
+        """#346: stylesheet !important white card must not bypass the adapt pipeline."""
+        doc = build_reader_document(
+            body_html=(
+                "<style>.card{background:#ffffff!important;color:#ffffff!important}</style>"
+                '<table class="card"><tr><td>Verification code</td></tr></table>'
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        compact = doc.replace(" ", "")
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("background-color:transparent!important", compact)
+
+    def test_adapt_text_strips_bgcolor_when_neutralizing_canvas(self) -> None:
+        """#346: bgcolor must not survive canvas neutralization."""
+        doc = build_reader_document(
+            body_html=(
+                '<table bgcolor="#FFFFFF" style="background-color:#FFFFFF">'
+                "<tr><td>Verification code</td></tr></table>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        compact = doc.replace(" ", "")
+        self.assertIn("background-color:transparent!important", compact)
+        self.assertNotIn("bgcolor=", compact)
+
+    def test_adapt_text_neutralizes_id_selector_white_canvas(self) -> None:
+        """#346: stylesheet #id backgrounds must not survive on the dark shell."""
+        doc = build_reader_document(
+            body_html=(
+                "<style>#emailBody{background-color:#ffffff;color:#001435}</style>"
+                '<div id="emailBody"><p style="font-size:22px">Payment received</p>'
+                '<p style="color:#6c7378">Transaktionsdetails</p>'
+                '<a style="background:#000000;color:#ffffff;padding:10px">Mehr erfahren</a>'
+                "</div>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        compact = doc.replace(" ", "")
+        self.assertIn('<div class="message-body">', doc)
+        self.assertNotIn("#emailBody{background-color:#ffffff", compact)
+        self.assertIn("background-color:transparent!important", compact)
+        self.assertRegex(
+            compact,
+            r'<divid="emailBody"[^>]*background-color:transparent!important',
+        )
+
 
 class ResolveCidImagesTests(unittest.TestCase):
     def test_matches_angle_bracket_content_id(self) -> None:

@@ -268,9 +268,14 @@ _FONT_COLOR_ATTR = re.compile(r"<font\b[^>]*\bcolor\s*=", re.IGNORECASE)
 # Complex selectors still contribute class tokens via harvest (see #320).
 _STYLE_RULE_BLOCK = re.compile(r"([^{}@]+)\{([^{}]*)\}", re.MULTILINE)
 _SIMPLE_CSS_SELECTOR = re.compile(
-    r"^\s*(?:([A-Za-z][\w]*)?\.([A-Za-z_][\w-]*)|([A-Za-z][\w]*))\s*$"
+    r"^\s*(?:"
+    r"([A-Za-z][\w]*)?\.([A-Za-z_][\w-]*)"
+    r"|#([A-Za-z_][\w-]*)"
+    r"|([A-Za-z][\w]*)"
+    r")\s*$"
 )
 _CSS_CLASS_TOKEN = re.compile(r"\.([A-Za-z_][\w-]*)")
+_CSS_ID_TOKEN = re.compile(r"#([A-Za-z_][\w-]*)")
 _CSS_CLASS_ATTR = re.compile(
     r"""\[\s*class\s*(?:\*=|\^=|\$=|~=|\|=|=)\s*(["'])([^"']+)\1\s*\]""",
     re.IGNORECASE,
@@ -565,6 +570,11 @@ def _class_names_from_complex_selector(selector: str) -> set[str]:
     return names
 
 
+def _id_names_from_complex_selector(selector: str) -> set[str]:
+    """Harvest id tokens from otherwise-complex CSS selectors."""
+    return {match.group(1).lower() for match in _CSS_ID_TOKEN.finditer(selector)}
+
+
 def _merge_class_declarations(
     class_styles: dict[str, dict[str, str]],
     class_name: str,
@@ -574,17 +584,31 @@ def _merge_class_declarations(
     class_styles[key] = {**class_styles.get(key, {}), **declarations}
 
 
+def _merge_id_declarations(
+    id_styles: dict[str, dict[str, str]],
+    id_name: str,
+    declarations: dict[str, str],
+) -> None:
+    key = id_name.lower()
+    id_styles[key] = {**id_styles.get(key, {}), **declarations}
+
+
 def _parse_class_styles(body_html: str) -> dict[str, dict[str, str]]:
-    class_styles, _tag_styles = _parse_stylesheet_maps(body_html)
+    class_styles, _tag_styles, _id_styles = _parse_stylesheet_maps(body_html)
     return class_styles
 
 
 def _parse_stylesheet_maps(
     body_html: str,
-) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
-    """Parse ``.class`` / tag selectors; harvest class tokens from complex ones."""
+) -> tuple[
+    dict[str, dict[str, str]],
+    dict[str, dict[str, str]],
+    dict[str, dict[str, str]],
+]:
+    """Parse ``.class`` / ``#id`` / tag selectors; harvest tokens from complex ones."""
     class_styles: dict[str, dict[str, str]] = {}
     tag_styles: dict[str, dict[str, str]] = {}
+    id_styles: dict[str, dict[str, str]] = {}
     for style_match in _STYLE_BLOCK.finditer(body_html):
         for rule_match in _STYLE_RULE_BLOCK.finditer(style_match.group(1)):
             selector_group = rule_match.group(1).strip()
@@ -596,11 +620,13 @@ def _parse_stylesheet_maps(
             for raw_selector in selector_group.split(","):
                 match = _SIMPLE_CSS_SELECTOR.match(raw_selector)
                 if match is not None:
-                    class_name, tag_name = match.group(2), match.group(3)
+                    _tag_prefix, class_name, id_name, tag_name = match.groups()
                     if class_name is not None:
                         _merge_class_declarations(
                             class_styles, class_name, declarations
                         )
+                    elif id_name is not None:
+                        _merge_id_declarations(id_styles, id_name, declarations)
                     elif tag_name is not None:
                         key = tag_name.lower()
                         tag_styles[key] = {
@@ -610,7 +636,9 @@ def _parse_stylesheet_maps(
                     continue
                 for class_name in _class_names_from_complex_selector(raw_selector):
                     _merge_class_declarations(class_styles, class_name, declarations)
-    return class_styles, tag_styles
+                for id_name in _id_names_from_complex_selector(raw_selector):
+                    _merge_id_declarations(id_styles, id_name, declarations)
+    return class_styles, tag_styles, id_styles
 
 
 def _inherited_root_styles(
@@ -631,6 +659,7 @@ def _merge_element_declarations(
     *,
     tag: str = "",
     tag_styles: dict[str, dict[str, str]] | None = None,
+    id_styles: dict[str, dict[str, str]] | None = None,
     inherited_styles: dict[str, str] | None = None,
 ) -> dict[str, str]:
     merged: dict[str, str] = {}
@@ -638,6 +667,10 @@ def _merge_element_declarations(
         merged.update(inherited_styles)
     if tag_styles and tag:
         merged.update(tag_styles.get(tag.lower(), {}))
+    if id_styles:
+        element_id = attrs.get("id", "")
+        if element_id:
+            merged.update(id_styles.get(element_id.lower(), {}))
     for class_name in attrs.get("class", "").split():
         for name, value in class_styles.get(class_name.lower(), {}).items():
             merged[name] = value
@@ -772,6 +805,7 @@ def _element_has_explicit_text_color(
     class_styles: dict[str, dict[str, str]] | None = None,
     *,
     tag_styles: dict[str, dict[str, str]] | None = None,
+    id_styles: dict[str, dict[str, str]] | None = None,
     inherited_styles: dict[str, str] | None = None,
 ) -> bool:
     if class_styles is not None and _declarations_have_text_color(
@@ -780,6 +814,7 @@ def _element_has_explicit_text_color(
             class_styles,
             tag=tag,
             tag_styles=tag_styles,
+            id_styles=id_styles,
             inherited_styles=inherited_styles,
         )
     ):
@@ -800,6 +835,7 @@ def _element_has_meaningful_background(
     *,
     tag: str = "",
     tag_styles: dict[str, dict[str, str]] | None = None,
+    id_styles: dict[str, dict[str, str]] | None = None,
     inherited_styles: dict[str, str] | None = None,
 ) -> bool:
     if _bgcolor_attr_is_meaningful(attrs.get("bgcolor", "")):
@@ -810,6 +846,7 @@ def _element_has_meaningful_background(
             class_styles,
             tag=tag,
             tag_styles=tag_styles,
+            id_styles=id_styles,
             inherited_styles=inherited_styles,
         )
     ):
@@ -830,6 +867,7 @@ def _element_text_color_value(
     class_styles: dict[str, dict[str, str]] | None = None,
     *,
     tag_styles: dict[str, dict[str, str]] | None = None,
+    id_styles: dict[str, dict[str, str]] | None = None,
     inherited_styles: dict[str, str] | None = None,
 ) -> str | None:
     if class_styles is not None:
@@ -839,6 +877,7 @@ def _element_text_color_value(
                 class_styles,
                 tag=tag,
                 tag_styles=tag_styles,
+                id_styles=id_styles,
                 inherited_styles=inherited_styles,
             )
         )
@@ -867,6 +906,13 @@ def _colors_have_adequate_contrast(foreground: str, background: str) -> bool:
     lighter = max(l1, l2)
     darker = min(l1, l2)
     return (lighter + 0.05) / (darker + 0.05) >= 3.0
+
+
+def _remove_attr_from_attrs(
+    attrs: list[tuple[str, str | None]], name: str
+) -> list[tuple[str, str | None]]:
+    lower = name.lower()
+    return [(attr_name, attr_value) for attr_name, attr_value in attrs if attr_name.lower() != lower]
 
 
 def _append_style_declaration(
@@ -1003,6 +1049,7 @@ class _AdaptationClassMarker(HTMLParser):
         self,
         class_styles: dict[str, dict[str, str]],
         tag_styles: dict[str, dict[str, str]],
+        id_styles: dict[str, dict[str, str]],
         *,
         shell_background: str,
         inherited_styles: dict[str, str] | None = None,
@@ -1011,6 +1058,7 @@ class _AdaptationClassMarker(HTMLParser):
         super().__init__(convert_charrefs=False)
         self._class_styles = class_styles
         self._tag_styles = tag_styles
+        self._id_styles = id_styles
         self._inherited_styles = inherited_styles or {}
         self._shell_background = shell_background
         self._shell_foreground = _contrasting_text_color(shell_background)
@@ -1032,6 +1080,7 @@ class _AdaptationClassMarker(HTMLParser):
             self._class_styles,
             tag=tag_lower,
             tag_styles=self._tag_styles,
+            id_styles=self._id_styles,
             inherited_styles=self._inherited_styles,
         )
         paint_merged = _merge_element_declarations(
@@ -1039,6 +1088,7 @@ class _AdaptationClassMarker(HTMLParser):
             self._class_styles,
             tag=tag_lower,
             tag_styles=self._tag_styles,
+            id_styles=self._id_styles,
             inherited_styles=None,
         )
         inside_painted = self._inside_painted_depth > 0
@@ -1047,6 +1097,7 @@ class _AdaptationClassMarker(HTMLParser):
             self._class_styles,
             tag=tag_lower,
             tag_styles=self._tag_styles,
+            id_styles=self._id_styles,
             inherited_styles=None,
         )
         paint_background = (
@@ -1064,6 +1115,7 @@ class _AdaptationClassMarker(HTMLParser):
             attrs_dict,
             self._class_styles,
             tag_styles=self._tag_styles,
+            id_styles=self._id_styles,
             inherited_styles=self._inherited_styles,
         )
         text_color_value = _element_text_color_value(
@@ -1071,6 +1123,7 @@ class _AdaptationClassMarker(HTMLParser):
             attrs_dict,
             self._class_styles,
             tag_styles=self._tag_styles,
+            id_styles=self._id_styles,
             inherited_styles=self._inherited_styles,
         )
         extra_classes: list[str] = []
@@ -1095,7 +1148,14 @@ class _AdaptationClassMarker(HTMLParser):
             extra_classes.append("post-painted")
             enter_painted = True
             if has_sender_color:
-                extra_classes.append("post-keep-color")
+                effective_background = paint_background or self._shell_background
+                if text_color_value and _colors_have_adequate_contrast(
+                    text_color_value, effective_background
+                ):
+                    extra_classes.append("post-keep-color")
+                else:
+                    extra_classes.append("post-adapt-text")
+                    adapt_color = _contrasting_text_color(effective_background)
             elif self_painted and paint_background is not None:
                 extra_classes.append("post-forced-contrast")
                 contrast_color = _contrasting_text_color(paint_background)
@@ -1125,6 +1185,7 @@ class _AdaptationClassMarker(HTMLParser):
                 "background",
                 "transparent !important",
             )
+            updated_attrs = _remove_attr_from_attrs(updated_attrs, "bgcolor")
         if contrast_color is not None:
             updated_attrs = _append_style_declaration(
                 updated_attrs,
@@ -1166,6 +1227,11 @@ class _AdaptationClassMarker(HTMLParser):
         self._parts.append(f"<?{data}>")
 
 
+def _strip_sender_style_blocks(body_html: str) -> str:
+    """Remove sender ``<style>`` blocks after styles are consumed for adaptation."""
+    return _STYLE_BLOCK.sub("", body_html)
+
+
 def mark_adaptation_classes(
     body_html: str,
     *,
@@ -1174,11 +1240,12 @@ def mark_adaptation_classes(
 ) -> str:
     """Add classes that drive per-element adapt-text overrides."""
     body_html = _normalize_bracketed_literals(body_html)
-    class_styles, tag_styles = _parse_stylesheet_maps(body_html)
+    class_styles, tag_styles, id_styles = _parse_stylesheet_maps(body_html)
     inherited = _inherited_root_styles(tag_styles) if prefer_reader_shell else {}
     marker = _AdaptationClassMarker(
         class_styles,
         tag_styles,
+        id_styles,
         shell_background=shell_background,
         inherited_styles=inherited,
         prefer_reader_shell=prefer_reader_shell,
@@ -1188,7 +1255,7 @@ def mark_adaptation_classes(
         marker.close()
     except Exception:
         return body_html
-    return marker.get_result()
+    return _strip_sender_style_blocks(marker.get_result())
 
 
 def html_has_explicit_text_color(body_html: str) -> bool:
@@ -1227,6 +1294,18 @@ def _style_blocks_have_text_without_background(body_html: str) -> bool:
     return False
 
 
+def _marked_html_neutralizes_opposing_canvas(marked: str) -> bool:
+    """Return True when marking strips sender canvases opposing the reader shell."""
+    return "background-color:transparent!important" in marked.replace(" ", "")
+
+
+def _marked_html_needs_adaptation(marked: str) -> bool:
+    """Return True when marked HTML needs adapt-text treatment."""
+    if "post-adapt-text" in marked or "post-forced-contrast" in marked:
+        return True
+    return _marked_html_neutralizes_opposing_canvas(marked)
+
+
 def html_message_needs_adaptation(
     body_html: str,
     *,
@@ -1246,7 +1325,7 @@ def html_message_needs_adaptation(
             shell_background=shell_background,
             prefer_reader_shell=prefer_reader_shell,
         )
-        if "post-adapt-text" in marked or "post-forced-contrast" in marked:
+        if _marked_html_needs_adaptation(marked):
             return True
     return False
 
