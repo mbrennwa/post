@@ -30,6 +30,11 @@ from post.mail.helpers import (
     write_temp_attachment,
 )
 from post.mail.io_thread import get_mail_io_thread
+from post.mail.network_errors import (
+    format_message_read_error,
+    is_sign_in_required_error,
+    log_mail_error,
+)
 from post.open_uri import open_uri_externally
 from post.preferences import get_load_remote_content, get_message_appearance
 from post.reader.pane import MessageReaderPane
@@ -262,7 +267,7 @@ class ReaderWindow(Adw.ApplicationWindow):
                 )
                 error = exc
             except Exception as exc:
-                log.exception("Failed to read message in reader window")
+                log_mail_error(log, "Failed to read message in reader window", exc)
                 error = exc
             GLib.idle_add(self._on_message_read, read_id, msg, error)
 
@@ -290,10 +295,27 @@ class ReaderWindow(Adw.ApplicationWindow):
 
         if error is not None:
             self._current_message = None
-            self._reader_pane.show_error(error, dark=self._app_prefers_dark())
-            self.set_title("Could not read message")
+            sign_in_required = is_sign_in_required_error(error) or (
+                self._mail.get_account_connect_health(self._account.uid)
+                == "needs_sign_in"
+            )
+            if sign_in_required:
+                self._mail.set_account_connect_health(
+                    self._account.uid, "needs_sign_in"
+                )
+            user_message = format_message_read_error(
+                error,
+                cached=not sign_in_required,
+            )
+            self._reader_pane.show_unavailable(
+                user_message,
+                dark=self._app_prefers_dark(),
+            )
+            self.set_title("Message unavailable")
             self._refresh_flag_toggle_buttons()
-            show_error_toast(self, f"Read error: {error}")
+            show_error_toast(self, user_message)
+            if sign_in_required:
+                self._set_status(user_message)
             return False
 
         assert msg is not None

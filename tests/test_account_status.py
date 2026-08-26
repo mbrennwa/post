@@ -20,9 +20,11 @@ from post.mail.account_status import (
 from post.mail.eds import FlushSendQueueResult, MailService
 from post.mail.send_errors import SendError
 from post.mail.network_errors import (
+    MESSAGE_NOT_CACHED_SIGN_IN,
     SIGN_IN_FOLDER_MESSAGE,
     TOKEN_EXPIRED_FOLDER_MESSAGE,
     format_folder_load_error,
+    format_message_read_error,
     format_sign_in_required_log,
     log_mail_error,
 )
@@ -152,6 +154,45 @@ class FolderLoadErrorFormatTests(unittest.TestCase):
         self.assertEqual(args[1], "Failed to list folders for acct")
         self.assertNotIn("AADSTS", args[2])
         logger.exception.assert_not_called()
+
+
+class MessageReadErrorFormatTests(unittest.TestCase):
+    def test_token_expired_is_user_facing(self) -> None:
+        exc = RuntimeError(
+            "Failed to refresh access token (goa-error-quark, 4): AADSTS70043"
+        )
+        self.assertEqual(
+            format_message_read_error(exc, cached=True),
+            TOKEN_EXPIRED_FOLDER_MESSAGE,
+        )
+
+    def test_uncached_sign_in_uses_dedicated_copy(self) -> None:
+        exc = RuntimeError(
+            "Failed to refresh access token (goa-error-quark, 4): AADSTS70043"
+        )
+        self.assertEqual(
+            format_message_read_error(exc, cached=False),
+            MESSAGE_NOT_CACHED_SIGN_IN,
+        )
+
+    def test_revoked_google_grant_is_sign_in(self) -> None:
+        from post.mail.network_errors import is_sign_in_required_error
+
+        exc = RuntimeError(
+            "invalid_grant: Token has been expired or revoked."
+        )
+        self.assertTrue(is_sign_in_required_error(exc))
+        self.assertEqual(
+            format_message_read_error(exc, cached=False),
+            MESSAGE_NOT_CACHED_SIGN_IN,
+        )
+
+    def test_generic_error_hides_raw_details(self) -> None:
+        message = format_message_read_error(
+            RuntimeError("g-io-error-quark: weird dump")
+        )
+        self.assertNotIn("g-io-error-quark", message)
+        self.assertEqual(message, "Could not read this message.")
 
 
 class FlushSendQueueResultTests(unittest.TestCase):

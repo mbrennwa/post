@@ -84,7 +84,12 @@ from post.mail.search import (
 from post.mail.search_debug import search_trace, search_trace_timer
 from post.mail.operation_queue import offline_queue_status_text
 from post.mail.send_delay import OutboundSendDelayScheduler
-from post.mail.network_errors import is_network_unavailable_error, log_mail_error
+from post.mail.network_errors import (
+    format_message_read_error,
+    is_network_unavailable_error,
+    is_sign_in_required_error,
+    log_mail_error,
+)
 from post.mail.offline_status import (
     OFFLINE_CACHED_LIST_STATUS,
     OFFLINE_MAIL_MESSAGE,
@@ -3421,6 +3426,25 @@ class MainWindow(Adw.ApplicationWindow):
         self._current_message = None
         self._reader_pane.clear()
         self._update_message_toolbar()
+        GLib.idle_add(self._reload_reader_for_selection_if_needed)
+
+    def _reload_reader_for_selection_if_needed(self) -> bool:
+        if self._message_stack.get_visible_child_name() != "list":
+            return False
+        if not self._current_account or not self._current_folder:
+            return False
+        if self._current_message is not None:
+            return False
+        selected = self._message_list_view.get_selected_uids()
+        if len(selected) != 1:
+            return False
+        uid = selected[0]
+        self._current_message_uid = uid
+        self._load_message_body_for_uid(
+            uid,
+            mark_seen=self._mark_seen_when_reading_uid(uid),
+        )
+        return False
 
     def _on_reader_attachment_context_menu(
         self,
@@ -5972,11 +5996,6 @@ class MainWindow(Adw.ApplicationWindow):
         if len(selected) == 1 and selected[0] == uid:
             if uid == self._current_message_uid and self._reader_shows_list_key(uid):
                 return
-            if (
-                uid == self._pending_message_read_uid
-                and self._inflight_message_read_id is not None
-            ):
-                return
             self._current_message_uid = uid
             self._load_message_body_for_uid(uid, mark_seen=True)
             return
@@ -6871,11 +6890,6 @@ class MainWindow(Adw.ApplicationWindow):
         uid = selected[0]
         if uid == self._current_message_uid and self._reader_shows_list_key(uid):
             return False
-        if (
-            uid == self._pending_message_read_uid
-            and self._inflight_message_read_id is not None
-        ):
-            return False
 
         mark_seen = self._user_message_click_pending
         if mark_seen:
@@ -7002,12 +7016,6 @@ class MainWindow(Adw.ApplicationWindow):
             account = self._mail.get_account(account_uid)
         except ValueError:
             return
-        if (
-            uid == self._pending_message_read_uid
-            and self._inflight_message_read_id is not None
-            and self._inflight_message_read_id == self._message_read_generation
-        ):
-            return
 
         self._message_read_generation += 1
         read_id = self._message_read_generation
@@ -7051,7 +7059,7 @@ class MainWindow(Adw.ApplicationWindow):
                 )
                 error = exc
             except Exception as exc:
-                log.exception("Failed to read message")
+                log_mail_error(log, "Failed to read message", exc)
                 error = exc
             GLib.idle_add(
                 self._on_message_read,
@@ -7243,8 +7251,31 @@ class MainWindow(Adw.ApplicationWindow):
 
         if error is not None:
             self._pending_message_read_uid = None
-            self._reader_pane.show_error(error, dark=self._app_prefers_dark())
-            show_error_toast(self, f"Read error: {error}")
+            location = self._message_location_for_list_key(uid)
+            account_uid = (
+                location[0]
+                if location is not None
+                else (
+                    self._current_account.uid
+                    if self._current_account is not None
+                    else None
+                )
+            )
+            sign_in_required = is_sign_in_required_error(error) or (
+                account_uid is not None
+                and self._mail.get_account_connect_health(account_uid)
+                == "needs_sign_in"
+            )
+            if account_uid is not None and sign_in_required:
+                self._mail.set_account_connect_health(account_uid, "needs_sign_in")
+            user_message = format_message_read_error(
+                error,
+                cached=not sign_in_required,
+            )
+            self._show_message_unavailable_reader(user_message)
+            show_error_toast(self, user_message)
+            if sign_in_required:
+                self._set_status(user_message)
             return False
 
         assert msg is not None

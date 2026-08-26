@@ -243,6 +243,111 @@ class FollowUpFlagTests(unittest.TestCase):
         )
 
 
+class ReadMessageSignInTests(unittest.TestCase):
+    @patch("post.mail.eds.MailService._mark_message_seen_unlocked")
+    @patch("post.mail.eds.MailService._get_message_mime_sync")
+    @patch("post.mail.eds.MailService._get_store_unlocked")
+    def test_mark_seen_auth_failure_still_returns_body(
+        self,
+        get_store_mock: MagicMock,
+        get_mime_mock: MagicMock,
+        mark_seen_mock: MagicMock,
+    ) -> None:
+        from post.mail.eds import MailService
+
+        service = MailService(registry=MagicMock())
+        folder = MagicMock()
+        info = MagicMock()
+        info.get_flags.return_value = 0
+        folder.get_message_info.return_value = info
+        folder.get_unread_message_count.return_value = 0
+        folder.get_message_count.return_value = 1
+        store = MagicMock()
+        store.get_folder_sync.return_value = folder
+        get_store_mock.return_value = store
+        get_mime_mock.return_value = mime = MagicMock()
+        mime.get_message_id.return_value = None
+        mime.get_header.return_value = None
+        mark_seen_mock.side_effect = RuntimeError(
+            "Failed to refresh access token (goa-error-quark, 4): AADSTS70043"
+        )
+
+        with patch("post.mail.helpers.message_info_to_dict", return_value={"uid": "42"}):
+            with patch(
+                "post.mail.helpers.extract_message_bodies",
+                return_value={"plain": "Hello", "html": None},
+            ):
+                with patch("post.mail.helpers.extract_attachments", return_value=[]):
+                    with patch(
+                        "post.mail.helpers.extract_inline_images", return_value=[]
+                    ):
+                        result = service._read_message_unlocked(
+                            "acct-1",
+                            "INBOX",
+                            "42",
+                        )
+
+        self.assertEqual(result["body_plain"], "Hello")
+        self.assertTrue((result.get("flags") or {}).get("seen"))
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+
+class ReadMessageGoaUnavailableTests(unittest.TestCase):
+    @patch("post.mail.eds.ensure_goa_credentials", return_value=False)
+    @patch("post.mail.eds.MailService._get_store_unlocked")
+    def test_goa_unavailable_sets_health_and_raises(
+        self,
+        get_store_mock: MagicMock,
+        ensure_goa_mock: MagicMock,
+    ) -> None:
+        from post.mail.eds import MailService
+
+        service = MailService(registry=MagicMock())
+        source = MagicMock()
+        source.has_extension.return_value = True
+        service.registry.ref_source.return_value = source
+
+        with self.assertRaises(RuntimeError):
+            service._read_message_unlocked("acct-1", "INBOX", "42")
+
+        ensure_goa_mock.assert_called_once()
+        get_store_mock.assert_not_called()
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+
+class PersistFlagSignInTests(unittest.TestCase):
+    @patch("post.mail.eds.MailService._queue_flag_operation_unlocked")
+    @patch("post.mail.eds.MailService._get_store_unlocked")
+    @patch("post.mail.eds.MailService._persist_folder_flags_unlocked")
+    def test_sign_in_error_queues_seen(
+        self,
+        persist_mock: MagicMock,
+        get_store_mock: MagicMock,
+        queue_mock: MagicMock,
+    ) -> None:
+        from post.mail.eds import MailService
+
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        folder = MagicMock()
+        folder.get_full_name.return_value = "INBOX"
+        persist_mock.side_effect = RuntimeError(
+            "Failed to refresh access token (goa-error-quark, 4): AADSTS70043"
+        )
+
+        queued = service._persist_message_flag_changes_unlocked(
+            "acct-1",
+            folder,
+            ["42"],
+            op_type="set_seen",
+            seen=True,
+        )
+
+        self.assertTrue(queued)
+        queue_mock.assert_called_once()
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+
 @unittest.skipUnless(
     os.environ.get("POST_EDS_TESTS"),
     "Set POST_EDS_TESTS=1 to run EDS integration tests",
