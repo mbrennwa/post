@@ -12,6 +12,7 @@ from post.compose_editor import (
     compose_uri_opens_externally,
     editor_html_is_plain_equivalent,
     normalize_compose_link_url,
+    stored_body_needs_rich_editor,
 )
 from post.mail.compose import html_body_fragment, plain_to_simple_html
 
@@ -20,7 +21,7 @@ class BuildEditorDocumentTests(unittest.TestCase):
     def test_escapes_plain_body(self) -> None:
         doc = build_editor_document(body_plain="Hello <script>alert(1)</script> {x}")
         self.assertIn("Hello &lt;script&gt;alert(1)&lt;/script&gt; {x}", doc)
-        self.assertIn('contenteditable="true"', doc)
+        self.assertIn('contenteditable="plaintext-only"', doc)
         self.assertIn("window.__postCompose", doc)
         self.assertNotIn("__COMPOSE_BODY__", doc)
         self.assertNotIn("__COMPOSE_HANDLER__", doc)
@@ -37,13 +38,53 @@ class BuildEditorDocumentTests(unittest.TestCase):
     def test_html_fragment_path(self) -> None:
         doc = build_editor_document(body_html="<b>Hi</b>")
         self.assertIn("<b>Hi</b>", doc)
+        self.assertIn('contenteditable="true"', doc)
         self.assertNotIn("&lt;b&gt;", doc)
+
+    def test_plain_mode_default(self) -> None:
+        doc = build_editor_document(body_plain="Hello")
+        self.assertIn('contenteditable="plaintext-only"', doc)
+
+    def test_rich_mode_explicit(self) -> None:
+        doc = build_editor_document(body_plain="Hello", edit_mode="true")
+        self.assertIn('contenteditable="true"', doc)
+
+    def test_promote_and_demote_helpers_in_document(self) -> None:
+        doc = build_editor_document()
+        self.assertIn("promoteToRich", doc)
+        self.assertIn("demoteToPlainIfAllowed", doc)
+        self.assertIn("hasMeaningfulFormatting", doc)
+        self.assertIn('addEventListener("paste"', doc)
 
     def test_quoted_html_uses_normal_whitespace(self) -> None:
         doc = build_editor_document()
         self.assertIn("blockquote.post_quote", doc)
         self.assertIn("white-space: normal", doc)
         self.assertIn("blockquote.post_quote p", doc)
+
+
+class StoredBodyNeedsRichEditorTests(unittest.TestCase):
+    def test_plain_wrapper_is_not_rich(self) -> None:
+        plain = "Hello\nWorld"
+        self.assertFalse(
+            stored_body_needs_rich_editor(plain_to_simple_html(plain), plain)
+        )
+
+    def test_structural_html_without_formatting_is_not_rich(self) -> None:
+        self.assertFalse(
+            stored_body_needs_rich_editor("<div>Hello</div><div>World</div>", "Hello\nWorld")
+        )
+
+    def test_bold_html_is_rich(self) -> None:
+        self.assertTrue(stored_body_needs_rich_editor("<b>Hello</b>", "Hello"))
+
+    def test_post_quote_is_rich(self) -> None:
+        html = '<blockquote class="post_quote"><p>Hi</p></blockquote>'
+        self.assertTrue(stored_body_needs_rich_editor(html, "Hi"))
+
+    def test_empty_html_is_not_rich(self) -> None:
+        self.assertFalse(stored_body_needs_rich_editor(None, "Hello"))
+        self.assertFalse(stored_body_needs_rich_editor("", "Hello"))
 
 
 class EditorHtmlPlainEquivalentTests(unittest.TestCase):

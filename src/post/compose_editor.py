@@ -86,11 +86,50 @@ _EDITOR_DOCUMENT = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<div id="editor" contenteditable="true" spellcheck="true">__COMPOSE_BODY__</div>
+<div id="editor" contenteditable="__COMPOSE_EDIT_MODE__" spellcheck="true">__COMPOSE_BODY__</div>
 <script>
 (function () {
   const editor = document.getElementById("editor");
   let savedRange = null;
+  function currentMode() {
+    return editor.getAttribute("contenteditable") === "plaintext-only"
+      ? "plain"
+      : "rich";
+  }
+  function promoteToRich() {
+    if (editor.getAttribute("contenteditable") === "plaintext-only") {
+      editor.setAttribute("contenteditable", "true");
+    }
+  }
+  function spanStyleIsFormatted(span) {
+    const style = (span.getAttribute("style") || "").toLowerCase();
+    if (/font-weight\\s*:\\s*(bold|bolder|[6-9]\\d{2})/.test(style)) return true;
+    if (/font-style\\s*:\\s*(italic|oblique)/.test(style)) return true;
+    if (/text-decoration(?:-line)?\\s*:\\s*(underline|line-through)/.test(style)) {
+      return true;
+    }
+    return false;
+  }
+  function hasMeaningfulFormatting() {
+    if (editor.querySelector("blockquote.post_quote")) return true;
+    if (editor.querySelector("a[href]")) return true;
+    if (editor.querySelector("blockquote")) return true;
+    if (editor.querySelector("b,strong,i,em,u,s,strike")) return true;
+    const spans = editor.querySelectorAll("span[style]");
+    for (let i = 0; i < spans.length; i++) {
+      const span = spans[i];
+      if (span.classList.contains("webkit-spell-check-error")) continue;
+      if (spanStyleIsFormatted(span)) return true;
+    }
+    return false;
+  }
+  function demoteToPlainIfAllowed() {
+    if (hasMeaningfulFormatting()) return;
+    const text = editor.innerText;
+    editor.setAttribute("contenteditable", "plaintext-only");
+    editor.innerText = text;
+    notify();
+  }
   function stampLinks() {
     editor.querySelectorAll("a").forEach(function (a) {
       const href = a.getAttribute("href") || a.href || "";
@@ -105,7 +144,8 @@ _EDITOR_DOCUMENT = """<!DOCTYPE html>
       stampLinks();
       window.webkit.messageHandlers.__COMPOSE_HANDLER__.postMessage({
         plain: editor.innerText,
-        html: editor.innerHTML
+        html: editor.innerHTML,
+        mode: currentMode()
       });
     } catch (e) {}
   }
@@ -160,6 +200,7 @@ _EDITOR_DOCUMENT = """<!DOCTYPE html>
     } catch (e) {}
   }
   function increaseQuote() {
+    promoteToRich();
     const sel = window.getSelection();
     if (!sel.rangeCount) return;
     let range = sel.getRangeAt(0);
@@ -198,11 +239,27 @@ _EDITOR_DOCUMENT = """<!DOCTYPE html>
       node = node.parentNode;
     }
     notify();
+    demoteToPlainIfAllowed();
   }
   function exec(command) {
+    if (command !== "removeFormat") {
+      promoteToRich();
+    }
     document.execCommand(command, false, null);
     notify();
+    demoteToPlainIfAllowed();
   }
+  editor.addEventListener("paste", function (e) {
+    if (editor.getAttribute("contenteditable") !== "plaintext-only") return;
+    const clip = e.clipboardData;
+    if (!clip) return;
+    const pastedHtml = (clip.getData("text/html") || "").trim();
+    if (!pastedHtml) return;
+    e.preventDefault();
+    promoteToRich();
+    document.execCommand("insertHTML", false, pastedHtml);
+    notify();
+  });
   editor.addEventListener("input", notify);
   editor.addEventListener("keyup", notify);
   editor.addEventListener("mouseup", saveSelection);
@@ -266,6 +323,7 @@ _EDITOR_DOCUMENT = """<!DOCTYPE html>
     },
     createLink: function (url) {
       restoreSelection();
+      promoteToRich();
       const sel = window.getSelection();
       if (!sel || !sel.rangeCount) return;
       let node = sel.anchorNode;
@@ -300,6 +358,7 @@ _EDITOR_DOCUMENT = """<!DOCTYPE html>
       restoreSelection();
       document.execCommand("unlink", false, null);
       notify();
+      demoteToPlainIfAllowed();
     },
     placeCursorAtStart: function () {
       editor.focus();
@@ -335,18 +394,43 @@ _EDITOR_DOCUMENT = """<!DOCTYPE html>
 """
 
 
-def build_editor_document(*, body_plain: str = "", body_html: str | None = None) -> str:
+def build_editor_document(
+    *,
+    body_plain: str = "",
+    body_html: str | None = None,
+    edit_mode: str | None = None,
+) -> str:
     """Build the trusted contenteditable shell document."""
     if body_html is not None:
-        # Fragment only — never full documents from callers.
         body = body_html
+        if edit_mode is None:
+            edit_mode = "true"
     else:
         body = html.escape(body_plain)
+        if edit_mode is None:
+            edit_mode = "plaintext-only"
     return (
         _EDITOR_DOCUMENT.replace("__COMPOSE_BODY__", body)
+        .replace("__COMPOSE_EDIT_MODE__", edit_mode)
         .replace("__COMPOSE_HANDLER__", _HANDLER_NAME)
         .replace("__COMPOSE_ACTION__", _ACTION_HANDLER)
     )
+
+
+def stored_body_needs_rich_editor(stored_html: str | None, plain: str) -> bool:
+    """Return True when stored MIME HTML needs the rich compose editor."""
+    from post.mail.compose import is_plain_wrapper_html
+
+    html_text = (stored_html or "").strip()
+    if not html_text or is_plain_wrapper_html(html_text, plain):
+        return False
+    if "post_quote" in html_text:
+        return True
+    if re.search(r"<(b|strong|i|em|u|s|strike|a)\b", html_text, re.I):
+        return True
+    if re.search(r"<blockquote\b", html_text, re.I):
+        return True
+    return False
 
 
 def editor_html_is_plain_equivalent(body_html: str, body_plain: str) -> bool:
@@ -437,6 +521,7 @@ class ComposeBodyEditor(Gtk.Box):
 
         self._cached_plain = ""
         self._cached_html = ""
+        self._edit_mode = "plain"
         self._loaded = False
         self._pending_cursor_start = False
         self._pending_scroll_top = False
@@ -528,18 +613,26 @@ class ComposeBodyEditor(Gtk.Box):
     def get_html(self) -> str:
         return self._cached_html
 
+    def is_plain_mode(self) -> bool:
+        return self._edit_mode == "plain"
+
+    def is_rich_mode(self) -> bool:
+        return self._edit_mode == "rich"
+
     def set_plain(self, text: str) -> None:
         """Replace the entire body from plain text (reloads the editor document)."""
+        self._edit_mode = "plain"
         self._suppress_changed = True
         self._cached_plain = text
         self._cached_html = html.escape(text)
-        self._load_document(body_plain=text)
+        self._load_document(body_plain=text, edit_mode="plaintext-only")
 
     def set_html_fragment(self, fragment: str) -> None:
         """Replace editor contents with an HTML fragment (not a full document)."""
+        self._edit_mode = "rich"
         self._suppress_changed = True
         self._cached_html = fragment
-        self._load_document(body_html=fragment)
+        self._load_document(body_html=fragment, edit_mode="true")
 
     def grab_focus(self) -> bool:  # type: ignore[override]
         return self._web_view.grab_focus()
@@ -691,18 +784,24 @@ class ComposeBodyEditor(Gtk.Box):
         label = getattr(self, "_mode_label", None)
         if label is None:
             return
-        html_mode = not editor_html_is_plain_equivalent(
-            self._cached_html, self._cached_plain
-        )
+        html_mode = self._edit_mode == "rich"
         label.set_label("HTML" if html_mode else "Plain Text")
         label.add_css_class("dim-label")
         label.remove_css_class("accent")
 
     def _load_document(
-        self, *, body_plain: str = "", body_html: str | None = None
+        self,
+        *,
+        body_plain: str = "",
+        body_html: str | None = None,
+        edit_mode: str | None = None,
     ) -> None:
         self._loaded = False
-        document = build_editor_document(body_plain=body_plain, body_html=body_html)
+        document = build_editor_document(
+            body_plain=body_plain,
+            body_html=body_html,
+            edit_mode=edit_mode,
+        )
         self._web_view.load_html(document, "about:blank")
 
     def _run_js(self, script: str) -> None:
@@ -817,10 +916,15 @@ class ComposeBodyEditor(Gtk.Box):
             if value.is_object():
                 plain_v = value.object_get_property("plain")
                 html_v = value.object_get_property("html")
+                mode_v = value.object_get_property("mode")
                 if plain_v is not None and plain_v.is_string():
                     self._cached_plain = plain_v.to_string()
                 if html_v is not None and html_v.is_string():
                     self._cached_html = html_v.to_string()
+                if mode_v is not None and mode_v.is_string():
+                    self._edit_mode = (
+                        "rich" if mode_v.to_string() == "rich" else "plain"
+                    )
             elif value.is_string():
                 # Fallback if a bare string is posted.
                 self._cached_plain = value.to_string()
