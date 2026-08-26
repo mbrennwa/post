@@ -23,8 +23,8 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from post.compose_editor import (
     ComposeBodyEditor,
-    editor_html_is_plain_equivalent,
     normalize_compose_link_url,
+    stored_body_needs_rich_editor,
 )
 from post.header_bar import add_end_window_controls, apply_header_corner_inset
 from post.icon_utils import apply_window_icon
@@ -1213,13 +1213,8 @@ class ComposeWindow(Adw.Window):
         self._tracking_edits = True
 
     def _set_body_from_stored(self, plain: str, stored_html: str | None) -> None:
-        html = (stored_html or "").strip() or None
-        if (
-            html
-            and not is_plain_wrapper_html(html, plain)
-            and not editor_html_is_plain_equivalent(html, plain)
-        ):
-            self._set_body_html_fragment(html_body_fragment(html))
+        if stored_body_needs_rich_editor(stored_html, plain):
+            self._set_body_html_fragment(html_body_fragment(stored_html or ""))
             return
         self._set_body_plain_text(plain)
 
@@ -1810,46 +1805,46 @@ class ComposeWindow(Adw.Window):
         self._begin_save_draft(close_when_done=False)
 
     def _resolve_outbound_body_html(self, body_plain: str) -> str | None:
-        editor_html = self._body_view.get_html()
-        formatted = not editor_html_is_plain_equivalent(editor_html, body_plain)
-        if formatted:
-            prepared = prepare_editor_html_for_send(editor_html)
+        if self._body_view.is_plain_mode():
             if self._mode in ("reply", "reply-all", "forward"):
-                if "post_quote" in (editor_html or ""):
-                    return prepared or None
-                user_html: str | None = None
-                quoted_html_source = self._quoted_html_source
-                _user_plain, quoted_plain = split_compose_body_at_quote(
-                    body_plain, self._mode
-                )
-                if (
-                    quoted_plain.strip()
-                    and quoted_plain == self._quoted_plain_expected
-                ):
-                    user_html, quote_in_editor = split_editor_html_at_quote(
-                        editor_html, quoted_plain
-                    )
-                    if quote_in_editor is None:
-                        return prepared or None
-                    user_html = prepare_editor_html_for_send(user_html)
-                else:
-                    return prepared or None
                 return build_outbound_html_for_compose(
                     body_plain=body_plain,
                     mode=self._mode,
                     reply_to=self._reply_to,
-                    quoted_html_source=quoted_html_source,
+                    quoted_html_source=self._quoted_html_source,
                     quoted_plain_expected=self._quoted_plain_expected,
-                    user_html=user_html,
                 )
-            return prepared or None
+            return None
+
+        editor_html = self._body_view.get_html()
+        prepared = prepare_editor_html_for_send(editor_html)
         if self._mode in ("reply", "reply-all", "forward"):
+            if "post_quote" in (editor_html or ""):
+                return prepared or None
+            user_html: str | None = None
+            quoted_html_source = self._quoted_html_source
+            _user_plain, quoted_plain = split_compose_body_at_quote(
+                body_plain, self._mode
+            )
+            if (
+                quoted_plain.strip()
+                and quoted_plain == self._quoted_plain_expected
+            ):
+                user_html, quote_in_editor = split_editor_html_at_quote(
+                    editor_html, quoted_plain
+                )
+                if quote_in_editor is None:
+                    return prepared or None
+                user_html = prepare_editor_html_for_send(user_html)
+            else:
+                return prepared or None
             return build_outbound_html_for_compose(
                 body_plain=body_plain,
                 mode=self._mode,
                 reply_to=self._reply_to,
-                quoted_html_source=self._quoted_html_source,
+                quoted_html_source=quoted_html_source,
                 quoted_plain_expected=self._quoted_plain_expected,
+                user_html=user_html,
             )
         if self._mode in ("draft", "send-again", "outbox"):
             if (
@@ -1858,8 +1853,8 @@ class ComposeWindow(Adw.Window):
                 and not is_plain_wrapper_html(self._draft_body_html, body_plain)
             ):
                 return self._draft_body_html
-            return None
-        return None
+            return prepared or None
+        return prepared or None
 
     def _on_link_request(self, selected_text: str, existing_href: str) -> None:
         entry = Gtk.Entry()
@@ -1934,6 +1929,12 @@ class ComposeWindow(Adw.Window):
         bcc_addrs = parse_addresses(self._bcc_entry.get_text())
         subject = self._subject_entry.get_text().strip()
         body = self._body_view.get_plain()
+        if (
+            self._body_view.is_plain_mode()
+            and not self._user_edited
+            and self._mode in ("draft", "send-again", "outbox")
+        ):
+            body = self._draft_body_plain_snapshot
         body_html = self._resolve_outbound_body_html(body)
 
         in_reply_to = None
