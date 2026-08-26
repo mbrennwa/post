@@ -33,6 +33,7 @@ from post.mail.compose import (
     plain_to_simple_html,
     parse_draft_address_list,
     quote_html_forward,
+    quote_html_reply,
     quote_plain_forward,
     quote_plain_reply,
     compose_html_quote_prefill,
@@ -1789,6 +1790,49 @@ class HtmlForwardReplyTests(unittest.TestCase):
         )
         self.assertIn('<a href="https://example.com">', html)
         self.assertIn("click", html)
+
+    def test_quote_html_reply_stamps_normal_whitespace(self) -> None:
+        quoted = quote_html_reply(
+            {"from": "Alice <a@example.com>", "date_received": "2026-08-26"},
+            "<p>Hello</p>",
+        )
+        self.assertIn('class="post_quote"', quoted)
+        self.assertIn("white-space:normal", quoted)
+        self.assertIn("<p>Hello</p>", quoted)
+
+    def test_prepare_editor_html_does_not_br_quote_newlines(self) -> None:
+        source = "<p>Hello,</p>\n<p>&nbsp;</p>\n<p>Thanks</p>"
+        editor = (
+            "<div>My reply\nsecond line</div>\n"
+            '<blockquote class="post_quote">'
+            f"{source}"
+            "</blockquote>"
+        )
+        html = prepare_editor_html_for_send(editor)
+        quote_at = html.find("post_quote")
+        self.assertGreater(quote_at, 0)
+        quote = html[quote_at:]
+        self.assertIn("<p>Hello,</p>\n<p>&nbsp;</p>\n<p>Thanks</p>", quote)
+        self.assertNotIn("</p><br>", quote)
+        self.assertIn("white-space:normal", html)
+        self.assertIn("white-space:pre-wrap", html)
+        self.assertIn("My reply<br>second line", html)
+        self.assertNotIn("Hello,<br>", html)
+
+    def test_prepare_editor_html_keeps_nested_quote_inside_post_quote(self) -> None:
+        editor = (
+            "<div>Hi</div>"
+            '<blockquote class="post_quote">'
+            "<p>Outer</p>\n"
+            "<blockquote><p>Inner</p></blockquote>\n"
+            "<p>After</p>"
+            "</blockquote>"
+            "<div>Bottom</div>"
+        )
+        html = prepare_editor_html_for_send(editor)
+        self.assertIn("<blockquote><p>Inner</p></blockquote>\n<p>After</p>", html)
+        self.assertIn("Bottom", html)
+        self.assertNotIn("</p><br><blockquote>", html)
 
     def test_restore_stamped_link_hrefs(self) -> None:
         from post.mail.compose import restore_stamped_link_hrefs

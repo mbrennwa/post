@@ -39,6 +39,12 @@ class BuildEditorDocumentTests(unittest.TestCase):
         self.assertIn("<b>Hi</b>", doc)
         self.assertNotIn("&lt;b&gt;", doc)
 
+    def test_quoted_html_uses_normal_whitespace(self) -> None:
+        doc = build_editor_document()
+        self.assertIn("blockquote.post_quote", doc)
+        self.assertIn("white-space: normal", doc)
+        self.assertIn("blockquote.post_quote p", doc)
+
 
 class EditorHtmlPlainEquivalentTests(unittest.TestCase):
     def test_plain_to_simple_html(self) -> None:
