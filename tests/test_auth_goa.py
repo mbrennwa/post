@@ -27,13 +27,35 @@ class EnsureGoaCredentialsTests(unittest.TestCase):
 
         bus = mock.Mock()
         with mock.patch("post.mail.auth.Gio.bus_get_sync", return_value=bus):
-            auth.ensure_goa_credentials(registry, source, None)
+            self.assertTrue(auth.ensure_goa_credentials(registry, source, None))
 
         bus.call_sync.assert_called_once()
         timeout_ms = bus.call_sync.call_args.args[7]
         self.assertEqual(timeout_ms, auth._GOA_ENSURE_CREDENTIALS_TIMEOUT_MS)
         self.assertGreater(timeout_ms, 0)
         self.assertNotEqual(timeout_ms, -1)
+
+    def test_ensure_credentials_failure_returns_false(self) -> None:
+        registry = mock.Mock()
+        source = mock.Mock()
+        source.get_display_name.return_value = "Gmail"
+        source.get_uid.return_value = "acct-1"
+        source.get_parent.return_value = ""
+        source.has_extension.return_value = True
+        goa = mock.Mock()
+        goa.get_account_id.return_value = "goa-1"
+        source.get_extension.return_value = goa
+        registry.list_sources.return_value = [source]
+        registry.ref_source.return_value = None
+
+        bus = mock.Mock()
+        bus.call_sync.side_effect = auth.GLib.Error.new_literal(
+            auth.Gio.io_error_quark(),
+            "Connection refused",
+            auth.Gio.IOErrorEnum.FAILED,
+        )
+        with mock.patch("post.mail.auth.Gio.bus_get_sync", return_value=bus):
+            self.assertFalse(auth.ensure_goa_credentials(registry, source, None))
 
     def test_source_uses_goa(self) -> None:
         registry = mock.Mock()

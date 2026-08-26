@@ -22,6 +22,10 @@ SIGN_IN_FOLDER_MESSAGE = (
 TOKEN_EXPIRED_FOLDER_MESSAGE = (
     "Sign-in expired — open Settings → Online Accounts to reconnect."
 )
+MESSAGE_NOT_CACHED_SIGN_IN = (
+    "This message isn't cached. Sign-in expired — open Settings → "
+    "Online Accounts to reconnect."
+)
 
 
 def is_queueable_network_error(exc: BaseException) -> bool:
@@ -88,24 +92,56 @@ def is_sign_in_required_error(exc: BaseException) -> bool:
             "authentication",
             "auth failed",
             "invalid credentials",
+            "invalid_grant",
             "login failed",
             "password",
             "sign-in",
             "sign in",
             "oauth",
+            "unauthorized",
+            "access denied",
+            "permission denied",
+            "insufficient permission",
+            "credentials have been revoked",
+            "token has been expired or revoked",
+            "revoked",
+            "goa credentials",
+            "ensurecredentials",
+            "onlineaccounts",
+            "account disabled",
+            "account not found",
         )
     )
+
+
+def _is_token_expired_error(exc: BaseException) -> bool:
+    lowered = _error_text(exc).lower()
+    return any(
+        token in lowered
+        for token in ("access token", "refresh token", "aadsts", "goa-error", "oauth")
+    )
+
+
+def format_message_read_error(
+    exc: BaseException, *, cached: bool = True
+) -> str:
+    """User-facing message-read failure text (never raw GLib/Camel dumps)."""
+    if is_network_unavailable_error(exc):
+        return OFFLINE_FOLDER_MESSAGE
+    if is_sign_in_required_error(exc):
+        if not cached:
+            return MESSAGE_NOT_CACHED_SIGN_IN
+        if _is_token_expired_error(exc):
+            return TOKEN_EXPIRED_FOLDER_MESSAGE
+        return "Sign-in required — reconnect this account to read this message."
+    return "Could not read this message."
 
 
 def format_folder_load_error(exc: BaseException) -> str:
     """User-facing folder-list failure text (never raw GLib/Camel dumps)."""
     if is_network_unavailable_error(exc):
         return OFFLINE_FOLDER_MESSAGE
-    lowered = _error_text(exc).lower()
-    if any(
-        token in lowered
-        for token in ("access token", "refresh token", "aadsts", "goa-error", "oauth")
-    ):
+    if _is_token_expired_error(exc):
         return TOKEN_EXPIRED_FOLDER_MESSAGE
     if is_sign_in_required_error(exc):
         return SIGN_IN_FOLDER_MESSAGE

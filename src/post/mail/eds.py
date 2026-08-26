@@ -104,6 +104,7 @@ from .network_errors import (
     is_network_unavailable_error,
     is_queueable_network_error,
     is_sign_in_required_error,
+    log_mail_error,
 )
 from .send_queue import (
     QueuedOutboundMessage,
@@ -190,6 +191,8 @@ _TRANSFER_POST_TIMEOUT_SECONDS = 30
 # Per-folder refresh_info_sync / store FolderInfo REFRESH for sidebar counts
 # must not pin post-mail-io (#197, #210).
 _FOLDER_STATS_TIMEOUT_SECONDS = 15
+# Bound get_message_sync so revoked GOA tokens cannot leave the reader hung (#341).
+_MESSAGE_READ_TIMEOUT_SECONDS = 30
 # Stay below Camel IMAPx MAX_UIDSET_ITEMS (100) to avoid spurious uidset warnings
 # in evolution-data-server 3.56 when batching UID MOVE/COPY commands.
 _TRANSFER_MESSAGE_BATCH_SIZE = 50
@@ -4846,12 +4849,17 @@ class MailService:
                     )
                     graph_gone = True
                     cause = sync_exc
+                elif is_sign_in_required_error(sync_exc):
+                    self.set_account_connect_health(account_uid, "needs_sign_in")
+                    cached = self._try_message_cached(folder, api_uid)
+                    if cached is not None:
+                        return cached
+                    raise
                 else:
-                    log.warning(
-                        "synchronize_message_sync failed for %s in %r",
-                        message_uid,
-                        folder_name,
-                        exc_info=True,
+                    log_mail_error(
+                        log,
+                        f"synchronize_message_sync failed for {message_uid} in {folder_name!r}",
+                        sync_exc,
                     )
         elif known:
             log.info(
@@ -4907,6 +4915,30 @@ class MailService:
             raise MessageNotAvailableError(message_uid, folder_name) from cause
         raise MessageNotAvailableError(message_uid, folder_name)
 
+    def _get_message_sync_with_timeout(
+        self,
+        folder: Camel.Folder,
+        api_uid: str,
+    ) -> Any:
+        cancellable = Gio.Cancellable()
+        timer = threading.Timer(
+            _MESSAGE_READ_TIMEOUT_SECONDS, cancellable.cancel
+        )
+        timer.start()
+        try:
+            return folder.get_message_sync(api_uid, cancellable)
+        except GLib.Error as exc:
+            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                cached = self._try_message_cached(folder, api_uid)
+                if cached is not None:
+                    return cached
+                raise TimeoutError(
+                    f"Timed out loading message {api_uid}"
+                ) from exc
+            raise
+        finally:
+            timer.cancel()
+
     def _get_message_mime_sync(
         self,
         folder: Camel.Folder,
@@ -4919,7 +4951,13 @@ class MailService:
         self._recovered_read_uid = None
         api_uid = camel_uid_to_api(message_uid)
         try:
-            mime = folder.get_message_sync(api_uid, None)
+            mime = self._get_message_sync_with_timeout(folder, api_uid)
+        except TimeoutError:
+            self.set_account_connect_health(account_uid, "needs_sign_in")
+            mime = self._try_message_cached(folder, api_uid)
+            if mime is not None:
+                return mime
+            raise
         except GLib.Error as exc:
             if self._is_missing_message_error(exc):
                 if offline:
@@ -4939,6 +4977,11 @@ class MailService:
                     api_uid,
                     cause=exc,
                 )
+            if is_sign_in_required_error(exc):
+                self.set_account_connect_health(account_uid, "needs_sign_in")
+                mime = self._try_message_cached(folder, api_uid)
+                if mime is not None:
+                    return mime
             raise
         if mime is None:
             if offline:
@@ -6637,6 +6680,18 @@ class MailService:
             account_uid, source_folder, message_uids, dest, op_type="move_to_folder"
         )
 
+    def _ensure_goa_ready_for_read_unlocked(self, account_uid: str) -> None:
+        """Fail fast when GOA cannot supply credentials (disabled/expired account)."""
+        source = self.registry.ref_source(account_uid)
+        if source is None or not source.has_extension("GNOME Online Accounts"):
+            return
+        if ensure_goa_credentials(self.registry, source, None):
+            return
+        self.set_account_connect_health(account_uid, "needs_sign_in")
+        raise RuntimeError(
+            "Sign-in expired — GOA credentials unavailable"
+        )
+
     def _read_message_unlocked(
         self,
         account_uid: str,
@@ -6652,6 +6707,7 @@ class MailService:
             extract_message_bodies,
         )
 
+        self._ensure_goa_ready_for_read_unlocked(account_uid)
         store = self._get_store_unlocked(account_uid)
         folder = store.get_folder_sync(folder_name, 0, None)
         if folder is None:
@@ -6706,12 +6762,21 @@ class MailService:
                 result["references"] = normalize_references_header(references)
 
         if was_unread and mark_seen:
-            unread, total = self._mark_message_seen_unlocked(
-                folder, account_uid, folder_name, actual_uid
-            )
-            result.setdefault("flags", {})["seen"] = True
-            result["folder_unread"] = unread
-            result["folder_total"] = total
+            try:
+                unread, total = self._mark_message_seen_unlocked(
+                    folder, account_uid, folder_name, actual_uid
+                )
+                result.setdefault("flags", {})["seen"] = True
+                result["folder_unread"] = unread
+                result["folder_total"] = total
+            except Exception as exc:
+                if is_sign_in_required_error(exc):
+                    self.set_account_connect_health(account_uid, "needs_sign_in")
+                log_mail_error(log, "Mark-seen sync failed", exc)
+                # Local \\Seen may already be set; do not discard the read result.
+                result.setdefault("flags", {})["seen"] = True
+                result["folder_unread"] = folder_get_unread_count(folder)
+                result["folder_total"] = folder.get_message_count()
 
         return result
 
@@ -7626,11 +7691,12 @@ class MailService:
         try:
             self._persist_folder_flags_unlocked(store, folder, message_uids)
         except Exception as exc:
-            if (
+            if not self._flushing_operation_queue and op_type is not None and (
                 is_queueable_network_error(exc)
-                and not self._flushing_operation_queue
-                and op_type is not None
+                or is_sign_in_required_error(exc)
             ):
+                if is_sign_in_required_error(exc):
+                    self.set_account_connect_health(account_uid, "needs_sign_in")
                 folder_name = folder.get_full_name()
                 if folder_name:
                     self._queue_flag_operation_unlocked(

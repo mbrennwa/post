@@ -152,17 +152,21 @@ def ensure_goa_credentials(
     registry: EDataServer.SourceRegistry,
     source: EDataServer.Source,
     cancellable: Gio.Cancellable | None = None,
-) -> None:
-    """Refresh GOA credentials so EDS can read them from the keyring."""
+) -> bool:
+    """Refresh GOA credentials so EDS can read them from the keyring.
+
+    Returns True when every GOA account responded successfully (or none apply).
+    """
     account_ids = _goa_account_ids(registry, source)
     if not account_ids:
-        return
+        return True
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, cancellable)
     except GLib.Error:
         log.exception("Could not connect to session D-Bus for GOA")
-        return
+        return False
 
+    ok = True
     for account_id in account_ids:
         path = f"/org/gnome/OnlineAccounts/Accounts/{account_id}"
         try:
@@ -183,12 +187,15 @@ def ensure_goa_credentials(
                     "GOA EnsureCredentials cancelled for %s",
                     account_id,
                 )
+                ok = False
             else:
                 log.warning(
                     "GOA EnsureCredentials failed for %s: %s",
                     account_id,
                     exc.message,
                 )
+                ok = False
+    return ok
 
 
 def lookup_stored_password(
