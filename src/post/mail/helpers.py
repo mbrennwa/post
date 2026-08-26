@@ -858,11 +858,19 @@ def searchable_body_text(
 
 
 def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:
-    """Return plain-text and HTML bodies from a Camel.MimeMessage."""
+    """Return plain-text and HTML bodies from a Camel.MimeMessage.
+
+    ``text/html`` parts with ``Content-Disposition: attachment`` (e.g.
+    ``ATT00001.htm``) are not used as the HTML body when an inline body
+    exists (#344). They are a last resort only when nothing else remains.
+    """
     bodies: dict[str, str | None] = {"plain": None, "html": None}
-    _walk_mime_parts(mime_msg, bodies)
+    attached_html: list[str] = []
+    _walk_mime_parts(mime_msg, bodies, attached_html)
     if bodies["plain"] is None and bodies["html"] is None:
-        _email_module_fallback(mime_msg, bodies)
+        _email_module_fallback(mime_msg, bodies, attached_html)
+    if bodies["html"] is None and bodies["plain"] is None and attached_html:
+        bodies["html"] = attached_html[0]
     return bodies
 
 
@@ -952,7 +960,9 @@ def extract_plain_body(mime_msg: Any) -> str | None:
     return extract_message_bodies(mime_msg)["plain"]
 
 
-def _walk_mime_parts(part: Any, bodies: dict[str, str | None]) -> None:
+def _walk_mime_parts(
+    part: Any, bodies: dict[str, str | None], attached_html: list[str]
+) -> None:
     import gi
 
     gi.require_version("Camel", "1.2")
@@ -971,20 +981,30 @@ def _walk_mime_parts(part: Any, bodies: dict[str, str | None]) -> None:
             for i in range(part.get_number()):
                 child = part.get_part(i)
                 if child is not None:
-                    _walk_mime_parts(child, bodies)
+                    _walk_mime_parts(child, bodies, attached_html)
             return
         wrapper = part.get_content()
         if wrapper is not None and hasattr(wrapper, "get_number"):
             for i in range(wrapper.get_number()):
                 child = wrapper.get_part(i)
                 if child is not None:
-                    _walk_mime_parts(child, bodies)
+                    _walk_mime_parts(child, bodies, attached_html)
         return
 
     if mime_type == "text/plain" and bodies["plain"] is None:
         bodies["plain"] = _decode_text_part(part)
-    elif mime_type == "text/html" and bodies["html"] is None:
-        bodies["html"] = _decode_text_part(part)
+        return
+    if mime_type != "text/html":
+        return
+    decoded = _decode_text_part(part)
+    if decoded is None:
+        return
+    if _mime_part_is_attachment(part, mime_type):
+        if not attached_html:
+            attached_html.append(decoded)
+        return
+    if bodies["html"] is None:
+        bodies["html"] = decoded
 
 
 def _mime_message_raw_bytes(mime_msg: Any) -> bytes | None:
@@ -1135,7 +1155,9 @@ def _email_part_text(part: Any) -> str | None:
     return None
 
 
-def _email_module_fallback(mime_msg: Any, bodies: dict[str, str | None]) -> None:
+def _email_module_fallback(
+    mime_msg: Any, bodies: dict[str, str | None], attached_html: list[str]
+) -> None:
     """Parse raw MIME with Python's email module when Camel walking finds nothing."""
     import email
     import email.policy
@@ -1161,7 +1183,14 @@ def _email_module_fallback(mime_msg: Any, bodies: dict[str, str | None]) -> None
             continue
         if ct == "text/plain" and bodies["plain"] is None:
             bodies["plain"] = text
-        elif ct == "text/html" and bodies["html"] is None:
+            continue
+        if ct != "text/html":
+            continue
+        if part.get_content_disposition() == "attachment":
+            if not attached_html:
+                attached_html.append(text)
+            continue
+        if bodies["html"] is None:
             bodies["html"] = text
 
 

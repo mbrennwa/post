@@ -10,10 +10,11 @@ import gi
 gi.require_version("Camel", "1.2")
 from gi.repository import Camel
 
-from post.mail.compose import build_plain_mime_message
+from post.mail.compose import ComposeAttachment, build_plain_mime_message
 from post.mail.helpers import (
     _decode_text_bytes,
     _decode_text_part,
+    extract_attachments,
     extract_message_bodies,
 )
 
@@ -107,6 +108,120 @@ PHA+SGVsbG8gljwvcD4K
         bodies = extract_message_bodies(mime)
         self.assertEqual(bodies["plain"], "Café\n")
         self.assertEqual(bodies["html"], "<p>Hello \u2013</p>\n")
+
+    def test_attached_html_does_not_replace_plain_reply(self) -> None:
+        raw = b"""From: a@example.com
+To: b@example.com
+Subject: Reply
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bound"
+
+--bound
+Content-Type: text/plain; charset="utf-8"
+
+Hello Bob,
+
+This is the new reply.
+
+-----Original Message-----
+From: Bob
+Hello Alice
+--bound
+Content-Type: text/html; name="ATT00001.htm"
+Content-Disposition: attachment; filename="ATT00001.htm"
+
+<div style="white-space:pre-wrap">Hello Alice</div>
+--bound--
+"""
+        mime = _FakeMimeMessage(raw)
+        bodies = extract_message_bodies(mime)
+        self.assertIn("This is the new reply", bodies["plain"] or "")
+        self.assertIsNone(bodies["html"])
+        attachments = extract_attachments(mime)
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["filename"], "ATT00001.htm")
+
+    def test_inline_html_alternative_still_preferred(self) -> None:
+        raw = b"""From: a@example.com
+To: b@example.com
+Subject: HTML mail
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="bound"
+
+--bound
+Content-Type: text/plain; charset="utf-8"
+
+Plain reply
+--bound
+Content-Type: text/html; charset="utf-8"
+
+<p>HTML reply</p>
+--bound--
+"""
+        mime = _FakeMimeMessage(raw)
+        bodies = extract_message_bodies(mime)
+        self.assertEqual((bodies["plain"] or "").strip(), "Plain reply")
+        self.assertEqual((bodies["html"] or "").strip(), "<p>HTML reply</p>")
+
+    def test_attached_html_used_when_no_other_body(self) -> None:
+        raw = b"""From: a@example.com
+To: b@example.com
+Subject: HTML only
+MIME-Version: 1.0
+Content-Type: text/html; name="ATT00001.htm"
+Content-Disposition: attachment; filename="ATT00001.htm"
+
+<p>Only html</p>
+"""
+        mime = _FakeMimeMessage(raw)
+        bodies = extract_message_bodies(mime)
+        self.assertIsNone(bodies["plain"])
+        self.assertIn("Only html", bodies["html"] or "")
+
+    def test_camel_walk_skips_attached_html_when_plain_exists(self) -> None:
+        message = build_plain_mime_message(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Reply",
+            body="Hello Bob,\n\nThis is the new reply.",
+            attachments=[
+                ComposeAttachment(
+                    filename="ATT00001.htm",
+                    mime_type="text/html",
+                    data=b'<div style="white-space:pre-wrap">Hello Alice</div>',
+                )
+            ],
+        )
+        bodies = extract_message_bodies(message)
+        self.assertIn("This is the new reply", bodies["plain"] or "")
+        self.assertIsNone(bodies["html"])
+        attachments = extract_attachments(message)
+        self.assertEqual(attachments[0]["filename"], "ATT00001.htm")
+
+    def test_camel_inline_html_wins_over_attached_html(self) -> None:
+        message = build_plain_mime_message(
+            from_name=None,
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Reply",
+            body="Plain reply",
+            body_html="<p>HTML reply</p>",
+            attachments=[
+                ComposeAttachment(
+                    filename="ATT00001.htm",
+                    mime_type="text/html",
+                    data=b"<div>Quoted original</div>",
+                )
+            ],
+        )
+        bodies = extract_message_bodies(message)
+        self.assertIn("HTML reply", bodies["html"] or "")
+        self.assertNotIn("Quoted original", bodies["html"] or "")
 
 
 if __name__ == "__main__":
