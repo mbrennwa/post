@@ -268,6 +268,22 @@ def _strip_html_document_wrappers(body_html: str) -> str:
     return text
 
 
+_POST_QUOTE_STYLE = "white-space:normal"
+_POST_QUOTE_OPEN_RE = re.compile(
+    r"<blockquote\b[^>]*\bclass\s*=\s*(['\"])[^'\"]*\bpost_quote\b[^'\"]*\1[^>]*>",
+    re.IGNORECASE,
+)
+_BLOCKQUOTE_OPEN_RE = re.compile(r"<blockquote\b", re.IGNORECASE)
+_BLOCKQUOTE_CLOSE_RE = re.compile(r"</blockquote\s*>", re.IGNORECASE)
+
+
+def _post_quote_blockquote(content: str) -> str:
+    return (
+        f'<blockquote class="post_quote" style="{_POST_QUOTE_STYLE}">'
+        f"{content}</blockquote>"
+    )
+
+
 def quote_html_forward(original: dict[str, Any], body_html: str) -> str:
     from .helpers import format_forward_quote_header
 
@@ -277,7 +293,7 @@ def quote_html_forward(original: dict[str, Any], body_html: str) -> str:
     return (
         f"<div>{FORWARD_QUOTE_MARKER}</div>"
         f"<div>{header_html}</div>"
-        f'<blockquote class="post_quote">{content}</blockquote>'
+        f"{_post_quote_blockquote(content)}"
     )
 
 
@@ -287,7 +303,7 @@ def quote_html_reply(original: dict[str, Any], body_html: str) -> str:
     content = _strip_html_document_wrappers(body_html)
     return (
         f"<div>On {html.escape(str(date))}, {sender} wrote:</div>"
-        f'<blockquote class="post_quote">{content}</blockquote>'
+        f"{_post_quote_blockquote(content)}"
     )
 
 
@@ -363,15 +379,83 @@ def html_text_newlines_to_br(fragment: str) -> str:
     return "".join(out)
 
 
-def prepare_editor_html_for_send(fragment: str) -> str:
-    """Make compose-editor HTML safe to send as text/html (keep line breaks)."""
-    text = (fragment or "").strip()
-    if not text:
-        return ""
-    converted = html_text_newlines_to_br(restore_stamped_link_hrefs(text))
+def _post_quote_region(fragment: str) -> tuple[int, int] | None:
+    """Return start/end of the first ``blockquote.post_quote`` including nested quotes."""
+    match = _POST_QUOTE_OPEN_RE.search(fragment)
+    if not match:
+        return None
+    start = match.start()
+    pos = match.end()
+    depth = 1
+    while depth > 0 and pos < len(fragment):
+        open_m = _BLOCKQUOTE_OPEN_RE.search(fragment, pos)
+        close_m = _BLOCKQUOTE_CLOSE_RE.search(fragment, pos)
+        if close_m is None:
+            return start, len(fragment)
+        if open_m is not None and open_m.start() < close_m.start():
+            depth += 1
+            pos = open_m.end()
+        else:
+            depth -= 1
+            pos = close_m.end()
+    return start, pos
+
+
+def _stamp_post_quote_normal_whitespace(quote_html: str) -> str:
+    """Ensure the post_quote blockquote keeps ``white-space:normal`` for recipients."""
+
+    def repl(match: re.Match[str]) -> str:
+        tag = match.group(0)
+        if re.search(r"white-space\s*:\s*normal", tag, re.IGNORECASE):
+            return tag
+        if re.search(r"\bstyle\s*=", tag, re.IGNORECASE):
+            return re.sub(
+                r"""style\s*=\s*(['"])""",
+                lambda m: f"style={m.group(1)}{_POST_QUOTE_STYLE};",
+                tag,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        if tag.endswith("/>"):
+            return f'{tag[:-2]} style="{_POST_QUOTE_STYLE}"/>'
+        return f'{tag[:-1]} style="{_POST_QUOTE_STYLE}">'
+
+    return _POST_QUOTE_OPEN_RE.sub(repl, quote_html, count=1)
+
+
+def _wrap_user_html_for_send(fragment: str) -> str:
+    converted = html_text_newlines_to_br(restore_stamped_link_hrefs(fragment))
     if "white-space:pre-wrap" in converted:
         return converted
     return f'<div style="white-space:pre-wrap">{converted}</div>'
+
+
+def prepare_editor_html_for_send(fragment: str) -> str:
+    """Make compose-editor HTML safe to send as text/html (keep line breaks).
+
+    Quoted original HTML (``blockquote.post_quote``) is left as HTML, not
+    treated as typed plaintext: inter-tag newlines must not become ``<br>``
+    and the quote must not inherit ``white-space:pre-wrap`` (#342).
+    """
+    text = (fragment or "").strip()
+    if not text:
+        return ""
+    region = _post_quote_region(text)
+    if region is None:
+        return _wrap_user_html_for_send(text)
+    start, end = region
+    before = text[:start].strip()
+    quote = _stamp_post_quote_normal_whitespace(
+        restore_stamped_link_hrefs(text[start:end])
+    )
+    after = text[end:].strip()
+    parts: list[str] = []
+    if before:
+        parts.append(_wrap_user_html_for_send(before))
+    parts.append(quote)
+    if after:
+        parts.append(_wrap_user_html_for_send(after))
+    return "\n\n".join(parts)
 
 
 def plain_to_simple_html(plain: str) -> str:

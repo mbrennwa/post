@@ -69,6 +69,19 @@ _EDITOR_DOCUMENT = """<!DOCTYPE html>
     padding-left: 0.75em;
     border-left: 3px solid #888;
   }
+  /* Quoted original HTML is not typed plaintext (#342). */
+  #editor blockquote.post_quote {
+    white-space: normal;
+  }
+  #editor blockquote.post_quote p,
+  #editor blockquote.post_quote li {
+    margin: 0;
+  }
+  #editor blockquote.post_quote ol,
+  #editor blockquote.post_quote ul {
+    margin: 0.25em 0;
+    padding-left: 1.5em;
+  }
   #editor a { color: LinkText; text-decoration: underline; }
 </style>
 </head>
