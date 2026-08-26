@@ -636,6 +636,9 @@ class MailService:
     _sync_setup_cancel: Callable[[], None] | None = field(
         default=None, init=False, repr=False
     )
+    _sync_setup_resume: Callable[[], None] | None = field(
+        default=None, init=False, repr=False
+    )
     # Concurrent sidebar folder-tree loads (one per account at startup).
     # Preempt may cancel these so interactive mail work can run; registering
     # must not cancel siblings. Do not share with refresh ops — message loads
@@ -675,9 +678,14 @@ class MailService:
             return
         get_mail_io_thread().set_background_preempt_callbacks(
             self._preempt_background_work,
-            self.schedule_offline_body_sync,
+            self._on_background_resume,
         )
         self._mail_io_callbacks_registered = True
+
+    def _on_background_resume(self) -> None:
+        self.schedule_offline_body_sync()
+        if self._sync_setup_resume is not None:
+            self._sync_setup_resume()
 
     def _preempt_background_work(self) -> None:
         self.cancel_folder_search()
@@ -778,6 +786,16 @@ class MailService:
         self, callback: Callable[[], None] | None
     ) -> None:
         self._sync_setup_cancel = callback
+
+    def set_sync_setup_resume_callback(
+        self, callback: Callable[[], None] | None
+    ) -> None:
+        self._sync_setup_resume = callback
+        if self._mail_io_callbacks_registered:
+            get_mail_io_thread().set_background_preempt_callbacks(
+                self._preempt_background_work,
+                self._on_background_resume,
+            )
 
     def cancel_folder_search(self) -> None:
         """Abort an in-flight Camel folder search so interactive reads can proceed."""

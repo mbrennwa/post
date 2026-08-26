@@ -31,6 +31,7 @@ OnFolderChanged = Callable[[str, str], None]
 OnFolderTreeChanged = Callable[[str], None]
 
 _DEBOUNCE_MS = 400
+_SETUP_RETRY_MS = 500
 
 
 @dataclass
@@ -66,6 +67,7 @@ class MailSyncWatcher:
         self._debounce_ids: dict[tuple[str, str], int] = {}
         self._setup_generation = 0
         self._setup_cancellable: Gio.Cancellable | None = None
+        self._setup_retry_id: int | None = None
 
     def cancel_setup(self) -> None:
         cancellable = self._setup_cancellable
@@ -81,12 +83,15 @@ class MailSyncWatcher:
         if self._running:
             return
         self._running = True
+        self._mail.set_sync_setup_resume_callback(self._on_background_resume_retry)
         self._schedule_setup()
 
     def stop(self) -> None:
         if not self._running:
             return
         self._running = False
+        self._mail.set_sync_setup_resume_callback(None)
+        self._clear_setup_retry()
         self._setup_generation += 1
         self._clear_debounce_timers()
         for watch in list(self._accounts.values()):
@@ -103,6 +108,11 @@ class MailSyncWatcher:
     def set_current_folder(
         self, account_uid: str | None, folder_name: str | None
     ) -> None:
+        if (
+            self._current_account_uid == account_uid
+            and self._current_folder_name == folder_name
+        ):
+            return
         self._current_account_uid = account_uid
         self._current_folder_name = folder_name
         if self._running:
@@ -120,6 +130,7 @@ class MailSyncWatcher:
             self._setup_cancellable = cancellable
             search_trace("sync_watcher_setup_start", generation=generation)
             setups: list[tuple[str, Camel.Store, str | None, str | None]] = []
+            skipped_not_ready = False
             try:
                 for account_uid in account_uids:
                     if cancellable.is_cancelled():
@@ -128,11 +139,19 @@ class MailSyncWatcher:
                             generation=generation,
                             reason="cancelled",
                         )
+                        GLib.idle_add(
+                            self._schedule_setup_retry_on_main,
+                            "cancelled",
+                        )
                         return
                     if get_mail_io_thread().has_interactive_work_pending():
                         search_trace(
                             "sync_watcher_setup_yield",
                             generation=generation,
+                        )
+                        GLib.idle_add(
+                            self._schedule_setup_retry_on_main,
+                            "yield",
                         )
                         return
                     if account_is_user_offline(account_uid):
@@ -141,6 +160,7 @@ class MailSyncWatcher:
                     current_name: str | None = None
                     store = self._mail.get_store_for_sync_if_ready(account_uid)
                     if store is None:
+                        skipped_not_ready = True
                         search_trace(
                             "sync_watcher_setup_skip_account",
                             account=account_uid,
@@ -160,6 +180,11 @@ class MailSyncWatcher:
                 generation=generation,
                 account_count=len(setups),
             )
+            if skipped_not_ready:
+                GLib.idle_add(
+                    self._schedule_setup_retry_on_main,
+                    "store_not_ready",
+                )
             GLib.idle_add(
                 self._apply_setup,
                 generation,
@@ -167,6 +192,35 @@ class MailSyncWatcher:
             )
 
         get_mail_io_thread().submit_background(worker)
+
+    def _on_background_resume_retry(self) -> None:
+        self._schedule_setup_retry("background_resume")
+
+    def _schedule_setup_retry_on_main(self, reason: str) -> bool:
+        self._schedule_setup_retry(reason)
+        return False
+
+    def _schedule_setup_retry(self, reason: str) -> None:
+        if not self._running:
+            return
+        search_trace("sync_watcher_setup_retry_scheduled", reason=reason)
+        existing = self._setup_retry_id
+        if existing is not None:
+            GLib.source_remove(existing)
+
+        def fire() -> bool:
+            self._setup_retry_id = None
+            if self._running:
+                self._schedule_setup()
+            return False
+
+        self._setup_retry_id = GLib.timeout_add(_SETUP_RETRY_MS, fire)
+
+    def _clear_setup_retry(self) -> None:
+        retry_id = self._setup_retry_id
+        if retry_id is not None:
+            GLib.source_remove(retry_id)
+            self._setup_retry_id = None
 
     def _apply_setup(
         self,
