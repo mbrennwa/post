@@ -557,6 +557,107 @@ class FetchAttachmentSearchLocationTests(unittest.TestCase):
         on_ready.assert_called_once_with("file.pdf", b"%PDF", None)
 
 
+class SearchSelectionReaderSyncTests(unittest.TestCase):
+    """Search list selection must load the clicked hit, not a stale reader row."""
+
+    def _window_stub(self, *, messages: list[dict], sidebar_folder: str = "Archive"):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        account = SimpleNamespace(uid="acct-1")
+        window = SimpleNamespace(
+            _current_account=account,
+            _current_folder=sidebar_folder,
+            _current_folder_messages=list(messages),
+            _current_message_uid=None,
+            _current_message=None,
+            _pending_restore_message_uid="old-plain-uid",
+            _pending_message_read_uid=None,
+            _inflight_message_read_id=None,
+            _message_read_generation=0,
+            _user_message_click_pending=False,
+            _mail=mock.Mock(),
+            _reader_pane=mock.Mock(),
+            _message_list_view=mock.Mock(
+                get_selected_uids=mock.Mock(return_value=["selected-key"]),
+            ),
+        )
+        window._message_list_key = lambda msg: MainWindow._message_list_key(
+            window, msg
+        )
+        window._message_location_for_list_key = (
+            lambda list_key: MainWindow._message_location_for_list_key(
+                window, list_key
+            )
+        )
+        window._reader_shows_list_key = lambda list_key: MainWindow._reader_shows_list_key(
+            window, list_key
+        )
+        window._load_message_body_for_uid = mock.Mock()
+        return window
+
+    def test_reader_shows_list_key_false_when_stale_body(self) -> None:
+        from post.window import MainWindow
+
+        hit = annotate_search_match(
+            {"uid": "100", "subject": "Prusa repair"},
+            account_uid="acct-1",
+            folder_name="Archive",
+        )
+        stale = annotate_search_match(
+            {"uid": "200", "subject": "Schau event"},
+            account_uid="acct-1",
+            folder_name="Archive",
+        )
+        window = self._window_stub(messages=[hit, stale])
+        window._current_message_uid = hit["_search_row_key"]
+        window._current_message = dict(stale)
+
+        self.assertFalse(
+            MainWindow._reader_shows_list_key(window, hit["_search_row_key"])
+        )
+        self.assertTrue(
+            MainWindow._reader_shows_list_key(window, stale["_search_row_key"])
+        )
+
+    def test_item_pressed_reloads_when_uid_matches_but_reader_stale(self) -> None:
+        from post.window import MainWindow
+
+        hit = annotate_search_match(
+            {"uid": "100", "subject": "Prusa repair"},
+            account_uid="acct-1",
+            folder_name="Archive",
+        )
+        stale = annotate_search_match(
+            {"uid": "200", "subject": "Schau event"},
+            account_uid="acct-1",
+            folder_name="Archive",
+        )
+        window = self._window_stub(messages=[hit, stale])
+        list_key = hit["_search_row_key"]
+        window._message_list_view.get_selected_uids.return_value = [list_key]
+        window._current_message_uid = list_key
+        window._current_message = dict(stale)
+
+        MainWindow._on_message_list_item_pressed(window, list_key)
+
+        window._load_message_body_for_uid.assert_called_once_with(
+            list_key, mark_seen=True
+        )
+        self.assertIsNone(window._pending_restore_message_uid)
+
+    def test_location_parses_search_row_key_before_sidebar_fallback(self) -> None:
+        from post.mail.search import make_search_row_key
+        from post.window import MainWindow
+
+        sent_key = make_search_row_key("acct-1", "Sent", "1")
+        window = self._window_stub(messages=[], sidebar_folder="INBOX")
+        location = MainWindow._message_location_for_list_key(window, sent_key)
+        self.assertEqual(location, ("acct-1", "Sent", "1"))
+
+
 class UniformBoolStateTests(unittest.TestCase):
     def test_empty_returns_none(self) -> None:
         self.assertIsNone(uniform_bool_state([]))

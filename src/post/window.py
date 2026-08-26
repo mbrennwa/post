@@ -2929,9 +2929,39 @@ class MainWindow(Adw.ApplicationWindow):
             return str(row_key)
         return str(message.get("uid") or "")
 
+    def _reader_shows_list_key(self, list_key: str) -> bool:
+        """True when the reader pane is displaying the message for ``list_key``."""
+        if self._current_message is None:
+            return False
+        if self._message_list_key(self._current_message) == list_key:
+            return True
+        location = self._message_location_for_list_key(list_key)
+        if location is None:
+            return False
+        expected_account, expected_folder, expected_uid = location
+        message_uid = str(self._current_message.get("uid") or "")
+        if message_uid != expected_uid:
+            return False
+        search_account = self._current_message.get("_search_account_uid")
+        search_folder = self._current_message.get("_search_folder")
+        if search_account and search_folder:
+            return (
+                str(search_account) == expected_account
+                and str(search_folder) == expected_folder
+            )
+        if self._current_account and self._current_folder:
+            return (
+                self._current_account.uid == expected_account
+                and self._current_folder == expected_folder
+            )
+        return True
+
     def _message_location_for_list_key(
         self, list_key: str
     ) -> tuple[str, str, str] | None:
+        parsed = parse_search_row_key(list_key)
+        if parsed is not None:
+            return parsed
         if self._current_folder_messages:
             for message in self._current_folder_messages:
                 if self._message_list_key(message) == list_key:
@@ -2946,9 +2976,6 @@ class MainWindow(Adw.ApplicationWindow):
                             self._current_folder,
                             message_uid,
                         )
-        parsed = parse_search_row_key(list_key)
-        if parsed is not None:
-            return parsed
         if (
             self._current_account
             and self._current_folder
@@ -4476,12 +4503,22 @@ class MainWindow(Adw.ApplicationWindow):
             self._update_search_scope_ui()
             self._message_stack.set_visible_child_name("list")
 
+        annotated_batch = [
+            annotate_search_match(
+                message,
+                account_uid=account.uid,
+                folder_name=folder_name,
+            )
+            if not message.get("_search_row_key")
+            else message
+            for message in batch
+        ]
         self._message_list_view.insert_messages_newest_first(
-            batch, folder_name=folder_name
+            annotated_batch, folder_name=folder_name
         )
         if self._current_folder_messages is None:
             self._current_folder_messages = []
-        insert_messages_newest_first(self._current_folder_messages, batch)
+        insert_messages_newest_first(self._current_folder_messages, annotated_batch)
         return False
 
     def _should_use_cached_header_search(
@@ -5882,9 +5919,10 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_message_list_item_pressed(self, uid: str) -> None:
         self._user_message_click_pending = True
+        self._pending_restore_message_uid = None
         selected = self._message_list_view.get_selected_uids()
         if len(selected) == 1 and selected[0] == uid:
-            if uid == self._current_message_uid and self._current_message is not None:
+            if uid == self._current_message_uid and self._reader_shows_list_key(uid):
                 return
             if (
                 uid == self._pending_message_read_uid
@@ -6783,7 +6821,7 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         uid = selected[0]
-        if uid == self._current_message_uid and self._current_message is not None:
+        if uid == self._current_message_uid and self._reader_shows_list_key(uid):
             return False
         if (
             uid == self._pending_message_read_uid
@@ -6792,6 +6830,8 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         mark_seen = self._user_message_click_pending
+        if mark_seen:
+            self._pending_restore_message_uid = None
         self._user_message_click_pending = False
         self._current_message_uid = uid
         self._load_message_body_for_uid(uid, mark_seen=mark_seen)
@@ -6925,6 +6965,7 @@ class MainWindow(Adw.ApplicationWindow):
         read_id = self._message_read_generation
         self._pending_message_read_uid = uid
         self._inflight_message_read_id = read_id
+        self._current_message = None
         self._reader_pane.show_loading()
         viewing_outbox = is_post_outbox_folder(folder_name)
         viewing_drafts = self._sidebar.folder_is_drafts(account.uid, folder_name)
