@@ -26,6 +26,7 @@ from post.mail.helpers import (
     reader_header_rows,
 )
 from post.preferences import (
+    MESSAGE_APPEARANCE_ADAPT_BACKGROUND,
     MESSAGE_APPEARANCE_ADAPT_TEXT,
     MessageAppearance,
     get_load_remote_content,
@@ -437,6 +438,7 @@ class MessageReaderPane(Gtk.Box):
         self._web_view.set_vexpand(True)
         self._web_view.set_hexpand(True)
         self._web_view.set_halign(Gtk.Align.FILL)
+        self._sync_web_view_background()
         # Prevent long message URLs from forcing a huge minimum width.
         self._web_view.set_size_request(1, -1)
 
@@ -1013,12 +1015,26 @@ class MessageReaderPane(Gtk.Box):
             self._dark = dark
         if message_appearance is not None:
             self._message_appearance = message_appearance
+        self._sync_web_view_background()
         if self._current_message is not None:
             self._show_reader_document()
+
+    def _sync_web_view_background(self) -> None:
+        """Match the GTK WebView canvas to the reader shell (not UA white)."""
+        reader_dark = self._dark
+        if self._message_appearance == MESSAGE_APPEARANCE_ADAPT_BACKGROUND:
+            reader_dark = not self._dark
+        color = "#1e1e1e" if reader_dark else "#ffffff"
+        rgba = Gdk.RGBA()
+        rgba.parse(color)
+        setter = getattr(self._web_view, "set_background_color", None)
+        if setter is not None:
+            setter(rgba)
 
     def _load_error_html(self, message: str) -> None:
         self._clear_link_hover()
         self._reader_body_stack.set_visible_child_name("content")
+        self._sync_web_view_background()
         error_color = "#aaaaaa" if self._dark else "#666666"
         self._web_view.load_html(
             "<body style='font-family:sans-serif;"
@@ -1126,6 +1142,7 @@ class MessageReaderPane(Gtk.Box):
             return
 
         self._reader_body_stack.set_visible_child_name("content")
+        self._sync_web_view_background()
         document = build_reader_document(
             body_html=self._current_body.get("html"),
             body_plain=self._current_body.get("plain"),
