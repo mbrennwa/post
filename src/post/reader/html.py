@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import html
 import re
+from dataclasses import dataclass
 from html.parser import HTMLParser
 
 from post.mail.quote_history import split_html_at_quote_history
@@ -134,6 +135,9 @@ def html_has_blocked_remote_content(body_html: str) -> bool:
 
 
 _READER_CSS_LIGHT = """
+html {
+  background: #ffffff;
+}
 body {
   font-family: system-ui, sans-serif;
   font-size: 14px;
@@ -169,6 +173,9 @@ span.post-bracketed {
 """
 
 _READER_CSS_DARK = """
+html {
+  background: #1e1e1e;
+}
 body {
   font-family: system-ui, sans-serif;
   font-size: 14px;
@@ -204,20 +211,21 @@ span.post-bracketed {
 """
 
 _ADAPT_TEXT_CSS = """
+.message-body {
+  min-height: 100%;
+  background: inherit;
+}
 .message-body .post-adapt-text {
   color: inherit !important;
 }
-.message-body :where(
-  p, div, span, li, td, th, font, blockquote, pre,
-  h1, h2, h3, h4, h5, h6
-):not(.post-painted):not(.post-keep-color) {
+.message-body .post-on-shell:not(.post-keep-color):not(.post-adapt-text):not(.post-forced-contrast) {
   color: inherit !important;
 }
-.message-body .post-painted :where(
-  p, div, span, li, td, th, font, blockquote, pre,
-  h1, h2, h3, h4, h5, h6
-):not(.post-keep-color):not(.post-forced-contrast) {
-  color: inherit !important;
+.message-body .post-painted {
+  color-scheme: inherit;
+}
+.message-body .post-image-canvas {
+  color-scheme: light;
 }
 """
 
@@ -239,10 +247,16 @@ _DECL_BACKGROUND_VALUE = re.compile(
     r"(?:^|[;{\s])background\s*:\s*([^;}{]+)",
     re.IGNORECASE | re.MULTILINE,
 )
+_DECL_BG_IMAGE = re.compile(r"\bbackground-image\s*:", re.IGNORECASE)
 _BGCOLOR_VALUE = re.compile(
     r"""\bbgcolor\s*=\s*(["']?)([^"'\s>]+)\1""",
     re.IGNORECASE,
 )
+_HTML_BACKGROUND_ATTR = re.compile(
+    r"""<[a-z][^>]*\sbackground\s*=\s*(["']?)([^"'\s>]+)\1""",
+    re.IGNORECASE,
+)
+_CSS_URL_TOKEN = re.compile(r"url\s*\(", re.IGNORECASE)
 _TRANSPARENT_COLOR_VALUES = frozenset(
     {
         "transparent",
@@ -438,9 +452,47 @@ def _html_for_adaptation_detection(body_html: str) -> str:
 
 def _iter_style_sources(body_html: str):
     for match in _STYLE_BLOCK.finditer(body_html):
-        yield match.group(1)
+        yield _unwrap_at_rules(match.group(1))
     for match in _INLINE_STYLE.finditer(body_html):
         yield match.group(2)
+
+
+def _unwrap_at_rules(source: str) -> str:
+    """Expose declarations nested in ``@media`` / ``@supports`` for parsing."""
+    result: list[str] = []
+    index = 0
+    length = len(source)
+    lower = source.lower()
+    while index < length:
+        at_index = lower.find("@", index)
+        if at_index == -1:
+            result.append(source[index:])
+            break
+        result.append(source[index:at_index])
+        brace = source.find("{", at_index)
+        if brace == -1:
+            result.append(source[at_index:])
+            break
+        depth = 0
+        end = None
+        for cursor in range(brace, length):
+            char = source[cursor]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = cursor
+                    break
+        if end is None:
+            result.append(source[at_index:])
+            break
+        header = lower[at_index:brace].strip()
+        inner = source[brace + 1 : end]
+        if header.startswith("@media") or header.startswith("@supports"):
+            result.append(_unwrap_at_rules(inner))
+        index = end + 1
+    return "".join(result)
 
 
 def _normalize_css_declaration_value(value: str) -> str:
@@ -525,6 +577,50 @@ def _css_background_shorthand_is_meaningful(value: str) -> bool:
     return _css_background_shorthand_color(value) is not None
 
 
+def _css_value_has_url(value: str) -> bool:
+    """Return True when a CSS value includes a real ``url(...)`` image."""
+    if not _CSS_URL_TOKEN.search(value or ""):
+        return False
+    compact = (value or "").lower().replace(" ", "")
+    without_placeholder = compact.replace("url(none)", "")
+    return "url(" in without_placeholder
+
+
+def _html_background_attr_is_image(value: str) -> bool:
+    """Return True when an HTML ``background`` attribute is an image, not a color."""
+    candidate = value.strip()
+    if not candidate:
+        return False
+    lower = candidate.lower()
+    if lower.startswith(("http://", "https://", "cid:", "data:", "/", "./", "url(")):
+        return True
+    if _parse_css_color_rgb(candidate) is not None:
+        return False
+    if lower in _TRANSPARENT_COLOR_VALUES:
+        return False
+    if "." in candidate:
+        return True
+    return False
+
+
+def _html_background_attr_color(value: str) -> str | None:
+    """Return a color token from an HTML ``background`` attribute, if any."""
+    if not value or _html_background_attr_is_image(value):
+        return None
+    if _css_color_value_is_meaningful(value):
+        return _normalize_css_color_token(value)
+    return None
+
+
+def _style_source_has_background_image(source: str) -> bool:
+    if _DECL_BG_IMAGE.search(source) and _css_value_has_url(source):
+        return True
+    for match in _DECL_BACKGROUND_VALUE.finditer(source):
+        if _css_value_has_url(match.group(1)):
+            return True
+    return False
+
+
 def _style_source_has_meaningful_background(source: str) -> bool:
     for match in _DECL_BG_COLOR_VALUE.finditer(source):
         if _css_color_value_is_meaningful(match.group(1)):
@@ -544,15 +640,33 @@ def _style_source_has_text_color(source: str) -> bool:
 
 def _parse_style_declarations(style: str) -> dict[str, str]:
     declarations: dict[str, str] = {}
-    for part in style.split(";"):
-        if ":" not in part:
-            continue
-        name, _, value = part.partition(":")
-        name = name.strip().lower()
-        value = value.strip()
-        if name and value:
-            declarations[name] = value
+    depth = 0
+    current: list[str] = []
+    for char in style:
+        if char == "(":
+            depth += 1
+            current.append(char)
+        elif char == ")" and depth:
+            depth -= 1
+            current.append(char)
+        elif char == ";" and depth == 0:
+            _store_style_declaration(declarations, "".join(current))
+            current = []
+        else:
+            current.append(char)
+    if current:
+        _store_style_declaration(declarations, "".join(current))
     return declarations
+
+
+def _store_style_declaration(declarations: dict[str, str], part: str) -> None:
+    if ":" not in part:
+        return
+    name, _, value = part.partition(":")
+    name = name.strip().lower()
+    value = value.strip()
+    if name and value:
+        declarations[name] = value
 
 
 def _declarations_to_style(declarations: dict[str, str]) -> str:
@@ -610,7 +724,8 @@ def _parse_stylesheet_maps(
     tag_styles: dict[str, dict[str, str]] = {}
     id_styles: dict[str, dict[str, str]] = {}
     for style_match in _STYLE_BLOCK.finditer(body_html):
-        for rule_match in _STYLE_RULE_BLOCK.finditer(style_match.group(1)):
+        style_source = _unwrap_at_rules(style_match.group(1))
+        for rule_match in _STYLE_RULE_BLOCK.finditer(style_source):
             selector_group = rule_match.group(1).strip()
             if not selector_group or selector_group.startswith("@"):
                 continue
@@ -709,7 +824,35 @@ def _element_painted_background_value(
     bgcolor = attrs.get("bgcolor", "")
     if _bgcolor_attr_is_meaningful(bgcolor):
         return _normalize_css_color_token(bgcolor)
-    return None
+    return _html_background_attr_color(attrs.get("background", ""))
+
+
+def _declarations_have_background_image(declarations: dict[str, str]) -> bool:
+    return _css_value_has_url(declarations.get("background-image", "")) or _css_value_has_url(
+        declarations.get("background", "")
+    )
+
+
+def _element_has_background_image(
+    attrs: dict[str, str],
+    class_styles: dict[str, dict[str, str]],
+    *,
+    tag: str = "",
+    tag_styles: dict[str, dict[str, str]] | None = None,
+    id_styles: dict[str, dict[str, str]] | None = None,
+) -> bool:
+    html_bg = attrs.get("background", "")
+    if html_bg and _html_background_attr_is_image(html_bg):
+        return True
+    merged = _merge_element_declarations(
+        attrs,
+        class_styles,
+        tag=tag,
+        tag_styles=tag_styles,
+        id_styles=id_styles,
+        inherited_styles=None,
+    )
+    return _declarations_have_background_image(merged)
 
 
 def _parse_css_color_rgb(value: str) -> tuple[int, int, int] | None:
@@ -840,6 +983,8 @@ def _element_has_meaningful_background(
 ) -> bool:
     if _bgcolor_attr_is_meaningful(attrs.get("bgcolor", "")):
         return True
+    if _html_background_attr_color(attrs.get("background", "")):
+        return True
     if class_styles is not None and _declarations_have_meaningful_background(
         _merge_element_declarations(
             attrs,
@@ -952,6 +1097,40 @@ _VOID_HTML_ELEMENTS = frozenset(
         "wbr",
     }
 )
+_ON_SHELL_TEXT_TAGS = frozenset(
+    {
+        "p",
+        "div",
+        "span",
+        "li",
+        "td",
+        "th",
+        "font",
+        "blockquote",
+        "pre",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+    }
+)
+_CANVAS_SHELL = "shell"
+_CANVAS_COLOR = "color"
+_CANVAS_IMAGE = "image"
+_ROOT_CANVAS_TAGS = frozenset({"html", "body"})
+
+
+@dataclass(frozen=True)
+class _CanvasFrame:
+    """Effective background for one open element in the adaptation walk."""
+
+    tag: str
+    background: str
+    kind: str
+
+
 _ADAPTATION_SKIP_TAGS = frozenset(
     {
         "style",
@@ -1043,7 +1222,7 @@ def _format_start_tag(tag: str, attrs: list[tuple[str, str | None]]) -> str:
 
 
 class _AdaptationClassMarker(HTMLParser):
-    """Mark elements that should keep sender colors or receive adapted text."""
+    """Mark elements using contrast against the effective painted background."""
 
     def __init__(
         self,
@@ -1061,28 +1240,38 @@ class _AdaptationClassMarker(HTMLParser):
         self._id_styles = id_styles
         self._inherited_styles = inherited_styles or {}
         self._shell_background = shell_background
-        self._shell_foreground = _contrasting_text_color(shell_background)
         self._prefer_reader_shell = prefer_reader_shell
-        self._inside_painted_depth = 0
+        self._stack: list[_CanvasFrame] = []
         self._parts: list[str] = []
 
     def get_result(self) -> str:
         return "".join(self._parts)
 
+    def _effective(self) -> tuple[str, str]:
+        if self._stack:
+            frame = self._stack[-1]
+            return frame.background, frame.kind
+        return self._shell_background, _CANVAS_SHELL
+
+    def _push(self, tag: str, background: str, kind: str) -> None:
+        self._stack.append(_CanvasFrame(tag, background, kind))
+
+    def _pop_until(self, tag: str) -> None:
+        tag_lower = tag.lower()
+        for index in range(len(self._stack) - 1, -1, -1):
+            if self._stack[index].tag == tag_lower:
+                del self._stack[index:]
+                return
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag_lower = tag.lower()
         if tag_lower in _ADAPTATION_SKIP_TAGS:
             self._parts.append(_format_start_tag(tag, attrs))
+            if tag_lower not in _VOID_HTML_ELEMENTS:
+                background, kind = self._effective()
+                self._push(tag_lower, background, kind)
             return
         attrs_dict = _attrs_list_to_dict(attrs)
-        merged = _merge_element_declarations(
-            attrs_dict,
-            self._class_styles,
-            tag=tag_lower,
-            tag_styles=self._tag_styles,
-            id_styles=self._id_styles,
-            inherited_styles=self._inherited_styles,
-        )
         paint_merged = _merge_element_declarations(
             attrs_dict,
             self._class_styles,
@@ -1091,7 +1280,6 @@ class _AdaptationClassMarker(HTMLParser):
             id_styles=self._id_styles,
             inherited_styles=None,
         )
-        inside_painted = self._inside_painted_depth > 0
         self_painted = _element_has_meaningful_background(
             attrs_dict,
             self._class_styles,
@@ -1105,10 +1293,12 @@ class _AdaptationClassMarker(HTMLParser):
             if self_painted
             else None
         )
-        opposes_shell = bool(
-            self._prefer_reader_shell
-            and paint_background
-            and _sender_canvas_opposes_shell(paint_background, self._shell_background)
+        own_image = _element_has_background_image(
+            attrs_dict,
+            self._class_styles,
+            tag=tag_lower,
+            tag_styles=self._tag_styles,
+            id_styles=self._id_styles,
         )
         has_sender_color = _element_has_explicit_text_color(
             tag_lower,
@@ -1126,66 +1316,114 @@ class _AdaptationClassMarker(HTMLParser):
             id_styles=self._id_styles,
             inherited_styles=self._inherited_styles,
         )
+        if "post-bracketed" in attrs_dict.get("class", "").split():
+            self._parts.append(_format_start_tag(tag, attrs))
+            if tag_lower not in _VOID_HTML_ELEMENTS:
+                background, kind = self._effective()
+                self._push(tag_lower, background, kind)
+            return
+        ancestor_background, ancestor_kind = self._effective()
         extra_classes: list[str] = []
         adapt_color: str | None = None
         contrast_color: str | None = None
+        keep_color_value: str | None = None
         neutralize_background = False
-        enter_painted = False
-
-        if self_painted and opposes_shell:
-            # Adapt text keeps the reader shell: drop light/dark opposing canvases
-            # and remap clashing text to the shell foreground (#317).
+        neutralize_to_shell = False
+        island_paint: str | None = None
+        image_root = False
+        opposes_shell = bool(
+            self._prefer_reader_shell
+            and paint_background is not None
+            and _sender_canvas_opposes_shell(paint_background, self._shell_background)
+        )
+        # Shell-first: drop canvases that oppose the reader (white cards on a
+        # dark shell, or the reverse). Descendants then contrast against the
+        # background that remains — that is Adapt text (#317/#347/#348).
+        # Keeping those cards as light islands made newsletters readable but
+        # left a white page, and it undid PayPal.
+        if own_image and paint_background is None:
+            effective_background = ancestor_background
+            kind = _CANVAS_IMAGE
+            image_root = True
+        elif opposes_shell:
             neutralize_background = True
-            if has_sender_color:
-                if text_color_value and _colors_have_adequate_contrast(
-                    text_color_value, self._shell_background
-                ):
-                    extra_classes.append("post-keep-color")
-                else:
-                    extra_classes.append("post-adapt-text")
-                    adapt_color = self._shell_foreground
-        elif inside_painted or self_painted:
+            extra_classes.append("post-neutralized")
+            if tag_lower in _ROOT_CANVAS_TAGS:
+                neutralize_to_shell = True
+                effective_background = self._shell_background
+                kind = _CANVAS_SHELL
+            else:
+                effective_background = ancestor_background
+                kind = ancestor_kind
+        elif paint_background is not None:
+            effective_background = paint_background
+            kind = _CANVAS_COLOR
+            island_paint = paint_background
+        else:
+            effective_background = ancestor_background
+            kind = ancestor_kind
+
+        if kind == _CANVAS_IMAGE:
             extra_classes.append("post-painted")
-            enter_painted = True
-            if has_sender_color:
-                effective_background = paint_background or self._shell_background
-                if text_color_value and _colors_have_adequate_contrast(
-                    text_color_value, effective_background
-                ):
-                    extra_classes.append("post-keep-color")
-                else:
-                    extra_classes.append("post-adapt-text")
-                    adapt_color = _contrasting_text_color(effective_background)
-            elif self_painted and paint_background is not None:
-                extra_classes.append("post-forced-contrast")
-                contrast_color = _contrasting_text_color(paint_background)
+            if image_root:
+                extra_classes.append("post-image-canvas")
+            if has_sender_color and text_color_value:
+                extra_classes.append("post-keep-color")
+                keep_color_value = text_color_value
         elif has_sender_color:
-            background = (
-                _declarations_background_value(merged) or self._shell_background
-            )
+            if kind == _CANVAS_COLOR:
+                extra_classes.append("post-painted")
             if text_color_value and _colors_have_adequate_contrast(
-                text_color_value, background
+                text_color_value, effective_background
             ):
                 extra_classes.append("post-keep-color")
+                keep_color_value = text_color_value
             else:
                 extra_classes.append("post-adapt-text")
-                adapt_color = _contrasting_text_color(background)
+                adapt_color = _contrasting_text_color(effective_background)
+        elif kind == _CANVAS_COLOR:
+            extra_classes.append("post-painted")
+            if paint_background is not None:
+                extra_classes.append("post-forced-contrast")
+                contrast_color = _contrasting_text_color(effective_background)
+        elif kind == _CANVAS_SHELL and tag_lower in _ON_SHELL_TEXT_TAGS:
+            extra_classes.append("post-on-shell")
 
         updated_attrs = attrs
         if extra_classes:
             updated_attrs = _add_classes_to_attrs(updated_attrs, extra_classes)
         if neutralize_background:
+            if neutralize_to_shell:
+                updated_attrs = _append_style_declaration(
+                    updated_attrs,
+                    "background-color",
+                    f"{self._shell_background} !important",
+                )
+                updated_attrs = _append_style_declaration(
+                    updated_attrs,
+                    "background",
+                    f"{self._shell_background} !important",
+                )
+            else:
+                updated_attrs = _append_style_declaration(
+                    updated_attrs,
+                    "background-color",
+                    "transparent !important",
+                )
+                updated_attrs = _append_style_declaration(
+                    updated_attrs,
+                    "background",
+                    "transparent !important",
+                )
+            updated_attrs = _remove_attr_from_attrs(updated_attrs, "bgcolor")
+            if _html_background_attr_color(attrs_dict.get("background", "")):
+                updated_attrs = _remove_attr_from_attrs(updated_attrs, "background")
+        elif island_paint is not None:
             updated_attrs = _append_style_declaration(
                 updated_attrs,
                 "background-color",
-                "transparent !important",
+                f"{island_paint} !important",
             )
-            updated_attrs = _append_style_declaration(
-                updated_attrs,
-                "background",
-                "transparent !important",
-            )
-            updated_attrs = _remove_attr_from_attrs(updated_attrs, "bgcolor")
         if contrast_color is not None:
             updated_attrs = _append_style_declaration(
                 updated_attrs,
@@ -1198,17 +1436,23 @@ class _AdaptationClassMarker(HTMLParser):
                 "color",
                 f"{adapt_color} !important",
             )
+        if keep_color_value is not None and not _style_source_has_text_color(
+            attrs_dict.get("style", "")
+        ):
+            updated_attrs = _append_style_declaration(
+                updated_attrs,
+                "color",
+                f"{keep_color_value} !important",
+            )
         self._parts.append(_format_start_tag(tag, updated_attrs))
         if tag_lower in _VOID_HTML_ELEMENTS:
             return
-        if enter_painted:
-            self._inside_painted_depth += 1
+        self._push(tag_lower, effective_background, kind)
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() in _VOID_HTML_ELEMENTS:
             return
-        if self._inside_painted_depth > 0:
-            self._inside_painted_depth -= 1
+        self._pop_until(tag)
         self._parts.append(f"</{tag}>")
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -1270,9 +1514,22 @@ def html_has_explicit_background_color(body_html: str) -> bool:
     for match in _BGCOLOR_VALUE.finditer(body_html):
         if _css_color_value_is_meaningful(match.group(2)):
             return True
+    for match in _HTML_BACKGROUND_ATTR.finditer(body_html):
+        if _html_background_attr_color(match.group(2)):
+            return True
     return any(
         _style_source_has_meaningful_background(source)
         for source in _iter_style_sources(body_html)
+    )
+
+
+def html_has_background_image(body_html: str) -> bool:
+    """Return True when HTML paints with a background image and no measured color."""
+    for match in _HTML_BACKGROUND_ATTR.finditer(body_html):
+        if _html_background_attr_is_image(match.group(2)):
+            return True
+    return any(
+        _style_source_has_background_image(source) for source in _iter_style_sources(body_html)
     )
 
 
@@ -1294,16 +1551,14 @@ def _style_blocks_have_text_without_background(body_html: str) -> bool:
     return False
 
 
-def _marked_html_neutralizes_opposing_canvas(marked: str) -> bool:
-    """Return True when marking strips sender canvases opposing the reader shell."""
-    return "background-color:transparent!important" in marked.replace(" ", "")
-
-
 def _marked_html_needs_adaptation(marked: str) -> bool:
     """Return True when marked HTML needs adapt-text treatment."""
     if "post-adapt-text" in marked or "post-forced-contrast" in marked:
         return True
-    return _marked_html_neutralizes_opposing_canvas(marked)
+    if "post-image-canvas" in marked or "post-neutralized" in marked:
+        return True
+    compact = marked.replace(" ", "").lower()
+    return "background-color:transparent!important" in compact
 
 
 def html_message_needs_adaptation(
@@ -1313,8 +1568,10 @@ def html_message_needs_adaptation(
 ) -> bool:
     """Return True when any element needs adapt-text or adapt-background treatment."""
     content = _html_for_adaptation_detection(body_html)
-    if not html_has_explicit_text_color(content) and not html_has_explicit_background_color(
-        content
+    if (
+        not html_has_explicit_text_color(content)
+        and not html_has_explicit_background_color(content)
+        and not html_has_background_image(content)
     ):
         return False
     if _style_blocks_have_text_without_background(content):

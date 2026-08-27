@@ -258,6 +258,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("background-color:transparent!important", doc.replace(" ", ""))
         self.assertIn('name="color-scheme" content="dark"', doc)
 
+
     def test_adapt_background_preserves_sender_colors_when_both_set(self) -> None:
         doc = build_reader_document(
             body_html='<div style="color:#000000;background:#fffffe"><p>Hello</p></div>',
@@ -314,6 +315,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("background-color:transparent!important", doc.replace(" ", ""))
         self.assertIn("color: inherit !important", doc)
 
+
     def test_adapt_text_skipped_for_body_text_and_bgcolor_attrs(self) -> None:
         doc = build_reader_document(
             body_html='<body bgcolor="#ffffff" text="#000000"><p>Hello</p></body>',
@@ -322,10 +324,12 @@ class BuildReaderDocumentTests(unittest.TestCase):
             dark=True,
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
+        compact = doc.replace(" ", "")
         self.assertIn('<div class="message-body">', doc)
         self.assertIn("post-adapt-text", doc)
-        self.assertIn("color:#eeeeee!important", doc.replace(" ", ""))
-        self.assertIn("background-color:transparent!important", doc.replace(" ", ""))
+        self.assertIn("color:#eeeeee!important", compact)
+        self.assertIn("background-color:#1e1e1e!important", compact)
+        self.assertNotIn("bgcolor=", compact.lower())
 
     def test_adapt_text_applies_for_transparent_background(self) -> None:
         doc = build_reader_document(
@@ -340,6 +344,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         )
         self.assertIn('<div class="message-body">', doc)
         self.assertIn("color: inherit !important", doc)
+
 
     def test_adapt_text_applies_for_style_block_transparent_background(self) -> None:
         doc = build_reader_document(
@@ -481,6 +486,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("post-adapt-text", doc)
         self.assertIn("color:#eeeeee!important", doc.replace(" ", ""))
 
+
     def test_adapt_text_dark_shell_on_white_card_without_body_color(self) -> None:
         """Newsletter card: Adapt text keeps dark shell and drops light canvases (#317)."""
         body_html = (
@@ -517,6 +523,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         # CSS mentions the class name; assert no forced-contrast class on elements.
         self.assertNotRegex(doc, r'class="[^"]*post-forced-contrast')
 
+
     def test_adapt_text_handles_class_based_white_boxes(self) -> None:
         doc = build_reader_document(
             body_html=(
@@ -536,6 +543,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("background-color:transparent!important", doc.replace(" ", ""))
         self.assertIn("post-keep-color", doc)
         self.assertIn("color: inherit !important", doc)
+
 
     def test_adapt_text_keeps_sender_color_on_children_of_painted_ancestor(self) -> None:
         doc = build_reader_document(
@@ -566,6 +574,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("background-color:transparent!important", doc.replace(" ", ""))
         self.assertNotIn("color: revert !important", doc)
 
+
     def test_adapt_text_keeps_sender_color_on_painted_div_with_inline_color(self) -> None:
         """Outlook white card + black text: Adapt text keeps dark shell (#317)."""
         doc = build_reader_document(
@@ -585,6 +594,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("background-color:transparent!important", doc.replace(" ", ""))
         self.assertNotIn("color: revert !important", doc)
 
+
     def test_adapt_text_skipped_when_new_content_has_background(self) -> None:
         doc = build_reader_document(
             body_html=(
@@ -602,6 +612,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("post-adapt-text", doc)
         self.assertIn("color:#eeeeee!important", doc.replace(" ", ""))
         self.assertIn("background-color:transparent!important", doc.replace(" ", ""))
+
 
     def test_cid_images_are_embedded_as_data_urls(self) -> None:
         png = b"\x89PNG\r\n\x1a\n"
@@ -928,6 +939,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
             r'class="button[^"]*post-adapt-text"',
         )
 
+
     def test_adapt_text_harvests_complex_microsoft_style_selectors(self) -> None:
         """Complex MS-like selectors still neutralize light cards on dark shell (#320)."""
         body_html = (
@@ -966,6 +978,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
             r'class="ms-button[^"]*post-adapt-text"',
         )
 
+
     def test_adapt_text_neutralizes_bare_hex_microsoft_backgrounds(self) -> None:
         """Microsoft often omits '#' in hex backgrounds (e.g. E5E5E5) (#320)."""
         body_html = (
@@ -996,6 +1009,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
             r'style="[^"]*background-color:\s*E5E5E5[^"]*"',
         )
 
+
     def test_adapt_text_runs_pipeline_for_body_white_text_on_white_card(self) -> None:
         """#346: canvas neutralization must run even when only post-keep-color applies."""
         doc = build_reader_document(
@@ -1017,9 +1031,11 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("color:#0070ba", compact)
         self.assertIn("post-keep-color", doc)
         self.assertRegex(
-            doc.replace(" ", ""),
-            r'<tableclass="cardpost-keep-color"[^>]*background-color:transparent!important',
+            compact,
+            r'<tableclass="cardpost-neutralizedpost-keep-color"[^>]*'
+            r"background-color:transparent!important",
         )
+
 
     def test_adapt_text_runs_pipeline_for_same_element_white_on_white(self) -> None:
         """#346: same-element white canvas + light text must not skip adaptation."""
@@ -1035,6 +1051,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn("background-color:transparent!important", compact)
         self.assertIn("post-keep-color", doc)
         self.assertNotIn('style="background:#ffffff', compact)
+
 
     def test_adapt_text_runs_pipeline_for_stylesheet_important_white_card(self) -> None:
         """#346: stylesheet !important white card must not bypass the adapt pipeline."""
@@ -1052,6 +1069,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertIn('<div class="message-body">', doc)
         self.assertIn("background-color:transparent!important", compact)
 
+
     def test_adapt_text_strips_bgcolor_when_neutralizing_canvas(self) -> None:
         """#346: bgcolor must not survive canvas neutralization."""
         doc = build_reader_document(
@@ -1067,6 +1085,7 @@ class BuildReaderDocumentTests(unittest.TestCase):
         compact = doc.replace(" ", "")
         self.assertIn("background-color:transparent!important", compact)
         self.assertNotIn("bgcolor=", compact)
+
 
     def test_adapt_text_neutralizes_id_selector_white_canvas(self) -> None:
         """#346: stylesheet #id backgrounds must not survive on the dark shell."""
@@ -1091,6 +1110,187 @@ class BuildReaderDocumentTests(unittest.TestCase):
             compact,
             r'<divid="emailBody"[^>]*background-color:transparent!important',
         )
+
+    def test_adapt_text_keeps_dark_text_on_medium_island_not_shell(self) -> None:
+        """#348: contrast uses the effective background, not the reader shell alone."""
+        doc = build_reader_document(
+            body_html=(
+                '<span style="color:#333333">shell copy</span>'
+                '<div style="background-color:#a0a0a0">'
+                '<span style="color:#333333">chip copy</span></div>'
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        compact = doc.replace(" ", "")
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("post-adapt-text", doc)
+        self.assertIn("color:#eeeeee!important", compact)
+        self.assertIn("post-keep-color", doc)
+        self.assertIn("color:#333333", compact)
+        self.assertIn("post-painted", doc)
+
+    def test_adapt_text_neutralizes_html_background_attr_white_canvas(self) -> None:
+        """#348: HTML background attribute is an opposing canvas on the dark shell."""
+        doc = build_reader_document(
+            body_html=(
+                "<style>td, p, h1 { color: #222222; }</style>"
+                '<table background="#ffffff"><tr><td>'
+                "<h1>Morning briefing</h1><p>Hello</p>"
+                "</td></tr></table>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        compact = doc.replace(" ", "")
+        self.assertIn('<div class="message-body">', doc)
+        self.assertNotIn("td, p, h1 { color: #222222; }", doc)
+        self.assertIn("background-color:transparent!important", compact)
+        self.assertNotIn('background="#ffffff"', doc)
+        self.assertIn("color:#eeeeee!important", compact)
+        self.assertIn('name="color-scheme" content="dark"', doc)
+
+    def test_adapt_text_nested_table_keeps_island_after_td_end(self) -> None:
+        """#348: </td> must not pop a painted ancestor off the background stack."""
+        doc = build_reader_document(
+            body_html=(
+                '<div style="background-color:#1d1d1d">'
+                "<table><tr><td>cell</td></tr></table>"
+                "<p>after table</p></div>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertRegex(doc, r'<p class="post-painted">after table</p>')
+        self.assertNotRegex(doc, r'<p class="[^"]*post-on-shell[^"]*">after table</p>')
+
+    def test_adapt_text_unmarked_heading_on_color_island_is_not_on_shell(self) -> None:
+        """#348: surviving islands must not inherit shell foreground onto headings."""
+        doc = build_reader_document(
+            body_html='<div style="background-color:#a0a0a0"><h1>Headline</h1></div>',
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("post-forced-contrast", doc)
+        self.assertIn("post-painted", doc)
+        self.assertNotRegex(doc, r"<h1 class=\"[^\"]*post-on-shell")
+
+    def test_adapt_text_image_only_canvas_keeps_sender_text_color(self) -> None:
+        """#348: image-only canvases are sender islands; do not inherit shell grey."""
+        png = b"\x89PNG\r\n\x1a\n"
+        doc = build_reader_document(
+            body_html=(
+                "<style>.hero { color: #222222; }</style>"
+                '<div class="hero" style="background-image: url(cid:hero@local)">'
+                "<h1>Headline</h1></div>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+            inline_images={"hero@local": ("image/png", png)},
+        )
+        expected = base64.b64encode(png).decode("ascii")
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("post-image-canvas", doc)
+        self.assertIn("color-scheme: light", doc)
+        self.assertIn(f"url(data:image/png;base64,{expected})", doc)
+        self.assertIn("color:#222222!important", doc.replace(" ", ""))
+        self.assertNotRegex(doc, r"<h1 class=\"[^\"]*post-on-shell")
+        self.assertIn('name="color-scheme" content="dark"', doc)
+
+    def test_adapt_text_quoted_prefix_white_card_still_adapts(self) -> None:
+        """#348: white-card prefix plus quoted history must still run Adapt text."""
+        doc = build_reader_document(
+            body_html=(
+                '<div style="color:#000000;background-color:#ffffff">New reply</div>'
+                '<div id="appendonsend"></div>'
+                "<blockquote><p>Quoted history</p></blockquote>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        compact = doc.replace(" ", "")
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("background-color:transparent!important", compact)
+        self.assertIn("color:#eeeeee!important", compact)
+        self.assertIn('name="color-scheme" content="dark"', doc)
+        self.assertNotIn('name="color-scheme" content="light"', doc)
+
+    def test_adapt_text_nested_html_body_uses_shell_not_transparent(self) -> None:
+        """#348: nested html/body opposing canvases paint the shell, not UA white."""
+        doc = build_reader_document(
+            body_html=(
+                "<html><body bgcolor='#ffffff'>"
+                "<p>Newsletter copy</p>"
+                "</body></html>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        compact = doc.replace(" ", "")
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("background-color:#1e1e1e!important", compact)
+        self.assertNotIn("bgcolor=", compact.lower())
+        self.assertIn('class="post-on-shell"', doc)
+        self.assertNotIn("background-color:transparent!important", compact)
+
+    def test_adapt_text_neutralizes_white_canvas_inside_media_query(self) -> None:
+        """#348: @media wrappers still expose newsletter table canvases."""
+        doc = build_reader_document(
+            body_html=(
+                "<style>@media only screen { .card { background:#ffffff; color:#222222; } }"
+                "</style>"
+                '<table class="card"><tr><td><h1>Morning briefing</h1></td></tr></table>'
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        compact = doc.replace(" ", "")
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("background-color:transparent!important", compact)
+        self.assertIn("color:#eeeeee!important", compact)
+
+    def test_adapt_text_newsletter_white_card_joins_dark_shell(self) -> None:
+        """#348: newsletter white cards dissolve; copy remaps to the shell."""
+        doc = build_reader_document(
+            body_html=(
+                "<style>@media only screen {"
+                "body, td, p, h1 { color: #222222; }"
+                ".card { background: #ffffff; }"
+                "}</style>"
+                '<table class="card"><tr><td>'
+                "<h1>Der Morgen</h1><p>Guten Morgen,</p>"
+                "</td></tr></table>"
+            ),
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        compact = doc.replace(" ", "")
+        self.assertIn('<div class="message-body">', doc)
+        self.assertIn("Der Morgen", doc)
+        self.assertIn("Guten Morgen,", doc)
+        self.assertIn("background-color:transparent!important", compact)
+        self.assertIn("color:#eeeeee!important", compact)
+        self.assertNotIn("background-color:#ffffff!important", compact)
 
 
 class ResolveCidImagesTests(unittest.TestCase):
