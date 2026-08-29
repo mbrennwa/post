@@ -1613,11 +1613,41 @@ class HtmlForwardReplyTests(unittest.TestCase):
             "to": "Bob <bob@example.com>",
             "date_received": "2026-06-17 16:49:57",
         }
-        source = '<p style="color:#000000">Newsletter</p>'
+        source = "<p><b>Newsletter</b></p>"
         quoted = quote_html_forward(original, source)
         self.assertIn('class="post_quote"', quoted)
         self.assertIn(source, quoted)
         self.assertIn("---------- Forwarded message ---------", quoted)
+
+    def test_quote_html_forward_strips_theme_locked_black_text(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "to": "Bob <bob@example.com>",
+            "date_received": "2026-06-17 16:49:57",
+        }
+        source = '<p style="color:#000000">Newsletter</p>'
+        quoted = quote_html_forward(original, source)
+        self.assertIn('class="post_quote"', quoted)
+        self.assertIn("Newsletter", quoted)
+        self.assertNotIn("color:#000000", quoted)
+        self.assertNotIn("color: #000000", quoted)
+
+    def test_quote_html_reply_strips_outlook_black_keeps_white_card(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "date_received": "2026-08-26",
+        }
+        source = (
+            '<div style="font-size: 12pt; color: rgb(0, 0, 0);">Hello</div>'
+            '<div style="color:#000000;background:#ffffff">Card</div>'
+            '<p style="color:red">Warning</p>'
+        )
+        quoted = quote_html_reply(original, source)
+        self.assertIn('class="post_quote"', quoted)
+        self.assertIn("Hello", quoted)
+        self.assertNotIn("rgb(0, 0, 0)", quoted)
+        self.assertIn("color:#000000;background:#ffffff", quoted)
+        self.assertIn("color:red", quoted)
 
     def test_quote_html_forward_omits_bcc_from_header(self) -> None:
         original = {
@@ -1725,7 +1755,7 @@ class HtmlForwardReplyTests(unittest.TestCase):
             "to": "Bob <bob@example.com>",
             "date_received": "2026-06-17",
         }
-        source = '<p style="color:#000000">Original</p>'
+        source = "<p><b>Original</b></p>"
         quoted_plain = quote_plain_forward(original, "Plain fallback")
         body_plain = f"My note{quoted_plain}"
         html = build_outbound_html_for_compose(
@@ -1739,6 +1769,29 @@ class HtmlForwardReplyTests(unittest.TestCase):
         assert html is not None
         self.assertIn(source, html)
         self.assertIn("My note", html)
+
+    def test_unchanged_plain_quote_strips_theme_locked_black(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "to": "Bob <bob@example.com>",
+            "date_received": "2026-06-17",
+        }
+        source = '<p style="color:#000000">Original</p>'
+        quoted_plain = quote_plain_forward(original, "Plain fallback")
+        body_plain = f"My note{quoted_plain}"
+        html = build_outbound_html_for_compose(
+            body_plain=body_plain,
+            mode="forward",
+            reply_to=original,
+            quoted_html_source=source,
+            quoted_plain_expected=quoted_plain,
+        )
+        self.assertIsNotNone(html)
+        assert html is not None
+        self.assertIn("Original", html)
+        self.assertIn("My note", html)
+        self.assertNotIn("color:#000000", html)
+        self.assertNotIn("#eeeeee", html)
 
     def test_edited_plain_quote_omits_html_alternative(self) -> None:
         original = {

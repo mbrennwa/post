@@ -18,6 +18,8 @@ gi.require_version("Gio", "2.0")
 
 from gi.repository import Gio
 
+from post.reader.html import strip_theme_locked_text_colors
+
 from .subject_prefixes import strip_subject_prefixes as _strip_subject_prefixes
 
 _ADDRESS_SPLIT = re.compile(r",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)")
@@ -289,7 +291,9 @@ def quote_html_forward(original: dict[str, Any], body_html: str) -> str:
 
     header_lines = format_forward_quote_header(original).splitlines()
     header_html = "<br>\n".join(html.escape(line) for line in header_lines)
-    content = _strip_html_document_wrappers(body_html)
+    content = strip_theme_locked_text_colors(
+        _strip_html_document_wrappers(body_html)
+    )
     return (
         f"<div>{FORWARD_QUOTE_MARKER}</div>"
         f"<div>{header_html}</div>"
@@ -300,7 +304,9 @@ def quote_html_forward(original: dict[str, Any], body_html: str) -> str:
 def quote_html_reply(original: dict[str, Any], body_html: str) -> str:
     date = original.get("date_received") or original.get("date_sent") or ""
     sender = html.escape(str(original.get("from") or ""))
-    content = _strip_html_document_wrappers(body_html)
+    content = strip_theme_locked_text_colors(
+        _strip_html_document_wrappers(body_html)
+    )
     return (
         f"<div>On {html.escape(str(date))}, {sender} wrote:</div>"
         f"{_post_quote_blockquote(content)}"

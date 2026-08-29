@@ -12,7 +12,7 @@ from post.preferences import (
     MESSAGE_APPEARANCE_ADAPT_TEXT,
 )
 from post.reader import build_reader_document
-from post.reader.html import resolve_cid_images
+from post.reader.html import resolve_cid_images, strip_theme_locked_text_colors
 
 
 class BuildReaderDocumentTests(unittest.TestCase):
@@ -1302,6 +1302,41 @@ class ResolveCidImagesTests(unittest.TestCase):
         )
         self.assertIn("data:image/png;base64,", resolved)
         self.assertNotIn("cid:", resolved)
+
+
+class StripThemeLockedTextColorsTests(unittest.TestCase):
+    def test_strips_orphan_black_and_white_text(self) -> None:
+        html = (
+            '<p style="color:#000000">Black</p>'
+            '<p style="color:#ffffff">White</p>'
+            '<font color="#000000">Font</font>'
+        )
+        out = strip_theme_locked_text_colors(html)
+        self.assertIn("Black", out)
+        self.assertIn("White", out)
+        self.assertIn("Font", out)
+        self.assertNotIn("color:#000000", out)
+        self.assertNotIn("color:#ffffff", out)
+        self.assertNotIn('color="#000000"', out)
+
+    def test_keeps_black_on_white_card(self) -> None:
+        html = '<div style="color:#000000;background:#ffffff">Card</div>'
+        out = strip_theme_locked_text_colors(html)
+        self.assertIn("color:#000000", out)
+        self.assertIn("background:#ffffff", out)
+
+    def test_keeps_accent_that_contrasts_on_both_shells(self) -> None:
+        html = '<p style="color:red">Warning</p>'
+        out = strip_theme_locked_text_colors(html)
+        self.assertIn("color:red", out)
+
+    def test_keeps_other_style_properties_when_stripping_color(self) -> None:
+        html = '<div style="direction: ltr; font-size: 12pt; color: rgb(0, 0, 0);">Hi</div>'
+        out = strip_theme_locked_text_colors(html)
+        self.assertIn("Hi", out)
+        self.assertNotIn("rgb(0, 0, 0)", out)
+        self.assertRegex(out, r"direction:\s*ltr")
+        self.assertRegex(out, r"font-size:\s*12pt")
 
 
 if __name__ == "__main__":

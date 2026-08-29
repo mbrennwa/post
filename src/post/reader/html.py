@@ -1476,6 +1476,124 @@ def _strip_sender_style_blocks(body_html: str) -> str:
     return _STYLE_BLOCK.sub("", body_html)
 
 
+_COMPOSE_SHELL_DARK = "#1e1e1e"
+_COMPOSE_SHELL_LIGHT = "#ffffff"
+
+
+def _text_color_is_theme_locked(foreground: str) -> bool:
+    """True when a color fails contrast on a light or dark unpainted page."""
+    return not (
+        _colors_have_adequate_contrast(foreground, _COMPOSE_SHELL_DARK)
+        and _colors_have_adequate_contrast(foreground, _COMPOSE_SHELL_LIGHT)
+    )
+
+
+def _remove_style_declaration(
+    attrs: list[tuple[str, str | None]], name: str
+) -> list[tuple[str, str | None]]:
+    """Drop one CSS property from a ``style`` attribute, or the attr if empty."""
+    lower = name.lower()
+    updated: list[tuple[str, str | None]] = []
+    for attr_name, attr_value in attrs:
+        if attr_name.lower() != "style":
+            updated.append((attr_name, attr_value))
+            continue
+        declarations = _parse_style_declarations(attr_value or "")
+        declarations.pop(lower, None)
+        if declarations:
+            updated.append(("style", _declarations_to_style(declarations)))
+    return updated
+
+
+class _ThemeLockedTextColorStripper(HTMLParser):
+    """Remove orphan page-color text styles that break light/dark compose."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        # True when this open element or an ancestor has a painted background.
+        self._painted_stack: list[bool] = []
+        self._tag_stack: list[str] = []
+        self._parts: list[str] = []
+
+    def get_result(self) -> str:
+        return "".join(self._parts)
+
+    def _on_painted(self) -> bool:
+        return bool(self._painted_stack and self._painted_stack[-1])
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag_lower = tag.lower()
+        if tag_lower in _ADAPTATION_SKIP_TAGS:
+            self._parts.append(_format_start_tag(tag, attrs))
+            if tag_lower not in _VOID_HTML_ELEMENTS:
+                self._painted_stack.append(self._on_painted())
+                self._tag_stack.append(tag_lower)
+            return
+        attrs_dict = _attrs_list_to_dict(attrs)
+        self_painted = _element_has_meaningful_background(attrs_dict)
+        on_painted = self_painted or self._on_painted()
+        updated_attrs = attrs
+        if not on_painted:
+            text_color = _element_text_color_value(tag_lower, attrs_dict)
+            if text_color and _text_color_is_theme_locked(text_color):
+                if _style_source_has_text_color(attrs_dict.get("style", "")):
+                    updated_attrs = _remove_style_declaration(updated_attrs, "color")
+                if tag_lower == "font" and "color" in attrs_dict:
+                    updated_attrs = _remove_attr_from_attrs(updated_attrs, "color")
+                if tag_lower == "body" and "text" in attrs_dict:
+                    updated_attrs = _remove_attr_from_attrs(updated_attrs, "text")
+        self._parts.append(_format_start_tag(tag, updated_attrs))
+        if tag_lower in _VOID_HTML_ELEMENTS:
+            return
+        self._painted_stack.append(on_painted)
+        self._tag_stack.append(tag_lower)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag_lower = tag.lower()
+        if tag_lower in _VOID_HTML_ELEMENTS:
+            return
+        for index in range(len(self._tag_stack) - 1, -1, -1):
+            if self._tag_stack[index] == tag_lower:
+                del self._tag_stack[index:]
+                del self._painted_stack[index:]
+                break
+        self._parts.append(f"</{tag}>")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_data(self, data: str) -> None:
+        self._parts.append(data)
+
+    def handle_comment(self, data: str) -> None:
+        self._parts.append(f"<!--{data}-->")
+
+    def handle_decl(self, decl: str) -> None:
+        self._parts.append(f"<!{decl}>")
+
+    def handle_pi(self, data: str) -> None:
+        self._parts.append(f"<?{data}>")
+
+
+def strip_theme_locked_text_colors(body_html: str) -> str:
+    """Strip orphan near-black/near-white text colors from HTML for compose quotes.
+
+    Colors that sit on a painted sender background are kept. Colors without a
+    local canvas that fail contrast against a light *or* dark page shell are
+    removed so text inherits (readable in dark compose, safe for light MIME
+    recipients). Does not neutralize backgrounds or bake a shell foreground.
+    """
+    if not body_html:
+        return body_html
+    stripper = _ThemeLockedTextColorStripper()
+    try:
+        stripper.feed(body_html)
+        stripper.close()
+    except Exception:
+        return body_html
+    return stripper.get_result()
+
+
 def mark_adaptation_classes(
     body_html: str,
     *,
