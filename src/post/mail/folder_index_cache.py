@@ -98,6 +98,16 @@ def has_cache(account_uid: str, folder_name: str) -> bool:
     return _cache_path(account_uid, folder_name).is_file()
 
 
+def cached_account_uids() -> list[str]:
+    """Return account uids that have a folder-index directory on disk."""
+    if not _CACHE_ROOT.is_dir():
+        return []
+    try:
+        return [path.name for path in _CACHE_ROOT.iterdir() if path.is_dir()]
+    except OSError:
+        return []
+
+
 def cached_folder_names(account_uid: str) -> list[str]:
     """Return folder names stored on disk for an account (no Camel)."""
     account_dir = _CACHE_ROOT / account_uid

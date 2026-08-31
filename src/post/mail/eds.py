@@ -37,6 +37,7 @@ from . import correspondent_cache
 from . import folder_index_cache
 from . import folder_status_cache
 from . import graph_folder_counts
+from .account_cache_gc import drop_orphan_account_caches
 from .helpers import (
     message_info_to_dict,
     message_is_read_unflagged,
@@ -1098,6 +1099,7 @@ class MailService:
             )
         service = cls(registry=registry)
         service._ensure_mail_io_callbacks()
+        service._drop_orphan_account_caches()
         return service
 
     def set_password_prompt(self, callback: PasswordPromptCallback | None) -> None:
@@ -1349,6 +1351,30 @@ class MailService:
                     "Could not reconnect to evolution-source-registry."
                 )
             self.registry = registry
+        self._drop_orphan_account_caches()
+
+    def _mail_account_uids_from_registry(self) -> set[str] | None:
+        """Mail Account source uids (enabled and disabled). None if listing failed."""
+        try:
+            sources = self.registry.list_sources("Mail Account")
+        except Exception:
+            log.exception("Could not list Mail Account sources for cache GC")
+            return None
+        if sources is None:
+            return None
+        live: set[str] = set()
+        for source in sources:
+            uid = source.get_uid()
+            if uid:
+                live.add(uid)
+        return live
+
+    def _drop_orphan_account_caches(self) -> None:
+        """Delete Post caches whose EDS Mail Account source is gone (#366)."""
+        live = self._mail_account_uids_from_registry()
+        if live is None:
+            return
+        drop_orphan_account_caches(live)
 
     def list_accounts(self) -> list[MailAccount]:
         accounts: list[MailAccount] = []

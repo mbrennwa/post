@@ -114,6 +114,14 @@ class FolderIndexCacheTests(unittest.TestCase):
         names = set(folder_index_cache.cached_folder_names("acct-1"))
         self.assertEqual(names, {"INBOX", "Archive"})
 
+    def test_cached_account_uids_lists_saved_accounts(self) -> None:
+        folder_index_cache.save("acct-1", "INBOX", [{"uid": "1"}], unread=0, total=1)
+        folder_index_cache.save("acct-2", "INBOX", [{"uid": "2"}], unread=0, total=1)
+        self.assertEqual(
+            set(folder_index_cache.cached_account_uids()),
+            {"acct-1", "acct-2"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

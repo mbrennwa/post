@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +103,16 @@ def load(account_uid: str) -> list[Correspondent] | None:
     return correspondents
 
 
+def cached_account_uids() -> list[str]:
+    """Return account uids that have a correspondents directory on disk."""
+    if not _CACHE_ROOT.is_dir():
+        return []
+    try:
+        return [path.name for path in _CACHE_ROOT.iterdir() if path.is_dir()]
+    except OSError:
+        return []
+
+
 def invalidate(account_uid: str) -> None:
     path = _cache_path(account_uid)
     try:
@@ -109,6 +120,20 @@ def invalidate(account_uid: str) -> None:
     except OSError:
         log.debug(
             "Could not invalidate correspondent cache for %s",
+            account_uid,
+            exc_info=True,
+        )
+
+
+def invalidate_account(account_uid: str) -> None:
+    account_dir = _CACHE_ROOT / account_uid
+    if not account_dir.is_dir():
+        return
+    try:
+        shutil.rmtree(account_dir)
+    except OSError:
+        log.debug(
+            "Could not invalidate correspondent cache for account %s",
             account_uid,
             exc_info=True,
         )
