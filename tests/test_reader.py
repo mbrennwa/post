@@ -66,6 +66,38 @@ class BuildReaderDocumentTests(unittest.TestCase):
         self.assertNotIn("www.example.com", doc)
         self.assertNotIn('<pre class="plain-body">', doc)
 
+    def test_html_pre_body_keeps_sender_pre_and_wrap_css(self) -> None:
+        # Outlook/Exchange often wraps plain text in <pre> (#361).
+        html = (
+            '<pre style="font-family: Calibri, Arial, sans-serif; font-size: 11pt;">'
+            "Hi,\n\n"
+            "This is a normal paragraph with spaces but no hard line breaks, "
+            "long enough that it does not fit a typical reader pane width.\n"
+            "</pre>"
+        )
+        for dark in (False, True):
+            doc = build_reader_document(
+                body_html=html,
+                body_plain="Hi,\n\nThis is a normal paragraph with spaces.",
+                allow_remote=False,
+                dark=dark,
+            )
+            self.assertIn("<pre style=", doc)
+            self.assertIn("long enough that it does not fit", doc)
+            self.assertNotIn('<pre class="plain-body">', doc)
+            self.assertRegex(
+                doc,
+                r"pre\s*\{[^}]*white-space:\s*pre-wrap",
+            )
+            self.assertRegex(
+                doc,
+                r"pre\s*\{[^}]*overflow-wrap:\s*anywhere",
+            )
+            self.assertRegex(
+                doc,
+                r"pre\s*\{[^}]*max-width:\s*100%",
+            )
+
     def test_blocks_remote_images_when_disabled(self) -> None:
         html = '<p>Hi</p><img src="https://tracker.example/pixel.png">'
         doc = build_reader_document(
