@@ -8,7 +8,7 @@ Related: [#6](https://github.com/mbrennwa/post/issues/6), [offline body cache](o
 
 - **Folder lists on cold start** — when the server is unreachable, Post reads folder names from Camel's on-disk store (`dup_downsync_folders` and local folder info), not a separate Post folder list file.
 - **Message lists** — in-memory indexes and `~/.cache/post/folder-index/` disk cache; see status *Offline · showing cached list*. Heavy folders (Archive/Trash/Junk) grow via chunked background indexing (#208).
-- **Read & search** — cached bodies and headers via Camel; search filters the folder-index (see [offline-body-cache.md](offline-body-cache.md)).
+- **Read & search** — read uses cached bodies in Camel. Header search filters the folder-index (headers only). `body:` / bare-word search also needs cached MIME (see [offline-body-cache.md](offline-body-cache.md)).
 - **Compose & send** — outbound mail is queued in `~/.config/post/outbox/` and sent on reconnect.
 - **Move, archive, flag** — changes apply locally in the UI; server sync is queued in `~/.config/post/operations/` and flushed on reconnect.
 - **Drafts** — queued in `~/.config/post/draft-queue/` when offline (IMAP cannot append to Drafts until reconnect); flushed to the server Drafts folder when back online.

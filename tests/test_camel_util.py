@@ -18,6 +18,7 @@ from post.mail.camel_util import (
     folder_get_message_info,
     folder_get_uids,
     folder_get_unread_count,
+    folder_search_all_uids,
     folder_search_uids,
 )
 
@@ -221,6 +222,53 @@ class FolderSearchUidsTests(unittest.TestCase):
             )
 
         self.assertEqual(result, ["2"])
+
+    def test_empty_scope_returns_empty_without_search(self) -> None:
+        folder = mock.Mock()
+        lib = mock.Mock()
+        with mock.patch("post.mail.camel_util._get_libcamel", return_value=lib):
+            result = folder_search_uids(
+                folder,
+                "(match-all #t)",
+                [],
+            )
+        self.assertEqual(result, [])
+        lib.camel_folder_search_by_expression.assert_not_called()
+
+
+class FolderSearchAllUidsTests(unittest.TestCase):
+    def test_does_not_restrict_to_local_uid_scope(self) -> None:
+        folder = mock.Mock()
+        lib = mock.Mock()
+        lib.camel_folder_search_by_expression.return_value = ctypes.c_void_p(0x1)
+
+        with (
+            mock.patch("post.mail.camel_util._get_libcamel", return_value=lib),
+            mock.patch(
+                "post.mail.camel_util._gobject_pointer",
+                return_value=ctypes.c_void_p(1),
+            ),
+            mock.patch(
+                "post.mail.camel_util._read_ptr_array_uids",
+                return_value=["1", "99"],
+            ),
+        ):
+            result = folder_search_all_uids(folder, "(match-all #t)")
+
+        self.assertEqual(result, ["1", "99"])
+        lib.camel_folder_search_free.assert_called_once()
+
+    def test_cancelled_returns_empty(self) -> None:
+        folder = mock.Mock()
+        cancellable = mock.Mock()
+        cancellable.is_cancelled.return_value = True
+        lib = mock.Mock()
+        with mock.patch("post.mail.camel_util._get_libcamel", return_value=lib):
+            result = folder_search_all_uids(
+                folder, "(match-all #t)", cancellable=cancellable
+            )
+        self.assertEqual(result, [])
+        lib.camel_folder_search_by_expression.assert_not_called()
 
 
 class FolderSearchIntegrationTests(unittest.TestCase):

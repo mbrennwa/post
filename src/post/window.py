@@ -1767,8 +1767,9 @@ class MainWindow(Adw.ApplicationWindow):
             heading="Offline Mail",
             body=(
                 "Post can download message bodies from all folders so you can "
-                "read and search mail while offline. This uses extra disk space "
-                "and network bandwidth."
+                "read mail and search message text while offline. Header search "
+                "uses the folder index and does not need this. This uses extra "
+                "disk space and network bandwidth."
             ),
         )
         dialog.add_response("not_now", "Not Now")
