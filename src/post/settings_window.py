@@ -175,6 +175,11 @@ class SettingsDialog(Adw.PreferencesWindow):
 
         group = Adw.PreferencesGroup()
         group.set_title("Download Message Bodies")
+        group.set_description(
+            "Downloads copies of message bodies so you can read mail and "
+            "search message text while offline. Header search uses the folder "
+            "index and does not need this."
+        )
 
         self._offline_accounts = [
             account

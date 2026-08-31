@@ -358,9 +358,35 @@ class SearchAllMessagesTests(unittest.TestCase):
                 "flags": 0,
             },
         ]
-        with mock.patch.object(service, "_list_folders_unlocked", return_value=folders):
+        with (
+            mock.patch.object(service, "_list_folders_unlocked", return_value=folders),
+            mock.patch(
+                "post.mail.eds.folder_index_cache.cached_folder_names",
+                return_value=[],
+            ),
+        ):
             ordered = service._ordered_searchable_folders_unlocked("acct-1")
         self.assertEqual([folder["full_name"] for folder in ordered], ["INBOX"])
+
+    def test_ordered_searchable_folders_unions_cached_names(self) -> None:
+        service = MailService(registry=mock.Mock())
+        folders = [
+            {"full_name": "INBOX", "display_name": "Inbox", "flags": 0},
+        ]
+        with (
+            mock.patch.object(
+                service, "_list_folders_unlocked", return_value=folders
+            ),
+            mock.patch(
+                "post.mail.eds.folder_index_cache.cached_folder_names",
+                return_value=["INBOX", "Archive", ".#evolution/Junk"],
+            ),
+        ):
+            ordered = service._ordered_searchable_folders_unlocked("acct-1")
+        self.assertEqual(
+            [folder["full_name"] for folder in ordered],
+            ["INBOX", "Archive"],
+        )
 
     def test_cancelled_search_returns_empty(self) -> None:
         service = MailService(registry=mock.Mock())
@@ -515,6 +541,70 @@ class SearchAccountMessagesTests(unittest.TestCase):
             ],
             ["1"],
         )
+
+    def test_account_search_visits_disk_only_folder_missing_from_live_tree(
+        self,
+    ) -> None:
+        """Cached folder names are searched even when the live Camel tree omitted them (#365)."""
+        inbox = [
+            {
+                "uid": "1",
+                "subject": "Inbox",
+                "from": "other@example.com",
+                "sort_date": 100,
+                "flags": {"seen": True},
+            },
+        ]
+        disk_only = [
+            {
+                "uid": "99",
+                "subject": "Old list post",
+                "from": "hidden@example.net",
+                "sort_date": 50,
+                "flags": {"seen": True},
+            },
+        ]
+        service = MailService(registry=mock.Mock())
+        service._folder_indexes[("acct-1", "INBOX")] = _FolderMessageIndex(
+            messages=inbox, unread=0, total=1
+        )
+        query = parse_search_query("from: hidden")
+        assert query is not None
+
+        def fake_load(account_uid: str, folder_name: str):
+            if account_uid == "acct-1" and folder_name == "Lists/Old":
+                return (disk_only, 0, 1)
+            return None
+
+        with (
+            mock.patch.object(
+                service,
+                "get_account",
+                return_value=mock.Mock(display_label="Test"),
+            ),
+            mock.patch.object(
+                service,
+                "_list_folders_unlocked",
+                return_value=[
+                    {"full_name": "INBOX", "display_name": "Inbox", "flags": 0},
+                ],
+            ),
+            mock.patch(
+                "post.mail.eds.folder_index_cache.cached_folder_names",
+                return_value=["INBOX", "Lists/Old"],
+            ),
+            mock.patch(
+                "post.mail.eds.folder_index_cache.load",
+                side_effect=fake_load,
+            ),
+        ):
+            matched, _unread, total, _source = (
+                service._search_account_messages_unlocked("acct-1", query)
+            )
+
+        self.assertEqual(total, 1)
+        self.assertEqual([message["uid"] for message in matched], ["99"])
+        self.assertEqual(matched[0]["_search_folder"], "Lists/Old")
 
     def test_cancelled_search_returns_empty(self) -> None:
         service = MailService(registry=mock.Mock())

@@ -121,6 +121,7 @@ _HEADER_CALLS: dict[str, int] = {
 _SENTENCE_CALLS: dict[str, int] = {
     "_set_status": 0,
     "set_body": 0,
+    "set_description": 0,
 }
 
 # Gtk.Label / button targets whose set_label text uses header capitalization.

@@ -6,7 +6,14 @@ Epic: [#99](https://github.com/mbrennwa/post/issues/99)
 
 ## Settings
 
-**Settings → Offline Mail** configures per-account policy:
+**Settings → Offline** configures per-account **body** download into Camel
+(`~/.cache/evolution/`). It does **not** store bodies in the folder-index
+(`~/.cache/post/folder-index/`). Header search (`from:`, `subject:`, …) uses
+the folder-index. `body:` and bare-word search need cached MIME
+([#137](https://github.com/mbrennwa/post/issues/137),
+[#365](https://github.com/mbrennwa/post/issues/365)).
+
+Policy:
 
 | Mode | Behavior |
 |------|----------|
@@ -43,7 +50,7 @@ List and search require folder-index rows. Bodies in Camel’s cache alone are n
 
 ## Search
 
-Folder search filters the in-memory folder index. Header and flag terms match index metadata directly. Bare-word and `body:` terms load cached MIME and match human-readable body text via `searchable_body_text()`.
+Folder search filters the folder-index (headers only). Header and flag terms match index metadata directly. Bare-word and `body:` terms load cached MIME and match human-readable body text via `searchable_body_text()`. Offline body download does not put bodies into the folder-index.
 
 Limits: per-folder only; attachment content not searched; offline body matches require cached MIME.
 

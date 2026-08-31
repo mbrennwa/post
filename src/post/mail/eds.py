@@ -64,6 +64,7 @@ from .camel_util import (
     folder_get_message_info,
     folder_get_uids,
     folder_get_unread_count,
+    folder_search_all_uids,
     folder_search_uids,
     normalize_camel_uid,
 )
@@ -747,6 +748,7 @@ class MailService:
             session = {
                 "did_prepare_content_refresh": False,
                 "status_seeded": False,
+                "did_server_uid_search": False,
             }
             self._heavy_index_sessions[key] = session
         return session
@@ -3771,7 +3773,15 @@ class MailService:
             ),
             key=lambda folder: str(folder.get("full_name") or ""),
         )
-        return priority + remaining
+        ordered = priority + remaining
+        for name in folder_index_cache.cached_folder_names(account_uid):
+            if not name or name in seen:
+                continue
+            if is_post_outbox_folder(name) or is_virtual_folder(name):
+                continue
+            seen.add(name)
+            ordered.append({"full_name": name, "display_name": name})
+        return ordered
 
     def _prepare_single_folder_search_unlocked(
         self,
@@ -4455,6 +4465,10 @@ class MailService:
                     )
                     self._store_folder_index(account_uid, folder_name, existing)
                     source = "disk_cache"
+            if existing is not None:
+                existing, source = self._union_heavy_index_with_disk_unlocked(
+                    account_uid, folder_name, existing, source
+                )
             if existing is not None and existing.messages:
                 log.debug(
                     "Heavy-folder skip sync rebuild for %s/%s "
@@ -4497,6 +4511,10 @@ class MailService:
 
         index = self._folder_indexes.get(key)
         if index is not None:
+            if heavy:
+                return self._union_heavy_index_with_disk_unlocked(
+                    account_uid, folder_name, index, "memory"
+                )
             return index, "memory"
 
         cached = folder_index_cache.load(account_uid, folder_name)
@@ -4565,6 +4583,31 @@ class MailService:
                         grow_only=True,
                     )
         return index, "local"
+
+    def _union_heavy_index_with_disk_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        existing: _FolderMessageIndex,
+        source: FolderIndexSource,
+    ) -> tuple[_FolderMessageIndex, FolderIndexSource]:
+        """Keep disk-only headers in RAM so the list can scroll to them (#365)."""
+        cached = folder_index_cache.load(account_uid, folder_name)
+        if cached is None or not cached[0]:
+            return existing, source
+        disk_messages, disk_unread, disk_total = cached
+        unioned = union_folder_index_messages(
+            list(existing.messages), list(disk_messages)
+        )
+        if len(unioned) <= len(existing.messages):
+            return existing, source
+        index = _FolderMessageIndex(
+            messages=sort_messages_newest_first(unioned),
+            unread=max(existing.unread, disk_unread),
+            total=max(existing.total, disk_total, len(unioned)),
+        )
+        self._store_folder_index(account_uid, folder_name, index)
+        return index, "disk_cache"
 
     def _is_missing_folder_error(self, exc: GLib.Error) -> bool:
         return exc.matches(Camel.store_error_quark(), Camel.StoreError.NO_FOLDER)
@@ -5247,6 +5290,60 @@ class MailService:
             on_progress=on_progress,
         )
 
+    def _heavy_folder_imap_extra_uids(
+        self,
+        folder: Any,
+        account_uid: str,
+        folder_name: str,
+        by_uid: dict[str, dict],
+        *,
+        known_total: int,
+        session: dict[str, Any],
+        already_tried: bool,
+    ) -> list[str]:
+        """IMAP UID SEARCH for headers Camel has not summarized yet (#365).
+
+        Microsoft 365 / EWS keep using Graph ``refresh_info``. One attempt per
+        folder-open session. Returns only UIDs missing from the grow-only index.
+        """
+        if already_tried or session.get("did_server_uid_search"):
+            return []
+        backend = (self._backend_for_account(account_uid) or "").lower()
+        if backend not in {"imap", "imapx"}:
+            return []
+        camel_n = len(folder_get_uids(folder))
+        if not _heavy_folder_camel_behind_server(camel_n, known_total):
+            cached = folder_status_cache.load(account_uid, folder_name)
+            status_total = cached[1] if cached is not None else known_total
+            if not _heavy_folder_camel_behind_server(camel_n, status_total):
+                if folder_status_cache.index_caught_up(
+                    len(by_uid), status_total, folder_name
+                ):
+                    return []
+                if status_total <= 0 or camel_n >= status_total:
+                    return []
+        try:
+            session["did_server_uid_search"] = True
+            found = folder_search_all_uids(
+                folder,
+                "(match-all #t)",
+            )
+        except Exception:
+            session["did_server_uid_search"] = True
+            log.debug(
+                "Heavy-folder IMAP SEARCH failed for %s/%s",
+                account_uid,
+                folder_name,
+                exc_info=True,
+            )
+            return []
+        extra = [
+            str(uid)
+            for uid in found
+            if uid and str(uid) not in by_uid
+        ]
+        return extra
+
     def _continue_heavy_folder_index_unlocked(
         self,
         account_uid: str,
@@ -5298,8 +5395,18 @@ class MailService:
         with self._lock:
             memory = self._folder_indexes.get(key)
 
-        if memory is not None:
-            known_messages = list(memory.messages)
+        memory_messages = list(memory.messages) if memory is not None else []
+        disk_messages = (
+            list(existing_disk[0]) if existing_disk is not None else []
+        )
+        if memory is not None and existing_disk is not None:
+            known_messages = union_folder_index_messages(
+                memory_messages, disk_messages
+            )
+            unread = max(memory.unread, existing_disk[1])
+            total = max(memory.total, existing_disk[2], len(known_messages))
+        elif memory is not None:
+            known_messages = memory_messages
             unread = memory.unread
             total = memory.total
         elif existing_disk is not None:
@@ -5347,10 +5454,14 @@ class MailService:
         prev_indexed = int(state.get("indexed_after_refresh") or 0)
         status_seeded = bool(state.get("status_seeded"))
         did_prepare = bool(state.get("did_prepare_content_refresh"))
+        did_server_uid_search = bool(state.get("did_server_uid_search"))
         session = self._heavy_index_session(account_uid, folder_name)
         status_seeded = status_seeded or bool(session.get("status_seeded"))
         did_prepare = did_prepare or bool(
             session.get("did_prepare_content_refresh")
+        )
+        did_server_uid_search = did_server_uid_search or bool(
+            session.get("did_server_uid_search")
         )
         uids: list[str] | None = state.get("uids")
         if uids is not None and not isinstance(uids, list):
@@ -5428,6 +5539,7 @@ class MailService:
                             "indexed_after_refresh": prev_indexed,
                             "status_seeded": status_seeded,
                             "did_prepare_content_refresh": did_prepare,
+                            "did_server_uid_search": did_server_uid_search,
                             "uids": uids,
                             "uid_offset": uid_offset,
                             "yield_for_interactive": True,
@@ -5441,28 +5553,6 @@ class MailService:
                     all_uids = folder_get_uids(folder)
                     uids = [u for u in all_uids if str(u) not in by_uid]
                     uid_offset = 0
-                    if not uids:
-                        # Local headers already indexed — fetch more from server.
-                        return HeavyFolderIndexProgress(
-                            messages=known_messages,
-                            unread=known_unread,
-                            total=max(known_total, len(known_messages)),
-                            done=False,
-                            cursor=_cursor_with_pipeline(
-                                {
-                                    "refresh_done": False,
-                                    "pending_server_refresh": True,
-                                    "refresh_attempts": refresh_attempts,
-                                    "refresh_stalls": refresh_stalls,
-                                    "uid_count_after_refresh": len(all_uids),
-                                    "indexed_after_refresh": len(
-                                        known_messages
-                                    ),
-                                    "status_seeded": status_seeded,
-                                    "did_prepare_content_refresh": did_prepare,
-                                }
-                            ),
-                        )
             else:
                 # Phase 2: pull one or more Graph pages, materialize only NEW UIDs.
                 # Re-scanning the whole folder after every +25 page was O(n²) (#208).
@@ -6234,6 +6324,34 @@ class MailService:
 
         if uids is None:
             uids = []
+        if (
+            not uids
+            and allow_refresh
+            and not local_only
+        ):
+            extra_uids = self._heavy_folder_imap_extra_uids(
+                folder,
+                account_uid,
+                folder_name,
+                by_uid,
+                known_total=max(known_total, total, len(by_uid)),
+                session=session,
+                already_tried=did_server_uid_search,
+            )
+            did_server_uid_search = did_server_uid_search or bool(
+                session.get("did_server_uid_search")
+            )
+            if extra_uids:
+                uids = extra_uids
+                uid_offset = 0
+                log.info(
+                    "Heavy-folder IMAP SEARCH queued %d extra UIDs for "
+                    "%s/%s (indexed=%d)",
+                    len(extra_uids),
+                    account_uid,
+                    folder_name,
+                    len(by_uid),
+                )
         if not uids:
             # No pending UIDs to materialize — persist and decide whether to
             # refresh again.
@@ -6385,6 +6503,7 @@ class MailService:
                             "indexed_after_refresh": len(messages),
                             "status_seeded": status_seeded,
                             "did_prepare_content_refresh": did_prepare,
+                            "did_server_uid_search": did_server_uid_search,
                             "force_prepare_incomplete_delta": force_incomplete,
                             "incomplete_delta": force_incomplete or behind_status,
                         }
@@ -6530,6 +6649,7 @@ class MailService:
                 "indexed_after_refresh": prev_indexed,
                 "status_seeded": status_seeded,
                 "did_prepare_content_refresh": did_prepare,
+                "did_server_uid_search": did_server_uid_search,
             }
             base.update(extra)
             return _cursor_with_pipeline(base)
@@ -6542,12 +6662,40 @@ class MailService:
                 uid_offset=uid_offset,
             )
         elif allow_refresh and not local_only:
-            # Local/new UIDs indexed — fetch more server headers (#208).
-            next_cursor = _cursor_base(
-                refresh_done=False,
-                pending_server_refresh=True,
-                indexed_after_refresh=len(messages),
+            extra_uids = self._heavy_folder_imap_extra_uids(
+                folder,
+                account_uid,
+                folder_name,
+                by_uid,
+                known_total=max(known_total, total, len(messages)),
+                session=session,
+                already_tried=did_server_uid_search,
             )
+            did_server_uid_search = did_server_uid_search or bool(
+                session.get("did_server_uid_search")
+            )
+            if extra_uids:
+                log.info(
+                    "Heavy-folder IMAP SEARCH queued %d extra UIDs for "
+                    "%s/%s (indexed=%d)",
+                    len(extra_uids),
+                    account_uid,
+                    folder_name,
+                    len(messages),
+                )
+                next_cursor = _cursor_base(
+                    refresh_done=False,
+                    pending_server_refresh=False,
+                    uids=extra_uids,
+                    uid_offset=0,
+                )
+            else:
+                # Local/new UIDs indexed — fetch more server headers (#208).
+                next_cursor = _cursor_base(
+                    refresh_done=False,
+                    pending_server_refresh=True,
+                    indexed_after_refresh=len(messages),
+                )
         else:
             done = True
 

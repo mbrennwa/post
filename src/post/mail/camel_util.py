@@ -324,6 +324,44 @@ def folder_search_uids(
     return aligned
 
 
+def folder_search_all_uids(
+    folder: Any,
+    expression: str,
+    *,
+    cancellable: Any | None = None,
+) -> list[str]:
+    """Run Camel folder search without restricting to a local UID scope (#365).
+
+    Used to discover IMAP UIDs that are not yet in the local summary so the
+    heavy-folder indexer can fetch headers toward STATUS. Returns an empty
+    list when cancelled or when Camel yields nothing.
+    """
+    if cancellable is not None and cancellable.is_cancelled():
+        return []
+    lib = _get_libcamel()
+    folder_ptr = _gobject_pointer(folder)
+    cancel_ptr = (
+        _gobject_pointer(cancellable)
+        if cancellable is not None
+        else ctypes.c_void_p()
+    )
+    array = lib.camel_folder_search_by_expression(
+        folder_ptr,
+        expression.encode("utf-8"),
+        None,
+        cancel_ptr,
+    )
+    if cancellable is not None and cancellable.is_cancelled():
+        if array:
+            lib.camel_folder_search_free(folder_ptr, array)
+        return []
+    try:
+        return _read_ptr_array_uids(array)
+    finally:
+        if array:
+            lib.camel_folder_search_free(folder_ptr, array)
+
+
 def normalize_camel_uid(value: Any) -> str | None:
     """Return a stripped Camel UID string, or None if empty/invalid.
 
