@@ -4597,10 +4597,11 @@ class MainWindow(Adw.ApplicationWindow):
         account_uid: str,
         folder_name: str,
     ) -> bool:
-        """True when header-only search can use the current folder disk index.
+        """True when header-only search can use the folder-index (RAM ∪ disk).
 
         Account / All Mail scopes must use ``_start_mail_search`` so the
-        selected scope is respected (#173).
+        selected scope is respected (#173). Search unions grow-only disk
+        with RAM so a smaller Camel summary cannot hide indexed headers (#363).
         """
         return (
             search_query is not None
@@ -5169,30 +5170,26 @@ class MainWindow(Adw.ApplicationWindow):
                         load_id=load_id,
                         path="disk_cache_headers",
                     )
-                    snapshot = self._mail.get_folder_index_snapshot(
-                        account_uid, folder_name
-                    )
-                    if snapshot is None:
-                        try:
-                            snapshot = load_folder_index_cache(
-                                account_uid, folder_name
-                            )
-                        except Exception as exc:
-                            schedule_on_gtk_main(
-                                self._on_messages_loaded,
-                                load_id,
-                                account_uid,
-                                folder_name,
-                                None,
-                                -1,
-                                -1,
-                                initial_source,
-                                False,
-                                exc,
-                            )
-                            return
-                        if load_id != self._messages_load_generation:
-                            return
+                    try:
+                        snapshot = self._mail.get_folder_index_for_search(
+                            account_uid, folder_name
+                        )
+                    except Exception as exc:
+                        schedule_on_gtk_main(
+                            self._on_messages_loaded,
+                            load_id,
+                            account_uid,
+                            folder_name,
+                            None,
+                            -1,
+                            -1,
+                            initial_source,
+                            False,
+                            exc,
+                        )
+                        return
+                    if load_id != self._messages_load_generation:
+                        return
                     schedule_on_gtk_main(
                         self._begin_chunked_cached_header_search,
                         load_id,

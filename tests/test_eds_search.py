@@ -15,7 +15,7 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Gio
 
 from post.mail.eds import MailService, _FolderMessageIndex
-from post.mail.search import MessageSearchQuery, SearchTerm
+from post.mail.search import MessageSearchQuery, SearchTerm, parse_search_query
 
 
 class FolderSearchUidTests(unittest.TestCase):
@@ -168,6 +168,71 @@ class SearchFolderMessagesTests(unittest.TestCase):
 
         _args, kwargs = filter_query.call_args
         self.assertIs(kwargs.get("on_matches"), on_matches)
+
+    def test_header_search_unions_disk_when_memory_is_smaller(self) -> None:
+        ram = [
+            {
+                "uid": "1",
+                "subject": "Hello",
+                "from": "other@example.com",
+                "flags": {"seen": True},
+            },
+        ]
+        disk = ram + [
+            {
+                "uid": "333",
+                "subject": "Order confirmation",
+                "from": "Sender <orders@example.net>",
+                "flags": {"seen": True},
+            },
+        ]
+        service, _folder = self._service_with_index(ram)
+        query = parse_search_query("from: sender")
+        assert query is not None
+
+        with mock.patch(
+            "post.mail.eds.folder_index_cache.load",
+            return_value=(disk, 0, len(disk)),
+        ):
+            matched, _unread, total, source = (
+                service._search_folder_messages_unlocked(
+                    "acct-1",
+                    "INBOX",
+                    query,
+                    sync=False,
+                )
+            )
+
+        self.assertEqual([message["uid"] for message in matched], ["333"])
+        self.assertEqual(total, 1)
+        self.assertEqual(source, "disk_cache")
+        self.assertEqual(
+            [message["uid"] for message in service._folder_indexes[("acct-1", "INBOX")].messages],
+            ["1"],
+        )
+
+    def test_get_folder_index_for_search_does_not_store_union(self) -> None:
+        ram = [{"uid": "1", "from": "a@b.c", "flags": {"seen": True}}]
+        disk = [
+            {"uid": "1", "from": "a@b.c", "flags": {"seen": True}},
+            {"uid": "2", "from": "b@c.d", "flags": {"seen": True}},
+        ]
+        service, _folder = self._service_with_index(ram)
+
+        with mock.patch(
+            "post.mail.eds.folder_index_cache.load",
+            return_value=(disk, 0, 2),
+        ):
+            snapshot = service.get_folder_index_for_search("acct-1", "INBOX")
+
+        assert snapshot is not None
+        messages, _unread, total = snapshot
+        self.assertEqual({message["uid"] for message in messages}, {"1", "2"})
+        self.assertEqual(total, 2)
+        self.assertEqual(
+            [message["uid"] for message in service._folder_indexes[("acct-1", "INBOX")].messages],
+            ["1"],
+        )
 
     def test_get_folder_index_snapshot_returns_memory_index(self) -> None:
         messages = [
@@ -387,6 +452,69 @@ class SearchAccountMessagesTests(unittest.TestCase):
         self.assertEqual(matched[0]["_search_account_uid"], "acct-1")
         self.assertEqual(matched[0]["_search_folder"], "INBOX")
         self.assertEqual(matched[1]["_search_folder"], "Sent")
+
+    def test_account_search_unions_disk_when_memory_is_smaller(self) -> None:
+        ram = [
+            {
+                "uid": "1",
+                "subject": "Hello",
+                "from": "other@example.com",
+                "sort_date": 1,
+                "flags": {"seen": True},
+            },
+        ]
+        disk = ram + [
+            {
+                "uid": "333",
+                "subject": "Order confirmation",
+                "from": "Sender <orders@example.net>",
+                "sort_date": 2,
+                "flags": {"seen": True},
+            },
+        ]
+        service = MailService(registry=mock.Mock())
+        service._folder_indexes[("acct-1", "[Google Mail]/All Mail")] = (
+            _FolderMessageIndex(messages=ram, unread=0, total=1)
+        )
+        query = parse_search_query("from: sender")
+        assert query is not None
+
+        with (
+            mock.patch.object(
+                service,
+                "get_account",
+                return_value=mock.Mock(display_label="Gmail"),
+            ),
+            mock.patch.object(
+                service,
+                "_ordered_searchable_folders_unlocked",
+                return_value=[
+                    {
+                        "full_name": "[Google Mail]/All Mail",
+                        "display_name": "All Mail",
+                    }
+                ],
+            ),
+            mock.patch(
+                "post.mail.eds.folder_index_cache.load",
+                return_value=(disk, 0, len(disk)),
+            ),
+        ):
+            matched, _unread, total, _source = (
+                service._search_account_messages_unlocked("acct-1", query)
+            )
+
+        self.assertEqual([message["uid"] for message in matched], ["333"])
+        self.assertEqual(total, 1)
+        self.assertEqual(
+            [
+                message["uid"]
+                for message in service._folder_indexes[
+                    ("acct-1", "[Google Mail]/All Mail")
+                ].messages
+            ],
+            ["1"],
+        )
 
     def test_cancelled_search_returns_empty(self) -> None:
         service = MailService(registry=mock.Mock())

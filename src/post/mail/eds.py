@@ -158,6 +158,7 @@ from .message_list_state import (
     is_heavy_folder_name,
     is_trash_or_junk_folder_name,
     prune_stale_folder_index_uids,
+    union_folder_index_messages,
     upsert_folder_index_by_identity,
 )
 from .offline_settings import apply_offline_settings_to_store, apply_offline_sync_to_folder
@@ -1513,6 +1514,62 @@ class MailService:
         return self._get_folder_index_snapshot_unlocked(
             account_uid, folder_name
         )
+
+    def get_folder_index_for_search(
+        self,
+        account_uid: str,
+        folder_name: str,
+    ) -> tuple[list[dict], int, int] | None:
+        """Return RAM ∪ disk folder-index rows for search (#363).
+
+        Does not replace the in-memory list index.
+        """
+        prepared = self._folder_index_for_search_unlocked(
+            account_uid, folder_name
+        )
+        if prepared is None:
+            return None
+        messages, unread, total, _source = prepared
+        return messages, unread, total
+
+    def _folder_index_for_search_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+    ) -> tuple[list[dict], int, int, FolderIndexSource] | None:
+        memory_messages: list[dict] | None = None
+        memory_unread = 0
+        memory_total = 0
+        with self._lock:
+            index = self._folder_indexes.get((account_uid, folder_name))
+            if index is not None:
+                memory_messages = list(index.messages)
+                memory_unread = index.unread
+                memory_total = index.total
+        cached = folder_index_cache.load(account_uid, folder_name)
+        if cached is None:
+            if memory_messages is None:
+                return None
+            return memory_messages, memory_unread, memory_total, "memory"
+        disk_messages, disk_unread, disk_total = cached
+        if not memory_messages:
+            return list(disk_messages), disk_unread, disk_total, "disk_cache"
+        unioned = union_folder_index_messages(memory_messages, disk_messages)
+        if len(unioned) != len(memory_messages):
+            search_trace(
+                "search_index_union_disk",
+                account=account_uid,
+                folder=folder_name,
+                memory=len(memory_messages),
+                disk=len(disk_messages),
+                union=len(unioned),
+            )
+        unread = max(memory_unread, disk_unread)
+        total = max(memory_total, disk_total, len(unioned))
+        source: FolderIndexSource = (
+            "disk_cache" if len(unioned) > len(memory_messages) else "memory"
+        )
+        return unioned, unread, total, source
 
     def _get_folder_index_snapshot_unlocked(
         self,
@@ -3696,23 +3753,24 @@ class MailService:
         folder_name: str,
         query: MessageSearchQuery,
     ) -> tuple[list[dict], int, FolderIndexSource, Any | None, bool]:
-        with self._lock:
-            key = (account_uid, folder_name)
-            index = self._folder_indexes.get(key)
-            if index is None:
-                search_trace(
-                    "search_index_load",
-                    account=account_uid,
-                    folder=folder_name,
-                    source="missing_memory",
-                )
+        prepared = self._folder_index_for_search_unlocked(
+            account_uid, folder_name
+        )
+        if prepared is not None:
+            messages, unread, _total, source = prepared
+        else:
+            search_trace(
+                "search_index_load",
+                account=account_uid,
+                folder=folder_name,
+                source="missing_memory",
+            )
+            with self._lock:
                 index, source = self._get_folder_index_unlocked(
                     account_uid, folder_name, sync=False
                 )
-            else:
-                source = "memory"
-            messages = list(index.messages)
-            unread = index.unread
+                messages = list(index.messages)
+                unread = index.unread
 
         needs_body = query_requires_body_scan(query)
         folder = (
