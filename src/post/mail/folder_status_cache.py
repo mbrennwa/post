@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 
 from post.mail.message_list_state import is_trash_or_junk_folder_name
@@ -66,6 +67,30 @@ def load(account_uid: str, folder_name: str) -> tuple[int, int] | None:
     if total < 0:
         return None
     return unread, total
+
+
+def cached_account_uids() -> list[str]:
+    """Return account uids that have a folder-status directory on disk."""
+    if not _CACHE_ROOT.is_dir():
+        return []
+    try:
+        return [path.name for path in _CACHE_ROOT.iterdir() if path.is_dir()]
+    except OSError:
+        return []
+
+
+def invalidate_account(account_uid: str) -> None:
+    account_dir = _CACHE_ROOT / account_uid
+    if not account_dir.is_dir():
+        return
+    try:
+        shutil.rmtree(account_dir)
+    except OSError:
+        log.debug(
+            "Could not invalidate folder STATUS cache for account %s",
+            account_uid,
+            exc_info=True,
+        )
 
 
 def clear(account_uid: str, folder_name: str) -> None:

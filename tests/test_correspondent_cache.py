@@ -61,6 +61,28 @@ class CorrespondentCacheTests(unittest.TestCase):
         correspondent_cache.invalidate("acct-1")
         self.assertIsNone(correspondent_cache.load("acct-1"))
 
+    def test_invalidate_account_removes_directory(self) -> None:
+        items = [
+            Correspondent(
+                display="Alice <alice@example.com>",
+                email="alice@example.com",
+                name="Alice",
+                last_seen=1,
+            )
+        ]
+        correspondent_cache.save("acct-1", items)
+        correspondent_cache.save("acct-2", items)
+        self.assertEqual(
+            set(correspondent_cache.cached_account_uids()),
+            {"acct-1", "acct-2"},
+        )
+        correspondent_cache.invalidate_account("acct-1")
+        self.assertIsNone(correspondent_cache.load("acct-1"))
+        self.assertEqual(correspondent_cache.load("acct-2"), items)
+        self.assertFalse(
+            (Path(self._tmpdir.name) / "acct-1").exists()
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

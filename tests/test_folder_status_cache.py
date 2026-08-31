@@ -203,6 +203,24 @@ class FolderStatusCacheTests(unittest.TestCase):
             folder_status_cache.status_total_is_trusted("Archive", 28177)
         )
 
+    def test_invalidate_account_removes_status_dir(self) -> None:
+        folder_status_cache.observe(
+            "acct-1", "Archive", 3803, 28177, trusted=True
+        )
+        folder_status_cache.observe(
+            "acct-2", "Archive", 3803, 28177, trusted=True
+        )
+        self.assertEqual(
+            set(folder_status_cache.cached_account_uids()),
+            {"acct-1", "acct-2"},
+        )
+        folder_status_cache.invalidate_account("acct-1")
+        self.assertIsNone(folder_status_cache.load("acct-1", "Archive"))
+        self.assertEqual(
+            folder_status_cache.load("acct-2", "Archive"),
+            (3803, 28177),
+        )
+
 
 class GraphFolderCountsTests(unittest.TestCase):
     def test_well_known_ids(self) -> None:
