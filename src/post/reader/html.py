@@ -147,6 +147,11 @@ body {
   color: #1e1e1e;
   background: #ffffff;
 }
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
 pre.plain-body {
   white-space: pre-wrap;
   font-family: inherit;
@@ -184,6 +189,11 @@ body {
   overflow-wrap: anywhere;
   color: #eeeeee;
   background: #1e1e1e;
+}
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 100%;
 }
 pre.plain-body {
   white-space: pre-wrap;
