@@ -402,6 +402,47 @@ def normalize_folder_index_by_uid(
     return by_uid
 
 
+def union_folder_index_messages(
+    primary: list[dict[str, Any]],
+    extra: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Union ``extra`` into ``primary`` by identity without shrinking (#363).
+
+    ``primary`` wins on RestId remaps (live Camel / RAM UIDs). Rows that exist
+    only in ``extra`` (grow-only disk) are kept. Does not mutate the inputs.
+    """
+    if not extra:
+        return list(primary)
+    if not primary:
+        return list(extra)
+    prefer_uids = {
+        str(message.get("uid") or "")
+        for message in primary
+        if message.get("uid")
+    }
+    by_uid: dict[str, dict[str, Any]] = {}
+    by_identity: dict[str, str] = {}
+    for message in primary:
+        if not isinstance(message, dict):
+            continue
+        upsert_folder_index_by_identity(
+            by_uid,
+            message,
+            prefer_uids=prefer_uids,
+            by_identity=by_identity,
+        )
+    for message in extra:
+        if not isinstance(message, dict):
+            continue
+        upsert_folder_index_by_identity(
+            by_uid,
+            message,
+            prefer_uids=prefer_uids,
+            by_identity=by_identity,
+        )
+    return list(by_uid.values())
+
+
 def prune_stale_folder_index_uids(
     by_uid: dict[str, dict[str, Any]],
     camel_uids: set[str],

@@ -560,5 +560,49 @@ class FolderIndexIdentityUpsertTests(unittest.TestCase):
         self.assertNotIn("uid-dup", by_uid)
 
 
+class UnionFolderIndexMessagesTests(unittest.TestCase):
+    def test_keeps_extra_only_rows(self) -> None:
+        from post.mail.message_list_state import union_folder_index_messages
+
+        primary = [{"uid": "1", "from": "a@b.c", "subject": "Hi"}]
+        extra = [
+            {"uid": "1", "from": "a@b.c", "subject": "Hi"},
+            {"uid": "333", "from": "Sender <mail@example.net>", "subject": "Order"},
+        ]
+        unioned = union_folder_index_messages(primary, extra)
+        self.assertEqual({row["uid"] for row in unioned}, {"1", "333"})
+
+    def test_keeps_primary_only_rows(self) -> None:
+        from post.mail.message_list_state import union_folder_index_messages
+
+        primary = [
+            {"uid": "new", "from": "a@b.c", "subject": "Today"},
+            {"uid": "1", "from": "a@b.c", "subject": "Hi"},
+        ]
+        extra = [{"uid": "1", "from": "a@b.c", "subject": "Hi"}]
+        unioned = union_folder_index_messages(primary, extra)
+        self.assertEqual({row["uid"] for row in unioned}, {"new", "1"})
+
+    def test_primary_wins_restid_remap(self) -> None:
+        from post.mail.message_list_state import union_folder_index_messages
+
+        primary = [
+            {
+                "uid": "live-uid",
+                "message_id": "<msg@example.com>",
+                "subject": "Hello",
+            }
+        ]
+        extra = [
+            {
+                "uid": "stale-uid",
+                "message_id": "<msg@example.com>",
+                "subject": "Hello",
+            }
+        ]
+        unioned = union_folder_index_messages(primary, extra)
+        self.assertEqual([row["uid"] for row in unioned], ["live-uid"])
+
+
 if __name__ == "__main__":
     unittest.main()
