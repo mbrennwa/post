@@ -293,25 +293,121 @@ class ReadMessageSignInTests(unittest.TestCase):
 
 
 class ReadMessageGoaUnavailableTests(unittest.TestCase):
+    def _goa_account(self, service: object) -> None:
+        source = MagicMock()
+        source.has_extension.return_value = True
+        service.registry.ref_source.return_value = source
+
+    def _read_with_mocked_mime(
+        self,
+        service,
+        *,
+        get_mime_mock: MagicMock,
+        get_store_mock: MagicMock,
+        mark_seen: bool = True,
+    ) -> dict:
+        folder = MagicMock()
+        info = MagicMock()
+        info.get_flags.return_value = 0
+        folder.get_message_info.return_value = info
+        folder.get_unread_message_count.return_value = 0
+        folder.get_message_count.return_value = 1
+        store = MagicMock()
+        store.get_folder_sync.return_value = folder
+        get_store_mock.return_value = store
+        mime = MagicMock()
+        mime.get_message_id.return_value = None
+        mime.get_header.return_value = None
+        get_mime_mock.return_value = mime
+        with patch("post.mail.helpers.message_info_to_dict", return_value={"uid": "42"}):
+            with patch(
+                "post.mail.helpers.extract_message_bodies",
+                return_value={"plain": "Hello", "html": None},
+            ):
+                with patch("post.mail.helpers.extract_attachments", return_value=[]):
+                    with patch(
+                        "post.mail.helpers.extract_inline_images", return_value=[]
+                    ):
+                        return service._read_message_unlocked(
+                            "acct-1",
+                            "INBOX",
+                            "42",
+                            mark_seen=mark_seen,
+                        )
+
     @patch("post.mail.eds.ensure_goa_credentials", return_value=False)
+    @patch("post.mail.eds.MailService._mark_message_seen_unlocked")
+    @patch("post.mail.eds.MailService._get_message_mime_sync")
     @patch("post.mail.eds.MailService._get_store_unlocked")
-    def test_goa_unavailable_sets_health_and_raises(
+    def test_goa_unavailable_cache_hit_returns_body(
         self,
         get_store_mock: MagicMock,
+        get_mime_mock: MagicMock,
+        mark_seen_mock: MagicMock,
         ensure_goa_mock: MagicMock,
     ) -> None:
         from post.mail.eds import MailService
 
         service = MailService(registry=MagicMock())
-        source = MagicMock()
-        source.has_extension.return_value = True
-        service.registry.ref_source.return_value = source
+        self._goa_account(service)
+        mark_seen_mock.return_value = (0, 1)
 
-        with self.assertRaises(RuntimeError):
-            service._read_message_unlocked("acct-1", "INBOX", "42")
+        result = self._read_with_mocked_mime(
+            service,
+            get_mime_mock=get_mime_mock,
+            get_store_mock=get_store_mock,
+        )
 
         ensure_goa_mock.assert_called_once()
-        get_store_mock.assert_not_called()
+        get_store_mock.assert_called_once()
+        self.assertFalse(get_store_mock.call_args.kwargs.get("allow_online", True))
+        self.assertFalse(get_mime_mock.call_args.kwargs.get("allow_network", True))
+        self.assertEqual(result["body_plain"], "Hello")
+        self.assertTrue((result.get("flags") or {}).get("seen"))
+        mark_seen_mock.assert_called_once()
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+    @patch("post.mail.eds.ensure_goa_credentials", return_value=False)
+    @patch("post.mail.eds.MailService._mark_message_seen_unlocked")
+    @patch("post.mail.eds.MailService._get_message_mime_sync")
+    @patch("post.mail.eds.MailService._get_store_unlocked")
+    def test_goa_unavailable_cache_miss_leaves_unread(
+        self,
+        get_store_mock: MagicMock,
+        get_mime_mock: MagicMock,
+        mark_seen_mock: MagicMock,
+        ensure_goa_mock: MagicMock,
+    ) -> None:
+        from post.mail.eds import (
+            MailService,
+            MessageNotAvailableError,
+            MessageUnavailableReason,
+        )
+
+        service = MailService(registry=MagicMock())
+        self._goa_account(service)
+        folder = MagicMock()
+        info = MagicMock()
+        info.get_flags.return_value = 0
+        folder.get_message_info.return_value = info
+        store = MagicMock()
+        store.get_folder_sync.return_value = folder
+        get_store_mock.return_value = store
+        get_mime_mock.side_effect = MessageNotAvailableError(
+            "42",
+            "INBOX",
+            reason=MessageUnavailableReason.NOT_CACHED_SIGN_IN,
+        )
+
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._read_message_unlocked("acct-1", "INBOX", "42")
+
+        self.assertEqual(
+            ctx.exception.reason, MessageUnavailableReason.NOT_CACHED_SIGN_IN
+        )
+        mark_seen_mock.assert_not_called()
+        get_store_mock.assert_called_once()
+        self.assertFalse(get_mime_mock.call_args.kwargs.get("allow_network", True))
         self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
 
 

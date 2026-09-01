@@ -63,6 +63,47 @@ class ServiceLockReleaseTests(unittest.TestCase):
         self.assertEqual(lock_held_during_sync, [False])
         self.assertIs(service._stores["acct-1"], store)
 
+    def test_get_store_local_only_skips_credentials_and_online(self) -> None:
+        service = MailService(registry=mock.Mock())
+        store = mock.Mock()
+        store.get_connection_status.return_value = mock.Mock()
+        service._stores = {}
+
+        source = mock.Mock()
+        mail_ext = mock.Mock()
+        mail_ext.get_backend_name.return_value = "microsoft365"
+        source.get_extension.return_value = mail_ext
+        source.camel_configure_service = mock.Mock()
+        service.registry.ref_source.return_value = source
+
+        session = mock.Mock()
+        session.add_service.return_value = store
+        service._ensure_session = mock.Mock(return_value=session)
+        service._prepare_account_credentials_unlocked = mock.Mock()
+        service._configure_store_settings_unlocked = mock.Mock()
+        service._sync_store_online_state_unlocked = mock.Mock()
+        service._apply_local_only_store_state_unlocked = mock.Mock()
+
+        with service._lock:
+            result = service._get_store_unlocked("acct-1", allow_online=False)
+
+        self.assertIs(result, store)
+        service._prepare_account_credentials_unlocked.assert_not_called()
+        service._sync_store_online_state_unlocked.assert_not_called()
+        service._apply_local_only_store_state_unlocked.assert_called_once()
+
+    def test_apply_local_only_sets_offline_store_online_false(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        service = MailService(registry=mock.Mock())
+        store = mock.Mock(spec=Camel.OfflineStore)
+        store.set_online_sync = mock.Mock()
+        service._apply_local_only_store_state_unlocked(store, "acct-1")
+        store.set_online_sync.assert_called_once_with(False, None)
+
     def test_preempt_background_work_cancels_folder_list(self) -> None:
         service = MailService(registry=mock.Mock())
         service.cancel_folder_search = mock.Mock()

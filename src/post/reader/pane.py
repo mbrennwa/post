@@ -979,7 +979,8 @@ class MessageReaderPane(Gtk.Box):
         self._clear_invite_panel()
         self._message_actions.set_visible(False)
         self.set_actions_sensitive(False)
-        self._load_error_html(message)
+        self._clear_link_hover()
+        self._reader_body_stack.set_visible_child_name("empty")
 
     def show_error(self, error: Exception, *, dark: bool) -> None:
         self._current_message = None

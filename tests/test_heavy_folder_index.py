@@ -541,5 +541,46 @@ class HeavyFolderImapExtraUidTests(unittest.TestCase):
         self.assertTrue(progress.cursor.get("pending_server_refresh"))
 
 
+class InboxEmptyIndexKeepTests(unittest.TestCase):
+    @mock.patch("post.mail.eds.folder_index_cache")
+    def test_empty_inbox_sync_keeps_nonempty_disk(self, cache: mock.Mock) -> None:
+        from post.mail.eds import MailService, _FolderMessageIndex
+
+        disk = [{"uid": "1", "subject": "kept", "sort_date": 1}]
+        cache.load.return_value = (disk, 1, 10)
+        cache.save = mock.Mock()
+        mail = MailService(registry=mock.Mock())
+        mail._build_folder_index_unlocked = mock.Mock(
+            return_value=_FolderMessageIndex(messages=[], unread=0, total=0)
+        )
+        index, source = mail._get_folder_index_unlocked("acct", "INBOX", sync=True)
+        self.assertEqual(len(index.messages), 1)
+        self.assertEqual(index.messages[0]["uid"], "1")
+        self.assertEqual(source, "disk_cache")
+        cache.save.assert_not_called()
+
+    def test_open_inbox_prefers_nonempty_camel_alias(self) -> None:
+        from post.mail.eds import MailService
+
+        mail = MailService(registry=mock.Mock())
+        empty = mock.Mock()
+        empty.get_message_count.return_value = 0
+        cached = mock.Mock()
+        cached.get_message_count.return_value = 83
+        store = mock.Mock()
+
+        def get_folder(name, _flags, _cancellable):
+            if name == "INBOX":
+                return empty
+            if name == "Inbox":
+                return cached
+            return None
+
+        store.get_folder_sync.side_effect = get_folder
+        mail._get_store_unlocked = mock.Mock(return_value=store)
+        folder = mail._open_folder_unlocked("acct", "INBOX", allow_online=False)
+        self.assertIs(folder, cached)
+
+
 if __name__ == "__main__":
     unittest.main()

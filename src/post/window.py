@@ -7243,8 +7243,27 @@ class MainWindow(Adw.ApplicationWindow):
         if isinstance(error, MessageNotAvailableError):
             if error.reason == MessageUnavailableReason.VANISHED:
                 self._remove_vanished_message(uid)
+            sign_in_required = (
+                error.reason == MessageUnavailableReason.NOT_CACHED_SIGN_IN
+            )
+            if sign_in_required:
+                location = self._message_location_for_list_key(uid)
+                account_uid = (
+                    location[0]
+                    if location is not None
+                    else (
+                        self._current_account.uid
+                        if self._current_account is not None
+                        else None
+                    )
+                )
+                if account_uid is not None:
+                    self._mail.set_account_connect_health(
+                        account_uid, "needs_sign_in"
+                    )
             self._show_message_unavailable_reader(error.user_message())
-            show_error_toast(self, error.user_message())
+            if not sign_in_required:
+                show_error_toast(self, error.user_message())
             return False
 
         if error is not None:
@@ -7268,12 +7287,11 @@ class MainWindow(Adw.ApplicationWindow):
                 self._mail.set_account_connect_health(account_uid, "needs_sign_in")
             user_message = format_message_read_error(
                 error,
-                cached=not sign_in_required,
+                cached=False,
             )
             self._show_message_unavailable_reader(user_message)
-            show_error_toast(self, user_message)
-            if sign_in_required:
-                self._set_status(user_message)
+            if not sign_in_required:
+                show_error_toast(self, user_message)
             return False
 
         assert msg is not None
@@ -7314,9 +7332,6 @@ class MainWindow(Adw.ApplicationWindow):
                 msg["folder_unread"],
                 msg["folder_total"],
             )
-        if (msg.get("flags") or {}).get("seen"):
-            self._mark_message_read(uid)
-
         self._current_message = msg
         body = {
             "plain": msg.get("body_plain"),
@@ -7329,6 +7344,8 @@ class MainWindow(Adw.ApplicationWindow):
             dark=self._app_prefers_dark(),
             message_appearance=self._message_appearance,
         )
+        if (msg.get("flags") or {}).get("seen"):
+            self._mark_message_read(uid)
         return False
 
     def _app_prefers_dark(self) -> bool:
@@ -7459,6 +7476,8 @@ class MainWindow(Adw.ApplicationWindow):
                 message_appearance=self._message_appearance,
             )
             self._reader_pane.set_actions_sensitive(True)
+            if (msg.get("flags") or {}).get("seen"):
+                self._mark_message_read(uid)
 
     def _notify_reader_windows_message_moved(self, uids: list[str]) -> None:
         for list_key in uids:

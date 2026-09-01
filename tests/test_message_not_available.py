@@ -9,7 +9,8 @@ from unittest.mock import MagicMock, patch
 import gi
 
 gi.require_version("Camel", "1.2")
-from gi.repository import Camel, GLib
+gi.require_version("Gio", "2.0")
+from gi.repository import Camel, Gio, GLib
 
 from post.mail.eds import (
     MailService,
@@ -50,6 +51,16 @@ class MessageNotAvailableErrorTests(unittest.TestCase):
             reason=MessageUnavailableReason.NOT_CACHED_OFFLINE,
         )
         self.assertIn("offline", exc.user_message().lower())
+
+    def test_not_cached_sign_in_message(self) -> None:
+        from post.mail.network_errors import MESSAGE_NOT_CACHED_SIGN_IN
+
+        exc = MessageNotAvailableError(
+            "1",
+            "INBOX",
+            reason=MessageUnavailableReason.NOT_CACHED_SIGN_IN,
+        )
+        self.assertEqual(exc.user_message(), MESSAGE_NOT_CACHED_SIGN_IN)
 
 
 class MissingMessageErrorDetectionTests(unittest.TestCase):
@@ -398,6 +409,85 @@ class ReadMessageUnavailableTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.message_uid, "42")
         self.assertEqual(ctx.exception.reason, MessageUnavailableReason.VANISHED)
+
+
+class GoaDeadCacheReadTests(unittest.TestCase):
+    def test_skips_get_message_sync_when_network_disallowed(self) -> None:
+        service = MailService(registry=MagicMock())
+        folder = MagicMock()
+        cached = MagicMock(name="cached_mime")
+        folder.get_message_cached.return_value = cached
+
+        mime = service._get_message_mime_sync(
+            folder,
+            "account",
+            "INBOX",
+            "42",
+            allow_network=False,
+        )
+
+        self.assertIs(mime, cached)
+        folder.get_message_sync.assert_not_called()
+        folder.get_message_cached.assert_called_once()
+
+    def test_uncached_without_network_raises_sign_in(self) -> None:
+        service = MailService(registry=MagicMock())
+        folder = MagicMock()
+        folder.get_message_cached.return_value = None
+
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._get_message_mime_sync(
+                folder,
+                "account",
+                "INBOX",
+                "42",
+                allow_network=False,
+            )
+
+        self.assertEqual(
+            ctx.exception.reason,
+            MessageUnavailableReason.NOT_CACHED_SIGN_IN,
+        )
+        folder.get_message_sync.assert_not_called()
+        self.assertEqual(service.get_account_connect_health("account"), "needs_sign_in")
+
+    def test_online_auth_error_without_cache_is_sign_in(self) -> None:
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        folder = MagicMock()
+        folder.get_message_sync.side_effect = GLib.Error.new_literal(
+            Gio.io_error_quark(),
+            "Failed to refresh access token (goa-error-quark, 4): AADSTS70043",
+            int(Gio.IOErrorEnum.FAILED),
+        )
+        folder.get_message_cached.return_value = None
+
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._get_message_mime_sync(folder, "account", "INBOX", "42")
+
+        self.assertEqual(
+            ctx.exception.reason,
+            MessageUnavailableReason.NOT_CACHED_SIGN_IN,
+        )
+        folder.get_message_cached.assert_called()
+        self.assertEqual(service.get_account_connect_health("account"), "needs_sign_in")
+
+    def test_online_auth_error_recovers_from_cache(self) -> None:
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        folder = MagicMock()
+        cached = MagicMock(name="cached_mime")
+        folder.get_message_sync.side_effect = GLib.Error.new_literal(
+            Gio.io_error_quark(),
+            "Failed to refresh access token (goa-error-quark, 4): AADSTS70043",
+            int(Gio.IOErrorEnum.FAILED),
+        )
+        folder.get_message_cached.return_value = cached
+
+        mime = service._get_message_mime_sync(folder, "account", "INBOX", "42")
+
+        self.assertIs(mime, cached)
+        self.assertEqual(service.get_account_connect_health("account"), "needs_sign_in")
 
 
 if __name__ == "__main__":
