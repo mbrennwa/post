@@ -75,6 +75,18 @@ def _raw_error_text(exc: BaseException) -> str:
     return message
 
 
+def _token_expired_user_message(text: str) -> str | None:
+    lowered = text.lower()
+    if not any(
+        token in lowered
+        for token in ("aadsts", "goa-error", "refresh token", "access token")
+    ):
+        return None
+    from post.mail.network_errors import TOKEN_EXPIRED_FOLDER_MESSAGE
+
+    return TOKEN_EXPIRED_FOLDER_MESSAGE
+
+
 def _is_localhost_refused(text: str) -> bool:
     lowered = text.lower()
     if "connection refused" not in lowered:
@@ -90,7 +102,8 @@ def user_send_error_message(exc: BaseException) -> str:
     if isinstance(exc, SendQueued):
         return exc.user_message
     if isinstance(exc, SendError):
-        return exc.user_message
+        token_message = _token_expired_user_message(exc.user_message)
+        return token_message if token_message is not None else exc.user_message
 
     if isinstance(exc, TimeoutError):
         return _SEND_TIMED_OUT
@@ -122,6 +135,10 @@ def user_send_error_message(exc: BaseException) -> str:
 
     if "timed out" in lowered or "timeout" in lowered:
         return _SEND_TIMED_OUT
+
+    token_message = _token_expired_user_message(text)
+    if token_message is not None:
+        return token_message
 
     if any(
         token in lowered

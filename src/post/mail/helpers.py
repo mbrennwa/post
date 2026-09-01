@@ -874,6 +874,16 @@ def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:
     return bodies
 
 
+def extract_message_bodies_from_bytes(raw: bytes) -> dict[str, str | None]:
+    """Return plain-text and HTML bodies from raw RFC822 bytes."""
+    bodies: dict[str, str | None] = {"plain": None, "html": None}
+    attached_html: list[str] = []
+    _email_bodies_from_bytes(raw, bodies, attached_html)
+    if bodies["html"] is None and bodies["plain"] is None and attached_html:
+        bodies["html"] = attached_html[0]
+    return bodies
+
+
 def extract_attachments(mime_msg: Any) -> list[dict[str, Any]]:
     """Return attachment metadata from a Camel.MimeMessage."""
     attachments, _parts = _collect_attachments(mime_msg)
@@ -1155,16 +1165,13 @@ def _email_part_text(part: Any) -> str | None:
     return None
 
 
-def _email_module_fallback(
-    mime_msg: Any, bodies: dict[str, str | None], attached_html: list[str]
+def _email_bodies_from_bytes(
+    raw_bytes: bytes,
+    bodies: dict[str, str | None],
+    attached_html: list[str],
 ) -> None:
-    """Parse raw MIME with Python's email module when Camel walking finds nothing."""
     import email
     import email.policy
-
-    raw_bytes = _mime_message_raw_bytes(mime_msg)
-    if raw_bytes is None:
-        return
 
     try:
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
@@ -1192,6 +1199,16 @@ def _email_module_fallback(
             continue
         if bodies["html"] is None:
             bodies["html"] = text
+
+
+def _email_module_fallback(
+    mime_msg: Any, bodies: dict[str, str | None], attached_html: list[str]
+) -> None:
+    """Parse raw MIME with Python's email module when Camel walking finds nothing."""
+    raw_bytes = _mime_message_raw_bytes(mime_msg)
+    if raw_bytes is None:
+        return
+    _email_bodies_from_bytes(raw_bytes, bodies, attached_html)
 
 
 def _walk_attachment_parts(

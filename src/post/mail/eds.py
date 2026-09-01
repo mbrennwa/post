@@ -38,6 +38,13 @@ from . import folder_index_cache
 from . import folder_status_cache
 from . import graph_folder_counts
 from .account_cache_gc import drop_orphan_account_caches
+from .evolution_cache_path import (
+    cached_rfc822_candidates,
+    evolution_store_roots,
+    find_nonempty_rfc822,
+    first_nonempty_path,
+    rfc822_digest,
+)
 from .helpers import (
     message_info_to_dict,
     message_is_read_unflagged,
@@ -4813,11 +4820,103 @@ class MailService:
         folder: Camel.Folder,
         api_uid: str,
     ) -> Any | None:
+        file_mime = self._try_message_from_cache_file(folder, api_uid)
+        if file_mime is not None:
+            return file_mime
         try:
             return folder.get_message_cached(api_uid, None)
         except Exception:
             log.debug("get_message_cached failed for %s", api_uid, exc_info=True)
             return None
+
+    def _first_cached_rfc822_path(
+        self,
+        folder: Camel.Folder,
+        api_uid: str,
+    ) -> str | None:
+        getter = getattr(folder, "get_filename", None)
+        if callable(getter):
+            try:
+                filename = getter(api_uid)
+            except Exception:
+                log.debug("get_filename failed for %s", api_uid, exc_info=True)
+                filename = None
+            if isinstance(filename, str) and filename:
+                found = first_nonempty_path(cached_rfc822_candidates(filename))
+                if found is not None:
+                    return found
+        store_uid = None
+        parent = getattr(folder, "get_parent_store", None)
+        if callable(parent):
+            try:
+                store = parent()
+            except Exception:
+                store = None
+            uid_get = getattr(store, "get_uid", None) if store is not None else None
+            if callable(uid_get):
+                try:
+                    raw_uid = uid_get()
+                except Exception:
+                    raw_uid = None
+                if isinstance(raw_uid, str) and raw_uid:
+                    store_uid = raw_uid
+        folder_name = None
+        for attr in ("get_full_name", "get_display_name"):
+            name_get = getattr(folder, attr, None)
+            if not callable(name_get):
+                continue
+            try:
+                raw_name = name_get()
+            except Exception:
+                continue
+            if isinstance(raw_name, str) and raw_name:
+                folder_name = raw_name
+                break
+        if not store_uid:
+            return None
+        digest = rfc822_digest(api_uid)
+        names = [folder_name] if folder_name else []
+        if not folder_name or folder_name.lower() == "inbox":
+            names.extend(["Inbox", "INBOX"])
+        cache_root = os.path.expanduser("~/.cache/evolution")
+        for store_root in evolution_store_roots(cache_root, store_uid):
+            found = find_nonempty_rfc822(store_root, names, digest)
+            if found is not None:
+                return found
+        return None
+
+    def _construct_mime_from_rfc822_path(self, filename: str) -> Any | None:
+        try:
+            with open(filename, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            return None
+        if not data:
+            return None
+        try:
+            message = Camel.MimeMessage()
+            stream = Gio.MemoryInputStream.new_from_bytes(GLib.Bytes.new(data))
+            try:
+                message.construct_from_input_stream_sync(stream, None)
+            finally:
+                stream.close()
+            return message
+        except Exception:
+            log.debug(
+                "Could not parse cached MIME file %s", filename, exc_info=True
+            )
+            return None
+
+    def _try_message_from_cache_file(
+        self,
+        folder: Camel.Folder,
+        api_uid: str,
+    ) -> Any | None:
+        """Load MIME from Camel's on-disk cache file when get_message_cached is empty."""
+        path = self._first_cached_rfc822_path(folder, api_uid)
+        if path is None:
+            return None
+        return self._construct_mime_from_rfc822_path(path)
 
     def _try_fetch_message_uid(
         self,
@@ -5228,10 +5327,10 @@ class MailService:
         mime = None
         self._recovered_read_uid = None
         api_uid = camel_uid_to_api(message_uid)
+        mime = self._try_message_cached(folder, api_uid)
+        if mime is not None:
+            return mime
         if not allow_network:
-            mime = self._try_message_cached(folder, api_uid)
-            if mime is not None:
-                return mime
             self._raise_uncached_sign_in(account_uid, folder_name, message_uid)
         try:
             mime = self._get_message_sync_with_timeout(folder, api_uid)
@@ -7168,7 +7267,12 @@ class MailService:
             extract_message_bodies,
         )
 
-        allow_network = self._goa_credentials_ready_for_read_unlocked(account_uid)
+        if self.get_account_connect_health(account_uid) == "needs_sign_in":
+            allow_network = False
+        else:
+            allow_network = self._goa_credentials_ready_for_read_unlocked(
+                account_uid
+            )
         try:
             folder = self._open_folder_unlocked(
                 account_uid, folder_name, allow_online=allow_network
@@ -7219,6 +7323,32 @@ class MailService:
             result["_previous_uid"] = message_uid
         enrich_message_dict_from_mime(result, mime)
         bodies = extract_message_bodies(mime)
+        if not (bodies.get("plain") or bodies.get("html")):
+            file_mime = self._try_message_from_cache_file(
+                folder, camel_uid_to_api(actual_uid)
+            )
+            if file_mime is not None:
+                mime = file_mime
+                enrich_message_dict_from_mime(result, mime)
+                bodies = extract_message_bodies(mime)
+        if not (bodies.get("plain") or bodies.get("html")):
+            path = self._first_cached_rfc822_path(
+                folder, camel_uid_to_api(actual_uid)
+            )
+            if path:
+                try:
+                    with open(path, "rb") as handle:
+                        raw = handle.read()
+                except OSError:
+                    raw = b""
+                if raw:
+                    from .helpers import extract_message_bodies_from_bytes
+
+                    bodies = extract_message_bodies_from_bytes(raw)
+        if not (bodies.get("plain") or bodies.get("html")) and not allow_network:
+            self._raise_uncached_sign_in(
+                account_uid, folder_name, actual_uid
+            )
         result["body_plain"] = bodies["plain"]
         result["body_html"] = bodies["html"]
         result["attachments"] = extract_attachments(mime)
@@ -7238,7 +7368,9 @@ class MailService:
             if references:
                 result["references"] = normalize_references_header(references)
 
-        if was_unread and mark_seen:
+        if was_unread and mark_seen and (
+            bodies.get("plain") or bodies.get("html")
+        ):
             try:
                 unread, total = self._mark_message_seen_unlocked(
                     folder, account_uid, folder_name, actual_uid

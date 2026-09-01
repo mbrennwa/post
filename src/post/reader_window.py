@@ -35,6 +35,7 @@ from post.mail.helpers import (
 )
 from post.mail.io_thread import get_mail_io_thread
 from post.mail.network_errors import (
+    MESSAGE_NOT_CACHED_SIGN_IN,
     format_message_read_error,
     is_sign_in_required_error,
     log_mail_error,
@@ -330,6 +331,18 @@ class ReaderWindow(Adw.ApplicationWindow):
             return False
 
         assert msg is not None
+        if not (
+            (msg.get("body_plain") or "").strip()
+            or (msg.get("body_html") or "").strip()
+        ) and self._mail.get_account_connect_health(self._account.uid) == "needs_sign_in":
+            self._current_message = None
+            self._reader_pane.show_unavailable(
+                MESSAGE_NOT_CACHED_SIGN_IN,
+                dark=self._app_prefers_dark(),
+            )
+            self.set_title("Message unavailable")
+            self._refresh_flag_toggle_buttons()
+            return False
         self._current_message = msg
         subject = msg.get("subject") or "(no subject)"
         self.set_title(subject)
