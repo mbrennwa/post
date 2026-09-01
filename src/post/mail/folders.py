@@ -367,8 +367,26 @@ def is_sent_folder_name(
     for folder in folders:
         if folder.get("full_name") == folder_name:
             return is_sent_folder(folder, type_mask=type_mask)
+    return is_sent_folder_name_fallback(folder_name)
+
+
+def is_sent_folder_name_fallback(folder_name: str) -> bool:
+    """Return True when *folder_name* looks like a Sent folder (name only)."""
     base = folder_name.rsplit("/", 1)[-1].lower()
     return base in _SENT_NAME_FALLBACKS
+
+
+def sidebar_folder_label_unread(
+    folders: list[dict],
+    folder_name: str,
+    unread: int,
+    *,
+    type_mask: int = 64512,
+) -> int:
+    """Unread count for sidebar labels; Sent folders show total only."""
+    if is_sent_folder_name(folders, folder_name, type_mask=type_mask):
+        return -1
+    return unread
 
 
 def is_system_folder(

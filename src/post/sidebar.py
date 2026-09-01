@@ -36,6 +36,7 @@ from post.mail.folders import (
     find_inbox_folder,
     folder_names_for_count_refresh,
     format_folder_label,
+    sidebar_folder_label_unread,
     format_startup_loading_folders,
     is_drafts_folder_name,
     is_sent_folder_name,
@@ -283,6 +284,11 @@ class MailSidebar:
                 self._heavy_status_pending.add(key)
 
         pending = (account_uid, folder_name) in self._heavy_status_pending
+        label_unread = sidebar_folder_label_unread(
+            self._account_folders.get(account_uid, []),
+            folder_name,
+            unread,
+        )
         for folder_list in self._all_folder_listboxes():
             row = folder_list.get_first_child()
             while row is not None:
@@ -298,7 +304,7 @@ class MailSidebar:
                         label.set_label(
                             format_folder_label(
                                 display,
-                                unread,
+                                label_unread,
                                 total,
                                 status_pending=pending,
                             )
@@ -567,8 +573,15 @@ class MailSidebar:
                         label = self._folder_row_label(row)
                         if label is not None:
                             display = getattr(row, "display_name", folder_name)
+                            label_unread = sidebar_folder_label_unread(
+                                self._account_folders.get(account_uid, []),
+                                folder_name,
+                                unread,
+                            )
                             label.set_label(
-                                format_folder_label(display, unread, total)
+                                format_folder_label(
+                                    display, label_unread, total
+                                )
                             )
                     row = row.get_next_sibling()
 
@@ -2078,8 +2091,13 @@ class MailSidebar:
         ):
             self._heavy_status_pending.add((account_uid, folder_name))
             pending = True
+        label_unread = sidebar_folder_label_unread(
+            self._account_folders.get(account_uid, []),
+            folder_name or "",
+            unread,
+        )
         label_text = format_folder_label(
-            display, unread, total, status_pending=pending
+            display, label_unread, total, status_pending=pending
         )
 
         label = Gtk.Label(label=label_text, xalign=0, hexpand=True)

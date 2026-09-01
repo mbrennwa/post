@@ -19,7 +19,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
 from post.mail.dnd import MESSAGE_TRANSFER_MIME, MessageTransferPayload, encode_message_transfer
-from post.mail.folders import is_post_outbox_folder
+from post.mail.folders import is_post_outbox_folder, is_sent_folder_name_fallback
 from post.wrap_label import (
     WrappingLabel,
     configure_ellipsize_label,
@@ -647,7 +647,9 @@ class VirtualMessageList(Gtk.ScrolledWindow):
             sender = message.get("preview_to") or message.get("to") or ""
         else:
             sender = message.get("from") or ""
-        unread = message_is_unread(message)
+        unread = message_is_unread(message) and not is_sent_folder_name_fallback(
+            folder_name or ""
+        )
         flags = message.get("flags") or {}
 
         subject_label = list_item.subject_label

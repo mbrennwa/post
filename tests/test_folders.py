@@ -31,11 +31,13 @@ from post.mail.folders import (
     is_drafts_folder_name,
     is_sent_folder,
     is_sent_folder_name,
+    is_sent_folder_name_fallback,
     is_system_folder,
     outbox_folder_dict,
     resolve_folder_display_name,
     resolve_move_menu_state,
     resolve_sidebar_context_menu,
+    sidebar_folder_label_unread,
     validate_folder_display_name,
 )
 
@@ -747,6 +749,23 @@ class SentFolderTests(unittest.TestCase):
         ]
         self.assertTrue(is_sent_folder_name(folders, "[Gmail]/Sent Mail"))
         self.assertFalse(is_sent_folder_name(folders, "INBOX"))
+
+    def test_is_sent_folder_name_fallback(self) -> None:
+        self.assertTrue(is_sent_folder_name_fallback("[Gmail]/Sent Mail"))
+        self.assertFalse(is_sent_folder_name_fallback("INBOX"))
+
+    def test_sidebar_folder_label_unread_hides_sent_unread(self) -> None:
+        folders = [
+            {"full_name": "[Gmail]/Sent Mail", "display_name": "Sent", "flags": 5120},
+        ]
+        self.assertEqual(
+            sidebar_folder_label_unread(folders, "[Gmail]/Sent Mail", 31),
+            -1,
+        )
+        self.assertEqual(
+            sidebar_folder_label_unread(folders, "INBOX", 3),
+            3,
+        )
 
 
 class PostOutboxFolderTests(unittest.TestCase):

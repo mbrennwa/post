@@ -2500,8 +2500,9 @@ class MailService:
         timer = threading.Timer(_SEND_TIMEOUT_SECONDS, cancellable.cancel)
         timer.start()
         append_start = time.monotonic()
+        info = self._sent_message_info()
         try:
-            ok, _uid = folder.append_message_sync(message, None, cancellable)
+            ok, appended_uid = folder.append_message_sync(message, info, cancellable)
         except GLib.Error as exc:
             if cancellable.is_cancelled():
                 log.warning(
@@ -2522,6 +2523,22 @@ class MailService:
         if not ok:
             log.warning("Could not append message to Sent folder %r", folder_name)
             return
+
+        if appended_uid:
+            message_uid = str(appended_uid)
+            info_after = folder_get_message_info(folder, message_uid)
+            if info_after is not None and not (
+                info_after.get_flags() & Camel.MessageFlags.SEEN
+            ):
+                try:
+                    self._mark_message_seen_unlocked(
+                        folder, account_uid, folder_name, message_uid
+                    )
+                except Exception:
+                    log.debug(
+                        "Failed to mark appended sent message as read",
+                        exc_info=True,
+                    )
 
         log.debug(
             "Sent folder append finished in %.2fs folder=%r",
@@ -2557,6 +2574,14 @@ class MailService:
         if drafts_info is None:
             return None
         return drafts_info.get("full_name")
+
+    def _sent_message_info(self) -> Camel.MessageInfo | None:
+        seen_flag = getattr(Camel.MessageFlags, "SEEN", None)
+        if seen_flag is None:
+            return None
+        info = Camel.MessageInfo.new()
+        info.set_flags(seen_flag, seen_flag)
+        return info
 
     def _draft_message_info(self) -> Camel.MessageInfo | None:
         draft_flag = getattr(Camel.MessageFlags, "DRAFT", None)
