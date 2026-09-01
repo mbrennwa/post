@@ -592,6 +592,9 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
                 window, list_key
             )
         )
+        window._loaded_message_source_location = (
+            lambda: MainWindow._loaded_message_source_location(window)
+        )
         window._reader_shows_list_key = lambda list_key: MainWindow._reader_shows_list_key(
             window, list_key
         )
@@ -769,6 +772,240 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         window = self._window_stub(messages=[], sidebar_folder="INBOX")
         location = MainWindow._message_location_for_list_key(window, sent_key)
         self.assertEqual(location, ("acct-1", "Sent", "1"))
+
+
+class MarkReadOnClickTests(unittest.TestCase):
+    """Clicking an already-displayed unread row must mark read without reload (#377)."""
+
+    def _window_stub(self, *, message: dict, sidebar_folder: str = "INBOX"):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        account = SimpleNamespace(uid="acct-1")
+        uid = str(message.get("uid") or "42")
+        tagged_message = {
+            **message,
+            "_list_account_uid": account.uid,
+            "_list_folder": sidebar_folder,
+        }
+        window = SimpleNamespace(
+            _current_account=account,
+            _current_folder=sidebar_folder,
+            _current_folder_messages=[message],
+            _current_message_uid=uid,
+            _current_message=dict(tagged_message),
+            _pending_restore_message_uid=None,
+            _user_message_click_pending=False,
+            _mail=mock.Mock(),
+            _reader_pane=mock.Mock(),
+            _sidebar=SimpleNamespace(
+                folder_is_drafts=lambda _account_uid, folder: folder == "Drafts",
+            ),
+            _message_list_view=mock.Mock(
+                get_selected_uids=mock.Mock(return_value=[uid]),
+                get_message=mock.Mock(return_value=message),
+            ),
+        )
+        window._message_list_key = lambda msg: MainWindow._message_list_key(
+            window, msg
+        )
+        window._message_location_for_list_key = (
+            lambda list_key: MainWindow._message_location_for_list_key(
+                window, list_key
+            )
+        )
+        window._loaded_message_source_location = (
+            lambda: MainWindow._loaded_message_source_location(window)
+        )
+        window._reader_shows_list_key = lambda list_key: MainWindow._reader_shows_list_key(
+            window, list_key
+        )
+        window._message_flags_for_uid = (
+            lambda list_key: MainWindow._message_flags_for_uid(window, list_key)
+        )
+        window._mark_seen_when_reading_uid = (
+            lambda list_key: MainWindow._mark_seen_when_reading_uid(
+                window, list_key
+            )
+        )
+        window._mark_message_read_on_click_if_unread = (
+            lambda list_key: MainWindow._mark_message_read_on_click_if_unread(
+                window, list_key
+            )
+        )
+        window._load_message_body_for_uid = mock.Mock()
+        window._set_message_flags = mock.Mock()
+        window._mark_message_read = mock.Mock()
+        window._message_list_view.select_uid = mock.Mock(return_value=True)
+        return window
+
+    def test_item_pressed_marks_read_when_reader_already_shows_unread(self) -> None:
+        from post.window import MainWindow
+
+        message = {
+            "uid": "42",
+            "subject": "Digest",
+            "flags": {"seen": False},
+        }
+        window = self._window_stub(message=message)
+
+        MainWindow._on_message_list_item_pressed(window, "42")
+
+        window._mark_message_read.assert_called_once_with("42")
+        window._set_message_flags.assert_called_once_with(
+            "seen", seen=True, uids=["42"]
+        )
+        window._load_message_body_for_uid.assert_not_called()
+
+    def test_item_pressed_loads_unselected_with_mark_seen(self) -> None:
+        from post.window import MainWindow
+
+        message = {
+            "uid": "42",
+            "subject": "Digest",
+            "flags": {"seen": False},
+        }
+        window = self._window_stub(message=message)
+        window._message_list_view.get_selected_uids.return_value = ["99"]
+        window._current_message_uid = "99"
+        window._current_message = {
+            "uid": "99",
+            "subject": "Other",
+            "flags": {"seen": True},
+        }
+
+        MainWindow._on_message_list_item_pressed(window, "42")
+
+        window._message_list_view.select_uid.assert_called_once_with("42")
+        window._load_message_body_for_uid.assert_called_once_with(
+            "42", mark_seen=True
+        )
+        window._set_message_flags.assert_not_called()
+
+    def test_item_pressed_noop_when_reader_shows_read_message(self) -> None:
+        from post.window import MainWindow
+
+        message = {
+            "uid": "42",
+            "subject": "Digest",
+            "flags": {"seen": True},
+        }
+        window = self._window_stub(message=message)
+
+        MainWindow._on_message_list_item_pressed(window, "42")
+
+        window._set_message_flags.assert_not_called()
+        window._load_message_body_for_uid.assert_not_called()
+
+    def test_item_pressed_reclick_skips_mark_in_drafts(self) -> None:
+        from post.window import MainWindow
+
+        message = {
+            "uid": "42",
+            "subject": "Draft",
+            "flags": {"seen": False},
+        }
+        window = self._window_stub(message=message, sidebar_folder="Drafts")
+
+        MainWindow._on_message_list_item_pressed(window, "42")
+
+        window._set_message_flags.assert_not_called()
+        window._load_message_body_for_uid.assert_not_called()
+
+
+class ReaderListSyncTests(unittest.TestCase):
+    """Reader must not treat bare IMAP uids as globally unique (#377)."""
+
+    def _window_stub(
+        self,
+        *,
+        messages: list[dict],
+        sidebar_account: str = "acct-1",
+        sidebar_folder: str = "INBOX",
+    ):
+        from types import SimpleNamespace
+
+        from post.window import MainWindow
+
+        account = SimpleNamespace(uid=sidebar_account)
+        window = SimpleNamespace(
+            _current_account=account,
+            _current_folder=sidebar_folder,
+            _current_folder_messages=list(messages),
+            _current_message=None,
+            _current_message_uid=None,
+        )
+        window._message_list_key = lambda msg: MainWindow._message_list_key(
+            window, msg
+        )
+        window._message_location_for_list_key = (
+            lambda list_key: MainWindow._message_location_for_list_key(
+                window, list_key
+            )
+        )
+        window._loaded_message_source_location = (
+            lambda: MainWindow._loaded_message_source_location(window)
+        )
+        window._reader_shows_list_key = lambda list_key: MainWindow._reader_shows_list_key(
+            window, list_key
+        )
+        return window
+
+    def test_reader_shows_list_key_false_when_uid_collides_across_accounts(self) -> None:
+        from post.window import MainWindow
+
+        inbox_row = {"uid": "100", "subject": "Work quote"}
+        window = self._window_stub(
+            messages=[inbox_row],
+            sidebar_account="acct-work",
+            sidebar_folder="INBOX",
+        )
+        window._current_message = {
+            "uid": "100",
+            "subject": "Old gasometrix order",
+            "_list_account_uid": "acct-gas",
+            "_list_folder": "INBOX",
+        }
+
+        self.assertFalse(MainWindow._reader_shows_list_key(window, "100"))
+
+    def test_reader_shows_list_key_true_when_list_context_matches(self) -> None:
+        from post.window import MainWindow
+
+        inbox_row = {"uid": "100", "subject": "Work quote"}
+        window = self._window_stub(
+            messages=[inbox_row],
+            sidebar_account="acct-work",
+            sidebar_folder="INBOX",
+        )
+        window._current_message = {
+            "uid": "100",
+            "subject": "Work quote",
+            "_list_account_uid": "acct-work",
+            "_list_folder": "INBOX",
+        }
+
+        self.assertTrue(MainWindow._reader_shows_list_key(window, "100"))
+
+    def test_reader_shows_list_key_false_when_uid_collides_across_folders(self) -> None:
+        from post.window import MainWindow
+
+        inbox_row = {"uid": "55", "subject": "Inbox item"}
+        window = self._window_stub(
+            messages=[inbox_row],
+            sidebar_account="acct-1",
+            sidebar_folder="INBOX",
+        )
+        window._current_message = {
+            "uid": "55",
+            "subject": "Archived item",
+            "_list_account_uid": "acct-1",
+            "_list_folder": "Archive",
+        }
+
+        self.assertFalse(MainWindow._reader_shows_list_key(window, "55"))
 
 
 class UniformBoolStateTests(unittest.TestCase):
