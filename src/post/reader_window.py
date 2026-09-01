@@ -23,7 +23,11 @@ from post.folder_dialogs import confirm_action
 from post.header_bar import add_end_window_controls
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
-from post.mail.eds import MailAccount, MessageNotAvailableError
+from post.mail.eds import (
+    MailAccount,
+    MessageNotAvailableError,
+    MessageUnavailableReason,
+)
 from post.mail.helpers import (
     perform_one_click_unsubscribe,
     reader_toggle_button_state,
@@ -31,6 +35,7 @@ from post.mail.helpers import (
 )
 from post.mail.io_thread import get_mail_io_thread
 from post.mail.network_errors import (
+    MESSAGE_NOT_CACHED_SIGN_IN,
     format_message_read_error,
     is_sign_in_required_error,
     log_mail_error,
@@ -284,13 +289,21 @@ class ReaderWindow(Adw.ApplicationWindow):
 
         if isinstance(error, MessageNotAvailableError):
             self._current_message = None
+            sign_in_required = (
+                error.reason == MessageUnavailableReason.NOT_CACHED_SIGN_IN
+            )
+            if sign_in_required:
+                self._mail.set_account_connect_health(
+                    self._account.uid, "needs_sign_in"
+                )
             self._reader_pane.show_unavailable(
                 error.user_message(),
                 dark=self._app_prefers_dark(),
             )
             self.set_title("Message unavailable")
             self._refresh_flag_toggle_buttons()
-            show_error_toast(self, error.user_message())
+            if not sign_in_required:
+                show_error_toast(self, error.user_message())
             return False
 
         if error is not None:
@@ -305,7 +318,7 @@ class ReaderWindow(Adw.ApplicationWindow):
                 )
             user_message = format_message_read_error(
                 error,
-                cached=not sign_in_required,
+                cached=False,
             )
             self._reader_pane.show_unavailable(
                 user_message,
@@ -313,12 +326,23 @@ class ReaderWindow(Adw.ApplicationWindow):
             )
             self.set_title("Message unavailable")
             self._refresh_flag_toggle_buttons()
-            show_error_toast(self, user_message)
-            if sign_in_required:
-                self._set_status(user_message)
+            if not sign_in_required:
+                show_error_toast(self, user_message)
             return False
 
         assert msg is not None
+        if not (
+            (msg.get("body_plain") or "").strip()
+            or (msg.get("body_html") or "").strip()
+        ) and self._mail.get_account_connect_health(self._account.uid) == "needs_sign_in":
+            self._current_message = None
+            self._reader_pane.show_unavailable(
+                MESSAGE_NOT_CACHED_SIGN_IN,
+                dark=self._app_prefers_dark(),
+            )
+            self.set_title("Message unavailable")
+            self._refresh_flag_toggle_buttons()
+            return False
         self._current_message = msg
         subject = msg.get("subject") or "(no subject)"
         self.set_title(subject)

@@ -1805,6 +1805,8 @@ class MailSidebar:
         cached_name = self._account_inbox_folders.get(account_uid)
         if not cached_name:
             cached_name = self._mail.get_inbox_folder_name_cached(account_uid)
+        if not cached_name:
+            cached_name = self._mail.guess_inbox_from_folder_index(account_uid)
         inbox_name = cached_name or "INBOX"
         inbox_folder = {
             "full_name": inbox_name,

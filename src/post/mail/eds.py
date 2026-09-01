@@ -21,7 +21,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal, Sequence, Callable
+from typing import Any, Literal, NoReturn, Sequence, Callable
 
 FolderIndexSource = Literal["memory", "disk_cache", "local", "server"]
 
@@ -38,6 +38,13 @@ from . import folder_index_cache
 from . import folder_status_cache
 from . import graph_folder_counts
 from .account_cache_gc import drop_orphan_account_caches
+from .evolution_cache_path import (
+    cached_rfc822_candidates,
+    evolution_store_roots,
+    find_nonempty_rfc822,
+    first_nonempty_path,
+    rfc822_digest,
+)
 from .helpers import (
     message_info_to_dict,
     message_is_read_unflagged,
@@ -103,6 +110,7 @@ from .operation_queue import (
     remove_queued_operation,
 )
 from .network_errors import (
+    MESSAGE_NOT_CACHED_SIGN_IN,
     is_network_unavailable_error,
     is_queueable_network_error,
     is_sign_in_required_error,
@@ -209,6 +217,7 @@ def _run_on_gtk_thread(callback: Callable[[], None]) -> bool:
 class MessageUnavailableReason:
     VANISHED = "vanished"
     NOT_CACHED_OFFLINE = "not_cached_offline"
+    NOT_CACHED_SIGN_IN = "not_cached_sign_in"
 
 
 class MessageNotAvailableError(LookupError):
@@ -232,6 +241,8 @@ class MessageNotAvailableError(LookupError):
                 "This message isn't available offline yet. "
                 "Connect to download it."
             )
+        if self.reason == MessageUnavailableReason.NOT_CACHED_SIGN_IN:
+            return MESSAGE_NOT_CACHED_SIGN_IN
         return "This message is no longer available."
 
 
@@ -386,6 +397,16 @@ def _folder_index_is_cacheable(index: _FolderMessageIndex) -> bool:
     if index.total <= 0:
         return True
     return len(index.messages) >= index.total
+
+
+_INBOX_FOLDER_ALIASES = ("INBOX", "Inbox", "inbox")
+
+
+def _inbox_folder_name_aliases(folder_name: str) -> tuple[str, ...]:
+    """Camel M365 stores Inbox on disk; Post may open INBOX after a GOA failure."""
+    if folder_name in _INBOX_FOLDER_ALIASES:
+        return _INBOX_FOLDER_ALIASES
+    return (folder_name,)
 
 
 def _should_save_heavy_folder_index(
@@ -1687,6 +1708,15 @@ class MailService:
             return guess_inbox_name(cached)
         return None
 
+    def guess_inbox_from_folder_index(self, account_uid: str) -> str | None:
+        """Best Inbox name from persisted folder-index files (no Camel)."""
+        names = folder_index_cache.cached_folder_names(account_uid)
+        if not names:
+            return None
+        return guess_inbox_name(
+            [{"full_name": name, "display_name": name} for name in names]
+        )
+
     def prepare_account_credentials(self, account_uid: str) -> None:
         """Refresh GOA tokens before mail I/O (may show account sign-in UI)."""
         source = self.registry.ref_source(account_uid)
@@ -1711,9 +1741,24 @@ class MailService:
         account_uid: str,
         *,
         cancellable: Gio.Cancellable | None = None,
+        allow_online: bool = True,
     ) -> Camel.Store:
         if account_uid in self._stores:
             store = self._stores[account_uid]
+            if not allow_online:
+                if (
+                    store.get_connection_status()
+                    != Camel.ServiceConnectionStatus.CONNECTED
+                ):
+                    self._call_without_service_lock(
+                        self._apply_local_only_store_state_unlocked,
+                        store,
+                        account_uid,
+                        cancellable=cancellable,
+                    )
+                else:
+                    self._configure_store_settings_unlocked(store, account_uid)
+                return store
             if store.get_connection_status() == Camel.ServiceConnectionStatus.CONNECTED:
                 self._call_without_service_lock(
                     self._sync_store_online_state_unlocked,
@@ -1729,11 +1774,12 @@ class MailService:
         if source is None:
             raise ValueError(f"Unknown mail account: {account_uid}")
 
-        self._call_without_service_lock(
-            self._prepare_account_credentials_unlocked,
-            account_uid,
-            cancellable,
-        )
+        if allow_online:
+            self._call_without_service_lock(
+                self._prepare_account_credentials_unlocked,
+                account_uid,
+                cancellable,
+            )
         session = self._ensure_session()
         mail_ext = source.get_extension("Mail Account")
         service = session.add_service(
@@ -1746,15 +1792,42 @@ class MailService:
         store = service
         self._stores[account_uid] = store
 
-        self._call_without_service_lock(
-            self._sync_store_online_state_unlocked,
-            store,
-            account_uid,
-            cancellable=cancellable,
-        )
+        if allow_online:
+            self._call_without_service_lock(
+                self._sync_store_online_state_unlocked,
+                store,
+                account_uid,
+                cancellable=cancellable,
+            )
+        else:
+            self._call_without_service_lock(
+                self._apply_local_only_store_state_unlocked,
+                store,
+                account_uid,
+                cancellable=cancellable,
+            )
 
         self._configure_store_settings_unlocked(store, account_uid)
         return store
+
+    def _apply_local_only_store_state_unlocked(
+        self,
+        store: Camel.Store,
+        account_uid: str,
+        *,
+        cancellable: Gio.Cancellable | None = None,
+    ) -> None:
+        """Load Camel's on-disk summary without contacting the server."""
+        if not isinstance(store, Camel.OfflineStore):
+            return
+        try:
+            store.set_online_sync(False, cancellable)
+        except GLib.Error:
+            log.debug(
+                "Could not set store offline for local cache (%s)",
+                account_uid,
+                exc_info=True,
+            )
 
     def _sync_store_online_state_unlocked(
         self,
@@ -2962,9 +3035,7 @@ class MailService:
         self, account_uid: str
     ) -> list[dict]:
         """Build a folder tree from Camel's on-disk cache when the server is unreachable."""
-        with self._lock:
-            store = self._get_store_unlocked(account_uid)
-        self._sync_store_online_state_unlocked(store, account_uid)
+        store = self._get_store_unlocked(account_uid, allow_online=False)
 
         folders: list[dict] = []
         try:
@@ -3126,13 +3197,20 @@ class MailService:
                     )
                     return list(cached)
                 raise
-            if cached is not None and is_network_unavailable_error(exc):
+            if cached is not None and (
+                is_network_unavailable_error(exc) or is_sign_in_required_error(exc)
+            ):
+                if is_sign_in_required_error(exc):
+                    self.set_account_connect_health(account_uid, "needs_sign_in")
                 log.debug(
-                    "Using cached folder list for account %s while offline",
+                    "Using cached folder list for account %s after %s",
                     account_uid,
+                    "sign-in error" if is_sign_in_required_error(exc) else "offline",
                 )
                 return cached
-            if is_network_unavailable_error(exc):
+            if is_network_unavailable_error(exc) or is_sign_in_required_error(exc):
+                if is_sign_in_required_error(exc):
+                    self.set_account_connect_health(account_uid, "needs_sign_in")
                 result = self._list_folders_from_local_store_unlocked(account_uid)
                 if result:
                     with self._lock:
@@ -4437,6 +4515,44 @@ class MailService:
             page, has_more = paginate_messages(index.messages, offset, limit)
             return page, index.unread, index.total, has_more
 
+    def _prefer_nonempty_folder_index(
+        self,
+        account_uid: str,
+        folder_name: str,
+        index: _FolderMessageIndex,
+    ) -> tuple[_FolderMessageIndex, FolderIndexSource | None]:
+        """Keep a larger RAM/disk index when Camel's summary came back empty."""
+        if index.messages:
+            return index, None
+        key = (account_uid, folder_name)
+        ram = self._folder_indexes.get(key)
+        if ram is not None and ram.messages:
+            log.warning(
+                "Keeping in-memory folder index for %s/%s after empty Camel summary "
+                "(memory=%d)",
+                account_uid,
+                folder_name,
+                len(ram.messages),
+            )
+            return ram, "memory"
+        cached = folder_index_cache.load(account_uid, folder_name)
+        if cached is not None and cached[0]:
+            messages, unread, total = cached
+            log.warning(
+                "Keeping on-disk folder index for %s/%s after empty Camel summary "
+                "(disk=%d)",
+                account_uid,
+                folder_name,
+                len(messages),
+            )
+            return (
+                _FolderMessageIndex(
+                    messages=messages, unread=unread, total=total
+                ),
+                "disk_cache",
+            )
+        return index, None
+
     def _get_folder_index_unlocked(
         self,
         account_uid: str,
@@ -4497,8 +4613,16 @@ class MailService:
             index = self._build_folder_index_unlocked(
                 account_uid, folder_name, sync=True
             )
+            kept, kept_source = self._prefer_nonempty_folder_index(
+                account_uid, folder_name, index
+            )
+            if kept_source is not None:
+                self._store_folder_index(account_uid, folder_name, kept)
+                return kept, kept_source
             self._store_folder_index(account_uid, folder_name, index)
-            if _folder_index_is_cacheable(index):
+            if _folder_index_is_cacheable(index) and (
+                index.messages or folder_index_cache.load(account_uid, folder_name) is None
+            ):
                 folder_index_cache.save(
                     account_uid,
                     folder_name,
@@ -4696,11 +4820,103 @@ class MailService:
         folder: Camel.Folder,
         api_uid: str,
     ) -> Any | None:
+        file_mime = self._try_message_from_cache_file(folder, api_uid)
+        if file_mime is not None:
+            return file_mime
         try:
             return folder.get_message_cached(api_uid, None)
         except Exception:
             log.debug("get_message_cached failed for %s", api_uid, exc_info=True)
             return None
+
+    def _first_cached_rfc822_path(
+        self,
+        folder: Camel.Folder,
+        api_uid: str,
+    ) -> str | None:
+        getter = getattr(folder, "get_filename", None)
+        if callable(getter):
+            try:
+                filename = getter(api_uid)
+            except Exception:
+                log.debug("get_filename failed for %s", api_uid, exc_info=True)
+                filename = None
+            if isinstance(filename, str) and filename:
+                found = first_nonempty_path(cached_rfc822_candidates(filename))
+                if found is not None:
+                    return found
+        store_uid = None
+        parent = getattr(folder, "get_parent_store", None)
+        if callable(parent):
+            try:
+                store = parent()
+            except Exception:
+                store = None
+            uid_get = getattr(store, "get_uid", None) if store is not None else None
+            if callable(uid_get):
+                try:
+                    raw_uid = uid_get()
+                except Exception:
+                    raw_uid = None
+                if isinstance(raw_uid, str) and raw_uid:
+                    store_uid = raw_uid
+        folder_name = None
+        for attr in ("get_full_name", "get_display_name"):
+            name_get = getattr(folder, attr, None)
+            if not callable(name_get):
+                continue
+            try:
+                raw_name = name_get()
+            except Exception:
+                continue
+            if isinstance(raw_name, str) and raw_name:
+                folder_name = raw_name
+                break
+        if not store_uid:
+            return None
+        digest = rfc822_digest(api_uid)
+        names = [folder_name] if folder_name else []
+        if not folder_name or folder_name.lower() == "inbox":
+            names.extend(["Inbox", "INBOX"])
+        cache_root = os.path.expanduser("~/.cache/evolution")
+        for store_root in evolution_store_roots(cache_root, store_uid):
+            found = find_nonempty_rfc822(store_root, names, digest)
+            if found is not None:
+                return found
+        return None
+
+    def _construct_mime_from_rfc822_path(self, filename: str) -> Any | None:
+        try:
+            with open(filename, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            return None
+        if not data:
+            return None
+        try:
+            message = Camel.MimeMessage()
+            stream = Gio.MemoryInputStream.new_from_bytes(GLib.Bytes.new(data))
+            try:
+                message.construct_from_input_stream_sync(stream, None)
+            finally:
+                stream.close()
+            return message
+        except Exception:
+            log.debug(
+                "Could not parse cached MIME file %s", filename, exc_info=True
+            )
+            return None
+
+    def _try_message_from_cache_file(
+        self,
+        folder: Camel.Folder,
+        api_uid: str,
+    ) -> Any | None:
+        """Load MIME from Camel's on-disk cache file when get_message_cached is empty."""
+        path = self._first_cached_rfc822_path(folder, api_uid)
+        if path is None:
+            return None
+        return self._construct_mime_from_rfc822_path(path)
 
     def _try_fetch_message_uid(
         self,
@@ -4977,11 +5193,15 @@ class MailService:
                     graph_gone = True
                     cause = sync_exc
                 elif is_sign_in_required_error(sync_exc):
-                    self.set_account_connect_health(account_uid, "needs_sign_in")
                     cached = self._try_message_cached(folder, api_uid)
                     if cached is not None:
+                        self.set_account_connect_health(
+                            account_uid, "needs_sign_in"
+                        )
                         return cached
-                    raise
+                    self._raise_uncached_sign_in(
+                        account_uid, folder_name, message_uid, cause=sync_exc
+                    )
                 else:
                     log_mail_error(
                         log,
@@ -4999,6 +5219,16 @@ class MailService:
             try:
                 mime = folder.get_message_sync(api_uid, None)
             except GLib.Error as retry_exc:
+                if is_sign_in_required_error(retry_exc):
+                    cached = self._try_message_cached(folder, api_uid)
+                    if cached is not None:
+                        self.set_account_connect_health(
+                            account_uid, "needs_sign_in"
+                        )
+                        return cached
+                    self._raise_uncached_sign_in(
+                        account_uid, folder_name, message_uid, cause=retry_exc
+                    )
                 if not self._is_missing_message_error(retry_exc):
                     raise
                 mime = None
@@ -5066,17 +5296,42 @@ class MailService:
         finally:
             timer.cancel()
 
+    def _raise_uncached_sign_in(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        cause: BaseException | None = None,
+    ) -> NoReturn:
+        self.set_account_connect_health(account_uid, "needs_sign_in")
+        error = MessageNotAvailableError(
+            message_uid,
+            folder_name,
+            reason=MessageUnavailableReason.NOT_CACHED_SIGN_IN,
+        )
+        if cause is not None:
+            raise error from cause
+        raise error
+
     def _get_message_mime_sync(
         self,
         folder: Camel.Folder,
         account_uid: str,
         folder_name: str,
         message_uid: str,
+        *,
+        allow_network: bool = True,
     ) -> Any:
         offline = not self._network_available
         mime = None
         self._recovered_read_uid = None
         api_uid = camel_uid_to_api(message_uid)
+        mime = self._try_message_cached(folder, api_uid)
+        if mime is not None:
+            return mime
+        if not allow_network:
+            self._raise_uncached_sign_in(account_uid, folder_name, message_uid)
         try:
             mime = self._get_message_sync_with_timeout(folder, api_uid)
         except TimeoutError:
@@ -5109,6 +5364,9 @@ class MailService:
                 mime = self._try_message_cached(folder, api_uid)
                 if mime is not None:
                     return mime
+                self._raise_uncached_sign_in(
+                    account_uid, folder_name, message_uid, cause=exc
+                )
             raise
         if mime is None:
             if offline:
@@ -5136,25 +5394,80 @@ class MailService:
         """Newest-first list from the identity-keyed ``by_uid`` map (#267)."""
         return sort_messages_newest_first(list(by_uid.values()))
 
+    def _try_get_folder_sync_unlocked(
+        self,
+        store: Camel.Store,
+        folder_name: str,
+        cancellable: Gio.Cancellable | None = None,
+    ) -> Camel.Folder | None:
+        try:
+            return store.get_folder_sync(folder_name, 0, cancellable)
+        except GLib.Error as exc:
+            if self._is_missing_folder_error(exc):
+                log.debug(
+                    "Skipping unavailable folder %r",
+                    folder_name,
+                )
+                return None
+            raise
+
+    def _get_named_folder_unlocked(
+        self,
+        store: Camel.Store,
+        folder_name: str,
+        cancellable: Gio.Cancellable | None = None,
+    ) -> Camel.Folder | None:
+        """Open ``folder_name``, trying Inbox/INBOX aliases when the summary is empty."""
+        names = _inbox_folder_name_aliases(folder_name)
+        chosen: Camel.Folder | None = None
+        chosen_count = -1
+        for name in names:
+            folder = self._try_get_folder_sync_unlocked(store, name, cancellable)
+            if folder is None:
+                continue
+            try:
+                count = int(folder.get_message_count())
+            except Exception:
+                count = 0
+            if chosen is None or count > chosen_count:
+                chosen = folder
+                chosen_count = count
+                if count > 0 and name == folder_name:
+                    return folder
+        return chosen
+
     def _open_folder_unlocked(
         self,
         account_uid: str,
         folder_name: str,
         *,
         cancellable: Gio.Cancellable | None = None,
+        allow_online: bool = True,
     ) -> Camel.Folder | None:
-        store = self._get_store_unlocked(account_uid, cancellable=cancellable)
         try:
-            return store.get_folder_sync(folder_name, 0, cancellable)
+            store = self._get_store_unlocked(
+                account_uid, cancellable=cancellable, allow_online=allow_online
+            )
+        except Exception as exc:
+            if not (allow_online and is_sign_in_required_error(exc)):
+                raise
+            store = self._get_store_unlocked(
+                account_uid, cancellable=cancellable, allow_online=False
+            )
+        try:
+            return self._get_named_folder_unlocked(
+                store, folder_name, cancellable
+            )
         except GLib.Error as exc:
-            if self._is_missing_folder_error(exc):
-                log.debug(
-                    "Skipping unavailable folder %r for account %s",
-                    folder_name,
-                    account_uid,
-                )
-                return None
-            raise
+            if not (allow_online and is_sign_in_required_error(exc)):
+                raise
+            self.set_account_connect_health(account_uid, "needs_sign_in")
+            store = self._get_store_unlocked(
+                account_uid, cancellable=cancellable, allow_online=False
+            )
+            return self._get_named_folder_unlocked(
+                store, folder_name, cancellable
+            )
 
     def _try_get_folder_for_search_unlocked(
         self, account_uid: str, folder_name: str
@@ -5218,6 +5531,23 @@ class MailService:
                             Gio.IOErrorEnum.CANCELLED,
                         )
                     folder.refresh_info_sync(cancellable)
+                except GLib.Error as refresh_exc:
+                    if refresh_exc.matches(
+                        Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
+                    ):
+                        raise
+                    if is_sign_in_required_error(refresh_exc):
+                        self.set_account_connect_health(
+                            account_uid, "needs_sign_in"
+                        )
+                        log.warning(
+                            "refresh_info failed for %s/%s (sign-in required); "
+                            "using local Camel summary",
+                            account_uid,
+                            folder_name,
+                        )
+                    else:
+                        raise
                 finally:
                     self._unregister_folder_refresh_cancellable(cancellable)
             unread = folder_get_unread_count(folder)
@@ -6912,17 +7242,15 @@ class MailService:
             account_uid, source_folder, message_uids, dest, op_type="move_to_folder"
         )
 
-    def _ensure_goa_ready_for_read_unlocked(self, account_uid: str) -> None:
-        """Fail fast when GOA cannot supply credentials (disabled/expired account)."""
+    def _goa_credentials_ready_for_read_unlocked(self, account_uid: str) -> bool:
+        """Return False when GOA cannot mint a token (skip Graph, try cache)."""
         source = self.registry.ref_source(account_uid)
         if source is None or not source.has_extension("GNOME Online Accounts"):
-            return
+            return True
         if ensure_goa_credentials(self.registry, source, None):
-            return
+            return True
         self.set_account_connect_health(account_uid, "needs_sign_in")
-        raise RuntimeError(
-            "Sign-in expired — GOA credentials unavailable"
-        )
+        return False
 
     def _read_message_unlocked(
         self,
@@ -6939,11 +7267,28 @@ class MailService:
             extract_message_bodies,
         )
 
-        self._ensure_goa_ready_for_read_unlocked(account_uid)
-        store = self._get_store_unlocked(account_uid)
-        folder = store.get_folder_sync(folder_name, 0, None)
+        if self.get_account_connect_health(account_uid) == "needs_sign_in":
+            allow_network = False
+        else:
+            allow_network = self._goa_credentials_ready_for_read_unlocked(
+                account_uid
+            )
+        try:
+            folder = self._open_folder_unlocked(
+                account_uid, folder_name, allow_online=allow_network
+            )
+        except Exception as exc:
+            if not allow_network or is_sign_in_required_error(exc):
+                self._raise_uncached_sign_in(
+                    account_uid, folder_name, message_uid, cause=exc
+                )
+            raise
         if folder is None:
+            if not allow_network:
+                self._raise_uncached_sign_in(account_uid, folder_name, message_uid)
             raise ValueError(f"Folder not found: {folder_name}")
+        if self.get_account_connect_health(account_uid) == "needs_sign_in":
+            allow_network = False
 
         info = folder_get_message_info(folder,message_uid)
         was_unread = info is not None and not (
@@ -6951,7 +7296,11 @@ class MailService:
         )
 
         mime = self._get_message_mime_sync(
-            folder, account_uid, folder_name, message_uid
+            folder,
+            account_uid,
+            folder_name,
+            message_uid,
+            allow_network=allow_network,
         )
         actual_uid = self._recovered_read_uid or message_uid
         if actual_uid != message_uid:
@@ -6974,6 +7323,32 @@ class MailService:
             result["_previous_uid"] = message_uid
         enrich_message_dict_from_mime(result, mime)
         bodies = extract_message_bodies(mime)
+        if not (bodies.get("plain") or bodies.get("html")):
+            file_mime = self._try_message_from_cache_file(
+                folder, camel_uid_to_api(actual_uid)
+            )
+            if file_mime is not None:
+                mime = file_mime
+                enrich_message_dict_from_mime(result, mime)
+                bodies = extract_message_bodies(mime)
+        if not (bodies.get("plain") or bodies.get("html")):
+            path = self._first_cached_rfc822_path(
+                folder, camel_uid_to_api(actual_uid)
+            )
+            if path:
+                try:
+                    with open(path, "rb") as handle:
+                        raw = handle.read()
+                except OSError:
+                    raw = b""
+                if raw:
+                    from .helpers import extract_message_bodies_from_bytes
+
+                    bodies = extract_message_bodies_from_bytes(raw)
+        if not (bodies.get("plain") or bodies.get("html")) and not allow_network:
+            self._raise_uncached_sign_in(
+                account_uid, folder_name, actual_uid
+            )
         result["body_plain"] = bodies["plain"]
         result["body_html"] = bodies["html"]
         result["attachments"] = extract_attachments(mime)
@@ -6993,7 +7368,9 @@ class MailService:
             if references:
                 result["references"] = normalize_references_header(references)
 
-        if was_unread and mark_seen:
+        if was_unread and mark_seen and (
+            bodies.get("plain") or bodies.get("html")
+        ):
             try:
                 unread, total = self._mark_message_seen_unlocked(
                     folder, account_uid, folder_name, actual_uid

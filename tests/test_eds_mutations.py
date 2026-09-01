@@ -157,6 +157,16 @@ class InboxFolderNameTests(unittest.TestCase):
         list_folders.assert_not_called()
         self.assertEqual(inbox, "[Gmail]/Inbox")
 
+    def test_guess_inbox_from_folder_index(self) -> None:
+        service = MailService(registry=mock.Mock())
+        with mock.patch(
+            "post.mail.eds.folder_index_cache.cached_folder_names",
+            return_value=["Sent", "Inbox", "Archive"],
+        ):
+            self.assertEqual(
+                service.guess_inbox_from_folder_index("acct-1"), "Inbox"
+            )
+
 
 class ListFoldersOfflineBootstrapTests(unittest.TestCase):
     def test_offline_uses_local_bootstrap_when_no_memory_cache(self) -> None:
@@ -226,6 +236,36 @@ class ListFoldersOfflineBootstrapTests(unittest.TestCase):
 
         local_bootstrap.assert_called_once_with("acct-1")
         self.assertEqual(result, local_folders)
+
+    def test_sign_in_failure_falls_back_to_local_bootstrap(self) -> None:
+        import gi
+
+        gi.require_version("GLib", "2.0")
+        from gi.repository import GLib
+
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        store = mock.Mock()
+        store.get_folder_info_sync.side_effect = GLib.Error.new_literal(
+            GLib.quark_from_string("g-io-error-quark"),
+            "Failed to refresh access token (goa-error-quark, 4): AADSTS70043",
+            4,
+        )
+        local_folders = [{"full_name": "INBOX", "display_name": "Inbox"}]
+
+        with (
+            mock.patch.object(service, "_get_store_unlocked", return_value=store),
+            mock.patch.object(
+                service,
+                "_list_folders_from_local_store_unlocked",
+                return_value=local_folders,
+            ) as local_bootstrap,
+        ):
+            result = service._list_folders_unlocked("acct-1")
+
+        local_bootstrap.assert_called_once_with("acct-1")
+        self.assertEqual(result, local_folders)
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
 
     def test_null_folder_info_does_not_cache_empty(self) -> None:
         service = MailService(registry=mock.Mock())

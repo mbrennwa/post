@@ -93,3 +93,18 @@ class SendErrorMessageTests(unittest.TestCase):
 
         exc = SendQueued(MESSAGE_QUEUED)
         self.assertEqual(user_send_error_message(exc), MESSAGE_QUEUED)
+
+    def test_expired_refresh_token_is_sign_in_copy(self) -> None:
+        from post.mail.network_errors import TOKEN_EXPIRED_FOLDER_MESSAGE
+
+        exc = GLib.Error.new_literal(
+            GLib.quark_from_string("goa-error-quark"),
+            "Failed to refresh access token (goa-error-quark, 4): AADSTS70043: "
+            "The refresh token has expired or is invalid",
+            4,
+        )
+        self.assertEqual(user_send_error_message(exc), TOKEN_EXPIRED_FOLDER_MESSAGE)
+        self.assertEqual(
+            user_send_error_message(SendError(exc.message)),
+            TOKEN_EXPIRED_FOLDER_MESSAGE,
+        )

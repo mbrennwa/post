@@ -85,6 +85,8 @@ from post.mail.search_debug import search_trace, search_trace_timer
 from post.mail.operation_queue import offline_queue_status_text
 from post.mail.send_delay import OutboundSendDelayScheduler
 from post.mail.network_errors import (
+    MESSAGE_NOT_CACHED_SIGN_IN,
+    format_folder_load_error,
     format_message_read_error,
     is_network_unavailable_error,
     is_sign_in_required_error,
@@ -831,6 +833,15 @@ class MainWindow(Adw.ApplicationWindow):
         if result.failed_account_uid:
             self._sidebar.refresh_account_online_marker(result.failed_account_uid)
         if result.error_message:
+            if is_sign_in_required_error(RuntimeError(result.error_message)):
+                if result.failed_account_uid:
+                    self._mail.set_account_connect_health(
+                        result.failed_account_uid, "needs_sign_in"
+                    )
+                    self._sidebar.refresh_account_online_marker(
+                        result.failed_account_uid
+                    )
+                return False
             show_error_toast(self, result.error_message)
             self._set_status(result.error_message)
             return False
@@ -2310,9 +2321,10 @@ class MainWindow(Adw.ApplicationWindow):
                 msg = self._mail.read_message(account_uid, folder_name, message_uid)
             except MessageNotAvailableError as exc:
                 log.warning(
-                    "Message %s no longer available in %r",
+                    "Message %s unavailable in %r (%s)",
                     message_uid,
                     folder_name,
+                    exc.reason,
                 )
                 error = exc
             except Exception as exc:
@@ -5439,7 +5451,7 @@ class MainWindow(Adw.ApplicationWindow):
                 self._message_empty_label.set_label(OFFLINE_MAIL_MESSAGE)
                 self._message_stack.set_visible_child_name("empty")
             else:
-                self._message_error_label.set_label(str(error))
+                self._message_error_label.set_label(format_folder_load_error(error))
                 self._message_stack.set_visible_child_name("error")
                 show_error_toast(self, f"Could not load {folder_name}")
             self._release_offline_sync_for_folder_work(load_id)
@@ -6834,6 +6846,19 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> None:
         if error is not None:
+            if is_sign_in_required_error(error):
+                location = next(iter(updates_by_list_key), None)
+                account_uid = None
+                if location is not None:
+                    found = self._message_location_for_list_key(location)
+                    if found is not None:
+                        account_uid = found[0]
+                if account_uid is None and self._current_account is not None:
+                    account_uid = self._current_account.uid
+                if account_uid is not None:
+                    self._mail.set_account_connect_health(account_uid, "needs_sign_in")
+                    self._sidebar.refresh_account_online_marker(account_uid)
+                return
             show_error_toast(self, f"Could not update messages: {error}")
             return
         if not updates_by_list_key and not folder_count_updates:
@@ -7051,9 +7076,10 @@ class MainWindow(Adw.ApplicationWindow):
                     )
             except MessageNotAvailableError as exc:
                 log.warning(
-                    "Message %s no longer available in %r",
+                    "Message %s unavailable in %r (%s)",
                     uid,
                     folder_name,
+                    exc.reason,
                 )
                 error = exc
             except Exception as exc:
@@ -7243,8 +7269,27 @@ class MainWindow(Adw.ApplicationWindow):
         if isinstance(error, MessageNotAvailableError):
             if error.reason == MessageUnavailableReason.VANISHED:
                 self._remove_vanished_message(uid)
+            sign_in_required = (
+                error.reason == MessageUnavailableReason.NOT_CACHED_SIGN_IN
+            )
+            if sign_in_required:
+                location = self._message_location_for_list_key(uid)
+                account_uid = (
+                    location[0]
+                    if location is not None
+                    else (
+                        self._current_account.uid
+                        if self._current_account is not None
+                        else None
+                    )
+                )
+                if account_uid is not None:
+                    self._mail.set_account_connect_health(
+                        account_uid, "needs_sign_in"
+                    )
             self._show_message_unavailable_reader(error.user_message())
-            show_error_toast(self, error.user_message())
+            if not sign_in_required:
+                show_error_toast(self, error.user_message())
             return False
 
         if error is not None:
@@ -7268,15 +7313,35 @@ class MainWindow(Adw.ApplicationWindow):
                 self._mail.set_account_connect_health(account_uid, "needs_sign_in")
             user_message = format_message_read_error(
                 error,
-                cached=not sign_in_required,
+                cached=False,
             )
             self._show_message_unavailable_reader(user_message)
-            show_error_toast(self, user_message)
-            if sign_in_required:
-                self._set_status(user_message)
+            if not sign_in_required:
+                show_error_toast(self, user_message)
             return False
 
         assert msg is not None
+        if not (
+            (msg.get("body_plain") or "").strip()
+            or (msg.get("body_html") or "").strip()
+        ):
+            location = self._message_location_for_list_key(uid)
+            account_uid = (
+                location[0]
+                if location is not None
+                else (
+                    self._current_account.uid
+                    if self._current_account is not None
+                    else None
+                )
+            )
+            if (
+                account_uid is not None
+                and self._mail.get_account_connect_health(account_uid)
+                == "needs_sign_in"
+            ):
+                self._show_message_unavailable_reader(MESSAGE_NOT_CACHED_SIGN_IN)
+                return False
 
         previous_uid = str(msg.get("_previous_uid") or "")
         recovered_uid = str(msg.get("uid") or "")
@@ -7314,9 +7379,6 @@ class MainWindow(Adw.ApplicationWindow):
                 msg["folder_unread"],
                 msg["folder_total"],
             )
-        if (msg.get("flags") or {}).get("seen"):
-            self._mark_message_read(uid)
-
         self._current_message = msg
         body = {
             "plain": msg.get("body_plain"),
@@ -7329,6 +7391,8 @@ class MainWindow(Adw.ApplicationWindow):
             dark=self._app_prefers_dark(),
             message_appearance=self._message_appearance,
         )
+        if (msg.get("flags") or {}).get("seen"):
+            self._mark_message_read(uid)
         return False
 
     def _app_prefers_dark(self) -> bool:
@@ -7459,6 +7523,8 @@ class MainWindow(Adw.ApplicationWindow):
                 message_appearance=self._message_appearance,
             )
             self._reader_pane.set_actions_sensitive(True)
+            if (msg.get("flags") or {}).get("seen"):
+                self._mark_message_read(uid)
 
     def _notify_reader_windows_message_moved(self, uids: list[str]) -> None:
         for list_key in uids:
