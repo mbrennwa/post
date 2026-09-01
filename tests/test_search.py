@@ -691,5 +691,134 @@ class GroupListKeysByLocationTests(unittest.TestCase):
         self.assertIsNone(parse_search_row_key("a\0b"))
 
 
+class SearchStatusScopeTests(unittest.TestCase):
+    def _make_window(
+        self,
+        *,
+        scope,
+        viewing_account,
+        folder_name: str = "INBOX",
+        total: int = 0,
+        shown: int = 0,
+        search_query: object | None = object(),
+    ):
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        window = mock.Mock()
+        window._search_query = search_query
+        window._search_scope = scope
+        window._message_total = total
+        window._message_list_view = mock.Mock()
+        window._message_list_view.item_count.return_value = shown
+        window._current_account = viewing_account
+        window._sidebar = mock.Mock()
+        window._sidebar.account_display_label.side_effect = lambda uid: {
+            "acct-a": "Personal",
+            "acct-b": "Work",
+        }.get(uid, uid)
+        window._set_status = mock.Mock()
+        window._with_load_status_detail = lambda text: text
+        window._search_target_label = lambda folder: MainWindow._search_target_label(
+            window, folder
+        )
+        window._search_folder_scope_labels = (
+            lambda folder, **kwargs: MainWindow._search_folder_scope_labels(
+                window, folder, **kwargs
+            )
+        )
+        return window
+
+    def _account(self, uid: str) -> object:
+        from post.mail.eds import MailAccount
+
+        return MailAccount(
+            uid=uid,
+            name=f"Account {uid}",
+            email=f"{uid}@example.com",
+            backend="imapx",
+            identity_uid=None,
+            from_name=None,
+            from_address=None,
+            transport_uid=None,
+        )
+
+    def test_account_scope_status_uses_scope_not_viewing_folder(self) -> None:
+        from post.preferences import SEARCH_SCOPE_ACCOUNT, SearchScope
+        from post.window import MainWindow
+
+        viewing = self._account("acct-a")
+        window = self._make_window(
+            scope=SearchScope(SEARCH_SCOPE_ACCOUNT, account_uid="acct-b"),
+            viewing_account=viewing,
+            total=0,
+        )
+
+        MainWindow._update_message_status(window, viewing, "INBOX")
+
+        status = window._set_status.call_args[0][0]
+        self.assertEqual(status, "No matches in Work")
+        self.assertNotIn("Personal", status)
+        self.assertNotIn("INBOX", status)
+
+    def test_all_mail_scope_status(self) -> None:
+        from post.preferences import SEARCH_SCOPE_ALL, SearchScope
+        from post.window import MainWindow
+
+        viewing = self._account("acct-a")
+        window = self._make_window(
+            scope=SearchScope(SEARCH_SCOPE_ALL),
+            viewing_account=viewing,
+            total=0,
+        )
+
+        MainWindow._update_message_status(window, viewing, "INBOX")
+
+        status = window._set_status.call_args[0][0]
+        self.assertEqual(status, "No matches in All Mail")
+        self.assertNotIn("Personal", status)
+
+    def test_folder_scope_status_names_folder_target(self) -> None:
+        from post.preferences import SEARCH_SCOPE_FOLDER, SearchScope
+        from post.window import MainWindow
+
+        viewing = self._account("acct-a")
+        window = self._make_window(
+            scope=SearchScope(SEARCH_SCOPE_FOLDER),
+            viewing_account=viewing,
+            total=3,
+            shown=3,
+        )
+
+        MainWindow._update_message_status(window, viewing, "INBOX")
+
+        status = window._set_status.call_args[0][0]
+        self.assertEqual(
+            status,
+            f"3 matches in {viewing.display_label}/INBOX",
+        )
+
+    def test_non_search_status_uses_viewing_account(self) -> None:
+        from post.preferences import SEARCH_SCOPE_FOLDER, SearchScope
+        from post.window import MainWindow
+
+        viewing = self._account("acct-a")
+        window = self._make_window(
+            scope=SearchScope(SEARCH_SCOPE_FOLDER),
+            viewing_account=viewing,
+            total=5,
+            shown=5,
+            search_query=None,
+        )
+        window._current_folder_messages = [object()] * 5
+        window._mail = type("Mail", (), {"get_folder_status_totals": lambda *a: None})()
+
+        MainWindow._update_message_status(window, viewing, "INBOX")
+
+        status = window._set_status.call_args[0][0]
+        self.assertEqual(status, "5 messages in acct-a@example.com / INBOX")
+
+
 if __name__ == "__main__":
     unittest.main()

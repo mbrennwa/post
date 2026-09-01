@@ -5777,28 +5777,29 @@ class MainWindow(Adw.ApplicationWindow):
                 self._set_status(self._with_load_status_detail(f"{shown} queued for {label}"))
             return
         if self._search_query is not None:
+            target = self._search_target_label(folder_name)
             if total == 0:
                 self._set_status(
                     self._with_load_status_detail(
-                        f"No matches in {label} / {folder_name}"
+                        f"No matches in {target}"
                     )
                 )
             elif total >= 0 and shown < total:
                 self._set_status(
                     self._with_load_status_detail(
-                        f"Showing {shown} of {total} matches in {label} / {folder_name}"
+                        f"Showing {shown} of {total} matches in {target}"
                     )
                 )
             elif total >= 0:
                 self._set_status(
                     self._with_load_status_detail(
-                        f"{total} matches in {label} / {folder_name}"
+                        f"{total} matches in {target}"
                     )
                 )
             else:
                 self._set_status(
                     self._with_load_status_detail(
-                        f"{shown} matches in {label} / {folder_name}"
+                        f"{shown} matches in {target}"
                     )
                 )
             return
