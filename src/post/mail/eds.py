@@ -5327,10 +5327,10 @@ class MailService:
         mime = None
         self._recovered_read_uid = None
         api_uid = camel_uid_to_api(message_uid)
-        mime = self._try_message_cached(folder, api_uid)
-        if mime is not None:
-            return mime
         if not allow_network:
+            mime = self._try_message_cached(folder, api_uid)
+            if mime is not None:
+                return mime
             self._raise_uncached_sign_in(account_uid, folder_name, message_uid)
         try:
             mime = self._get_message_sync_with_timeout(folder, api_uid)
