@@ -648,6 +648,119 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         )
         self.assertIsNone(window._pending_restore_message_uid)
 
+    def test_selection_changed_idle_reloads_stale_reader(self) -> None:
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        hit = annotate_search_match(
+            {"uid": "100", "subject": "Prusa repair"},
+            account_uid="acct-1",
+            folder_name="Archive",
+        )
+        stale = annotate_search_match(
+            {"uid": "200", "subject": "Schau event"},
+            account_uid="acct-1",
+            folder_name="Archive",
+        )
+        window = self._window_stub(messages=[hit, stale])
+        list_key = hit["_search_row_key"]
+        window._message_list_view.get_selected_uids.return_value = [list_key]
+        window._message_list_view.is_restoring_selection = mock.Mock(
+            return_value=False
+        )
+        window._update_message_toolbar = mock.Mock()
+        window._current_message_uid = list_key
+        window._current_message = dict(stale)
+
+        MainWindow._on_message_list_selection_changed_idle(window)
+
+        window._load_message_body_for_uid.assert_called_once_with(
+            list_key, mark_seen=False
+        )
+
+    def test_reader_shows_list_key_false_for_search_key_without_annotations(
+        self,
+    ) -> None:
+        from post.window import MainWindow
+
+        archive_hit = annotate_search_match(
+            {"uid": "100", "subject": "Archive thread"},
+            account_uid="acct-1",
+            folder_name="Archive",
+        )
+        window = self._window_stub(messages=[archive_hit], sidebar_folder="INBOX")
+        window._current_message = {"uid": "100", "subject": "Inbox notification"}
+
+        self.assertFalse(
+            MainWindow._reader_shows_list_key(
+                window, archive_hit["_search_row_key"]
+            )
+        )
+
+    def test_apply_search_matches_reconciles_reader(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        hit = annotate_search_match(
+            {"uid": "100", "subject": "Search hit", "sort_date": 300},
+            account_uid="acct-1",
+            folder_name="Archive",
+        )
+        stale = annotate_search_match(
+            {"uid": "200", "subject": "Stale reader", "sort_date": 100},
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        account = SimpleNamespace(uid="acct-1")
+        list_key = hit["_search_row_key"]
+        window = SimpleNamespace(
+            _is_closing=False,
+            _messages_load_generation=1,
+            _search_query=object(),
+            _current_account=account,
+            _current_folder="INBOX",
+            _search_results_streamed=False,
+            _current_folder_messages=[stale],
+            _current_message_uid=list_key,
+            _current_message=dict(stale),
+            _message_stack=mock.Mock(
+                get_visible_child_name=mock.Mock(return_value="list")
+            ),
+            _message_list_view=mock.Mock(
+                get_selected_uids=mock.Mock(return_value=[list_key]),
+                is_restoring_selection=mock.Mock(return_value=False),
+                insert_messages_newest_first=mock.Mock(),
+            ),
+            _update_search_scope_ui=mock.Mock(),
+            _load_message_body_for_uid=mock.Mock(),
+        )
+        window._message_list_key = lambda msg: MainWindow._message_list_key(
+            window, msg
+        )
+        window._message_location_for_list_key = (
+            lambda list_key: MainWindow._message_location_for_list_key(
+                window, list_key
+            )
+        )
+        window._reader_shows_list_key = lambda list_key: MainWindow._reader_shows_list_key(
+            window, list_key
+        )
+        window._ensure_reader_matches_selection = (
+            lambda **kwargs: MainWindow._ensure_reader_matches_selection(
+                window, **kwargs
+            )
+        )
+        window._mark_seen_when_reading_uid = lambda _uid: True
+
+        MainWindow._apply_search_matches(window, 1, [hit])
+
+        window._load_message_body_for_uid.assert_called_once_with(
+            list_key, mark_seen=False
+        )
+
     def test_location_parses_search_row_key_before_sidebar_fallback(self) -> None:
         from post.mail.search import make_search_row_key
         from post.window import MainWindow
