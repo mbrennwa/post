@@ -110,6 +110,9 @@ class SettingsDialog(Adw.PreferencesWindow):
         # #235: hiding and re-presenting this window leaves close broken after the
         # next About-link open. Destroy on close so each open is a fresh instance.
         self.set_hide_on_close(False)
+        application = parent.get_application()
+        if application is not None:
+            self.set_application(application)
         self._parent = parent
         self._mail = mail
         self._set_status = set_status
