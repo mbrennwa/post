@@ -857,20 +857,46 @@ def searchable_body_text(
     return ""
 
 
+def _usable_plain_body(text: str | None) -> bool:
+    return bool(text and text.strip())
+
+
+def _usable_html_body(text: str | None) -> bool:
+    """True when inline HTML has visible text or an image (#370 vs #344)."""
+    if not text or not text.strip():
+        return False
+    lowered = text.lower()
+    if "<img" in lowered or "cid:" in lowered:
+        return True
+    return bool(html_to_quotable_plain(text).strip())
+
+
+def _promote_attached_html_if_needed(
+    bodies: dict[str, str | None], attached_html: list[str]
+) -> None:
+    """Use attached HTML only when no usable inline body remains (#344, #370)."""
+    if not _usable_html_body(bodies["html"]):
+        bodies["html"] = None
+    if not _usable_plain_body(bodies["plain"]):
+        bodies["plain"] = None
+    if bodies["html"] is None and bodies["plain"] is None and attached_html:
+        bodies["html"] = attached_html[0]
+
+
 def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:
     """Return plain-text and HTML bodies from a Camel.MimeMessage.
 
     ``text/html`` parts with ``Content-Disposition: attachment`` (e.g.
-    ``ATT00001.htm``) are not used as the HTML body when an inline body
-    exists (#344). They are a last resort only when nothing else remains.
+    ``ATT00001.htm``) are not used as the HTML body when a usable inline
+    body exists (#344). Empty or tag-only stubs do not count (#370).
+    Attached HTML is a last resort only when nothing else remains.
     """
     bodies: dict[str, str | None] = {"plain": None, "html": None}
     attached_html: list[str] = []
     _walk_mime_parts(mime_msg, bodies, attached_html)
     if bodies["plain"] is None and bodies["html"] is None:
         _email_module_fallback(mime_msg, bodies, attached_html)
-    if bodies["html"] is None and bodies["plain"] is None and attached_html:
-        bodies["html"] = attached_html[0]
+    _promote_attached_html_if_needed(bodies, attached_html)
     return bodies
 
 
@@ -879,8 +905,7 @@ def extract_message_bodies_from_bytes(raw: bytes) -> dict[str, str | None]:
     bodies: dict[str, str | None] = {"plain": None, "html": None}
     attached_html: list[str] = []
     _email_bodies_from_bytes(raw, bodies, attached_html)
-    if bodies["html"] is None and bodies["plain"] is None and attached_html:
-        bodies["html"] = attached_html[0]
+    _promote_attached_html_if_needed(bodies, attached_html)
     return bodies
 
 
