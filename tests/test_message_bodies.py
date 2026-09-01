@@ -16,6 +16,7 @@ from post.mail.helpers import (
     _decode_text_part,
     extract_attachments,
     extract_message_bodies,
+    extract_message_bodies_from_bytes,
 )
 
 
@@ -177,6 +178,118 @@ Content-Disposition: attachment; filename="ATT00001.htm"
         bodies = extract_message_bodies(mime)
         self.assertIsNone(bodies["plain"])
         self.assertIn("Only html", bodies["html"] or "")
+
+    def test_empty_inline_alternative_promotes_attached_html(self) -> None:
+        raw = b"""From: a@example.com
+To: b@example.com
+Subject: Fwd: intro
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mixed"
+
+--mixed
+Content-Type: multipart/alternative; boundary="alt"
+
+--alt
+Content-Type: text/plain; charset="utf-8"
+
+
+--alt
+Content-Type: text/html; charset="utf-8"
+
+
+--alt--
+--mixed
+Content-Type: text/html; name="ATT00001.htm"
+Content-Disposition: attachment; filename="ATT00001.htm"
+
+<p>Forwarded HTML</p>
+--mixed--
+"""
+        mime = _FakeMimeMessage(raw)
+        bodies = extract_message_bodies(mime)
+        self.assertIsNone(bodies["plain"])
+        self.assertIn("Forwarded HTML", bodies["html"] or "")
+        from_bytes = extract_message_bodies_from_bytes(raw)
+        self.assertEqual(from_bytes["html"], bodies["html"])
+        self.assertIsNone(from_bytes["plain"])
+
+    def test_stub_inline_html_promotes_attached_html(self) -> None:
+        raw = b"""From: a@example.com
+To: b@example.com
+Subject: Fwd: intro
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mixed"
+
+--mixed
+Content-Type: text/html; charset="utf-8"
+
+<html><body></body></html>
+--mixed
+Content-Type: text/html; name="ATT00001.htm"
+Content-Disposition: attachment; filename="ATT00001.htm"
+
+<p>Forwarded HTML</p>
+--mixed--
+"""
+        mime = _FakeMimeMessage(raw)
+        bodies = extract_message_bodies(mime)
+        self.assertIsNone(bodies["plain"])
+        self.assertIn("Forwarded HTML", bodies["html"] or "")
+        self.assertNotIn("<html>", bodies["html"] or "")
+
+    def test_empty_inline_html_keeps_real_plain_reply(self) -> None:
+        raw = b"""From: a@example.com
+To: b@example.com
+Subject: Reply
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bound"
+
+--bound
+Content-Type: multipart/alternative; boundary="alt"
+
+--alt
+Content-Type: text/plain; charset="utf-8"
+
+Hello Bob, this is the new reply.
+--alt
+Content-Type: text/html; charset="utf-8"
+
+<html><body></body></html>
+--alt--
+--bound
+Content-Type: text/html; name="ATT00001.htm"
+Content-Disposition: attachment; filename="ATT00001.htm"
+
+<div>Quoted original</div>
+--bound--
+"""
+        mime = _FakeMimeMessage(raw)
+        bodies = extract_message_bodies(mime)
+        self.assertIn("this is the new reply", bodies["plain"] or "")
+        self.assertIsNone(bodies["html"])
+
+    def test_image_only_inline_html_is_not_a_stub(self) -> None:
+        raw = b"""From: a@example.com
+To: b@example.com
+Subject: Photo
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mixed"
+
+--mixed
+Content-Type: text/html; charset="utf-8"
+
+<img src="cid:photo@example">
+--mixed
+Content-Type: text/html; name="ATT00001.htm"
+Content-Disposition: attachment; filename="ATT00001.htm"
+
+<div>Quoted original</div>
+--mixed--
+"""
+        mime = _FakeMimeMessage(raw)
+        bodies = extract_message_bodies(mime)
+        self.assertIn("cid:photo@example", bodies["html"] or "")
+        self.assertNotIn("Quoted original", bodies["html"] or "")
 
     def test_camel_walk_skips_attached_html_when_plain_exists(self) -> None:
         message = build_plain_mime_message(
