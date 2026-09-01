@@ -3011,12 +3011,55 @@ class MainWindow(Adw.ApplicationWindow):
                 str(search_account) == expected_account
                 and str(search_folder) == expected_folder
             )
+        if parse_search_row_key(list_key) is not None:
+            # Loaded body lacks search annotations — do not match via sidebar folder.
+            return False
         if self._current_account and self._current_folder:
             return (
                 self._current_account.uid == expected_account
                 and self._current_folder == expected_folder
             )
-        return True
+        return False
+
+    def _annotate_message_search_context(self, msg: dict, list_key: str) -> dict:
+        """Copy search row metadata onto a loaded body for reader/list sync."""
+        if parse_search_row_key(list_key) is None:
+            return msg
+        if self._current_folder_messages:
+            for message in self._current_folder_messages:
+                if self._message_list_key(message) == list_key:
+                    annotated = dict(msg)
+                    for key in ("_search_account_uid", "_search_folder", "_search_row_key"):
+                        if message.get(key):
+                            annotated[key] = message[key]
+                    return annotated
+        parsed = parse_search_row_key(list_key)
+        if parsed is None:
+            return msg
+        account_uid, folder_name, _message_uid = parsed
+        return annotate_search_match(
+            msg,
+            account_uid=account_uid,
+            folder_name=folder_name,
+        )
+
+    def _ensure_reader_matches_selection(self, *, mark_seen: bool | None = None) -> None:
+        if self._message_list_view.is_restoring_selection():
+            return
+        if not self._current_account or not self._current_folder:
+            return
+        if self._message_stack.get_visible_child_name() != "list":
+            return
+        selected = self._message_list_view.get_selected_uids()
+        if len(selected) != 1:
+            return
+        uid = selected[0]
+        if uid == self._current_message_uid and self._reader_shows_list_key(uid):
+            return
+        if mark_seen is None:
+            mark_seen = self._mark_seen_when_reading_uid(uid)
+        self._current_message_uid = uid
+        self._load_message_body_for_uid(uid, mark_seen=mark_seen)
 
     def _message_location_for_list_key(
         self, list_key: str
@@ -3442,21 +3485,7 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._reload_reader_for_selection_if_needed)
 
     def _reload_reader_for_selection_if_needed(self) -> bool:
-        if self._message_stack.get_visible_child_name() != "list":
-            return False
-        if not self._current_account or not self._current_folder:
-            return False
-        if self._current_message is not None:
-            return False
-        selected = self._message_list_view.get_selected_uids()
-        if len(selected) != 1:
-            return False
-        uid = selected[0]
-        self._current_message_uid = uid
-        self._load_message_body_for_uid(
-            uid,
-            mark_seen=self._mark_seen_when_reading_uid(uid),
-        )
+        self._ensure_reader_matches_selection()
         return False
 
     def _on_reader_attachment_context_menu(
@@ -4602,6 +4631,7 @@ class MainWindow(Adw.ApplicationWindow):
         if self._current_folder_messages is None:
             self._current_folder_messages = []
         insert_messages_newest_first(self._current_folder_messages, annotated_batch)
+        self._ensure_reader_matches_selection(mark_seen=False)
         return False
 
     def _should_use_cached_header_search(
@@ -7379,6 +7409,7 @@ class MainWindow(Adw.ApplicationWindow):
                 msg["folder_unread"],
                 msg["folder_total"],
             )
+        msg = self._annotate_message_search_context(msg, uid)
         self._current_message = msg
         body = {
             "plain": msg.get("body_plain"),
