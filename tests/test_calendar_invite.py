@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 from post.mail.calendar_invite import (
     build_vevent_ics,
     calendar_invite_from_email_message,
+    canonical_meeting_url,
     find_meeting_url,
     find_meeting_url_in_html,
     format_invite_copy_text,
@@ -22,9 +23,11 @@ from post.mail.calendar_invite import (
     invite_join_url,
     invite_link_label,
     is_calendar_mime,
+    is_join_url,
     looks_like_calendar_attachment,
     merge_invite_details,
     parse_ics_invite,
+    strip_join_urls,
 )
 from post.mail.calendar_write import (
     CalendarTarget,
@@ -61,6 +64,26 @@ LOCATION:Conference Room
 ORGANIZER:MAILTO:organizer@example.com
 DESCRIPTION:Weekly sync\\nJoin online
 URL:https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc
+END:VEVENT
+END:VCALENDAR
+"""
+
+_TEAMS_MEET_URL = "https://teams.microsoft.com/meet/390576036169085?p=PassCode1"
+_TEAMS_JOIN_URL = (
+    "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc"
+)
+_TEAMS_DELIMITER = "_" * 80
+_TEAMS_DUAL_ICS = f"""BEGIN:VCALENDAR
+VERSION:2.0
+METHOD:REQUEST
+BEGIN:VEVENT
+SUMMARY:Project sync
+DTSTART:20260730T140000Z
+DTEND:20260730T150000Z
+LOCATION:Microsoft Teams Meeting
+URL:{_TEAMS_JOIN_URL}
+X-MICROSOFT-SKYPETEAMSMEETINGURL:{_TEAMS_JOIN_URL}
+DESCRIPTION:{_TEAMS_DELIMITER}\\nMicrosoft Teams meeting\\nJoin: {_TEAMS_MEET_URL}\\nMeeting ID: 390 576 036 169 085\\nPasscode: PassCode1\\nNeed help?<https://aka.ms/JoinTeamsMeeting> | System reference<{_TEAMS_JOIN_URL}>\\nDial in by phone\\nhttps://dialin.teams.cloud.microsoft/example\\nFor organizers: https://teams.microsoft.com/meetingOptions/?organizerId=abc\\n{_TEAMS_DELIMITER}
 END:VEVENT
 END:VCALENDAR
 """
@@ -160,6 +183,25 @@ END:VCALENDAR
         assert invite is not None
         self.assertIn("teams.microsoft.com", invite["meeting_url"] or "")
 
+    def test_prefers_meet_join_over_ics_url(self) -> None:
+        invite = parse_ics_invite(_TEAMS_DUAL_ICS)
+        assert invite is not None
+        self.assertEqual(invite["meeting_url"], _TEAMS_MEET_URL)
+
+    def test_skype_prop_plus_description_meet_url(self) -> None:
+        ics = f"""BEGIN:VCALENDAR
+BEGIN:VEVENT
+SUMMARY:Teams
+DTSTART:20260101T100000Z
+X-MICROSOFT-SKYPETEAMSMEETINGURL:{_TEAMS_JOIN_URL}
+DESCRIPTION:Join {_TEAMS_MEET_URL}
+END:VEVENT
+END:VCALENDAR
+"""
+        invite = parse_ics_invite(ics)
+        assert invite is not None
+        self.assertEqual(invite["meeting_url"], _TEAMS_MEET_URL)
+
 
 class MeetingUrlTests(unittest.TestCase):
     def test_find_zoom_and_teams(self) -> None:
@@ -184,6 +226,55 @@ class MeetingUrlTests(unittest.TestCase):
 
     def test_ignores_non_meeting_hosts(self) -> None:
         self.assertIsNone(find_meeting_url("See https://example.com/docs"))
+
+    def test_canonical_prefers_teams_meet(self) -> None:
+        self.assertEqual(
+            canonical_meeting_url(
+                _TEAMS_JOIN_URL,
+                f"Join {_TEAMS_MEET_URL}",
+                fallback=_TEAMS_JOIN_URL,
+            ),
+            _TEAMS_MEET_URL,
+        )
+
+    def test_canonical_falls_back_to_meetup_join(self) -> None:
+        self.assertEqual(
+            canonical_meeting_url(
+                "No meeting here",
+                fallback=_TEAMS_JOIN_URL,
+            ),
+            _TEAMS_JOIN_URL,
+        )
+
+    def test_strip_join_urls_keeps_help_options_dialin(self) -> None:
+        notes = (
+            f"{'_' * 80}\n"
+            f"Join: {_TEAMS_MEET_URL}\n"
+            "Meeting ID: 390 576 036 169 085\n"
+            "Passcode: PassCode1\n"
+            f"Need help?<https://aka.ms/JoinTeamsMeeting> | "
+            f"System reference<{_TEAMS_JOIN_URL}>\n"
+            "https://dialin.teams.cloud.microsoft/example\n"
+            "https://teams.microsoft.com/meetingOptions/?organizerId=abc\n"
+            f"{'_' * 80}\n"
+        )
+        stripped = strip_join_urls(notes)
+        self.assertNotIn("/meet/", stripped)
+        self.assertNotIn("meetup-join", stripped)
+        self.assertNotIn("____", stripped)
+        self.assertNotIn("Join:", stripped)
+        self.assertNotIn("System reference", stripped)
+        self.assertIn("Meeting ID: 390 576 036 169 085", stripped)
+        self.assertIn("Passcode: PassCode1", stripped)
+        self.assertIn("https://aka.ms/JoinTeamsMeeting", stripped)
+        self.assertIn("https://dialin.teams.cloud.microsoft/example", stripped)
+        self.assertIn(
+            "https://teams.microsoft.com/meetingOptions/?organizerId=abc",
+            stripped,
+        )
+        self.assertFalse(is_join_url("https://teams.microsoft.com/meetingOptions/?x=1"))
+        self.assertTrue(is_join_url(_TEAMS_MEET_URL))
+        self.assertTrue(is_join_url(_TEAMS_JOIN_URL))
 
 
 class MergeInviteDetailsTests(unittest.TestCase):
@@ -269,6 +360,24 @@ END:VCALENDAR
             ),
         )
         self.assertIsNone(invite)
+
+    def test_ics_meetup_join_uses_body_meet_url(self) -> None:
+        invite = merge_invite_details(
+            subject="Project sync",
+            ics_text=f"""BEGIN:VCALENDAR
+BEGIN:VEVENT
+SUMMARY:Project sync
+DTSTART:20260730T140000Z
+DTEND:20260730T150000Z
+URL:{_TEAMS_JOIN_URL}
+END:VEVENT
+END:VCALENDAR
+""",
+            body_html=f'<a href="{_TEAMS_MEET_URL}">Join</a>',
+        )
+        assert invite is not None
+        self.assertEqual(invite["meeting_url"], _TEAMS_MEET_URL)
+        self.assertEqual(invite_join_url(invite), _TEAMS_MEET_URL)
 
     def test_ics_reply_method_is_not_an_invite(self) -> None:
         ics = """BEGIN:VCALENDAR
@@ -766,6 +875,7 @@ class BuildVeventTests(unittest.TestCase):
         self.assertIn("LOCATION:https://zoom.us/j/1", ics)
         self.assertIn("URL:https://zoom.us/j/1", ics)
         self.assertIn("DTSTART:20260730T120000Z", ics)
+        self.assertNotIn("DESCRIPTION:", ics)
 
     def test_teams_label_location_uses_meeting_url(self) -> None:
         with fixed_timezone("Europe/Zurich"):
@@ -787,6 +897,62 @@ class BuildVeventTests(unittest.TestCase):
         self.assertNotIn("LOCATION:Microsoft Teams Meeting", ics)
         self.assertIn("Microsoft Teams Meeting", ics)
         self.assertIn("Agenda item one", ics)
+        description = ics.split("DESCRIPTION:", 1)[-1] if "DESCRIPTION:" in ics else ""
+        self.assertNotIn("meetup-join", description)
+
+    def test_room_and_meeting_url_keeps_room_in_notes(self) -> None:
+        with fixed_timezone("Europe/Zurich"):
+            ics = build_vevent_ics(
+                {
+                    "title": "Hybrid",
+                    "start": "2026-08-07T10:00:00",
+                    "location": "Conference Room B",
+                    "meeting_url": "https://zoom.us/j/1",
+                    "uid": "hybrid-uid-1",
+                }
+            )
+        self.assertIn("LOCATION:https://zoom.us/j/1", ics)
+        self.assertIn("URL:https://zoom.us/j/1", ics)
+        self.assertIn("Conference Room B", ics)
+        description = ics.split("DESCRIPTION:", 1)[-1] if "DESCRIPTION:" in ics else ""
+        self.assertIn("Conference Room B", description)
+        self.assertNotIn("zoom.us", description)
+
+    def test_dual_teams_urls_write_single_meet_join(self) -> None:
+        invite = parse_ics_invite(_TEAMS_DUAL_ICS)
+        assert invite is not None
+        invite["uid"] = "dual-teams-1"
+        with fixed_timezone("Europe/Zurich"):
+            ics = build_vevent_ics(invite)
+        self.assertIn(f"LOCATION:{_TEAMS_MEET_URL}", ics)
+        self.assertIn(f"URL:{_TEAMS_MEET_URL}", ics)
+        self.assertNotIn("LOCATION:Microsoft Teams Meeting", ics)
+        description = ics.split("DESCRIPTION:", 1)[-1] if "DESCRIPTION:" in ics else ""
+        self.assertIn("Meeting ID: 390 576 036 169 085", description)
+        self.assertIn("Passcode: PassCode1", description)
+        self.assertIn("aka.ms/JoinTeamsMeeting", description)
+        self.assertIn("dialin.teams.cloud.microsoft", description)
+        self.assertIn("meetingOptions", description)
+        self.assertNotIn("/meet/", description)
+        self.assertNotIn("meetup-join", description)
+        self.assertNotIn(_TEAMS_DELIMITER, description)
+        self.assertNotIn("Join:", description)
+        self.assertNotIn("System reference", description)
+
+    def test_meetup_join_only_not_copied_into_notes(self) -> None:
+        with fixed_timezone("Europe/Zurich"):
+            ics = build_vevent_ics(
+                {
+                    "title": "Legacy Teams",
+                    "start": "2026-08-07T10:00:00",
+                    "meeting_url": _TEAMS_JOIN_URL,
+                    "description": f"System reference<{_TEAMS_JOIN_URL}>",
+                    "uid": "legacy-teams-1",
+                }
+            )
+        self.assertIn(f"LOCATION:{_TEAMS_JOIN_URL}", ics)
+        description = ics.split("DESCRIPTION:", 1)[-1] if "DESCRIPTION:" in ics else ""
+        self.assertNotIn("meetup-join", description)
 
     def test_room_only_location_without_meeting_url(self) -> None:
         with fixed_timezone("Europe/Zurich"):
