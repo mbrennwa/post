@@ -934,6 +934,7 @@ class MessageReaderPane(Gtk.Box):
         allow_remote: bool,
         dark: bool,
         message_appearance: MessageAppearance = MESSAGE_APPEARANCE_ADAPT_TEXT,
+        show_actions: bool = True,
     ) -> None:
         self._current_message = msg
         self._current_body = body
@@ -945,12 +946,18 @@ class MessageReaderPane(Gtk.Box):
         self._show_reader_header(msg)
         self._show_attachments(
             msg.get("attachments") or [],
-            hide_calendar=isinstance(msg.get("calendar_invite"), dict),
+            hide_calendar=show_actions and isinstance(msg.get("calendar_invite"), dict),
         )
-        self._update_unsubscribe_button(msg)
-        self._update_invite_panel(msg)
-        self._message_actions.set_visible(True)
-        self.set_actions_sensitive(True)
+        if show_actions:
+            self._update_unsubscribe_button(msg)
+            self._update_invite_panel(msg)
+            self._message_actions.set_visible(True)
+            self.set_actions_sensitive(True)
+        else:
+            self._update_unsubscribe_button(None)
+            self._clear_invite_panel()
+            self._message_actions.set_visible(False)
+            self.set_actions_sensitive(False)
         self._show_reader_document()
 
     def clear(self) -> None:

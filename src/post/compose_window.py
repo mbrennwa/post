@@ -67,7 +67,8 @@ from post.mail.compose import (
     replace_new_message_signature,
     validate_compose_mime_fields,
 )
-from post.mail.helpers import format_attachment_size, write_temp_attachment
+from post.attachment_open import open_attachment
+from post.mail.helpers import format_attachment_size
 from post.mail.correspondents import (
     Correspondent,
     apply_address_completion,
@@ -822,14 +823,13 @@ class ComposeWindow(Adw.Window):
         if index < 0 or index >= len(self._attachments):
             return
         attachment = self._attachments[index]
-        try:
-            path = write_temp_attachment(attachment.filename, attachment.data)
-            file = Gio.File.new_for_path(path)
-            Gio.AppInfo.launch_default_for_uri(file.get_uri(), None)
-        except (OSError, GLib.Error) as exc:
-            show_error_toast(self, f"Could not open attachment: {exc}")
-            return
-        self._set_status(f"Opened {os.path.basename(attachment.filename)}")
+        open_attachment(
+            self,
+            filename=attachment.filename,
+            data=attachment.data,
+            mime_type=attachment.mime_type,
+            on_status=self._set_status,
+        )
 
     def _on_remove_attachment(self, _button: Gtk.Button, index: int) -> None:
         if self._saving_draft:

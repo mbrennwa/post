@@ -909,6 +909,172 @@ def extract_message_bodies_from_bytes(raw: bytes) -> dict[str, str | None]:
     return bodies
 
 
+_RFC822_MIME_TYPES = frozenset({"message/rfc822", "message/global"})
+_OLE_COMPOUND_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_RFC822_HEADER_LINE = re.compile(rb"^[A-Za-z][A-Za-z0-9-]*\s*:")
+_UNSAFE_FILENAME_CHARS = re.compile(r"[/\\\x00-\x1f]")
+
+
+def is_rfc822_mime(mime_type: str | None) -> bool:
+    """True when *mime_type* is an encapsulated email payload."""
+    if not mime_type:
+        return False
+    base = str(mime_type).split(";", 1)[0].strip().lower()
+    return base in _RFC822_MIME_TYPES
+
+
+def looks_like_rfc822_attachment(
+    mime_type: str | None = None,
+    filename: str | None = None,
+    data: bytes | None = None,
+) -> bool:
+    """True when MIME, filename, or bytes look like an attached email.
+
+    Outlook ``.msg`` (OLE) is not RFC 822 and returns False.
+    """
+    if is_rfc822_mime(mime_type):
+        return True
+    name = (filename or "").strip().lower()
+    if name.endswith(".eml"):
+        return True
+    if data:
+        return _sniff_rfc822_bytes(data)
+    return False
+
+
+def _sniff_rfc822_bytes(data: bytes) -> bool:
+    if not data or data.startswith(b"%PDF") or data.startswith(_OLE_COMPOUND_MAGIC):
+        return False
+    if b"\x00" in data[:2048]:
+        return False
+    head = data.lstrip()
+    if head.startswith(b"From "):
+        newline = head.find(b"\n")
+        if newline < 0:
+            return False
+        head = head[newline + 1 :]
+    first = head.split(b"\n", 1)[0].rstrip(b"\r")
+    return bool(_RFC822_HEADER_LINE.match(first))
+
+
+def rfc822_attachment_filename(subject: str | None) -> str:
+    """Filesystem name for a nameless ``message/rfc822`` part."""
+    raw = (subject or "").strip() or "Forwarded message"
+    cleaned = _UNSAFE_FILENAME_CHARS.sub("_", raw).strip(" .")
+    if not cleaned:
+        cleaned = "Forwarded message"
+    if len(cleaned) > 120:
+        cleaned = cleaned[:120].rstrip(" .") or "Forwarded message"
+    if not cleaned.lower().endswith(".eml"):
+        cleaned += ".eml"
+    return cleaned
+
+
+def subject_from_rfc822_bytes(data: bytes | None) -> str | None:
+    """Return the Subject header from RFC 822 bytes, or ``None``."""
+    if not data:
+        return None
+    import email.parser
+    import email.policy
+
+    try:
+        msg = email.parser.BytesParser(policy=email.policy.default).parsebytes(
+            data, headersonly=True
+        )
+    except Exception:
+        return None
+    return _decode_header_value(msg.get("Subject"))
+
+
+def attachment_payload_bytes(part: Any) -> bytes:
+    """Raw bytes for an ``email.message`` part, including ``message/rfc822``."""
+    if is_rfc822_mime(part.get_content_type()):
+        payload = part.get_payload()
+        if isinstance(payload, list):
+            chunks: list[bytes] = []
+            for item in payload:
+                if hasattr(item, "as_bytes"):
+                    try:
+                        chunks.append(item.as_bytes())
+                    except Exception:
+                        continue
+                elif isinstance(item, (bytes, bytearray)):
+                    chunks.append(bytes(item))
+            return b"".join(chunks)
+        if hasattr(payload, "as_bytes"):
+            try:
+                return payload.as_bytes()
+            except Exception:
+                return b""
+        if isinstance(payload, (bytes, bytearray)):
+            return bytes(payload)
+    raw = part.get_payload(decode=True)
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw)
+    return b""
+
+
+def message_dict_from_rfc822_bytes(raw: bytes) -> dict[str, Any]:
+    """Build a reader message dict from encapsulated RFC 822 bytes."""
+    import email
+    import email.policy
+    import email.utils
+
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    subject = _decode_header_value(msg.get("Subject")) or "(no subject)"
+    date_sent = None
+    sort_date = 0.0
+    date_hdr = msg.get("Date")
+    if date_hdr:
+        try:
+            parsed = email.utils.parsedate_to_datetime(str(date_hdr))
+            if parsed is not None:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                sort_date = parsed.timestamp()
+                date_sent = format_message_datetime(sort_date)
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+    bodies = extract_message_bodies_from_bytes(raw)
+    attachments = extract_attachments_from_email_message(msg)
+    result: dict[str, Any] = {
+        "uid": None,
+        "subject": subject,
+        "from": format_recipient_header(msg.get("From")),
+        "to": format_recipient_header(msg.get("To")),
+        "cc": format_recipient_header(msg.get("Cc")),
+        "bcc": format_recipient_header(msg.get("Bcc")),
+        "date_sent": date_sent,
+        "date_received": date_sent,
+        "sort_date": sort_date,
+        "body_plain": bodies["plain"],
+        "body_html": bodies["html"],
+        "attachments": attachments,
+        "inline_images": extract_inline_images_from_email_message(msg),
+        "flags": {},
+    }
+    reply_to = format_recipient_header(msg.get("Reply-To"))
+    if reply_to:
+        result["reply_to"] = reply_to
+    return result
+
+
+def get_attachment_data_from_rfc822_bytes(raw: bytes, index: int) -> tuple[str, bytes]:
+    """Return ``(filename, bytes)`` for a leaf attachment of an RFC 822 payload."""
+    import email
+    import email.policy
+
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    attachments = extract_attachments_from_email_message(msg)
+    parts = list(_iter_email_attachment_parts(msg))
+    if index < 0 or index >= len(parts) or index >= len(attachments):
+        raise ValueError(f"Attachment not found: {index}")
+    data = attachment_payload_bytes(parts[index])
+    if not data:
+        raise ValueError(f"Could not decode attachment: {attachments[index].get('filename')}")
+    return attachments[index].get("filename") or "attachment", data
+
+
 def extract_attachments(mime_msg: Any) -> list[dict[str, Any]]:
     """Return attachment metadata from a Camel.MimeMessage."""
     attachments, _parts = _collect_attachments(mime_msg)
@@ -916,33 +1082,104 @@ def extract_attachments(mime_msg: Any) -> list[dict[str, Any]]:
 
 
 def extract_attachments_from_email_message(msg: Any) -> list[dict[str, Any]]:
-    """Return attachment metadata from a Python ``email.message`` (tests)."""
-    from post.mail.calendar_invite import (
-        default_calendar_filename,
-        email_part_counts_as_attachment,
-        is_calendar_mime,
-    )
+    """Return attachment metadata from a Python ``email.message``.
 
+    ``message/rfc822`` parts are leaves: inner PDFs stay on the nested
+    message, not the parent list.
+    """
     attachments: list[dict[str, Any]] = []
-    for part in msg.walk():
-        if not email_part_counts_as_attachment(part):
+    for part in _iter_email_attachment_parts(msg):
+        attachments.append(_email_attachment_meta(part, len(attachments)))
+    return attachments
+
+
+def extract_inline_images_from_email_message(
+    msg: Any,
+) -> dict[str, tuple[str, bytes]]:
+    """CID images from *msg*, excluding parts nested inside attached emails."""
+    images: dict[str, tuple[str, bytes]] = {}
+    for part in _iter_email_parts_excluding_nested_messages(msg):
+        content_id = part.get("Content-ID")
+        if not content_id:
             continue
         mime_type = part.get_content_type()
-        filename = part.get_filename()
+        if not mime_type.startswith("image/"):
+            continue
         payload = part.get_payload(decode=True) or b""
-        display_name = _decode_attachment_filename(filename)
-        if not display_name and is_calendar_mime(mime_type):
-            display_name = default_calendar_filename(mime_type)
-        attachments.append(
-            {
-                "filename": display_name or "attachment",
-                "mime_type": mime_type,
-                "size": len(payload),
-                "source": "email",
-                "index": len(attachments),
-            }
+        if not payload:
+            continue
+        images[_normalize_content_id(str(content_id))] = (mime_type, payload)
+    return images
+
+
+def _iter_email_attachment_parts(part: Any, *, is_root: bool = True) -> Any:
+    """Yield attachment parts; do not walk into encapsulated messages."""
+    from post.mail.calendar_invite import email_part_counts_as_attachment
+
+    ctype = part.get_content_type()
+    if ctype.startswith("multipart/"):
+        payload = part.get_payload()
+        if isinstance(payload, list):
+            for child in payload:
+                yield from _iter_email_attachment_parts(child, is_root=False)
+        return
+    if is_rfc822_mime(ctype):
+        if not is_root:
+            yield part
+        return
+    if email_part_counts_as_attachment(part):
+        yield part
+
+
+def _iter_email_parts_excluding_nested_messages(
+    part: Any, *, is_root: bool = True
+) -> Any:
+    """Yield MIME parts, skipping contents of nested ``message/rfc822``."""
+    ctype = part.get_content_type()
+    if is_rfc822_mime(ctype) and not is_root:
+        return
+    yield part
+    if ctype.startswith("multipart/"):
+        payload = part.get_payload()
+        if isinstance(payload, list):
+            for child in payload:
+                yield from _iter_email_parts_excluding_nested_messages(
+                    child, is_root=False
+                )
+
+
+def _email_attachment_meta(part: Any, index: int) -> dict[str, Any]:
+    from post.mail.calendar_invite import default_calendar_filename, is_calendar_mime
+
+    mime_type = part.get_content_type()
+    filename = part.get_filename()
+    display_name = _decode_attachment_filename(filename)
+    if not display_name and is_calendar_mime(mime_type):
+        display_name = default_calendar_filename(mime_type)
+    payload = attachment_payload_bytes(part)
+    if not display_name and is_rfc822_mime(mime_type):
+        display_name = rfc822_attachment_filename(
+            _rfc822_subject_from_email_part(part) or subject_from_rfc822_bytes(payload)
         )
-    return attachments
+    return {
+        "filename": display_name or "attachment",
+        "mime_type": mime_type,
+        "size": len(payload),
+        "source": "email",
+        "index": index,
+    }
+
+
+def _rfc822_subject_from_email_part(part: Any) -> str | None:
+    payload = part.get_payload()
+    nested = None
+    if isinstance(payload, list) and payload:
+        nested = payload[0]
+    elif payload is not None and not isinstance(payload, (bytes, bytearray, str)):
+        nested = payload
+    if nested is not None and hasattr(nested, "get"):
+        return _decode_header_value(nested.get("Subject"))
+    return None
 
 
 def _normalize_content_id(content_id: str) -> str:
@@ -1203,9 +1440,9 @@ def _email_bodies_from_bytes(
     except Exception:
         return
 
-    for part in msg.walk():
+    for part in _iter_email_parts_excluding_nested_messages(msg):
         ct = part.get_content_type()
-        if ct.startswith("multipart/"):
+        if ct.startswith("multipart/") or is_rfc822_mime(ct):
             continue
         try:
             text = _email_part_text(part)
@@ -1278,6 +1515,10 @@ def _walk_attachment_parts(
     display_name = _decode_attachment_filename(filename)
     if not display_name and is_calendar_mime(mime_type):
         display_name = default_calendar_filename(mime_type)
+    if not display_name and is_rfc822_mime(mime_type):
+        display_name = rfc822_attachment_filename(
+            _rfc822_subject_from_camel_part(part)
+        )
     calendar_method = None
     if is_calendar_mime(mime_type) and content_type is not None:
         try:
@@ -1340,17 +1581,7 @@ def _email_collect_inline_images(
 
     try:
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
-        for part in msg.walk():
-            content_id = part.get("Content-ID")
-            if not content_id:
-                continue
-            mime_type = part.get_content_type()
-            if not mime_type.startswith("image/"):
-                continue
-            payload = part.get_payload(decode=True) or b""
-            if not payload:
-                continue
-            images[_normalize_content_id(str(content_id))] = (mime_type, payload)
+        images.update(extract_inline_images_from_email_message(msg))
     except Exception:
         pass
 
@@ -1359,62 +1590,51 @@ def _email_collect_attachments(mime_msg: Any, attachments: list[dict[str, Any]])
     import email
     import email.policy
 
-    from post.mail.calendar_invite import (
-        default_calendar_filename,
-        email_part_counts_as_attachment,
-        is_calendar_mime,
-    )
-
     raw_bytes = _mime_message_raw_bytes(mime_msg)
     if raw_bytes is None:
         return
 
     try:
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
-        for part in msg.walk():
-            if not email_part_counts_as_attachment(part):
-                continue
-            mime_type = part.get_content_type()
-            filename = part.get_filename()
-            payload = part.get_payload(decode=True) or b""
-            display_name = _decode_attachment_filename(filename)
-            if not display_name and is_calendar_mime(mime_type):
-                display_name = default_calendar_filename(mime_type)
-            attachments.append(
-                {
-                    "filename": display_name or "attachment",
-                    "mime_type": mime_type,
-                    "size": len(payload),
-                    "source": "email",
-                    "index": len(attachments),
-                }
-            )
+        attachments.extend(extract_attachments_from_email_message(msg))
     except Exception:
         pass
 
 
 def _email_attachment_data_by_index(mime_msg: Any, index: int) -> bytes | None:
-    import email
-    import email.policy
-
-    from post.mail.calendar_invite import email_part_counts_as_attachment
-
     raw_bytes = _mime_message_raw_bytes(mime_msg)
     if raw_bytes is None:
         return None
-
     try:
-        msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
-        collected: list[bytes] = []
-        for part in msg.walk():
-            if not email_part_counts_as_attachment(part):
-                continue
-            collected.append(part.get_payload(decode=True) or b"")
-        if 0 <= index < len(collected):
-            return collected[index]
+        _name, data = get_attachment_data_from_rfc822_bytes(raw_bytes, index)
+        return data
     except Exception:
-        pass
-    return None
+        return None
+
+
+def _rfc822_subject_from_camel_part(part: Any) -> str | None:
+    content = part.get_content() if hasattr(part, "get_content") else None
+    if content is not None:
+        getter = getattr(content, "get_subject", None)
+        if callable(getter):
+            try:
+                value = getter()
+            except Exception:
+                value = None
+            decoded = _decode_header_value(value) if value else None
+            if decoded:
+                return decoded
+        header_get = getattr(content, "get_header", None)
+        if callable(header_get):
+            try:
+                value = header_get("Subject")
+            except Exception:
+                value = None
+            decoded = _decode_header_value(value) if value else None
+            if decoded:
+                return decoded
+    data = _decode_attachment_part(part)
+    return subject_from_rfc822_bytes(data) if data else None
 
 
 def _decode_attachment_part(part: Any) -> bytes | None:

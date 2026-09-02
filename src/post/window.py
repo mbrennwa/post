@@ -20,6 +20,7 @@ gi.require_version("Gdk", "4.0")
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
+from post.attachment_open import launch_attachment_with_app, open_attachment
 from post.compose_window import ComposeWindow, SavedDraftNotification
 from post.credentials import prompt_password_sync
 from post.folder_dialogs import confirm_action
@@ -129,7 +130,6 @@ from post.mail.helpers import (
     should_offer_send_again,
     sort_messages_newest_first,
     uniform_bool_state,
-    write_temp_attachment,
 )
 from post.message_list_activate import (
     MessageListActivateAction,
@@ -3538,8 +3538,21 @@ class MainWindow(Adw.ApplicationWindow):
         self._attachment_popover.set_pointing_to(rect)
         self._attachment_popover.popup()
 
+    def _attachment_mime_at(self, index: int) -> str | None:
+        attachments = (self._current_message or {}).get("attachments") or []
+        if 0 <= index < len(attachments):
+            mime = attachments[index].get("mime_type")
+            return mime if isinstance(mime, str) else None
+        return None
+
     def _on_reader_attachment_clicked(self, attachment_index: int) -> None:
-        self._fetch_attachment(attachment_index, self._open_attachment_direct)
+        mime = self._attachment_mime_at(attachment_index)
+        self._fetch_attachment(
+            attachment_index,
+            lambda filename, data, error: self._open_attachment_direct(
+                filename, data, error, mime_type=mime
+            ),
+        )
 
     def _on_attachment_menu_save(self, *_args) -> None:
         if self._context_attachment_index is None:
@@ -3617,6 +3630,7 @@ class MainWindow(Adw.ApplicationWindow):
         filename: str,
         data: bytes | None,
         error: Exception | None,
+        mime_type: str | None = None,
     ) -> None:
         if error is not None:
             show_error_toast(self, f"Attachment error: {error}")
@@ -3624,16 +3638,16 @@ class MainWindow(Adw.ApplicationWindow):
         if data is None:
             show_error_toast(self, "Attachment error: no data")
             return
-
-        try:
-            path = write_temp_attachment(filename, data)
-            file = Gio.File.new_for_path(path)
-            Gio.AppInfo.launch_default_for_uri(file.get_uri(), None)
-        except (OSError, GLib.Error) as exc:
-            show_error_toast(self, f"Could not open attachment: {exc}")
-            return
-
-        self._set_status(f"Opened {os.path.basename(filename)}")
+        open_attachment(
+            self,
+            filename=filename,
+            data=data,
+            mime_type=mime_type,
+            on_new_message_to=self._on_new_message_to_address,
+            on_search_messages_from=self._search_messages_from_address,
+            can_search_messages=lambda: self._header_search_entry.get_sensitive(),
+            on_status=self._set_status,
+        )
 
     def _prompt_save_attachment(
         self,
@@ -3693,51 +3707,13 @@ class MainWindow(Adw.ApplicationWindow):
         if data is None:
             show_error_toast(self, "Attachment error: no data")
             return
-
-        try:
-            path = write_temp_attachment(filename, data)
-        except OSError as exc:
-            show_error_toast(self, f"Could not open attachment: {exc}")
-            return
-
-        content_type = self._guess_content_type(
-            filename,
-            data,
-            self._context_attachment_mime,
-        )
-        dialog = Gtk.AppChooserDialog.new_for_content_type(
+        launch_attachment_with_app(
             self,
-            Gtk.DialogFlags.MODAL,
-            content_type,
+            filename=filename,
+            data=data,
+            mime_type=self._context_attachment_mime,
+            on_status=self._set_status,
         )
-        dialog.set_heading("Open With")
-        dialog.connect("response", self._on_app_chooser_response, (path, filename))
-        dialog.present()
-
-    def _on_app_chooser_response(
-        self,
-        dialog: Gtk.AppChooserDialog,
-        response: int,
-        user_data: tuple[str, str],
-    ) -> None:
-        path, filename = user_data
-        if response == Gtk.ResponseType.OK:
-            app_info = dialog.get_app_info()
-            if app_info is not None:
-                file = Gio.File.new_for_path(path)
-                try:
-                    app_info.launch_uris([file.get_uri()], None)
-                    self._set_status(f"Opened {os.path.basename(filename)}")
-                except GLib.Error as exc:
-                    show_error_toast(self, f"Could not open attachment: {exc.message}")
-        dialog.destroy()
-
-    @staticmethod
-    def _guess_content_type(filename: str, data: bytes, mime_hint: str | None = None) -> str:
-        if mime_hint:
-            return mime_hint
-        guessed, _certain = Gio.content_type_guess(filename, data)
-        return guessed or "application/octet-stream"
 
     def _on_refresh(self, *_args) -> None:
         if self._current_account and self._current_folder:
