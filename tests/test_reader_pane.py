@@ -98,6 +98,18 @@ class MessageReaderPaneTests(unittest.TestCase):
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
         self.assertIs(self.pane.current_message, msg)
+        self.assertTrue(self.pane._message_actions.get_visible())
+
+    def test_show_message_can_hide_actions(self) -> None:
+        self.pane.show_message(
+            _sample_message(),
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+            show_actions=False,
+        )
+        self.assertFalse(self.pane._message_actions.get_visible())
 
     def test_show_message_builds_interactive_address_rows(self) -> None:
         self.pane.show_message(

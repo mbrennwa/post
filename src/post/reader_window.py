@@ -19,6 +19,7 @@ gi.require_version("Gdk", "4.0")
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
+from post.attachment_open import launch_attachment_with_app, open_attachment
 from post.folder_dialogs import confirm_action
 from post.header_bar import add_end_window_controls
 from post.icon_utils import apply_window_icon
@@ -31,7 +32,6 @@ from post.mail.eds import (
 from post.mail.helpers import (
     perform_one_click_unsubscribe,
     reader_toggle_button_state,
-    write_temp_attachment,
 )
 from post.mail.io_thread import get_mail_io_thread
 from post.mail.network_errors import (
@@ -610,8 +610,21 @@ class ReaderWindow(Adw.ApplicationWindow):
         self._attachment_popover.set_pointing_to(rect)
         self._attachment_popover.popup()
 
+    def _attachment_mime_at(self, index: int) -> str | None:
+        attachments = (self._current_message or {}).get("attachments") or []
+        if 0 <= index < len(attachments):
+            mime = attachments[index].get("mime_type")
+            return mime if isinstance(mime, str) else None
+        return None
+
     def _on_attachment_clicked(self, attachment_index: int) -> None:
-        self._fetch_attachment(attachment_index, self._open_attachment_direct)
+        mime = self._attachment_mime_at(attachment_index)
+        self._fetch_attachment(
+            attachment_index,
+            lambda filename, data, error: self._open_attachment_direct(
+                filename, data, error, mime_type=mime
+            ),
+        )
 
     def _on_attachment_menu_save(self, *_args) -> None:
         if self._context_attachment_index is None:
@@ -679,20 +692,23 @@ class ReaderWindow(Adw.ApplicationWindow):
         filename: str,
         data: bytes | None,
         error: Exception | None,
+        mime_type: str | None = None,
     ) -> None:
         if error is not None:
             show_error_toast(self, f"Could not open attachment: {error}")
             return
         if data is None:
             return
-        path = write_temp_attachment(filename, data)
-        try:
-            Gio.AppInfo.launch_default_for_uri(
-                GLib.filename_to_uri(path, None),
-                None,
-            )
-        except GLib.Error as exc:
-            show_error_toast(self, f"Could not open attachment: {exc.message}")
+        open_attachment(
+            self,
+            filename=filename,
+            data=data,
+            mime_type=mime_type,
+            on_new_message_to=self._on_new_message_to,
+            on_search_messages_from=self._on_search_messages_from,
+            can_search_messages=self._can_search_messages,
+            on_status=self._set_status,
+        )
 
     def _prompt_save_attachment(
         self,
@@ -740,29 +756,13 @@ class ReaderWindow(Adw.ApplicationWindow):
             return
         if data is None:
             return
-        path = write_temp_attachment(filename, data)
-        uri = GLib.filename_to_uri(path, None)
-        dialog = Gtk.AppChooserDialog(
-            transient_for=self,
-            modal=True,
-            heading=f"Open {filename}",
+        launch_attachment_with_app(
+            self,
+            filename=filename,
+            data=data,
+            mime_type=self._context_attachment_mime,
+            on_status=self._set_status,
         )
-        dialog.set_default_response(Gtk.ResponseType.OK)
-        dialog.set_gicon(Gio.FileIcon.new(Gio.File.new_for_uri(uri)))
-
-        def on_response(_dialog: Gtk.AppChooserDialog, response: int) -> None:
-            if response != Gtk.ResponseType.OK:
-                return
-            app_info = _dialog.get_app_info()
-            if app_info is None:
-                return
-            try:
-                app_info.launch([Gio.File.new_for_uri(uri)], None)
-            except GLib.Error as exc:
-                show_error_toast(self, f"Could not open attachment: {exc.message}")
-
-        dialog.connect("response", on_response)
-        dialog.present()
 
     def _open_uri_externally(self, uri: str) -> None:
         open_uri_externally(
