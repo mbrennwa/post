@@ -10,14 +10,14 @@ description: >-
 
 # GitHub issue workflow
 
-Phased workflow for working a GH issue. After Analyze, switch into Plan automatically (do not ask). Other human gates (refine plan, manual test) stay interactive — do not skip them or auto-advance past them.
+Phased workflow for working a GH issue. Each phase is a human gate — do not skip them or auto-advance. After Analyze, stop and wait; only enter Plan when the user says `plan`.
 
 ## Triggers
 
 | Phrase | Phase |
 |--------|--------|
-| `analyze #<n>` / `analyze issue <n>` | Analyze → then Plan (auto) |
-| `plan` (if planning separately) | Plan |
+| `analyze #<n>` / `analyze issue <n>` | Analyze (then wait) |
+| `plan` | Plan |
 | `implement` (after plan approved) | Implement |
 | `ship` (after manual testing) | Ship |
 
@@ -42,13 +42,14 @@ If the issue number is missing and not clear from conversation, ask once.
    - **Root cause** — why it happens (or why the feature is missing), with file/symbol pointers
    - **Options** — 1–3 approaches with trade-offs
    - **Open questions** — anything blocking a good plan
-4. Immediately switch to Plan mode via `SwitchMode` (`target_mode_id: plan`) — do not ask the user, do not wait for `plan`. Then continue into Phase: Plan in the same turn when possible.
+   - **In short** — a brief, easy-to-understand recap of the analysis
+4. Stop. Do not switch to Plan mode. Do not start Phase: Plan. Wait for prompts (discussion, questions). Only move on to Plan if/when the user says `plan`.
 
 ## Phase: Plan
 
 **Goal:** Agreed implementation plan on a dedicated branch, in Plan mode.
 
-1. If not already in Plan mode (e.g. user said `plan` without a prior auto-switch), switch via `SwitchMode` (`target_mode_id: plan`) without asking
+1. Switch to Plan mode via `SwitchMode` (`target_mode_id: plan`) without asking — only after the user has said `plan`
 2. Pick a recommended approach from the analysis (note trade-offs); refine with the user if open questions block a coherent plan
 3. Update the GH issue with analysis + planning details (before or right as planning starts):
    - Comment via `gh issue comment <n> --body "$(cat <<'EOF' … EOF)"`
