@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta, timezone, tzinfo
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .quote_history import unquoted_html, unquoted_plain
@@ -59,6 +59,32 @@ _TZID_VENDOR_PREFIXES = (
 _MEETING_URL_RE = re.compile(
     r"https?://[^\s<>\"']+",
     re.IGNORECASE,
+)
+
+# Optional wrapping <> as in Teams "System reference<https://…>".
+_STRIP_URL_RE = re.compile(
+    r"<?https?://[^\s<>\"']+>?",
+    re.IGNORECASE,
+)
+
+# GNOME Calendar's gcal_utils_extract_teams_section looks for this line, then
+# treats the first https://teams.microsoft.com URL in the block as a Join link.
+_TEAMS_DELIMITER_LINE_RE = re.compile(
+    r"^[ \t]*_{40,}[ \t]*\r?$",
+    re.MULTILINE,
+)
+_EMPTY_JOIN_LINE_RE = re.compile(
+    r"^[ \t]*Join:[ \t]*\r?$",
+    re.MULTILINE | re.IGNORECASE,
+)
+_SYSTEM_REFERENCE_RE = re.compile(
+    r"[ \t]*\|?[ \t]*System reference[ \t]*",
+    re.IGNORECASE,
+)
+
+_TEAMS_JOIN_HOSTS = (
+    "teams.microsoft.com",
+    "teams.live.com",
 )
 
 _MEETING_HOST_MARKERS = (
@@ -365,6 +391,15 @@ def parse_ics_invite(ics_text: str) -> dict[str, Any] | None:
         meeting_url = find_meeting_url(f"{location}\n{description}") or ""
     if not meeting_url and location.lower().startswith(("https://", "http://")):
         meeting_url = location.strip()
+    meeting_url = (
+        canonical_meeting_url(
+            meeting_url,
+            location,
+            description,
+            fallback=meeting_url or None,
+        )
+        or ""
+    )
 
     method = ""
     method_match = re.search(r"^METHOD:(.*)$", unfolded, re.MULTILINE | re.IGNORECASE)
@@ -409,20 +444,115 @@ def _is_meeting_url(url: str) -> bool:
     return any(marker in lower for marker in _MEETING_HOST_MARKERS)
 
 
+def _normalize_extracted_url(url: str) -> str:
+    url = url.strip().strip("<>").rstrip(").,;]>\"'")
+    return (
+        url.replace("&amp;", "&")
+        .replace("&quot;", "")
+        .replace("&#39;", "")
+    )
+
+
+def _url_host(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _url_path(url: str) -> str:
+    try:
+        return unquote(urlparse(url).path or "").lower()
+    except Exception:
+        return ""
+
+
+def _is_teams_join_host(url: str) -> bool:
+    host = _url_host(url)
+    if not host:
+        return False
+    return any(host == allowed or host.endswith("." + allowed) for allowed in _TEAMS_JOIN_HOSTS)
+
+
+def is_teams_meet_join(url: str) -> bool:
+    """True for Teams ``/meet/<id>`` join URLs, not ``/meetingOptions``."""
+    if not _is_meeting_url(url) or not _is_teams_join_host(url):
+        return False
+    return _url_path(url).startswith("/meet/")
+
+
+def is_join_url(url: str) -> bool:
+    """True for a conferencing join URL (not help / dial-in / meeting options)."""
+    if not _is_meeting_url(url):
+        return False
+    if _is_teams_join_host(url):
+        path = _url_path(url)
+        return path.startswith("/meet/") or "/meetup-join" in path
+    return True
+
+
+def iter_meeting_urls(text: str | None):
+    """Yield meeting URLs found in *text*."""
+    if not text:
+        return
+    for match in _MEETING_URL_RE.finditer(text):
+        url = _normalize_extracted_url(match.group(0))
+        if _is_meeting_url(url):
+            yield url
+
+
+def canonical_meeting_url(
+    *texts: str | None,
+    fallback: str | None = None,
+) -> str | None:
+    """Prefer a Teams ``/meet/…`` join URL; else *fallback*; else first meeting URL."""
+    for text in texts:
+        if not text:
+            continue
+        for url in iter_meeting_urls(text):
+            if is_teams_meet_join(url):
+                return url
+    if isinstance(fallback, str) and fallback.strip():
+        return fallback.strip()
+    for text in texts:
+        found = find_meeting_url(text)
+        if found:
+            return found
+    return None
+
+
+def strip_join_urls(text: str | None) -> str:
+    """Remove join URLs and Teams chrome that calendar apps treat as Join links.
+
+    GNOME Calendar harvests a Join button from LOCATION *and* from the first
+    ``https://teams.microsoft.com`` URL between the underscore delimiters in
+    notes (``gcal_utils_extract_teams_section``). After join URLs are stripped,
+    that leftover is often ``meetingOptions`` (and may not even parse as a
+    URI). Drop the delimiter lines so only LOCATION supplies Join. Also drop
+    empty ``Join:`` lines and dangling ``System reference`` labels.
+    """
+    if not text:
+        return ""
+
+    def repl(match: re.Match[str]) -> str:
+        url = _normalize_extracted_url(match.group(0))
+        return "" if is_join_url(url) else match.group(0)
+
+    stripped = _STRIP_URL_RE.sub(repl, text)
+    stripped = _TEAMS_DELIMITER_LINE_RE.sub("", stripped)
+    stripped = _EMPTY_JOIN_LINE_RE.sub("", stripped)
+    stripped = _SYSTEM_REFERENCE_RE.sub("", stripped)
+    stripped = re.sub(r"[ \t]{2,}", " ", stripped)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+    return stripped.strip()
+
+
 def find_meeting_url(text: str | None) -> str | None:
     """Return the first Teams/Zoom/Meet/Webex-style URL in *text*."""
     if not text:
         return None
-    for match in _MEETING_URL_RE.finditer(text):
-        url = match.group(0).rstrip(").,;]>\"'")
-        # Decode common HTML entities left in plain extracts.
-        url = (
-            url.replace("&amp;", "&")
-            .replace("&quot;", "")
-            .replace("&#39;", "")
-        )
-        if _is_meeting_url(url):
-            return unquote(url) if "%" in url else url
+    for url in iter_meeting_urls(text):
+        return unquote(url) if "%" in url else url
     return None
 
 
@@ -494,6 +624,20 @@ def _ics_method(ics_text: str | None) -> str:
     return match.group(1).strip().upper() if match else ""
 
 
+def _meeting_url_scan_texts(
+    *,
+    subject: str | None,
+    body_plain: str | None,
+    body_html: str | None,
+) -> list[str | None]:
+    """Body texts to scan for join URLs (quoted history ignored unless forward)."""
+    if subject_looks_like_forward(subject):
+        return [body_html, body_plain]
+    if body_html:
+        return [unquoted_html(body_html)]
+    return [unquoted_plain(body_plain)]
+
+
 def _meeting_url_from_bodies(
     *,
     subject: str | None,
@@ -540,6 +684,25 @@ def merge_invite_details(
             body_html=body_html,
         )
 
+    extra_texts: list[str | None] = []
+    if invite is not None:
+        description = invite.get("description")
+        location = invite.get("location")
+        extra_texts.append(description if isinstance(description, str) else None)
+        extra_texts.append(location if isinstance(location, str) else None)
+    extra_texts.extend(
+        _meeting_url_scan_texts(
+            subject=subject,
+            body_plain=body_plain,
+            body_html=body_html,
+        )
+    )
+    meeting_url = canonical_meeting_url(
+        meeting_url if isinstance(meeting_url, str) else None,
+        *extra_texts,
+        fallback=meeting_url if isinstance(meeting_url, str) else None,
+    )
+
     if invite is None and meeting_url:
         invite = {
             "title": (subject or "").strip() or None,
@@ -555,7 +718,7 @@ def merge_invite_details(
             "source": "meeting_link",
         }
     elif invite is not None:
-        if not invite.get("meeting_url") and meeting_url:
+        if meeting_url:
             invite["meeting_url"] = meeting_url
         if not invite.get("title") and subject:
             invite["title"] = subject.strip() or None
@@ -817,15 +980,15 @@ def build_vevent_ics(invite: dict[str, Any]) -> str:
             preserved_location = location_text
     elif location_text:
         lines.append(f"LOCATION:{esc(location_text)}")
+    # Join URLs belong only in LOCATION/URL (#259, #382). Never copy them into
+    # DESCRIPTION — calendar apps harvest both fields as Join links.
     description = invite.get("description")
-    desc_text = str(description) if description else ""
+    desc_text = strip_join_urls(str(description) if description else "")
     desc_parts: list[str] = []
     if preserved_location and preserved_location not in desc_text:
         desc_parts.append(preserved_location)
     if desc_text:
         desc_parts.append(desc_text)
-    if meeting_url_text and meeting_url_text not in desc_text:
-        desc_parts.append(meeting_url_text)
     if desc_parts:
         lines.append(f"DESCRIPTION:{esc(chr(10).join(desc_parts))}")
     organizer = invite.get("organizer")
