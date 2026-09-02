@@ -411,6 +411,127 @@ class ReadMessageGoaUnavailableTests(unittest.TestCase):
         self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
 
 
+class ReadMessageEmptyBodyMarkSeenTests(unittest.TestCase):
+    """Unread empty-body mail must still be marked seen when the reader will show it (#377)."""
+
+    def _read_empty_body(
+        self,
+        *,
+        get_store_mock: MagicMock,
+        get_mime_mock: MagicMock,
+        attachments: list,
+        mark_seen: bool = True,
+    ) -> dict:
+        from post.mail.eds import MailService
+
+        service = MailService(registry=MagicMock())
+        service.registry.ref_source.return_value = None
+        folder = MagicMock()
+        info = MagicMock()
+        info.get_flags.return_value = 0
+        folder.get_message_info.return_value = info
+        folder.get_unread_message_count.return_value = 0
+        folder.get_message_count.return_value = 1
+        store = MagicMock()
+        store.get_folder_sync.return_value = folder
+        get_store_mock.return_value = store
+        mime = MagicMock()
+        mime.get_message_id.return_value = None
+        mime.get_header.return_value = None
+        get_mime_mock.return_value = mime
+        with patch.object(service, "_try_message_from_cache_file", return_value=None):
+            with patch.object(
+                service, "_first_cached_rfc822_path", return_value=None
+            ):
+                with patch(
+                    "post.mail.helpers.message_info_to_dict",
+                    return_value={"uid": "42"},
+                ):
+                    with patch(
+                        "post.mail.helpers.extract_message_bodies",
+                        return_value={"plain": None, "html": None},
+                    ):
+                        with patch(
+                            "post.mail.helpers.extract_attachments",
+                            return_value=attachments,
+                        ):
+                            with patch(
+                                "post.mail.helpers.extract_inline_images",
+                                return_value=[],
+                            ):
+                                return service._read_message_unlocked(
+                                    "acct-1",
+                                    "INBOX",
+                                    "42",
+                                    mark_seen=mark_seen,
+                                )
+
+    @patch("post.mail.eds.MailService._mark_message_seen_unlocked")
+    @patch("post.mail.eds.MailService._get_message_mime_sync")
+    @patch("post.mail.eds.MailService._get_store_unlocked")
+    def test_empty_body_with_attachment_marks_seen(
+        self,
+        get_store_mock: MagicMock,
+        get_mime_mock: MagicMock,
+        mark_seen_mock: MagicMock,
+    ) -> None:
+        mark_seen_mock.return_value = (0, 1)
+        result = self._read_empty_body(
+            get_store_mock=get_store_mock,
+            get_mime_mock=get_mime_mock,
+            attachments=[
+                {
+                    "index": 0,
+                    "filename": "file.pdf",
+                    "mime_type": "application/pdf",
+                }
+            ],
+        )
+
+        mark_seen_mock.assert_called_once()
+        self.assertTrue((result.get("flags") or {}).get("seen"))
+        self.assertEqual(result["body_plain"], None)
+        self.assertEqual(result["body_html"], None)
+
+    @patch("post.mail.eds.MailService._mark_message_seen_unlocked")
+    @patch("post.mail.eds.MailService._get_message_mime_sync")
+    @patch("post.mail.eds.MailService._get_store_unlocked")
+    def test_empty_body_without_attachments_marks_seen(
+        self,
+        get_store_mock: MagicMock,
+        get_mime_mock: MagicMock,
+        mark_seen_mock: MagicMock,
+    ) -> None:
+        mark_seen_mock.return_value = (0, 1)
+        result = self._read_empty_body(
+            get_store_mock=get_store_mock,
+            get_mime_mock=get_mime_mock,
+            attachments=[],
+        )
+
+        mark_seen_mock.assert_called_once()
+        self.assertTrue((result.get("flags") or {}).get("seen"))
+
+    @patch("post.mail.eds.MailService._mark_message_seen_unlocked")
+    @patch("post.mail.eds.MailService._get_message_mime_sync")
+    @patch("post.mail.eds.MailService._get_store_unlocked")
+    def test_empty_body_respects_mark_seen_false(
+        self,
+        get_store_mock: MagicMock,
+        get_mime_mock: MagicMock,
+        mark_seen_mock: MagicMock,
+    ) -> None:
+        result = self._read_empty_body(
+            get_store_mock=get_store_mock,
+            get_mime_mock=get_mime_mock,
+            attachments=[],
+            mark_seen=False,
+        )
+
+        mark_seen_mock.assert_not_called()
+        self.assertFalse((result.get("flags") or {}).get("seen"))
+
+
 class PersistFlagSignInTests(unittest.TestCase):
     @patch("post.mail.eds.MailService._queue_flag_operation_unlocked")
     @patch("post.mail.eds.MailService._get_store_unlocked")

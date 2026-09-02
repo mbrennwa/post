@@ -7393,9 +7393,8 @@ class MailService:
             if references:
                 result["references"] = normalize_references_header(references)
 
-        if was_unread and mark_seen and (
-            bodies.get("plain") or bodies.get("html")
-        ):
+        # Empty extracted body still displays in the reader (#377); #341 stubs already raised.
+        if was_unread and mark_seen:
             try:
                 unread, total = self._mark_message_seen_unlocked(
                     folder, account_uid, folder_name, actual_uid
