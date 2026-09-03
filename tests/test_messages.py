@@ -964,8 +964,8 @@ class ReaderListSyncTests(unittest.TestCase):
         )
         window._current_message = {
             "uid": "100",
-            "subject": "Old gasometrix order",
-            "_list_account_uid": "acct-gas",
+            "subject": "Old vendor order",
+            "_list_account_uid": "acct-other",
             "_list_folder": "INBOX",
         }
 
