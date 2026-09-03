@@ -861,13 +861,13 @@ class MailSidebar:
         append_item("Refresh", "sidebar.refresh", "refresh")
         append_item("Take Offline", "sidebar.take-offline", "take_offline")
         append_item("Take Online", "sidebar.take-online", "take_online")
-        append_item("Archive All", "sidebar.archive-all", "archive_all")
-        append_item("Archive All Read", "sidebar.archive-read", "archive_read")
         append_item(
             "Archive All Read and Unflagged",
             "sidebar.archive-read-unflagged",
             "archive_read_unflagged",
         )
+        append_item("Archive All Read", "sidebar.archive-read", "archive_read")
+        append_item("Archive All", "sidebar.archive-all", "archive_all")
         append_item("Send Now", "sidebar.send-now", "send_now")
         append_item("Empty Trash", "sidebar.empty-trash", "empty_trash")
         append_item("New Folder…", "sidebar.new-folder", "new_folder")
