@@ -578,8 +578,12 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
             _inflight_message_read_id=None,
             _message_read_generation=0,
             _user_message_click_pending=False,
+            _mark_seen_intent_list_key=None,
             _mail=mock.Mock(),
             _reader_pane=mock.Mock(),
+            _sidebar=SimpleNamespace(
+                folder_is_drafts=lambda _account_uid, folder: folder == "Drafts",
+            ),
             _message_list_view=mock.Mock(
                 get_selected_uids=mock.Mock(return_value=["selected-key"]),
             ),
@@ -597,6 +601,9 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         )
         window._reader_shows_list_key = lambda list_key: MainWindow._reader_shows_list_key(
             window, list_key
+        )
+        window._mark_seen_when_reading_uid = (
+            lambda list_key: MainWindow._mark_seen_when_reading_uid(window, list_key)
         )
         window._load_message_body_for_uid = mock.Mock()
         return window
@@ -649,6 +656,7 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         window._load_message_body_for_uid.assert_called_once_with(
             list_key, mark_seen=True
         )
+        self.assertEqual(window._mark_seen_intent_list_key, list_key)
         self.assertIsNone(window._pending_restore_message_uid)
 
     def test_selection_changed_idle_reloads_stale_reader(self) -> None:
@@ -729,6 +737,9 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
             _current_folder_messages=[stale],
             _current_message_uid=list_key,
             _current_message=dict(stale),
+            _mark_seen_intent_list_key=None,
+            _pending_message_read_uid=None,
+            _inflight_message_read_id=None,
             _message_stack=mock.Mock(
                 get_visible_child_name=mock.Mock(return_value="list")
             ),
@@ -798,6 +809,7 @@ class MarkReadOnClickTests(unittest.TestCase):
             _current_message=dict(tagged_message),
             _pending_restore_message_uid=None,
             _user_message_click_pending=False,
+            _mark_seen_intent_list_key=None,
             _mail=mock.Mock(),
             _reader_pane=mock.Mock(),
             _sidebar=SimpleNamespace(
@@ -882,6 +894,7 @@ class MarkReadOnClickTests(unittest.TestCase):
         window._load_message_body_for_uid.assert_called_once_with(
             "42", mark_seen=True
         )
+        self.assertEqual(window._mark_seen_intent_list_key, "42")
         window._set_message_flags.assert_not_called()
 
     def test_item_pressed_noop_when_reader_shows_read_message(self) -> None:
@@ -913,6 +926,225 @@ class MarkReadOnClickTests(unittest.TestCase):
 
         window._set_message_flags.assert_not_called()
         window._load_message_body_for_uid.assert_not_called()
+
+
+class MarkSeenClickIntentTests(unittest.TestCase):
+    """Click mark-seen intent must survive programmatic mark_seen=False reloads (#388)."""
+
+    def _window_stub(self, *, message: dict, sidebar_folder: str = "INBOX"):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        account = SimpleNamespace(uid="acct-1", email="a@b.c", display_label="a@b.c")
+        uid = str(message.get("uid") or "42")
+        window = SimpleNamespace(
+            _current_account=account,
+            _current_folder=sidebar_folder,
+            _current_folder_messages=[message],
+            _current_message_uid=uid,
+            _current_message=None,
+            _pending_restore_message_uid=None,
+            _pending_message_read_uid=None,
+            _inflight_message_read_id=None,
+            _message_read_generation=0,
+            _user_message_click_pending=False,
+            _mark_seen_intent_list_key=None,
+            _mail=mock.Mock(),
+            _reader_pane=mock.Mock(),
+            _sidebar=SimpleNamespace(
+                folder_is_drafts=lambda _account_uid, folder: folder == "Drafts",
+            ),
+            _message_list_view=mock.Mock(
+                get_selected_uids=mock.Mock(return_value=[uid]),
+                is_restoring_selection=mock.Mock(return_value=False),
+            ),
+            _message_stack=mock.Mock(
+                get_visible_child_name=mock.Mock(return_value="list")
+            ),
+        )
+        window._message_list_key = lambda msg: MainWindow._message_list_key(
+            window, msg
+        )
+        window._message_location_for_list_key = (
+            lambda list_key: MainWindow._message_location_for_list_key(
+                window, list_key
+            )
+        )
+        window._reader_shows_list_key = lambda list_key: MainWindow._reader_shows_list_key(
+            window, list_key
+        )
+        window._mark_seen_when_reading_uid = (
+            lambda list_key: MainWindow._mark_seen_when_reading_uid(window, list_key)
+        )
+        return window
+
+    def test_ensure_reader_skips_while_click_load_in_flight(self) -> None:
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        message = {"uid": "42", "subject": "Digest", "flags": {"seen": False}}
+        window = self._window_stub(message=message)
+        window._mark_seen_intent_list_key = "42"
+        window._pending_message_read_uid = "42"
+        window._inflight_message_read_id = 1
+        window._load_message_body_for_uid = mock.Mock()
+
+        MainWindow._ensure_reader_matches_selection(window, mark_seen=False)
+
+        window._load_message_body_for_uid.assert_not_called()
+
+    def test_selection_idle_skips_while_click_load_in_flight(self) -> None:
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        message = {"uid": "42", "subject": "Digest", "flags": {"seen": False}}
+        window = self._window_stub(message=message)
+        window._mark_seen_intent_list_key = "42"
+        window._pending_message_read_uid = "42"
+        window._user_message_click_pending = True
+        window._update_message_toolbar = mock.Mock()
+        window._load_message_body_for_uid = mock.Mock()
+
+        MainWindow._on_message_list_selection_changed_idle(window)
+
+        window._load_message_body_for_uid.assert_not_called()
+        self.assertFalse(window._user_message_click_pending)
+
+    def test_load_upgrades_mark_seen_false_when_intent_and_not_inflight(self) -> None:
+        from unittest import mock
+
+        from post.window import MainWindow
+        from post.mail.io_thread import get_mail_io_thread
+
+        message = {"uid": "42", "subject": "Digest", "flags": {"seen": False}}
+        window = self._window_stub(message=message)
+        window._mark_seen_intent_list_key = "42"
+        window._pending_message_read_uid = None
+        window._inflight_message_read_id = None
+        seen_kwargs: dict = {}
+
+        def fake_read(*_args, **kwargs):
+            seen_kwargs.update(kwargs)
+            return {"uid": "42", "body_plain": "Hi", "flags": {"seen": True}}
+
+        def run_front(worker) -> None:
+            worker()
+
+        window._mail.get_account = mock.Mock(return_value=window._current_account)
+        window._mail.read_message = fake_read
+        window._on_message_read = mock.Mock(return_value=False)
+        window._on_message_read_worker_stale = mock.Mock(return_value=False)
+        with mock.patch.object(
+            get_mail_io_thread(), "submit_front", side_effect=run_front
+        ):
+            with mock.patch(
+                "post.window.GLib.idle_add", side_effect=lambda *_a, **_k: False
+            ):
+                MainWindow._load_message_body_for_uid(window, "42", mark_seen=False)
+
+        self.assertEqual(window._pending_message_read_uid, "42")
+        self.assertTrue(seen_kwargs.get("mark_seen"))
+    def test_load_skips_false_supersede_when_intent_inflight(self) -> None:
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        message = {"uid": "42", "subject": "Digest", "flags": {"seen": False}}
+        window = self._window_stub(message=message)
+        window._mark_seen_intent_list_key = "42"
+        window._pending_message_read_uid = "42"
+        window._inflight_message_read_id = 7
+        window._message_read_generation = 7
+        window._mail.get_account = mock.Mock(return_value=window._current_account)
+
+        MainWindow._load_message_body_for_uid(window, "42", mark_seen=False)
+
+        self.assertEqual(window._message_read_generation, 7)
+        self.assertEqual(window._inflight_message_read_id, 7)
+
+    def test_apply_search_matches_skips_reload_with_click_intent_inflight(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.mail.search import annotate_search_match
+        from post.window import MainWindow
+
+        hit = annotate_search_match(
+            {"uid": "100", "subject": "Search hit", "sort_date": 300},
+            account_uid="acct-1",
+            folder_name="Archive",
+        )
+        list_key = hit["_search_row_key"]
+        account = SimpleNamespace(uid="acct-1")
+        window = SimpleNamespace(
+            _is_closing=False,
+            _messages_load_generation=1,
+            _search_query=object(),
+            _current_account=account,
+            _current_folder="INBOX",
+            _search_results_streamed=False,
+            _current_folder_messages=[],
+            _current_message_uid=list_key,
+            _current_message=None,
+            _mark_seen_intent_list_key=list_key,
+            _pending_message_read_uid=list_key,
+            _inflight_message_read_id=3,
+            _message_stack=mock.Mock(
+                get_visible_child_name=mock.Mock(return_value="list")
+            ),
+            _message_list_view=mock.Mock(
+                get_selected_uids=mock.Mock(return_value=[list_key]),
+                is_restoring_selection=mock.Mock(return_value=False),
+                insert_messages_newest_first=mock.Mock(),
+            ),
+            _update_search_scope_ui=mock.Mock(),
+            _load_message_body_for_uid=mock.Mock(),
+            _sidebar=SimpleNamespace(
+                folder_is_drafts=lambda *_args: False,
+            ),
+        )
+        window._message_list_key = lambda msg: MainWindow._message_list_key(
+            window, msg
+        )
+        window._message_location_for_list_key = (
+            lambda key: MainWindow._message_location_for_list_key(window, key)
+        )
+        window._reader_shows_list_key = lambda key: MainWindow._reader_shows_list_key(
+            window, key
+        )
+        window._ensure_reader_matches_selection = (
+            lambda **kwargs: MainWindow._ensure_reader_matches_selection(
+                window, **kwargs
+            )
+        )
+        window._mark_seen_when_reading_uid = lambda _uid: True
+
+        MainWindow._apply_search_matches(window, 1, [hit])
+
+        window._load_message_body_for_uid.assert_not_called()
+
+    def test_selection_without_click_still_loads_mark_seen_false(self) -> None:
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        message = {"uid": "42", "subject": "Digest", "flags": {"seen": False}}
+        window = self._window_stub(message=message)
+        window._current_message_uid = "99"
+        window._mark_seen_intent_list_key = None
+        window._user_message_click_pending = False
+        window._update_message_toolbar = mock.Mock()
+        window._load_message_body_for_uid = mock.Mock()
+
+        MainWindow._on_message_list_selection_changed_idle(window)
+
+        window._load_message_body_for_uid.assert_called_once_with(
+            "42", mark_seen=False
+        )
 
 
 class ReaderListSyncTests(unittest.TestCase):

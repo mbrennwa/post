@@ -337,6 +337,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._suppress_sync_list_reload: tuple[str, str] | None = None
         self._local_draft_sync_suppress_until: dict[tuple[str, str], float] = {}
         self._user_message_click_pending = False
+        # Click requested mark-seen for this list key; protect in-flight loads (#388).
+        self._mark_seen_intent_list_key: str | None = None
         self._search_query: MessageSearchQuery | None = None
         self._search_scope = get_search_scope()
         self._search_scope_items: list[SearchScope] = []
@@ -3077,6 +3079,12 @@ class MainWindow(Adw.ApplicationWindow):
         uid = selected[0]
         if uid == self._current_message_uid and self._reader_shows_list_key(uid):
             return
+        if (
+            uid == self._mark_seen_intent_list_key
+            and self._pending_message_read_uid == uid
+        ):
+            # Click load already in flight for this key — do not bump generation (#388).
+            return
         if mark_seen is None:
             mark_seen = self._mark_seen_when_reading_uid(uid)
         self._current_message_uid = uid
@@ -3499,6 +3507,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_read_generation += 1
         self._pending_message_read_uid = None
         self._inflight_message_read_id = None
+        self._mark_seen_intent_list_key = None
         self._current_message_uid = None
         self._current_message = None
         self._reader_pane.clear()
@@ -6044,6 +6053,10 @@ class MainWindow(Adw.ApplicationWindow):
         if uid == self._current_message_uid and self._reader_shows_list_key(uid):
             self._mark_message_read_on_click_if_unread(uid)
             return
+        if self._mark_seen_when_reading_uid(uid):
+            self._mark_seen_intent_list_key = uid
+        else:
+            self._mark_seen_intent_list_key = None
         self._current_message_uid = uid
         self._load_message_body_for_uid(uid, mark_seen=True)
 
@@ -6944,10 +6957,23 @@ class MainWindow(Adw.ApplicationWindow):
         selected = self._message_list_view.get_selected_uids()
         if len(selected) != 1:
             self._user_message_click_pending = False
+            self._mark_seen_intent_list_key = None
             return False
 
         uid = selected[0]
+        if (
+            self._mark_seen_intent_list_key is not None
+            and uid != self._mark_seen_intent_list_key
+        ):
+            self._mark_seen_intent_list_key = None
         if uid == self._current_message_uid and self._reader_shows_list_key(uid):
+            return False
+        if (
+            uid == self._mark_seen_intent_list_key
+            and self._pending_message_read_uid == uid
+        ):
+            # Press already started a mark_seen=True load for this key (#388).
+            self._user_message_click_pending = False
             return False
 
         mark_seen = self._user_message_click_pending
@@ -7075,6 +7101,17 @@ class MainWindow(Adw.ApplicationWindow):
             account = self._mail.get_account(account_uid)
         except ValueError:
             return
+
+        if not mark_seen and uid == self._mark_seen_intent_list_key:
+            if self._mark_seen_when_reading_uid(uid):
+                # Click intent must not be superseded by programmatic mark_seen=False (#388).
+                mark_seen = True
+            if (
+                self._pending_message_read_uid == uid
+                and self._inflight_message_read_id is not None
+            ):
+                # Keep the in-flight click load; do not bump generation.
+                return
 
         self._message_read_generation += 1
         read_id = self._message_read_generation
@@ -7301,6 +7338,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._pending_message_read_uid = None
         self._inflight_message_read_id = None
+        if self._mark_seen_intent_list_key == uid:
+            self._mark_seen_intent_list_key = None
 
         if isinstance(error, MessageNotAvailableError):
             if error.reason == MessageUnavailableReason.VANISHED:
