@@ -14,12 +14,12 @@ from gi.repository import Adw, Gdk, Gtk
 
 _END_DECORATION_LAYOUT = ":minimize,maximize,close"
 
-# Adwaita already insets header contents by 6px; this adds another 4px on each
-# side so start actions and end title buttons share equal ~10px corner gaps
+# Adwaita already insets header contents by 6px; this adds another 2px on each
+# side so start actions and end title buttons share equal ~8px corner gaps
 # (enough to clear typical window corner radii).
 _HEADER_CORNER_INSET_CSS = """
 headerbar.post-header-corner-inset {
-  padding: 4px;
+  padding: 2px;
 }
 """
 _corner_inset_provider: Gtk.CssProvider | None = None
