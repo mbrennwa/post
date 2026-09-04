@@ -1048,6 +1048,7 @@ class MarkSeenClickIntentTests(unittest.TestCase):
 
         self.assertEqual(window._pending_message_read_uid, "42")
         self.assertTrue(seen_kwargs.get("mark_seen"))
+
     def test_load_skips_false_supersede_when_intent_inflight(self) -> None:
         from unittest import mock
 
