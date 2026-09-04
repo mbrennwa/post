@@ -602,6 +602,41 @@ class FlushSendQueueResult:
     failed_account_uid: str | None = None
 
 
+EDS_REGISTRY_CONNECT_ERROR = (
+    "Could not connect to evolution-source-registry.\n\n"
+    "Is Evolution Data Server installed and your session running?"
+)
+EDS_REGISTRY_RECONNECT_ERROR = (
+    "Could not reconnect to evolution-source-registry."
+)
+EDS_REGISTRY_RECONNECT_AFTER_LOCAL_ERROR = (
+    "Could not reconnect to evolution-source-registry after "
+    "configuring local mail transport."
+)
+
+
+def source_registry_new_sync(
+    *,
+    failure_message: str = EDS_REGISTRY_CONNECT_ERROR,
+) -> EDataServer.SourceRegistry:
+    """Return a live SourceRegistry or raise RuntimeError with *failure_message*.
+
+    ``SourceRegistry.new_sync`` may return ``None`` or raise ``GLib.Error``
+    (e.g. D-Bus timeout). Both become the same user-facing RuntimeError (#390).
+    """
+    try:
+        registry = EDataServer.SourceRegistry.new_sync(None)
+    except GLib.Error as exc:
+        log.warning(
+            "SourceRegistry.new_sync failed: %s",
+            getattr(exc, "message", None) or exc,
+        )
+        raise RuntimeError(failure_message) from exc
+    if registry is None:
+        raise RuntimeError(failure_message)
+    return registry
+
+
 @dataclass
 class MailService:
     """Facade around EDS + Camel; blocking I/O is routed to the mail I/O thread."""
@@ -1107,19 +1142,13 @@ class MailService:
 
     @classmethod
     def connect(cls) -> MailService:
-        registry = EDataServer.SourceRegistry.new_sync(None)
-        if registry is None:
-            raise RuntimeError(
-                "Could not connect to evolution-source-registry. "
-                "Is Evolution Data Server installed and your session running?"
-            )
+        registry = source_registry_new_sync(
+            failure_message=EDS_REGISTRY_CONNECT_ERROR
+        )
         ensure_post_local_mail_transport(registry)
-        registry = EDataServer.SourceRegistry.new_sync(None)
-        if registry is None:
-            raise RuntimeError(
-                "Could not reconnect to evolution-source-registry after "
-                "configuring local mail transport."
-            )
+        registry = source_registry_new_sync(
+            failure_message=EDS_REGISTRY_RECONNECT_AFTER_LOCAL_ERROR
+        )
         service = cls(registry=registry)
         service._ensure_mail_io_callbacks()
         service._drop_orphan_account_caches()
@@ -1362,17 +1391,13 @@ class MailService:
             self._folder_tree_cache.clear()
             self._accounts_by_uid.clear()
             self._session = None
-            registry = EDataServer.SourceRegistry.new_sync(None)
-            if registry is None:
-                raise RuntimeError(
-                    "Could not reconnect to evolution-source-registry."
-                )
+            registry = source_registry_new_sync(
+                failure_message=EDS_REGISTRY_RECONNECT_ERROR
+            )
             ensure_post_local_mail_transport(registry)
-            registry = EDataServer.SourceRegistry.new_sync(None)
-            if registry is None:
-                raise RuntimeError(
-                    "Could not reconnect to evolution-source-registry."
-                )
+            registry = source_registry_new_sync(
+                failure_message=EDS_REGISTRY_RECONNECT_ERROR
+            )
             self.registry = registry
         self._drop_orphan_account_caches()
 

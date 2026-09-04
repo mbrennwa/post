@@ -23,12 +23,52 @@ from post.window import MainWindow
 log = logging.getLogger("post.app")
 
 
-def _ensure_main_window(application: Adw.Application) -> MainWindow:
+def _destroy_half_built_main_windows(application: Adw.Application) -> None:
+    """Drop MainWindows left registered if ``__init__`` raised mid-construction."""
+    for win in list(application.get_windows()):
+        if isinstance(win, MainWindow):
+            win.destroy()
+
+
+def _show_startup_failure(application: Adw.Application, message: str) -> None:
+    """Standalone modal alert (no parent window), then return (caller quits).
+
+    ``Adw.AlertDialog.present(None)`` shows as its own window when there is no
+    host (#390). Avoid a throwaway ApplicationWindow — it peeks out behind the
+    dialog.
+    """
+    loop = GLib.MainLoop()
+    dialog = Adw.AlertDialog(heading="Cannot start Post", body=message)
+    dialog.add_response("quit", "Quit")
+    dialog.set_default_response("quit")
+    dialog.set_close_response("quit")
+
+    def on_response(_dialog: Adw.AlertDialog, _response: str) -> None:
+        loop.quit()
+
+    dialog.connect("response", on_response)
+    # Keep the Gio.Application alive while the nested loop runs.
+    application.hold()
+    try:
+        dialog.present(None)
+        loop.run()
+    finally:
+        application.release()
+
+
+def _ensure_main_window(application: Adw.Application) -> MainWindow | None:
     for win in application.get_windows():
         if isinstance(win, MainWindow):
             win.present()
             return win
-    win = MainWindow(application=application)
+    try:
+        win = MainWindow(application=application)
+    except RuntimeError as exc:
+        log.error("%s", exc)
+        _destroy_half_built_main_windows(application)
+        _show_startup_failure(application, str(exc))
+        application.quit()
+        return None
     win.present()
     win.begin_load()
     return win
@@ -84,6 +124,9 @@ class PostApplication(Adw.Application):
         argv = command_line.get_arguments()
         log.debug("command-line argv=%r", list(argv))
         win = _ensure_main_window(self)
+        if win is None:
+            command_line.set_exit_status(1)
+            return 1
         mailtos = [
             arg
             for arg in argv[1:]
