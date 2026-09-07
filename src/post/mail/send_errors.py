@@ -76,14 +76,14 @@ def _raw_error_text(exc: BaseException) -> str:
 
 
 def _token_expired_user_message(text: str) -> str | None:
-    lowered = text.lower()
-    if not any(
-        token in lowered
-        for token in ("aadsts", "goa-error", "refresh token", "access token")
-    ):
-        return None
-    from post.mail.network_errors import TOKEN_EXPIRED_FOLDER_MESSAGE
+    # Lazy import: network_errors imports _is_localhost_refused from this module.
+    from post.mail.network_errors import (
+        TOKEN_EXPIRED_FOLDER_MESSAGE,
+        matches_token_expired_text,
+    )
 
+    if not matches_token_expired_text(text):
+        return None
     return TOKEN_EXPIRED_FOLDER_MESSAGE
 
 

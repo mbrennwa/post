@@ -27,6 +27,20 @@ MESSAGE_NOT_CACHED_SIGN_IN = (
     "Online Accounts to reconnect."
 )
 
+_TOKEN_EXPIRED_TOKENS = (
+    "access token",
+    "refresh token",
+    "aadsts",
+    "goa-error",
+    "oauth",
+)
+
+
+def matches_token_expired_text(text: str) -> bool:
+    """Return True when *text* looks like an expired/invalid OAuth token error."""
+    lowered = text.lower()
+    return any(token in lowered for token in _TOKEN_EXPIRED_TOKENS)
+
 
 def is_queueable_network_error(exc: BaseException) -> bool:
     """Return True when a send failure may succeed if retried later."""
@@ -115,11 +129,7 @@ def is_sign_in_required_error(exc: BaseException) -> bool:
 
 
 def _is_token_expired_error(exc: BaseException) -> bool:
-    lowered = _error_text(exc).lower()
-    return any(
-        token in lowered
-        for token in ("access token", "refresh token", "aadsts", "goa-error", "oauth")
-    )
+    return matches_token_expired_text(_error_text(exc))
 
 
 def format_message_read_error(
@@ -151,12 +161,9 @@ def format_folder_load_error(exc: BaseException) -> str:
 def format_sign_in_required_log(exc: BaseException) -> str:
     """Short log detail for expected auth failures (no AADSTS / GOA dumps)."""
     text = _error_text(exc)
-    lowered = text.lower()
-    if any(
-        token in lowered
-        for token in ("access token", "refresh token", "aadsts", "goa-error", "oauth")
-    ):
+    if matches_token_expired_text(text):
         return "sign-in expired or invalid (re-auth required)"
+    lowered = text.lower()
     if "password" in lowered or "credentials" in lowered:
         return "password or credentials required"
     return "sign-in required"
