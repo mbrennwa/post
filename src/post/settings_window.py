@@ -688,7 +688,3 @@ class SettingsDialog(Adw.PreferencesWindow):
 
     def _show_error(self, message: str) -> None:
         show_error_toast(self._parent, message, heading="Could not save settings")
-
-
-# Backwards-compatible alias for imports.
-SettingsWindow = SettingsDialog

@@ -121,7 +121,7 @@ from post.mail.send_queue import (
     soonest_pending_send_after,
     try_load_queued_outbound_message,
 )
-from post.settings_window import SettingsWindow
+from post.settings_window import SettingsDialog
 from post.mail.helpers import (
     flag_menu_items,
     flag_menu_label,
@@ -332,7 +332,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._pending_move_undo: dict | None = None
         self._undo_toast: Adw.Toast | None = None
         self._bulk_archive_progress_toast: Adw.Toast | None = None
-        self._settings_dialog: SettingsWindow | None = None
+        self._settings_dialog: SettingsDialog | None = None
         self._compose_windows: list[ComposeWindow] = []
         self._reader_windows: list[ReaderWindow] = []
         self._load_remote_content = get_load_remote_content()
@@ -1379,7 +1379,7 @@ class MainWindow(Adw.ApplicationWindow):
                 return
             existing.destroy()
             self._settings_dialog = None
-        dialog = SettingsWindow(
+        dialog = SettingsDialog(
             parent=self,
             mail=self._mail,
             set_status=self._set_status,
