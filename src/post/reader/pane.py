@@ -18,6 +18,7 @@ gi.require_version("Graphene", "1.0")
 
 from gi.repository import Gdk, Gio, Graphene, Gtk, WebKit
 
+from post.attachment_menu import ensure_popover_parent
 from post.mail.helpers import (
     ReaderHeaderRow,
     bare_email_from_address,
@@ -860,18 +861,6 @@ class MessageReaderPane(Gtk.Box):
             return
         self._popup_address_menu(widget, x, y, email)
 
-    def _ensure_popover_parent(
-        self, popover: Gtk.PopoverMenu, widget: Gtk.Widget
-    ) -> None:
-        current = popover.get_parent()
-        if current is widget:
-            return
-        if current is not None:
-            popover.popdown()
-            if popover.get_parent() is current:
-                popover.unparent()
-        popover.set_parent(widget)
-
     def _sync_address_search_action(self) -> None:
         self._address_search_action.set_enabled(bool(self._can_search_messages()))
 
@@ -885,7 +874,7 @@ class MessageReaderPane(Gtk.Box):
         menu.append(f"Search Messages from {email}", "reader.address-search-from")
         menu.append("Copy address", "reader.address-copy")
         self._address_popover.set_menu_model(menu)
-        self._ensure_popover_parent(self._address_popover, widget)
+        ensure_popover_parent(self._address_popover, widget)
         rect = Gdk.Rectangle()
         rect.x = int(x)
         rect.y = int(y)

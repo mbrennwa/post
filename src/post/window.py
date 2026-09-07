@@ -20,6 +20,11 @@ gi.require_version("Gdk", "4.0")
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
+from post.attachment_menu import (
+    make_attachment_popover,
+    popup_attachment_menu,
+    register_attachment_actions,
+)
 from post.attachment_open import launch_attachment_with_app, open_attachment
 from post.compose_window import ComposeWindow, SavedDraftNotification
 from post.credentials import prompt_password_sync
@@ -2631,24 +2636,13 @@ class MainWindow(Adw.ApplicationWindow):
         self._trigger_move_undo()
 
     def _setup_attachment_menu(self) -> None:
-        save_action = Gio.SimpleAction.new("attachment-save", None)
-        save_action.connect("activate", self._on_attachment_menu_save)
-        self.add_action(save_action)
-
-        open_with_action = Gio.SimpleAction.new("attachment-open-with", None)
-        open_with_action.connect("activate", self._on_attachment_menu_open_with)
-        self.add_action(open_with_action)
-
-        add_cal_action = Gio.SimpleAction.new("attachment-add-to-calendar", None)
-        add_cal_action.connect("activate", self._on_attachment_menu_add_to_calendar)
-        self.add_action(add_cal_action)
-
-        self._attachment_menu_model = Gio.Menu()
-        self._attachment_menu_model.append("Save...", "win.attachment-save")
-        self._attachment_menu_model.append("Open With…", "win.attachment-open-with")
-        self._attachment_popover = Gtk.PopoverMenu.new_from_model(
-            self._attachment_menu_model
+        register_attachment_actions(
+            self,
+            on_save=self._on_attachment_menu_save,
+            on_open_with=self._on_attachment_menu_open_with,
+            on_add_to_calendar=self._on_attachment_menu_add_to_calendar,
         )
+        self._attachment_popover = make_attachment_popover()
 
     def _setup_message_menu(self) -> None:
         mark_read_action = Gio.SimpleAction.new("message-mark-read", None)
@@ -2741,18 +2735,6 @@ class MainWindow(Adw.ApplicationWindow):
             return False
         self._popup_message_menu(uid, 8, 8)
         return True
-
-    def _ensure_popover_parent(
-        self, popover: Gtk.PopoverMenu, widget: Gtk.Widget
-    ) -> None:
-        current = popover.get_parent()
-        if current is widget:
-            return
-        if current is not None:
-            popover.popdown()
-            if popover.get_parent() is current:
-                popover.unparent()
-        popover.set_parent(widget)
 
     def begin_load(self) -> None:
         """Load accounts and folders after the window is on screen."""
@@ -3527,25 +3509,18 @@ class MainWindow(Adw.ApplicationWindow):
         mime_type: str | None,
         name: str,
     ) -> None:
-        from post.mail.calendar_invite import looks_like_calendar_attachment
-
         self._context_attachment_index = index
         self._context_attachment_mime = mime_type
         self._context_attachment_name = name
-        menu = Gio.Menu()
-        menu.append("Save...", "win.attachment-save")
-        menu.append("Open With…", "win.attachment-open-with")
-        if looks_like_calendar_attachment(mime_type, name):
-            menu.append("Add to Calendar…", "win.attachment-add-to-calendar")
-        self._attachment_popover.set_menu_model(menu)
-        self._ensure_popover_parent(self._attachment_popover, widget)
-        rect = Gdk.Rectangle()
-        rect.x = int(x)
-        rect.y = int(y)
-        rect.width = 1
-        rect.height = 1
-        self._attachment_popover.set_pointing_to(rect)
-        self._attachment_popover.popup()
+        popup_attachment_menu(
+            self._attachment_popover,
+            widget,
+            x,
+            y,
+            mime_type=mime_type,
+            name=name,
+            support_calendar=True,
+        )
 
     def _attachment_mime_at(self, index: int) -> str | None:
         attachments = (self._current_message or {}).get("attachments") or []
