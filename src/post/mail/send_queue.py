@@ -17,6 +17,7 @@ from typing import Any, Mapping, Sequence
 
 from .compose import ComposeAttachment
 from .helpers import format_message_datetime, paginate_messages
+from .queue_attachments import load_attachment_sidecars, write_attachment_sidecars
 
 
 @dataclass
@@ -195,59 +196,16 @@ def _write_attachment_sidecars(
     queue_id: str,
     attachments: Sequence[ComposeAttachment],
 ) -> list[dict[str, str]]:
-    if not attachments:
-        return []
-    directory = _queued_attachment_dir(queue_id)
-    os.makedirs(directory, exist_ok=True)
-    refs: list[dict[str, str]] = []
-    for index, attachment in enumerate(attachments):
-        rel_path = str(index)
-        path = os.path.join(directory, rel_path)
-        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".post-", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(attachment.data)
-            os.replace(tmp_path, path)
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        refs.append(
-            {
-                "filename": attachment.filename,
-                "mime_type": attachment.mime_type,
-                "path": rel_path,
-            }
-        )
-    return refs
+    return write_attachment_sidecars(outbox_dir(), queue_id, attachments)
 
 
 def load_queued_attachments(
     queue_id: str,
     message: QueuedOutboundMessage,
 ) -> list[ComposeAttachment]:
-    if not message.attachments:
-        return []
-    directory = _queued_attachment_dir(queue_id)
-    loaded: list[ComposeAttachment] = []
-    for ref in message.attachments:
-        rel_path = ref.get("path")
-        if not rel_path:
-            continue
-        path = os.path.join(directory, rel_path)
-        try:
-            with open(path, "rb") as handle:
-                data = handle.read()
-        except OSError:
-            continue
-        loaded.append(
-            ComposeAttachment(
-                filename=ref.get("filename") or "attachment",
-                mime_type=ref.get("mime_type") or "application/octet-stream",
-                data=data,
-            )
-        )
-    return loaded
-
+    return load_attachment_sidecars(
+        outbox_dir(), queue_id, message.attachments
+    )
 
 def load_queued_outbound_message(queue_id: str) -> QueuedOutboundMessage:
     path = os.path.join(outbox_dir(), f"{queue_id}.json")
