@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Sequence
 
 from .compose import ComposeAttachment
+from .queue_attachments import load_attachment_sidecars, write_attachment_sidecars
 
 _DRAFT_QUEUE_DIRNAME = "draft-queue"
 
@@ -102,59 +103,16 @@ def _write_attachment_sidecars(
     queue_id: str,
     attachments: Sequence[ComposeAttachment],
 ) -> list[dict[str, str]]:
-    if not attachments:
-        return []
-    directory = _queued_attachment_dir(queue_id)
-    os.makedirs(directory, exist_ok=True)
-    refs: list[dict[str, str]] = []
-    for index, attachment in enumerate(attachments):
-        rel_path = str(index)
-        path = os.path.join(directory, rel_path)
-        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".post-", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(attachment.data)
-            os.replace(tmp_path, path)
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        refs.append(
-            {
-                "filename": attachment.filename,
-                "mime_type": attachment.mime_type,
-                "path": rel_path,
-            }
-        )
-    return refs
+    return write_attachment_sidecars(draft_queue_dir(), queue_id, attachments)
 
 
 def load_queued_draft_attachments(
     queue_id: str,
     draft: QueuedDraft,
 ) -> list[ComposeAttachment]:
-    if not draft.attachments:
-        return []
-    directory = _queued_attachment_dir(queue_id)
-    loaded: list[ComposeAttachment] = []
-    for ref in draft.attachments:
-        rel_path = ref.get("path")
-        if not rel_path:
-            continue
-        path = os.path.join(directory, rel_path)
-        try:
-            with open(path, "rb") as handle:
-                data = handle.read()
-        except OSError:
-            continue
-        loaded.append(
-            ComposeAttachment(
-                filename=ref.get("filename") or "attachment",
-                mime_type=ref.get("mime_type") or "application/octet-stream",
-                data=data,
-            )
-        )
-    return loaded
-
+    return load_attachment_sidecars(
+        draft_queue_dir(), queue_id, draft.attachments
+    )
 
 def enqueue_draft(
     draft: QueuedDraft,
