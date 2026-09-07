@@ -734,9 +734,7 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.timeout_add_seconds(2, self._flush_send_queue_on_startup)
 
     def _flush_send_queue_on_startup(self) -> bool:
-        self._flush_send_queue_idle()
-        self._flush_operation_queue_idle()
-        self._flush_draft_queue_idle()
+        self._flush_all_offline_queues_idle()
         self._send_delay_scheduler.reschedule_all()
         self._update_stop_sending_button()
         return False
@@ -751,9 +749,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._refresh_status_display()
         if online:
             self._mail.go_online_sync()
-            self._flush_send_queue_idle()
-            self._flush_operation_queue_idle()
-            self._flush_draft_queue_idle()
+            self._flush_all_offline_queues_idle()
             self._mail.schedule_offline_body_sync()
             if self._current_account and self._current_folder:
                 if self._account_server_sync_enabled(self._current_account.uid):
@@ -770,6 +766,11 @@ class MainWindow(Adw.ApplicationWindow):
                 self._current_folder,
                 sync=False,
             )
+
+    def _flush_all_offline_queues_idle(self) -> None:
+        self._flush_send_queue_idle()
+        self._flush_operation_queue_idle()
+        self._flush_draft_queue_idle()
 
     def _flush_send_queue_idle(self, *, force: bool = False) -> bool:
         get_mail_io_thread().submit(self._flush_send_queue_worker, force=force)
