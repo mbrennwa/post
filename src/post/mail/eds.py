@@ -7361,13 +7361,21 @@ class MailService:
                     info.get_flags() & Camel.MessageFlags.SEEN
                 )
 
-        result = (
-            message_info_to_dict(
+        if info:
+            result = message_info_to_dict(
                 info, backend=self._backend_for_account(account_uid)
             )
-            if info
-            else {"uid": actual_uid}
-        )
+        else:
+            index_row = self._folder_index_row(
+                account_uid, folder_name, actual_uid
+            )
+            if index_row is None and actual_uid != message_uid:
+                index_row = self._folder_index_row(
+                    account_uid, folder_name, message_uid
+                )
+            result = (
+                dict(index_row) if index_row is not None else {"uid": actual_uid}
+            )
         result["uid"] = actual_uid
         if actual_uid != message_uid:
             result["_previous_uid"] = message_uid
