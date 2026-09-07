@@ -1221,12 +1221,6 @@ class ComposeWindow(Adw.Window):
     def _known_signatures(self) -> list[str]:
         return list(get_account_signatures().values())
 
-    def _clear_signature_mark(self) -> None:
-        """No-op: signature tracking no longer uses a Gtk.TextBuffer mark."""
-
-    def _place_signature_mark(self) -> None:
-        """No-op: auto-signature is re-detected from plain text on each edit."""
-
     def _sync_signature_for_account(
         self, *, previous_signature: str | None = None
     ) -> None:
@@ -1271,16 +1265,11 @@ class ComposeWindow(Adw.Window):
         self._tracking_edits = False
         try:
             if result is None:
-                self._clear_signature_mark()
                 self._tracked_signature = None
                 return
             new_body, new_tracked = result
             self._set_body_plain_text(new_body)
             self._tracked_signature = new_tracked
-            if new_tracked:
-                self._place_signature_mark()
-            else:
-                self._clear_signature_mark()
             if not new_body.strip():
                 self._place_body_cursor_at_start()
         finally:
@@ -1300,11 +1289,6 @@ class ComposeWindow(Adw.Window):
                 is None
             ):
                 self._tracked_signature = None
-                self._clear_signature_mark()
-            else:
-                self._place_signature_mark()
-        elif self._mode == "new":
-            self._clear_signature_mark()
         self._mark_user_edited()
 
     def _load_correspondents(self) -> None:
@@ -1658,7 +1642,6 @@ class ComposeWindow(Adw.Window):
                 body = mailto.body + body
             self._set_body_plain_text(body)
             self._tracked_signature = normalize_signature_text(signature) or None
-            self._place_signature_mark()
             self._place_body_cursor_at_start()
 
     def _place_body_cursor_at_start(self) -> None:
