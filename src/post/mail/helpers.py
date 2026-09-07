@@ -273,12 +273,141 @@ def perform_one_click_unsubscribe(url: str, *, timeout: float = 30.0) -> None:
         raise OSError(f"Unsubscribe request failed: {exc.reason}") from exc
 
 
+_PLACEHOLDER_SUBJECT = "(no subject)"
+
+
+def _envelope_text_missing(value: Any, *, placeholder: str | None = None) -> bool:
+    """True when a reader envelope string is absent, blank, or a placeholder."""
+    if not isinstance(value, str):
+        return True
+    text = value.strip()
+    if not text:
+        return True
+    return placeholder is not None and text == placeholder
+
+
+def _address_text_from_mime_value(value: Any) -> str:
+    """Format a Camel address object or header string."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return (_decode_header_value(value) or "").strip()
+    formatter = getattr(value, "format", None)
+    if callable(formatter):
+        try:
+            formatted = formatter()
+        except (TypeError, ValueError):
+            formatted = None
+        if isinstance(formatted, str) and formatted.strip():
+            return formatted.strip()
+    return ""
+
+
+def _from_field_from_mime(mime: Any) -> str:
+    """Return From from Camel MIME ``get_from`` or the From header."""
+    getter = getattr(mime, "get_from", None)
+    if callable(getter):
+        try:
+            text = _address_text_from_mime_value(getter())
+        except (TypeError, ValueError):
+            text = ""
+        if text:
+            return text
+    if hasattr(mime, "get_header"):
+        return _address_text_from_mime_value(mime.get_header("From"))
+    return ""
+
+
+def _subject_field_from_mime(mime: Any) -> str:
+    """Return a real Subject from MIME, skipping the ``(no subject)`` placeholder."""
+    getter = getattr(mime, "get_subject", None)
+    if callable(getter):
+        try:
+            raw = getter()
+        except (TypeError, ValueError):
+            raw = None
+        if isinstance(raw, (str, bytes)):
+            text = (_decode_header_value(raw) or "").strip()
+            if text and text != _PLACEHOLDER_SUBJECT:
+                return text
+    if hasattr(mime, "get_header"):
+        header = mime.get_header("Subject")
+        if isinstance(header, (str, bytes)):
+            text = (_decode_header_value(header) or "").strip()
+            if text and text != _PLACEHOLDER_SUBJECT:
+                return text
+    return ""
+
+
+def _unix_from_mime_date(mime: Any) -> float | None:
+    """Unix seconds from Camel ``get_date`` or the Date header."""
+    getter = getattr(mime, "get_date", None)
+    if callable(getter):
+        try:
+            raw = getter()
+        except (TypeError, ValueError):
+            raw = None
+        ts = None
+        if isinstance(raw, (int, float)):
+            ts = raw
+        elif isinstance(raw, tuple) and raw and isinstance(raw[0], (int, float)):
+            ts = raw[0]
+        value = _valid_unix_timestamp(ts)
+        if value is not None:
+            return value
+    if not hasattr(mime, "get_header"):
+        return None
+    header = mime.get_header("Date")
+    if not isinstance(header, (str, bytes)):
+        return None
+    text = (_decode_header_value(header) or "").strip()
+    if not text:
+        return None
+    import email.utils
+
+    try:
+        parsed = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return _valid_unix_timestamp(parsed.timestamp())
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def enrich_message_dict_from_mime(result: dict[str, Any], mime: Any) -> None:
-    """Prefer full To/Cc/Bcc from MIME over Camel MessageInfo summaries."""
+    """Prefer MIME recipients; fill empty From/Subject/Date (#393).
+
+    To/Cc/Bcc are overwritten when MIME has a value (Camel summaries truncate
+    recipient lists). From, Subject, and Date are copied only when the result
+    is missing them, so a real MessageInfo From is not replaced.
+    """
     for field in ("to", "cc", "bcc"):
         value = _recipient_field_from_mime(mime, field)
         if value:
             result[field] = value
+    from_value = _from_field_from_mime(mime)
+    if from_value and _envelope_text_missing(result.get("from")):
+        result["from"] = from_value
+    subject = _subject_field_from_mime(mime)
+    if subject and _envelope_text_missing(
+        result.get("subject"), placeholder=_PLACEHOLDER_SUBJECT
+    ):
+        result["subject"] = subject
+    unix = _unix_from_mime_date(mime)
+    if unix is not None:
+        formatted = format_message_datetime(unix)
+        if formatted:
+            if not result.get("date_sent"):
+                result["date_sent"] = formatted
+            if not result.get("date_received"):
+                result["date_received"] = formatted
+            if not result.get("sort_date"):
+                result["sort_date"] = unix
     if hasattr(mime, "get_header"):
         reply_to_header = mime.get_header("Reply-To")
         if reply_to_header:

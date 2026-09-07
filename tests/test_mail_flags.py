@@ -291,6 +291,66 @@ class ReadMessageSignInTests(unittest.TestCase):
         self.assertTrue((result.get("flags") or {}).get("seen"))
         self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
 
+    @patch("post.mail.eds.MailService._mark_message_seen_unlocked")
+    @patch("post.mail.eds.MailService._get_message_mime_sync")
+    @patch("post.mail.eds.MailService._get_store_unlocked")
+    def test_seeds_folder_index_when_messageinfo_missing(
+        self,
+        get_store_mock: MagicMock,
+        get_mime_mock: MagicMock,
+        mark_seen_mock: MagicMock,
+    ) -> None:
+        from post.mail.eds import MailService, _FolderMessageIndex
+
+        service = MailService(registry=MagicMock())
+        service._folder_indexes[("acct-1", "INBOX")] = _FolderMessageIndex(
+            messages=[
+                {
+                    "uid": "42",
+                    "from": "Alice <alice@example.com>",
+                    "subject": "Hi from index",
+                    "to": "me@example.com",
+                }
+            ],
+            unread=0,
+            total=1,
+        )
+        folder = MagicMock()
+        folder.get_message_info.return_value = None
+        store = MagicMock()
+        store.get_folder_sync.return_value = folder
+        get_store_mock.return_value = store
+        mime = MagicMock()
+        mime.get_from.return_value = None
+        mime.get_subject.return_value = None
+        mime.get_date.return_value = (-1, 0)
+        mime.get_message_id.return_value = None
+        mime.get_header.return_value = None
+        mime.get_recipients.return_value = None
+        get_mime_mock.return_value = mime
+
+        with patch(
+            "post.mail.helpers.extract_message_bodies",
+            return_value={"plain": "Hello", "html": None},
+        ):
+            with patch("post.mail.helpers.extract_attachments", return_value=[]):
+                with patch(
+                    "post.mail.helpers.extract_inline_images", return_value=[]
+                ):
+                    result = service._read_message_unlocked(
+                        "acct-1",
+                        "INBOX",
+                        "42",
+                    )
+
+        self.assertEqual(result["from"], "Alice <alice@example.com>")
+        self.assertEqual(result["subject"], "Hi from index")
+        self.assertEqual(result["body_plain"], "Hello")
+        self.assertEqual(
+            service._folder_indexes[("acct-1", "INBOX")].messages[0]["from"],
+            "Alice <alice@example.com>",
+        )
+
 
 class ReadMessageGoaUnavailableTests(unittest.TestCase):
     def _goa_account(self, service: object) -> None:

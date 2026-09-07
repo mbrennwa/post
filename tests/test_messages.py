@@ -1640,6 +1640,93 @@ class EnrichMessageDictFromMimeTests(unittest.TestCase):
         enrich_message_dict_from_mime(result, mime)
         self.assertNotIn("unsubscribe", result)
 
+    def test_fills_missing_from_subject_date_from_mime(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        from post.mail.compose import extract_reply_target_addresses
+
+        mime = Camel.MimeMessage()
+        sender = Camel.InternetAddress.new()
+        sender.add("Alice", "alice@example.com")
+        mime.set_from(sender)
+        mime.set_subject("Hello")
+        mime.set_date(1700000000, 0)
+
+        result: dict = {"uid": "42"}
+        enrich_message_dict_from_mime(result, mime)
+        self.assertEqual(result["from"], "Alice <alice@example.com>")
+        self.assertEqual(result["subject"], "Hello")
+        expected_date = format_message_datetime(1700000000)
+        self.assertEqual(result["date_sent"], expected_date)
+        self.assertEqual(result["date_received"], expected_date)
+        self.assertEqual(result["sort_date"], 1700000000.0)
+        self.assertEqual(
+            extract_reply_target_addresses(result),
+            ["Alice <alice@example.com>"],
+        )
+
+    def test_fills_from_subject_date_from_headers_when_getters_empty(self) -> None:
+        mime = MagicMock()
+        mime.get_from.return_value = None
+        mime.get_subject.return_value = None
+        mime.get_date.return_value = (-1, 0)
+        mime.get_recipients.return_value = None
+        mime.get_header.side_effect = lambda name: {
+            "From": "Alice <alice@example.com>",
+            "Subject": "Hello",
+            "Date": "Tue, 14 Nov 2023 22:13:20 +0000",
+            "To": None,
+            "Cc": None,
+            "Bcc": None,
+        }.get(name)
+
+        result: dict = {}
+        enrich_message_dict_from_mime(result, mime)
+        self.assertEqual(result["from"], "Alice <alice@example.com>")
+        self.assertEqual(result["subject"], "Hello")
+        self.assertEqual(
+            result["date_sent"],
+            format_message_datetime(1700000000),
+        )
+
+    def test_does_not_overwrite_existing_from_or_subject(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        mime = Camel.MimeMessage()
+        sender = Camel.InternetAddress.new()
+        sender.add("Alice", "alice@example.com")
+        mime.set_from(sender)
+        mime.set_subject("MIME subject")
+
+        result = {
+            "from": "List <list@example.com>",
+            "subject": "Keep me",
+            "date_sent": "2020-01-01 00:00:00",
+        }
+        enrich_message_dict_from_mime(result, mime)
+        self.assertEqual(result["from"], "List <list@example.com>")
+        self.assertEqual(result["subject"], "Keep me")
+        self.assertEqual(result["date_sent"], "2020-01-01 00:00:00")
+
+    def test_replaces_placeholder_subject_from_mime(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        mime = Camel.MimeMessage()
+        mime.set_subject("Real subject")
+
+        result = {"subject": "(no subject)"}
+        enrich_message_dict_from_mime(result, mime)
+        self.assertEqual(result["subject"], "Real subject")
+
 
 if __name__ == "__main__":
     unittest.main()
