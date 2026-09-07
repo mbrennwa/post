@@ -16,11 +16,15 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gio", "2.0")
-gi.require_version("Gdk", "4.0")
 gi.require_version("GLib", "2.0")
 
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+from gi.repository import Adw, Gio, GLib, Gtk
 
+from post.attachment_menu import (
+    make_attachment_popover,
+    popup_attachment_menu,
+    register_attachment_actions,
+)
 from post.header_bar import add_end_window_controls
 from post.icon_utils import apply_window_icon
 from post.mail.helpers import (
@@ -207,17 +211,12 @@ class AttachedMessageWindow(Adw.ApplicationWindow):
         )
 
     def _setup_attachment_menu(self) -> None:
-        save_action = Gio.SimpleAction.new("save-attachment", None)
-        save_action.connect("activate", self._on_attachment_menu_save)
-        self.add_action(save_action)
-        open_with_action = Gio.SimpleAction.new("open-with-attachment", None)
-        open_with_action.connect("activate", self._on_attachment_menu_open_with)
-        self.add_action(open_with_action)
-        menu = Gio.Menu()
-        menu.append("Save As…", "win.save-attachment")
-        menu.append("Open With…", "win.open-with-attachment")
-        self._attachment_popover = Gtk.PopoverMenu()
-        self._attachment_popover.set_menu_model(menu)
+        register_attachment_actions(
+            self,
+            on_save=self._on_attachment_menu_save,
+            on_open_with=self._on_attachment_menu_open_with,
+        )
+        self._attachment_popover = make_attachment_popover()
 
     def _on_attachment_context_menu(
         self,
@@ -231,14 +230,15 @@ class AttachedMessageWindow(Adw.ApplicationWindow):
         self._context_attachment_index = index
         self._context_attachment_mime = mime_type
         self._context_attachment_name = name
-        self._attachment_popover.set_parent(widget)
-        rect = Gdk.Rectangle()
-        rect.x = int(x)
-        rect.y = int(y)
-        rect.width = 1
-        rect.height = 1
-        self._attachment_popover.set_pointing_to(rect)
-        self._attachment_popover.popup()
+        popup_attachment_menu(
+            self._attachment_popover,
+            widget,
+            x,
+            y,
+            mime_type=mime_type,
+            name=name,
+            support_calendar=False,
+        )
 
     def _on_attachment_clicked(self, attachment_index: int) -> None:
         self._open_inner_attachment(attachment_index, open_with=False)
