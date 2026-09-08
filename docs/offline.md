@@ -21,7 +21,7 @@ Related: [#6](https://github.com/mbrennwa/post/issues/6), [offline body cache](o
 
 When the network returns:
 
-1. Camel stores go back online (`go_online_sync`)
+1. Camel stores go back online asynchronously (`MailService.set_network_available` on the mail I/O thread; never blocks GTK — #400)
 2. Outbound send queue is flushed
 3. Queued move/archive/flag operations are flushed
 4. Queued drafts are appended to Drafts on the server

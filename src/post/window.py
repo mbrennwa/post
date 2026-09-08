@@ -726,6 +726,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._clear_reader()
 
     def _setup_send_queue_flush(self) -> None:
+        # Non-blocking (#400): seeds Camel online flag on mail I/O thread.
         self._mail.set_network_available(self._network_available)
         self._sidebar.set_network_available(self._network_available)
         monitor = Gio.NetworkMonitor.get_default()
@@ -744,23 +745,36 @@ class MainWindow(Adw.ApplicationWindow):
         if online == self._network_available:
             return
         self._network_available = online
-        self._mail.set_network_available(online)
         self._sidebar.set_network_available(online)
         self._refresh_status_display()
+        # Never run_sync from GTK while Camel/GOA reconnects (#400).
         if online:
-            self._mail.go_online_sync()
-            self._flush_all_offline_queues_idle()
-            self._mail.schedule_offline_body_sync()
-            if self._current_account and self._current_folder:
-                if self._account_server_sync_enabled(self._current_account.uid):
-                    self._load_messages(
-                        self._current_account.uid,
-                        self._current_folder,
-                        sync=True,
-                    )
-            else:
-                GLib.idle_add(self._reload_sidebar)
-        elif self._current_account and self._current_folder:
+            self._mail.set_network_available(
+                True,
+                on_complete=self._on_network_reconnect_finished,
+            )
+        else:
+            self._mail.set_network_available(
+                False,
+                on_complete=self._on_network_offline_finished,
+            )
+
+    def _on_network_reconnect_finished(self) -> None:
+        """GTK: queues / folder reload after mail-thread reconnect completes."""
+        self._flush_all_offline_queues_idle()
+        if self._current_account and self._current_folder:
+            if self._account_server_sync_enabled(self._current_account.uid):
+                self._load_messages(
+                    self._current_account.uid,
+                    self._current_folder,
+                    sync=True,
+                )
+        else:
+            GLib.idle_add(self._reload_sidebar)
+
+    def _on_network_offline_finished(self) -> None:
+        """GTK: show cached folder after Camel stores were taken offline."""
+        if self._current_account and self._current_folder:
             self._load_messages(
                 self._current_account.uid,
                 self._current_folder,
