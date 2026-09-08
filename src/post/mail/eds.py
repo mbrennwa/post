@@ -204,6 +204,9 @@ _TRANSFER_POST_TIMEOUT_SECONDS = 30
 _FOLDER_STATS_TIMEOUT_SECONDS = 15
 # Bound get_message_sync so revoked GOA tokens cannot leave the reader hung (#341).
 _MESSAGE_READ_TIMEOUT_SECONDS = 30
+# Network reconnect set_online_sync per store (#400). Same order as GOA
+# EnsureCredentials so one dead OAuth account cannot pin post-mail-io / GTK.
+_NETWORK_RECONNECT_TIMEOUT_SECONDS = 15
 # Stay below Camel IMAPx MAX_UIDSET_ITEMS (100) to avoid spurious uidset warnings
 # in evolution-data-server 3.56 when batching UID MOVE/COPY commands.
 _TRANSFER_MESSAGE_BATCH_SIZE = 50
@@ -1289,37 +1292,75 @@ class MailService:
         else:
             self.set_account_connect_health(account_uid, "needs_sign_in")
 
-    def set_network_available(self, available: bool) -> None:
-        """Update Camel session/store online state from Gio.NetworkMonitor."""
-        run_on_mail_thread(self._set_network_available_unlocked, available)
+    def set_network_available(
+        self,
+        available: bool,
+        *,
+        on_complete: Callable[[], None] | None = None,
+    ) -> None:
+        """Update Camel session/store online state from Gio.NetworkMonitor.
+
+        Always dispatches to the mail I/O thread via ``submit_front`` (never
+        ``run_sync``) so GTK stays responsive while GOA/OAuth reconnects (#400).
+        Optional ``on_complete`` runs on the GTK thread after the pass finishes.
+        """
+
+        def work() -> None:
+            try:
+                self._set_network_available_unlocked(available)
+            finally:
+                if on_complete is not None:
+                    GLib.idle_add(_run_on_gtk_thread, on_complete)
+
+        if is_mail_io_thread():
+            work()
+            return
+        get_mail_io_thread().submit_front(work)
 
     def _set_network_available_unlocked(self, available: bool) -> None:
-        stores_to_sync: list[tuple[str, Camel.Store, bool]] = []
+        stores_to_sync: list[tuple[str, Camel.Store]] = []
+        going_online = False
         with self._lock:
             if self._network_available == available:
                 return
+            going_online = bool(available)
             self._network_available = available
             if self._session is not None:
                 self._session.set_online(available)
+            # Former go_online_sync: drop stale indexes once on offline→online.
+            if going_online:
+                self._folder_indexes.clear()
             for account_uid, store in self._stores.items():
                 if isinstance(store, Camel.OfflineStore):
-                    effective = available and get_account_user_online(account_uid)
-                    stores_to_sync.append((account_uid, store, effective))
-        for account_uid, store, effective in stores_to_sync:
-            try:
-                store.set_online_sync(effective, None)
-            except GLib.Error:
-                log.debug(
-                    "Could not set store offline=%s",
-                    not effective,
-                    exc_info=True,
-                )
+                    stores_to_sync.append((account_uid, store))
+        for account_uid, store in stores_to_sync:
+            self._sync_store_online_with_timeout_unlocked(store, account_uid)
         if available:
             self.offline_sync.schedule_all_accounts()
 
-    def go_online_sync(self) -> None:
-        """Bring offline stores back online and drop cached folder indexes."""
-        run_on_mail_thread(self._go_online_sync_unlocked)
+    def go_online_sync(
+        self,
+        *,
+        on_complete: Callable[[], None] | None = None,
+    ) -> None:
+        """Bring offline stores back online and drop cached folder indexes.
+
+        Non-blocking: submits to the mail I/O thread (#400). Prefer
+        :meth:`set_network_available` from the network monitor; this remains for
+        explicit reconnect callers.
+        """
+
+        def work() -> None:
+            try:
+                self._go_online_sync_unlocked()
+            finally:
+                if on_complete is not None:
+                    GLib.idle_add(_run_on_gtk_thread, on_complete)
+
+        if is_mail_io_thread():
+            work()
+            return
+        get_mail_io_thread().submit_front(work)
 
     def set_account_user_online(self, account_uid: str, online: bool) -> None:
         """Persist and apply per-account user online/offline state.
@@ -1363,23 +1404,49 @@ class MailService:
             self.cancel_offline_body_sync(account_uid)
 
     def _go_online_sync_unlocked(self) -> None:
-        stores_to_online: list[Camel.Store] = []
+        stores_to_online: list[tuple[str, Camel.Store]] = []
         with self._lock:
             self._network_available = True
             if self._session is not None:
                 self._session.set_online(True)
+            self._folder_indexes.clear()
             for account_uid, store in self._stores.items():
                 if not get_account_user_online(account_uid):
                     continue
                 if isinstance(store, Camel.OfflineStore):
-                    stores_to_online.append(store)
-            self._folder_indexes.clear()
-        for store in stores_to_online:
-            try:
-                store.set_online_sync(True, None)
-            except GLib.Error:
-                log.exception("Failed to bring mail store online")
+                    stores_to_online.append((account_uid, store))
+        for account_uid, store in stores_to_online:
+            self._sync_store_online_with_timeout_unlocked(store, account_uid)
         self.offline_sync.schedule_all_accounts()
+
+    def _sync_store_online_with_timeout_unlocked(
+        self,
+        store: Camel.Store,
+        account_uid: str,
+    ) -> None:
+        """Apply online/offline for one store with a finite cancellable (#400).
+
+        Failures are logged and swallowed so one dead OAuth account does not
+        block reconnect for the rest of the account list.
+        """
+        cancellable = Gio.Cancellable()
+        timer = threading.Timer(
+            _NETWORK_RECONNECT_TIMEOUT_SECONDS, cancellable.cancel
+        )
+        timer.daemon = True
+        timer.start()
+        try:
+            self._sync_store_online_state_unlocked(
+                store, account_uid, cancellable=cancellable
+            )
+        except GLib.Error as exc:
+            log.warning(
+                "Store online sync failed or timed out for %s: %s",
+                account_uid,
+                exc.message,
+            )
+        finally:
+            timer.cancel()
 
     def reload_registry(self) -> None:
         """Reconnect to EDS and drop cached Camel services (after account changes)."""
