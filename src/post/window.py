@@ -64,7 +64,9 @@ from post.mail.message_list_state import (
     MESSAGE_LIST_UI_BATCH_SIZE,
     MESSAGE_LIST_UI_BIND_CAP,
     MESSAGE_LIST_UI_BIND_MORE,
+    folder_index_headers_disagree,
     is_heavy_folder_name,
+    merge_folder_index_envelope,
     message_flag_patches,
     message_list_fingerprint,
     message_lists_equivalent_for_ui,
@@ -87,7 +89,7 @@ from post.mail.search import (
     query_requires_body_scan,
     search_filter_progress_fraction,
 )
-from post.mail.search_debug import search_trace, search_trace_timer
+from post.mail.search_debug import list_reader_trace, search_trace, search_trace_timer
 from post.mail.operation_queue import offline_queue_status_text
 from post.mail.send_delay import OutboundSendDelayScheduler
 from post.mail.network_errors import (
@@ -2553,6 +2555,56 @@ class MainWindow(Adw.ApplicationWindow):
         messages.insert(0, dict(message))
         self._current_folder_messages = messages
 
+    def _reconcile_folder_index_headers_after_read(
+        self,
+        list_key: str,
+        loaded: dict,
+    ) -> None:
+        """Repair list/index envelope when Camel headers disagree (#375)."""
+        list_row = self._message_list_view.get_message(list_key)
+        if list_row is None or not folder_index_headers_disagree(list_row, loaded):
+            return
+        location = self._message_location_for_list_key(list_key)
+        if location is not None:
+            account_uid, folder_name, message_uid = location
+            self._mail.repair_folder_index_message_headers(
+                account_uid,
+                folder_name,
+                message_uid,
+                loaded,
+            )
+        else:
+            folder_name = self._current_folder or ""
+            if self._current_account is not None and folder_name:
+                self._mail.repair_folder_index_message_headers(
+                    self._current_account.uid,
+                    folder_name,
+                    str(loaded.get("uid") or list_row.get("uid") or ""),
+                    loaded,
+                )
+        updated = merge_folder_index_envelope(list_row, loaded)
+        account_uid = updated.get("_search_account_uid")
+        search_folder = updated.get("_search_folder")
+        if account_uid and search_folder:
+            updated = annotate_search_match(
+                updated,
+                account_uid=str(account_uid),
+                folder_name=str(search_folder),
+            )
+            folder_name = str(search_folder)
+        else:
+            folder_name = str(
+                (location[1] if location is not None else None)
+                or self._current_folder
+                or ""
+            )
+        self._message_list_view.upsert_message(
+            updated,
+            folder_name=folder_name,
+            replace_uid=list_key,
+        )
+        self._upsert_message_in_folder_cache(updated, None)
+
     def _remove_message_from_folder_cache(self, uid: str) -> None:
         if self._current_folder_messages is None:
             return
@@ -4621,6 +4673,16 @@ class MainWindow(Adw.ApplicationWindow):
             else message
             for message in batch
         ]
+        for message in annotated_batch:
+            list_reader_trace(
+                "search_hit",
+                folder=str(
+                    message.get("_search_folder") or folder_name or ""
+                ),
+                uid=str(message.get("uid") or ""),
+                subject=str(message.get("subject") or "")[:80],
+                list_key=str(message.get("_search_row_key") or ""),
+            )
         self._message_list_view.insert_messages_newest_first(
             annotated_batch, folder_name=folder_name
         )
@@ -6040,6 +6102,20 @@ class MainWindow(Adw.ApplicationWindow):
         selected = self._message_list_view.get_selected_uids()
         if len(selected) != 1 or selected[0] != uid:
             self._message_list_view.select_uid(uid)
+        row = self._message_list_view.get_message(uid)
+        location = self._message_location_for_list_key(uid)
+        list_reader_trace(
+            "list_click",
+            list_key=uid,
+            row_subject=str((row or {}).get("subject") or "")[:80],
+            row_uid=str((row or {}).get("uid") or ""),
+            parsed_folder=(location[1] if location else None),
+            parsed_uid=(location[2] if location else None),
+            reader_already_matches=(
+                uid == self._current_message_uid
+                and self._reader_shows_list_key(uid)
+            ),
+        )
         if uid == self._current_message_uid and self._reader_shows_list_key(uid):
             self._mark_message_read_on_click_if_unread(uid)
             return
@@ -7410,9 +7486,25 @@ class MainWindow(Adw.ApplicationWindow):
 
         previous_uid = str(msg.get("_previous_uid") or "")
         recovered_uid = str(msg.get("uid") or "")
+        requested_location = self._message_location_for_list_key(uid)
+        list_reader_trace(
+            "message_read_complete",
+            requested_list_key=uid,
+            requested_folder=(
+                requested_location[1] if requested_location else None
+            ),
+            requested_uid=(
+                requested_location[2] if requested_location else None
+            ),
+            loaded_uid=recovered_uid,
+            loaded_subject=str(msg.get("subject") or "")[:80],
+            previous_uid=previous_uid or None,
+        )
         if previous_uid and recovered_uid and previous_uid != recovered_uid:
             self._remap_folder_message_uids({previous_uid: recovered_uid})
             uid = self._remap_list_key(uid, {previous_uid: recovered_uid}) or uid
+
+        self._reconcile_folder_index_headers_after_read(uid, msg)
 
         self._current_message_uid = uid
         set_active_message_uid(uid)

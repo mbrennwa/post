@@ -154,6 +154,7 @@ def main() -> int:
     # POST_LOG_LEVEL=DEBUG enables mail I/O task tracing (io_thread, eds send path)
     # and raises file + stderr verbosity.
     # POST_DEBUG_SEARCH=1 enables folder search tracing (post.search logger).
+    # POST_DEBUG_LIST_READER=1 enables list/reader UID sync traces (#375).
     from post.logging_setup import configure_logging
     from post.mail.search_debug import configure_search_debug_logging
 

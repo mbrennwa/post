@@ -633,5 +633,119 @@ class SearchAccountMessagesTests(unittest.TestCase):
         self.assertEqual(source, "memory")
 
 
+class FolderIndexHeaderRepairTests(unittest.TestCase):
+    def _service_with_index(
+        self, messages: list[dict], *, folder_name: str = "INBOX"
+    ) -> tuple[MailService, mock.Mock]:
+        service = MailService(registry=mock.Mock())
+        index = _FolderMessageIndex(
+            messages=messages,
+            unread=0,
+            total=len(messages),
+        )
+        service._folder_indexes[("acct-1", folder_name)] = index
+        folder = mock.Mock()
+        return service, folder
+
+    def test_repair_folder_index_message_headers_updates_subject(self) -> None:
+        service, _folder = self._service_with_index(
+            [
+                {
+                    "uid": "19025",
+                    "subject": "Stale index subject",
+                    "from": "a@b.c",
+                    "flags": {"seen": True},
+                }
+            ],
+            folder_name="Archive",
+        )
+
+        with mock.patch("post.mail.eds.folder_index_cache.save") as save:
+            repaired = service.repair_folder_index_message_headers(
+                "acct-1",
+                "Archive",
+                "19025",
+                {
+                    "uid": "19025",
+                    "subject": "Camel subject",
+                    "from": "a@b.c",
+                },
+            )
+
+        self.assertIsNotNone(repaired)
+        assert repaired is not None
+        self.assertEqual(repaired["subject"], "Camel subject")
+        self.assertEqual(repaired["flags"], {"seen": True})
+        snapshot = service.get_folder_index_snapshot("acct-1", "Archive")
+        assert snapshot is not None
+        self.assertEqual(snapshot[0][0]["subject"], "Camel subject")
+        save.assert_called_once()
+
+    def test_repair_returns_none_when_headers_agree(self) -> None:
+        service, _folder = self._service_with_index(
+            [
+                {
+                    "uid": "1",
+                    "subject": "Same",
+                    "from": "a@b.c",
+                    "flags": {},
+                }
+            ]
+        )
+
+        with mock.patch("post.mail.eds.folder_index_cache.save") as save:
+            repaired = service.repair_folder_index_message_headers(
+                "acct-1",
+                "INBOX",
+                "1",
+                {"uid": "1", "subject": "same", "from": "a@b.c"},
+            )
+
+        self.assertIsNone(repaired)
+        save.assert_not_called()
+
+    def test_body_loader_repairs_scan_row_on_cache_hit(self) -> None:
+        row = {
+            "uid": "19025",
+            "subject": "Stale index subject",
+            "from": "a@b.c",
+            "flags": {"seen": True},
+        }
+        service, folder = self._service_with_index([row], folder_name="Archive")
+        folder.get_message_cached.return_value = object()
+        cancellable = Gio.Cancellable()
+
+        with (
+            mock.patch(
+                "post.mail.helpers.envelope_dict_from_mime",
+                return_value={
+                    "subject": "Camel subject",
+                    "from": "a@b.c",
+                },
+            ),
+            mock.patch(
+                "post.mail.helpers.extract_message_bodies",
+                return_value={"plain": "query term in body", "html": None},
+            ),
+            mock.patch("post.mail.eds.folder_index_cache.save"),
+        ):
+            loader = service._body_text_for_uid_loader(
+                folder,
+                account_uid="acct-1",
+                folder_name="Archive",
+                messages_by_uid={"19025": row},
+                needs_body=True,
+                cancellable=cancellable,
+            )
+            assert loader is not None
+            text = loader("19025")
+
+        self.assertEqual(text, "query term in body")
+        self.assertEqual(row["subject"], "Camel subject")
+        snapshot = service.get_folder_index_snapshot("acct-1", "Archive")
+        assert snapshot is not None
+        self.assertEqual(snapshot[0][0]["subject"], "Camel subject")
+
+
 if __name__ == "__main__":
     unittest.main()

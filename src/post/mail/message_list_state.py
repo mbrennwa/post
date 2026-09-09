@@ -541,6 +541,82 @@ def folder_index_covers_identities(
     )
 
 
+# Envelope fields overwritten when Camel/MIME disagrees with the folder-index (#375).
+FOLDER_INDEX_ENVELOPE_FIELDS: tuple[str, ...] = (
+    "subject",
+    "from",
+    "to",
+    "cc",
+    "bcc",
+    "message_id",
+    "message_id_hash",
+    "sort_date",
+    "date_sent",
+    "date_received",
+)
+
+
+def normalize_folder_index_header_text(value: Any) -> str:
+    """Normalize a header string for mismatch comparison (#375)."""
+    return str(value or "").strip().casefold()
+
+
+def folder_index_headers_disagree(
+    index_row: dict[str, Any],
+    loaded: dict[str, Any],
+) -> bool:
+    """True when folder-index headers disagree with Camel/MIME for the same UID.
+
+    Compares normalized subject first. If subjects match but loaded ``from`` is
+    present and differs, treat as a mismatch as well (#375).
+    """
+    loaded_subject = normalize_folder_index_header_text(loaded.get("subject"))
+    if not loaded_subject:
+        return False
+    index_subject = normalize_folder_index_header_text(index_row.get("subject"))
+    if index_subject != loaded_subject:
+        return True
+    loaded_from = normalize_folder_index_header_text(loaded.get("from"))
+    if not loaded_from:
+        return False
+    index_from = normalize_folder_index_header_text(index_row.get("from"))
+    return index_from != loaded_from
+
+
+def merge_folder_index_envelope(
+    index_row: dict[str, Any],
+    loaded: dict[str, Any],
+) -> dict[str, Any]:
+    """Copy ``index_row`` with envelope fields overwritten from ``loaded`` (#375)."""
+    merged = dict(index_row)
+    for field in FOLDER_INDEX_ENVELOPE_FIELDS:
+        if field in loaded and loaded[field] is not None:
+            merged[field] = loaded[field]
+    uid = str(loaded.get("uid") or merged.get("uid") or "")
+    if uid:
+        merged["uid"] = uid
+    return merged
+
+
+def apply_folder_index_envelope_to_row(
+    index_row: dict[str, Any],
+    loaded: dict[str, Any],
+) -> bool:
+    """Mutate ``index_row`` envelope in place from ``loaded`` when they disagree.
+
+    Returns True when the row was updated.
+    """
+    if not folder_index_headers_disagree(index_row, loaded):
+        return False
+    repaired = merge_folder_index_envelope(index_row, loaded)
+    for field in FOLDER_INDEX_ENVELOPE_FIELDS:
+        if field in repaired:
+            index_row[field] = repaired[field]
+    if repaired.get("uid"):
+        index_row["uid"] = repaired["uid"]
+    return True
+
+
 def folder_list_ready_to_cache(
     shown: int,
     total: int,
