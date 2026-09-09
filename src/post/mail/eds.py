@@ -163,10 +163,13 @@ from .folders import (
 from post.preferences import get_account_user_online
 from .message_list_state import (
     HEAVY_FOLDER_INDEX_BATCH_SIZE,
+    apply_folder_index_envelope_to_row,
     find_folder_index_sibling_uids,
     folder_index_covers_identities,
+    folder_index_headers_disagree,
     is_heavy_folder_name,
     is_trash_or_junk_folder_name,
+    merge_folder_index_envelope,
     prune_stale_folder_index_uids,
     union_folder_index_messages,
     upsert_folder_index_by_identity,
@@ -1645,6 +1648,82 @@ class MailService:
                 total=total,
             ),
         )
+
+    def repair_folder_index_message_headers(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        loaded: dict,
+    ) -> dict | None:
+        """Overwrite folder-index envelope for ``message_uid`` from ``loaded`` (#375).
+
+        Updates the in-memory index and persists disk cache when the stored
+        subject/from disagree with Camel/MIME headers. Returns the repaired
+        row, or ``None`` when no change was needed / the UID is unknown.
+        """
+        return self._repair_folder_index_message_headers_unlocked(
+            account_uid,
+            folder_name,
+            message_uid,
+            loaded,
+        )
+
+    def _repair_folder_index_message_headers_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        loaded: dict,
+    ) -> dict | None:
+        if not message_uid or not loaded:
+            return None
+        messages = self._folder_index_messages(account_uid, folder_name)
+        if not messages:
+            return None
+        target_index: int | None = None
+        for index, message in enumerate(messages):
+            if str(message.get("uid") or "") == message_uid:
+                target_index = index
+                break
+        if target_index is None:
+            return None
+        current = dict(messages[target_index])
+        if not folder_index_headers_disagree(current, loaded):
+            return None
+        repaired = merge_folder_index_envelope(current, loaded)
+        repaired["uid"] = message_uid
+        messages[target_index] = repaired
+        key = (account_uid, folder_name)
+        existing = self._folder_indexes.get(key)
+        unread = existing.unread if existing is not None else 0
+        total = existing.total if existing is not None else len(messages)
+        self._store_folder_index(
+            account_uid,
+            folder_name,
+            _FolderMessageIndex(
+                messages=list(messages),
+                unread=unread,
+                total=total,
+            ),
+        )
+        folder_index_cache.save(
+            account_uid,
+            folder_name,
+            list(messages),
+            unread,
+            total,
+            grow_only=is_heavy_folder_name(folder_name),
+        )
+        search_trace(
+            "folder_index_header_repair",
+            account=account_uid,
+            folder=folder_name,
+            uid=message_uid,
+            index_subject=str(current.get("subject") or "")[:80],
+            loaded_subject=str(loaded.get("subject") or "")[:80],
+        )
+        return repaired
 
     def get_folder_index_snapshot(
         self,
@@ -4015,12 +4094,19 @@ class MailService:
         self,
         folder: Any | None,
         *,
+        account_uid: str,
+        folder_name: str,
+        messages_by_uid: dict[str, dict],
         needs_body: bool,
         cancellable: Gio.Cancellable,
     ) -> Callable[[str], str | None] | None:
         if not needs_body:
             return None
-        from .helpers import extract_message_bodies, searchable_body_text
+        from .helpers import (
+            envelope_dict_from_mime,
+            extract_message_bodies,
+            searchable_body_text,
+        )
 
         def body_text_for_uid(uid: str) -> str | None:
             if folder is None or cancellable.is_cancelled():
@@ -4031,12 +4117,36 @@ class MailService:
                 if mime is None:
                     return None
             except Exception:
+                search_trace(
+                    "search_body_cache_error",
+                    uid=str(uid),
+                )
                 return None
+            envelope = envelope_dict_from_mime(mime)
+            envelope["uid"] = str(uid)
+            row = messages_by_uid.get(str(uid))
+            repaired = self.repair_folder_index_message_headers(
+                account_uid,
+                folder_name,
+                str(uid),
+                envelope,
+            )
+            if repaired is not None and row is not None:
+                apply_folder_index_envelope_to_row(row, repaired)
+            elif row is not None:
+                apply_folder_index_envelope_to_row(row, envelope)
             bodies = extract_message_bodies(mime)
-            return searchable_body_text(
+            text = searchable_body_text(
                 plain=bodies.get("plain"),
                 html=bodies.get("html"),
             )
+            # Only log hits — misses are the common case on heavy folders.
+            search_trace(
+                "search_body_cache_hit",
+                uid=str(uid),
+                body_len=len(text or ""),
+            )
+            return text
 
         return body_text_for_uid
 
@@ -4067,11 +4177,19 @@ class MailService:
             source=source,
         )
 
+        messages_by_uid = {
+            str(message.get("uid") or ""): message
+            for message in messages
+            if message.get("uid")
+        }
         filtered = filter_messages_by_query(
             messages,
             query,
             body_text_for_uid=self._body_text_for_uid_loader(
                 folder,
+                account_uid=account_uid,
+                folder_name=folder_name,
+                messages_by_uid=messages_by_uid,
                 needs_body=needs_body,
                 cancellable=cancellable,
             ),
@@ -4366,6 +4484,13 @@ class MailService:
                 query,
                 body_text_for_uid=self._body_text_for_uid_loader(
                     folder,
+                    account_uid=account_uid,
+                    folder_name=folder_name,
+                    messages_by_uid={
+                        str(message.get("uid") or ""): message
+                        for message in messages
+                        if message.get("uid")
+                    },
                     needs_body=needs_body,
                     cancellable=cancellable,
                 ),

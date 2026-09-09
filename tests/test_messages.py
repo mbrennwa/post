@@ -784,6 +784,102 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         location = MainWindow._message_location_for_list_key(window, sent_key)
         self.assertEqual(location, ("acct-1", "Sent", "1"))
 
+    def test_reconcile_repairs_list_when_loaded_subject_disagrees(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        hit = annotate_search_match(
+            {
+                "uid": "19025",
+                "subject": "Stale index subject",
+                "from": "a@b.c",
+                "flags": {"seen": True},
+            },
+            account_uid="acct-1",
+            folder_name="Archive",
+        )
+        list_key = hit["_search_row_key"]
+        window = SimpleNamespace(
+            _current_account=SimpleNamespace(uid="acct-1"),
+            _current_folder="Archive",
+            _current_folder_messages=[dict(hit)],
+            _mail=mock.Mock(),
+            _message_list_view=mock.Mock(
+                get_message=mock.Mock(return_value=dict(hit)),
+                upsert_message=mock.Mock(),
+            ),
+        )
+        window._mail.repair_folder_index_message_headers.return_value = {
+            **hit,
+            "subject": "Camel subject",
+        }
+        window._message_location_for_list_key = (
+            lambda key: MainWindow._message_location_for_list_key(window, key)
+        )
+        window._upsert_message_in_folder_cache = (
+            lambda message, previous_uid: MainWindow._upsert_message_in_folder_cache(
+                window, message, previous_uid
+            )
+        )
+
+        MainWindow._reconcile_folder_index_headers_after_read(
+            window,
+            list_key,
+            {
+                "uid": "19025",
+                "subject": "Camel subject",
+                "from": "a@b.c",
+                "body_plain": "query match",
+            },
+        )
+
+        window._mail.repair_folder_index_message_headers.assert_called_once_with(
+            "acct-1",
+            "Archive",
+            "19025",
+            mock.ANY,
+        )
+        window._message_list_view.upsert_message.assert_called_once()
+        updated = window._message_list_view.upsert_message.call_args.args[0]
+        kwargs = window._message_list_view.upsert_message.call_args.kwargs
+        self.assertEqual(updated["subject"], "Camel subject")
+        self.assertEqual(updated["_search_row_key"], list_key)
+        self.assertEqual(kwargs["replace_uid"], list_key)
+        self.assertEqual(
+            window._current_folder_messages[0]["subject"],
+            "Camel subject",
+        )
+
+    def test_reconcile_noop_when_subjects_agree(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        hit = annotate_search_match(
+            {"uid": "1", "subject": "Same subject", "from": "a@b.c"},
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        window = SimpleNamespace(
+            _mail=mock.Mock(),
+            _message_list_view=mock.Mock(
+                get_message=mock.Mock(return_value=dict(hit)),
+                upsert_message=mock.Mock(),
+            ),
+        )
+
+        MainWindow._reconcile_folder_index_headers_after_read(
+            window,
+            hit["_search_row_key"],
+            {"uid": "1", "subject": "Same subject", "from": "a@b.c"},
+        )
+
+        window._mail.repair_folder_index_message_headers.assert_not_called()
+        window._message_list_view.upsert_message.assert_not_called()
+
 
 class MarkReadOnClickTests(unittest.TestCase):
     """Clicking an already-displayed unread row must mark read without reload (#377)."""

@@ -379,6 +379,40 @@ def _unix_from_mime_date(mime: Any) -> float | None:
         return None
 
 
+def envelope_dict_from_mime(mime: Any) -> dict[str, Any]:
+    """Build envelope fields from MIME for folder-index repair (#375).
+
+    Unlike ``enrich_message_dict_from_mime``, this always prefers MIME subject
+    and from when present so a stale folder-index subject can be overwritten.
+    """
+    envelope: dict[str, Any] = {}
+    subject = _subject_field_from_mime(mime)
+    if subject:
+        envelope["subject"] = subject
+    from_value = _from_field_from_mime(mime)
+    if from_value:
+        envelope["from"] = from_value
+    for field in ("to", "cc", "bcc"):
+        value = _recipient_field_from_mime(mime, field)
+        if value:
+            envelope[field] = value
+    unix = _unix_from_mime_date(mime)
+    if unix is not None:
+        formatted = format_message_datetime(unix)
+        if formatted:
+            envelope["date_sent"] = formatted
+            envelope["date_received"] = formatted
+        envelope["sort_date"] = unix
+    if hasattr(mime, "get_message_id"):
+        try:
+            mid = mime.get_message_id()
+        except (TypeError, ValueError):
+            mid = None
+        if isinstance(mid, str) and mid.strip():
+            envelope["message_id"] = mid.strip()
+    return envelope
+
+
 def enrich_message_dict_from_mime(result: dict[str, Any], mime: Any) -> None:
     """Prefer MIME recipients; fill empty From/Subject/Date (#393).
 

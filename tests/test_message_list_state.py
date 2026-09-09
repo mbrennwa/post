@@ -604,5 +604,80 @@ class UnionFolderIndexMessagesTests(unittest.TestCase):
         self.assertEqual([row["uid"] for row in unioned], ["live-uid"])
 
 
+class FolderIndexHeaderMismatchTests(unittest.TestCase):
+    def test_headers_disagree_on_subject(self) -> None:
+        from post.mail.message_list_state import folder_index_headers_disagree
+
+        self.assertTrue(
+            folder_index_headers_disagree(
+                {"uid": "1", "subject": "Index subject", "from": "a@b.c"},
+                {"uid": "1", "subject": "Camel subject", "from": "a@b.c"},
+            )
+        )
+
+    def test_headers_agree_when_subjects_match(self) -> None:
+        from post.mail.message_list_state import folder_index_headers_disagree
+
+        self.assertFalse(
+            folder_index_headers_disagree(
+                {"uid": "1", "subject": "Same", "from": "a@b.c"},
+                {"uid": "1", "subject": "same", "from": "a@b.c"},
+            )
+        )
+
+    def test_headers_disagree_on_from_when_subject_matches(self) -> None:
+        from post.mail.message_list_state import folder_index_headers_disagree
+
+        self.assertTrue(
+            folder_index_headers_disagree(
+                {"uid": "1", "subject": "Same", "from": "old@b.c"},
+                {"uid": "1", "subject": "Same", "from": "new@b.c"},
+            )
+        )
+
+    def test_headers_agree_when_loaded_subject_empty(self) -> None:
+        from post.mail.message_list_state import folder_index_headers_disagree
+
+        self.assertFalse(
+            folder_index_headers_disagree(
+                {"uid": "1", "subject": "Index subject"},
+                {"uid": "1", "subject": ""},
+            )
+        )
+
+    def test_merge_overwrites_envelope_preserves_flags(self) -> None:
+        from post.mail.message_list_state import merge_folder_index_envelope
+
+        merged = merge_folder_index_envelope(
+            {
+                "uid": "1",
+                "subject": "Old",
+                "from": "old@b.c",
+                "flags": {"seen": True, "flagged": True},
+            },
+            {
+                "uid": "1",
+                "subject": "New",
+                "from": "new@b.c",
+                "sort_date": 123,
+            },
+        )
+        self.assertEqual(merged["subject"], "New")
+        self.assertEqual(merged["from"], "new@b.c")
+        self.assertEqual(merged["sort_date"], 123)
+        self.assertEqual(merged["flags"], {"seen": True, "flagged": True})
+
+    def test_apply_mutates_row_when_disagree(self) -> None:
+        from post.mail.message_list_state import apply_folder_index_envelope_to_row
+
+        row = {"uid": "1", "subject": "Old", "from": "a@b.c"}
+        self.assertTrue(
+            apply_folder_index_envelope_to_row(
+                row, {"uid": "1", "subject": "New", "from": "a@b.c"}
+            )
+        )
+        self.assertEqual(row["subject"], "New")
+
+
 if __name__ == "__main__":
     unittest.main()
