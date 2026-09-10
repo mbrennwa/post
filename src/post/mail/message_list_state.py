@@ -79,6 +79,23 @@ def is_heavy_folder_name(folder_name: str | None) -> bool:
     )
 
 
+def is_moved_provisional(message: dict[str, Any] | None) -> bool:
+    """True when the row is a source RestId parked in the dest folder (#404).
+
+    Graph RestIds change on move. An Inbox id in Archive cannot be fetched.
+    """
+    return bool(message and message.get("moved_provisional"))
+
+
+def exclude_moved_provisional_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop leftover ``moved_provisional`` rows from list/search (#404)."""
+    return [
+        message for message in messages if not is_moved_provisional(message)
+    ]
+
+
 def offline_folder_priority(
     folder_name: str | None,
     *,

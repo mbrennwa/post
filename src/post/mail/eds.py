@@ -164,10 +164,12 @@ from post.preferences import get_account_user_online
 from .message_list_state import (
     HEAVY_FOLDER_INDEX_BATCH_SIZE,
     apply_folder_index_envelope_to_row,
+    exclude_moved_provisional_messages,
     find_folder_index_sibling_uids,
     folder_index_covers_identities,
     folder_index_headers_disagree,
     is_heavy_folder_name,
+    is_moved_provisional,
     is_trash_or_junk_folder_name,
     merge_folder_index_envelope,
     prune_stale_folder_index_uids,
@@ -213,6 +215,12 @@ _NETWORK_RECONNECT_TIMEOUT_SECONDS = 15
 # Stay below Camel IMAPx MAX_UIDSET_ITEMS (100) to avoid spurious uidset warnings
 # in evolution-data-server 3.56 when batching UID MOVE/COPY commands.
 _TRANSFER_MESSAGE_BATCH_SIZE = 50
+# After Graph move, dest ``refresh_info`` can hang (#189). For a small
+# interactive archive, a short dest refresh is enough to learn dest RestIds
+# (#404). Bulk Archive All must not wait on a 29k-folder refresh.
+_TRANSFER_DEST_REFRESH_TIMEOUT_SECONDS = 8
+_TRANSFER_DEST_RESOLVE_MAX = 20
+_TRANSFER_DEST_SYNC_MAX = 20
 
 
 def _run_on_gtk_thread(callback: Callable[[], None]) -> bool:
@@ -224,6 +232,7 @@ class MessageUnavailableReason:
     VANISHED = "vanished"
     NOT_CACHED_OFFLINE = "not_cached_offline"
     NOT_CACHED_SIGN_IN = "not_cached_sign_in"
+    NOT_FETCHABLE_YET = "not_fetchable_yet"
 
 
 class MessageNotAvailableError(LookupError):
@@ -249,6 +258,11 @@ class MessageNotAvailableError(LookupError):
             )
         if self.reason == MessageUnavailableReason.NOT_CACHED_SIGN_IN:
             return MESSAGE_NOT_CACHED_SIGN_IN
+        if self.reason == MessageUnavailableReason.NOT_FETCHABLE_YET:
+            return (
+                "This message isn't available yet. "
+                "Try again in a moment."
+            )
         return "This message is no longer available."
 
 
@@ -1770,11 +1784,23 @@ class MailService:
         if cached is None:
             if memory_messages is None:
                 return None
-            return memory_messages, memory_unread, memory_total, "memory"
+            return (
+                exclude_moved_provisional_messages(memory_messages),
+                memory_unread,
+                memory_total,
+                "memory",
+            )
         disk_messages, disk_unread, disk_total = cached
         if not memory_messages:
-            return list(disk_messages), disk_unread, disk_total, "disk_cache"
-        unioned = union_folder_index_messages(memory_messages, disk_messages)
+            return (
+                exclude_moved_provisional_messages(list(disk_messages)),
+                disk_unread,
+                disk_total,
+                "disk_cache",
+            )
+        unioned = exclude_moved_provisional_messages(
+            union_folder_index_messages(memory_messages, disk_messages)
+        )
         if len(unioned) != len(memory_messages):
             search_trace(
                 "search_index_union_disk",
@@ -3989,7 +4015,12 @@ class MailService:
             index, source = self._get_folder_index_unlocked(
                 account_uid, folder_name, sync=sync
             )
-            return list(index.messages), index.unread, index.total, source
+            return (
+                exclude_moved_provisional_messages(list(index.messages)),
+                index.unread,
+                index.total,
+                source,
+            )
 
     def get_folder_messages(
         self,
@@ -5338,43 +5369,41 @@ class MailService:
             return mime
 
         row = self._folder_index_row(account_uid, folder_name, message_uid)
-        if row is not None and row.get("moved_provisional"):
-            backend = self._backend_for_account(account_uid)
-            uid_limit = (
-                500 if (backend or "").lower() in {"microsoft365", "ews"} else None
+        if row is None:
+            return None
+        backend = self._backend_for_account(account_uid)
+        try:
+            dest_uids = self._find_moved_uids_in_folder_unlocked(
+                folder,
+                [row],
+                uid_limit=None,
+                backend=backend,
             )
-            try:
-                dest_uids = self._find_moved_uids_in_folder_unlocked(
-                    folder,
-                    [row],
-                    uid_limit=uid_limit,
-                    backend=backend,
-                )
-            except Exception:
-                log.debug(
-                    "Could not resolve destination UID for provisional %s in %r",
-                    message_uid,
-                    folder_name,
-                    exc_info=True,
-                )
-                dest_uids = []
-            for dest_uid in dest_uids:
-                if not dest_uid or dest_uid == message_uid:
-                    continue
-                mime = self._try_fetch_message_uid(folder, dest_uid)
-                if mime is None:
-                    continue
-                log.info(
-                    "Recovered provisional message %s in %r as %s",
-                    message_uid,
-                    folder_name,
-                    dest_uid,
-                )
-                self._remap_folder_index_uid(
-                    account_uid, folder_name, message_uid, dest_uid
-                )
-                self._recovered_read_uid = dest_uid
-                return mime
+        except Exception:
+            log.debug(
+                "Could not resolve destination UID for %s in %r",
+                message_uid,
+                folder_name,
+                exc_info=True,
+            )
+            dest_uids = []
+        for dest_uid in dest_uids:
+            if not dest_uid or dest_uid == message_uid:
+                continue
+            mime = self._try_fetch_message_uid(folder, dest_uid)
+            if mime is None:
+                continue
+            log.info(
+                "Recovered message %s in %r as dest RestId %s",
+                message_uid,
+                folder_name,
+                dest_uid,
+            )
+            self._remap_folder_index_uid(
+                account_uid, folder_name, message_uid, dest_uid
+            )
+            self._recovered_read_uid = dest_uid
+            return mime
         return None
 
     def _recover_online_message_mime(
@@ -5393,9 +5422,9 @@ class MailService:
         though the body is cached or the UID is still in Camel (#265). Listed
         messages soft-fail so the row stays; only truly unknown UIDs are vanished.
 
-        Graph ``ErrorItemNotFound`` means that RestId is gone (#294). Remap to a
-        same-identity live UID (or resolve ``moved_provisional``), otherwise drop
-        the stale index row and raise vanished.
+        Graph ``ErrorItemNotFound`` means that RestId is not in this folder
+        (#294/#404). Remap to a same-identity live UID. If the row is still
+        listed and dest is unresolved, keep it — do not call the message gone.
         """
         cached = self._try_message_cached(folder, api_uid)
         if cached is not None:
@@ -5490,14 +5519,16 @@ class MailService:
                 if recovered is not None:
                     return recovered
                 log.info(
-                    "Dropping Graph-gone RestId %s from %r folder-index",
+                    "Keeping listed RestId %s in %r after Graph miss "
+                    "(dest not resolved; not treating as vanished)",
                     message_uid,
                     folder_name,
                 )
-                self._drop_stale_folder_index_uid(
-                    account_uid, folder_name, message_uid
+                err = MessageNotAvailableError(
+                    message_uid,
+                    folder_name,
+                    reason=MessageUnavailableReason.NOT_FETCHABLE_YET,
                 )
-                err = MessageNotAvailableError(message_uid, folder_name)
                 if cause is not None:
                     raise err from cause
                 raise err
@@ -8397,23 +8428,20 @@ class MailService:
 
             if not destination_uids:
                 # Full Archive fingerprint scans are costly / can hang on Graph.
-                # Still try a capped newest-UID match so Archive cache can show
-                # the moved message with a real destination UID (#189).
-                try:
-                    destination_uids = self._find_moved_uids_in_folder_unlocked(
-                        destination_folder,
-                        source_messages,
-                        uid_limit=(
-                            500 if backend in {"microsoft365", "ews"} else None
-                        ),
-                        backend=backend or None,
-                    )
-                except Exception:
-                    log.debug(
-                        "Could not resolve destination UIDs after move",
-                        exc_info=True,
-                    )
-                    destination_uids = []
+                # For a small interactive move, bound dest refresh so Camel can
+                # learn dest RestIds without a 29k-folder sync (#404).
+                destination_uids = self._resolve_and_sync_moved_destination_uids_unlocked(
+                    destination_folder,
+                    source_messages,
+                    destination_uids,
+                    moved_count=len(moved_uids),
+                    backend=backend or "",
+                )
+            else:
+                destination_uids = self._sync_moved_destination_uids_unlocked(
+                    destination_folder,
+                    destination_uids,
+                )
 
             source_unread = folder_get_unread_count(source_folder)
             source_total = source_folder.get_message_count()
@@ -8695,6 +8723,98 @@ class MailService:
                 messages.append(message_info_to_dict(info, backend=backend))
         return messages
 
+    def _refresh_destination_folder_bounded_unlocked(
+        self,
+        destination_folder: Camel.Folder,
+        *,
+        timeout: float,
+    ) -> None:
+        """Best-effort dest ``refresh_info`` after a small move (#404).
+
+        Must not pin the mail thread the way unbounded Graph Archive refresh
+        does (#189).
+        """
+        cancellable = Gio.Cancellable()
+        timer = threading.Timer(timeout, cancellable.cancel)
+        timer.start()
+        try:
+            destination_folder.refresh_info_sync(cancellable)
+        except Exception:
+            log.debug(
+                "Bounded dest refresh after move failed or timed out",
+                exc_info=True,
+            )
+        finally:
+            timer.cancel()
+
+    def _sync_moved_destination_uids_unlocked(
+        self,
+        destination_folder: Camel.Folder,
+        destination_uids: list[str],
+    ) -> list[str]:
+        """Fetch MIME for dest RestIds after a move (#404). Failures are ignored."""
+        dest_uids = [uid for uid in destination_uids if uid]
+        for uid in dest_uids[:_TRANSFER_DEST_SYNC_MAX]:
+            try:
+                destination_folder.synchronize_message_sync(
+                    camel_uid_to_api(uid), None
+                )
+            except Exception:
+                log.debug(
+                    "synchronize_message_sync failed for dest UID %s after move",
+                    uid,
+                    exc_info=True,
+                )
+        return dest_uids
+
+    def _resolve_and_sync_moved_destination_uids_unlocked(
+        self,
+        destination_folder: Camel.Folder,
+        source_messages: list[dict],
+        destination_uids: list[str],
+        *,
+        moved_count: int,
+        backend: str,
+    ) -> list[str]:
+        """Learn dest RestIds after Graph omitted ``transferred_uids`` (#404)."""
+        dest_uids = [uid for uid in destination_uids if uid]
+        graph_like = backend in {"microsoft365", "ews"}
+        if not dest_uids and 0 < moved_count <= _TRANSFER_DEST_RESOLVE_MAX:
+            self._refresh_destination_folder_bounded_unlocked(
+                destination_folder,
+                timeout=_TRANSFER_DEST_REFRESH_TIMEOUT_SECONDS,
+            )
+            try:
+                dest_uids = self._find_moved_uids_in_folder_unlocked(
+                    destination_folder,
+                    source_messages,
+                    uid_limit=None if not graph_like else max(moved_count * 25, 100),
+                    backend=backend or None,
+                )
+            except Exception:
+                log.debug(
+                    "Could not resolve destination UIDs after bounded dest refresh",
+                    exc_info=True,
+                )
+                dest_uids = []
+        elif not dest_uids:
+            try:
+                dest_uids = self._find_moved_uids_in_folder_unlocked(
+                    destination_folder,
+                    source_messages,
+                    uid_limit=(500 if graph_like else None),
+                    backend=backend or None,
+                )
+            except Exception:
+                log.debug(
+                    "Could not resolve destination UIDs after move",
+                    exc_info=True,
+                )
+                dest_uids = []
+        return self._sync_moved_destination_uids_unlocked(
+            destination_folder, dest_uids
+        )
+
     def _find_moved_uids_in_folder_unlocked(
         self,
         folder: Camel.Folder,
@@ -8864,9 +8984,10 @@ class MailService:
     ) -> tuple[int, int]:
         """Update destination folder cache after a move without wiping it.
 
-        Returns ``(unread, total)`` for sidebar badges. Always prepend moved
-        message rows so Archive shows them immediately — even when Graph gives
-        no destination UIDs (provisional source UIDs) (#189).
+        Returns ``(unread, total)`` for sidebar badges. Prepend dest-UID rows
+        when Graph/Camel returned them. If dest RestIds are unknown, bump
+        counts only — do not park source Inbox UIDs as openable Archive rows
+        (#404).
         """
         if not dest_name:
             return -1, -1
@@ -8900,19 +9021,20 @@ class MailService:
                 base["uid"] = dest_uid
                 base.pop("moved_provisional", None)
                 new_messages.append(base)
-        else:
-            # Graph often returns no dest UIDs. Keep headers visible in Archive
-            # using source UIDs until a later resolve/refresh.
-            for message in by_order:
-                base = dict(message)
-                if not base.get("uid"):
-                    continue
-                base["moved_provisional"] = True
-                new_messages.append(base)
 
         if not new_messages:
-            if moved_count > 0 and index.total >= 0:
-                index.total += max(0, moved_count)
+            if moved_count > 0:
+                added_unread = sum(
+                    1
+                    for message in by_order
+                    if not (message.get("flags") or {}).get("seen", False)
+                )
+                if index.unread >= 0:
+                    index.unread += added_unread
+                if index.total >= 0:
+                    index.total += max(0, moved_count)
+                else:
+                    index.total = len(index.messages)
                 folder_index_cache.save(
                     account_uid,
                     dest_name,
@@ -8945,8 +9067,8 @@ class MailService:
                 for offset, existing in enumerate(index.messages):
                     if _fingerprint(existing) != fingerprint:
                         continue
-                    if existing.get("moved_provisional") and not message.get(
-                        "moved_provisional"
+                    if is_moved_provisional(existing) and not is_moved_provisional(
+                        message
                     ):
                         index.messages[offset] = message
                         existing_uids.add(uid)

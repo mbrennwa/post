@@ -422,6 +422,7 @@ class TransferFinalizeTests(unittest.TestCase):
         self.assertEqual(result["moved_uids"], ["opaque-1"])
         self.assertEqual(result["destination_folder"], "Archive")
         service._finalize_folder_transfer_unlocked.assert_called_once()
+        dest.synchronize_message_sync.assert_called()
         service._prune_folder_summary_uids_unlocked.assert_called_once_with(
             source, ["opaque-1"]
         )
@@ -835,10 +836,8 @@ class RemoveMessagesFromCacheTests(unittest.TestCase):
         self.assertEqual(total, 21)
         self.assertEqual(unread, 0)
         index = service._folder_indexes[("acct-1", "Archive")]
-        self.assertEqual(len(index.messages), 21)
-        self.assertEqual(index.messages[0]["uid"], "src-1")
-        self.assertTrue(index.messages[0].get("moved_provisional"))
-        self.assertEqual(index.messages[0]["subject"], "test3")
+        self.assertEqual(len(index.messages), 20)
+        self.assertFalse(any(message.get("uid") == "src-1" for message in index.messages))
         save.assert_called_once()
 
     def test_merge_dest_cache_prepends_when_dest_uids_known(self) -> None:
