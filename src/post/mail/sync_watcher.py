@@ -22,6 +22,7 @@ from .eds import MailService
 from .folders import is_post_local_folder
 from .io_thread import get_mail_io_thread
 from .offline_settings import account_is_user_offline
+from .offline_sync import added_uids_from_change_info
 from .search_debug import search_trace
 from .network_errors import is_network_unavailable_error, log_mail_error
 
@@ -310,7 +311,7 @@ class MailSyncWatcher:
             self._folder_to_account[id(folder)] = (watch.account_uid, folder_name)
 
     def _on_folder_changed_signal(
-        self, folder: Camel.Folder, _change_info: object
+        self, folder: Camel.Folder, change_info: object
     ) -> None:
         if not self._running:
             return
@@ -318,6 +319,11 @@ class MailSyncWatcher:
         if located is None:
             return
         account_uid, folder_name = located
+        added = added_uids_from_change_info(change_info)
+        if added:
+            self._mail.schedule_arrival_body_prefetch(
+                account_uid, folder_name, added
+            )
         self._schedule_folder_changed(account_uid, folder_name)
 
     def _schedule_folder_changed(self, account_uid: str, folder_name: str) -> None:

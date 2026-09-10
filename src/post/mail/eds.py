@@ -177,7 +177,11 @@ from .message_list_state import (
     upsert_folder_index_by_identity,
 )
 from .offline_settings import apply_offline_settings_to_store, apply_offline_sync_to_folder
-from .offline_sync import OfflineBodySyncCoordinator, OfflineSyncProgress
+from .offline_sync import (
+    OfflineBodySyncCoordinator,
+    OfflineSyncProgress,
+    sort_dates_for_uids,
+)
 from .search import (
     MessageSearchQuery,
     SearchCompleteCallback,
@@ -766,6 +770,7 @@ class MailService:
 
     def _on_background_resume(self) -> None:
         self.schedule_offline_body_sync()
+        self.offline_sync.resume_arrival_prefetch()
         if self._sync_setup_resume is not None:
             self._sync_setup_resume()
 
@@ -777,6 +782,7 @@ class MailService:
         # cache when available.
         self.cancel_folder_list()
         self.offline_sync.cancel_all()
+        self.offline_sync.cancel_arrival_in_flight()
         if self._sync_setup_cancel is not None:
             self._sync_setup_cancel()
 
@@ -938,6 +944,25 @@ class MailService:
             self.offline_sync.schedule_all_accounts()
         else:
             self.offline_sync.schedule_account(account_uid)
+
+    def schedule_arrival_body_prefetch(
+        self,
+        account_uid: str,
+        folder_name: str,
+        uids: list[str],
+        *,
+        sort_dates: dict[str, int] | None = None,
+    ) -> None:
+        """Best-effort MIME fetch for newly arrived UIDs (#372).
+
+        Runs even while full-account offline downsync is held.
+        """
+        self.offline_sync.schedule_arrival_prefetch(
+            account_uid,
+            folder_name,
+            uids,
+            sort_dates=sort_dates,
+        )
 
     def cancel_offline_body_sync(self, account_uid: str) -> None:
         self.offline_sync.cancel_account(account_uid)
@@ -1143,6 +1168,7 @@ class MailService:
         self.cancel_folder_search()
         offline_sync_active = self.offline_sync.is_active()
         self.offline_sync.cancel_all()
+        self.offline_sync.cancel_arrival_in_flight()
         self.wait_for_pending_mail_ops(timeout=2.0 if offline_sync_active else 1.0)
         # Never block GTK exit behind a long in-flight search or folder scan.
         get_mail_io_thread().submit_background(self._flush_stores_on_shutdown)
@@ -5793,6 +5819,8 @@ class MailService:
             return _FolderMessageIndex(messages=[], unread=0, total=0)
 
         try:
+            uids_before: set[str] | None = None
+            refresh_ok = False
             if sync:
                 cancellable = Gio.Cancellable()
                 self._register_folder_refresh_cancellable(cancellable)
@@ -5803,7 +5831,9 @@ class MailService:
                             "Operation was cancelled",
                             Gio.IOErrorEnum.CANCELLED,
                         )
+                    uids_before = set(folder_get_uids(folder))
                     folder.refresh_info_sync(cancellable)
+                    refresh_ok = True
                 except GLib.Error as refresh_exc:
                     if refresh_exc.matches(
                         Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
@@ -5827,6 +5857,15 @@ class MailService:
             total = folder.get_message_count()
 
             uids = folder_get_uids(folder)
+            if refresh_ok and uids_before is not None:
+                added = [uid for uid in uids if uid not in uids_before]
+                if added:
+                    self.schedule_arrival_body_prefetch(
+                        account_uid,
+                        folder_name,
+                        added,
+                        sort_dates=sort_dates_for_uids(folder, added),
+                    )
             if not uids:
                 return _FolderMessageIndex(messages=[], unread=unread, total=total)
 

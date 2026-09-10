@@ -110,6 +110,7 @@ class ServiceLockReleaseTests(unittest.TestCase):
         service.cancel_folder_list = mock.Mock()
         service.cancel_folder_refresh = mock.Mock()
         service.offline_sync.cancel_all = mock.Mock()
+        service.offline_sync.cancel_arrival_in_flight = mock.Mock()
         service._sync_setup_cancel = None
 
         service._preempt_background_work()
@@ -118,6 +119,7 @@ class ServiceLockReleaseTests(unittest.TestCase):
         service.cancel_folder_refresh.assert_called_once()
         service.cancel_folder_list.assert_called_once()
         service.offline_sync.cancel_all.assert_called_once()
+        service.offline_sync.cancel_arrival_in_flight.assert_called_once()
 
     def test_hold_offline_body_sync_blocks_resume_until_released(self) -> None:
         service = MailService(registry=mock.Mock())

@@ -13,6 +13,7 @@ from post.mail.offline_settings import (
     account_is_user_offline,
     apply_offline_settings_to_store,
     downsync_expression_for_mode,
+    message_within_offline_age,
 )
 from post.mail.search import (
     MessageSearchQuery,
@@ -37,6 +38,28 @@ class DownsyncExpressionTests(unittest.TestCase):
         self.assertEqual(
             downsync_expression_for_mode(OFFLINE_BODY_SYNC_ALL),
             "(match-all #t)",
+        )
+
+
+class OfflineAgeWindowTests(unittest.TestCase):
+    def test_off_rejects_any_timestamp(self) -> None:
+        self.assertFalse(message_within_offline_age(OFFLINE_BODY_SYNC_OFF, time.time()))
+
+    def test_all_accepts_any_timestamp(self) -> None:
+        self.assertTrue(message_within_offline_age(OFFLINE_BODY_SYNC_ALL, 1))
+        self.assertTrue(message_within_offline_age(OFFLINE_BODY_SYNC_ALL, None))
+
+    def test_last_month_skips_old_mail(self) -> None:
+        self.assertFalse(
+            message_within_offline_age(OFFLINE_BODY_SYNC_LAST_MONTH, 1)
+        )
+        self.assertTrue(
+            message_within_offline_age(OFFLINE_BODY_SYNC_LAST_MONTH, time.time())
+        )
+
+    def test_missing_timestamp_is_in_range(self) -> None:
+        self.assertTrue(
+            message_within_offline_age(OFFLINE_BODY_SYNC_LAST_YEAR, None)
         )
 
 
