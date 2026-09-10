@@ -10,9 +10,11 @@ from post.mail.message_list_state import (
     FolderListSnapshot,
     MESSAGE_LIST_UI_BATCH_SIZE,
     dedupe_folder_index_messages,
+    exclude_moved_provisional_messages,
     folder_cache_matches,
     folder_index_covers_identities,
     folder_list_ready_to_cache,
+    is_moved_provisional,
     message_batch_ranges,
     message_list_fingerprint,
     normalize_folder_index_by_uid,
@@ -54,6 +56,18 @@ class MessageListFingerprintTests(unittest.TestCase):
         self.assertNotEqual(
             message_list_fingerprint(first),
             message_list_fingerprint(second),
+        )
+
+
+class MovedProvisionalRowTests(unittest.TestCase):
+    def test_exclude_moved_provisional_messages(self) -> None:
+        kept = {"uid": "dest-1", "subject": "Hi"}
+        skipped = {"uid": "src-1", "subject": "Hi", "moved_provisional": True}
+        self.assertFalse(is_moved_provisional(kept))
+        self.assertTrue(is_moved_provisional(skipped))
+        self.assertEqual(
+            exclude_moved_provisional_messages([skipped, kept]),
+            [kept],
         )
 
 

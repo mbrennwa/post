@@ -221,6 +221,25 @@ class FilterMessagesByQueryTests(unittest.TestCase):
         matched = filter_messages_by_query(messages, query)
         self.assertEqual([message["uid"] for message in matched], ["1"])
 
+    def test_skips_moved_provisional_rows(self) -> None:
+        query = parse_search_query("from:rebecca")
+        assert query is not None
+        messages = [
+            {
+                "uid": "inbox-rest-id",
+                "subject": "hello",
+                "from": "Rebecca Smith <rebecca@example.com>",
+                "moved_provisional": True,
+            },
+            {
+                "uid": "archive-rest-id",
+                "subject": "hello",
+                "from": "Rebecca Smith <rebecca@example.com>",
+            },
+        ]
+        matched = filter_messages_by_query(messages, query)
+        self.assertEqual([message["uid"] for message in matched], ["archive-rest-id"])
+
     def test_text_matches_headers(self) -> None:
         query = parse_search_query("klotz")
         assert query is not None

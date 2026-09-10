@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from post.mail.search_debug import search_debug_enabled, search_trace
+from post.mail.message_list_state import is_moved_provisional
 
 SEARCH_FILTER_PROGRESS_INTERVAL = 100
 SEARCH_MATCH_BATCH_SIZE = 25
@@ -418,6 +419,8 @@ def filter_messages_by_query(
         on_progress(SearchFilterProgress(0, message_count, 0))
     for index in range(start_index, message_count):
         message = messages[index]
+        if is_moved_provisional(message):
+            continue
         if is_cancelled is not None and is_cancelled():
             search_trace(
                 "filter_messages_cancelled",
