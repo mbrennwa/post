@@ -219,6 +219,38 @@ def set_account_user_online(account_uid: str, online: bool) -> None:
     _save_raw(data)
 
 
+def _account_last_calendar_raw() -> dict[str, Any]:
+    raw = _load_raw().get("account_last_calendar")
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def get_account_last_calendar(account_uid: str) -> str | None:
+    """Return last calendar UID used with this mail account, if any."""
+    value = _account_last_calendar_raw().get(account_uid)
+    if not isinstance(value, str):
+        return None
+    uid = value.strip()
+    return uid or None
+
+
+def set_account_last_calendar(account_uid: str, calendar_uid: str) -> None:
+    """Remember the calendar last written for this mail account."""
+    data = _load_raw()
+    calendars = dict(_account_last_calendar_raw())
+    uid = calendar_uid.strip() if isinstance(calendar_uid, str) else ""
+    if uid:
+        calendars[account_uid] = uid
+    else:
+        calendars.pop(account_uid, None)
+    if calendars:
+        data["account_last_calendar"] = calendars
+    else:
+        data.pop("account_last_calendar", None)
+    _save_raw(data)
+
+
 SEND_DELAY_OFF = 0
 SEND_DELAY_PRESETS: tuple[int, ...] = (0, 5, 10, 30, 60, 120, 300)
 _SEND_DELAY_LABELS: tuple[str, ...] = (

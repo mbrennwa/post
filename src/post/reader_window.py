@@ -531,6 +531,7 @@ class ReaderWindow(Adw.ApplicationWindow):
         present_add_to_calendar(
             self,
             invite,
+            account_uid=self._account.uid,
             on_success=lambda label: show_toast(self, f"Added to {label}"),
             on_error=lambda message: show_error_toast(self, message),
             run_async=lambda worker: get_mail_io_thread().submit(worker),

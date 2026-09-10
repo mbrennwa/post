@@ -2155,13 +2155,23 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_unsubscribe_clicked(self, action: dict[str, str]) -> None:
         self._run_unsubscribe_action(action, list_key=self._current_message_uid)
 
-    def _on_add_to_calendar_clicked(self, invite: dict) -> None:
+    def _on_add_to_calendar_clicked(
+        self, invite: dict, *, list_key: str | None = None
+    ) -> None:
         from post.calendar_dialog import present_add_to_calendar
         from post.mail.io_thread import get_mail_io_thread
+
+        account_uid = None
+        key = list_key or self._current_message_uid
+        if key:
+            location = self._message_location_for_list_key(key)
+            if location is not None:
+                account_uid = location[0]
 
         present_add_to_calendar(
             self,
             invite,
+            account_uid=account_uid,
             on_success=lambda label: show_toast(self, f"Added to {label}"),
             on_error=lambda message: show_error_toast(self, message),
             run_async=lambda worker: get_mail_io_thread().submit(worker),
@@ -6169,9 +6179,10 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_message_menu_add_to_calendar(self, *_args) -> None:
         if len(self._context_message_uids) != 1:
             return
-        invite = self._calendar_invite_for_list_key(self._context_message_uids[0])
+        list_key = self._context_message_uids[0]
+        invite = self._calendar_invite_for_list_key(list_key)
         if invite is not None:
-            self._on_add_to_calendar_clicked(invite)
+            self._on_add_to_calendar_clicked(invite, list_key=list_key)
 
     def _on_message_menu_send_again(self, *_args) -> None:
         if len(self._context_message_uids) != 1:

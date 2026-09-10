@@ -17,6 +17,7 @@ from post.preferences import (
     SEARCH_SCOPE_ALL,
     SEARCH_SCOPE_FOLDER,
     SearchScope,
+    get_account_last_calendar,
     get_account_signature,
     get_account_signatures,
     get_account_user_online,
@@ -30,6 +31,7 @@ from post.preferences import (
     get_window_state,
     register_inbox_accounts,
     resolve_inbox_display_order,
+    set_account_last_calendar,
     set_account_signature,
     set_active_message_uid,
     set_account_user_online,
@@ -134,6 +136,30 @@ class PreferencesTests(unittest.TestCase):
                 with open(path, encoding="utf-8") as handle:
                     data = json.load(handle)
                 self.assertNotIn("account-1", data.get("account_user_online", {}))
+
+    def test_account_last_calendar_defaults_none(self) -> None:
+        with mock.patch(
+            "post.preferences._PREF_PATH",
+            os.path.join(tempfile.gettempdir(), "post-prefs-last-cal-missing.json"),
+        ):
+            self.assertIsNone(get_account_last_calendar("account-1"))
+
+    def test_account_last_calendar_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "preferences.json")
+            with mock.patch("post.preferences._PREF_PATH", path):
+                set_account_last_calendar("account-a", "cal-x")
+                set_account_last_calendar("account-b", "cal-y")
+                self.assertEqual(get_account_last_calendar("account-a"), "cal-x")
+                self.assertEqual(get_account_last_calendar("account-b"), "cal-y")
+                set_account_last_calendar("account-a", "cal-z")
+                self.assertEqual(get_account_last_calendar("account-a"), "cal-z")
+                self.assertEqual(get_account_last_calendar("account-b"), "cal-y")
+                set_account_last_calendar("account-b", "  ")
+                self.assertIsNone(get_account_last_calendar("account-b"))
+                with open(path, encoding="utf-8") as handle:
+                    data = json.load(handle)
+                self.assertEqual(data["account_last_calendar"], {"account-a": "cal-z"})
 
     def test_send_delay_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
