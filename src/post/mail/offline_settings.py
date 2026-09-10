@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import time
+
 import gi
 
 gi.require_version("Camel", "1.2")
@@ -25,11 +27,43 @@ from post.preferences import (
 _DOWNSYNC_EXPRESSION = "(match-all #t)"
 
 
+_SECONDS_PER_DAY = 86400
+
+
 def downsync_expression_for_mode(mode: OfflineBodySyncMode) -> str | None:
     """Return Camel downsync S-expression, or None when sync is disabled."""
     if mode == OFFLINE_BODY_SYNC_OFF:
         return None
     return _DOWNSYNC_EXPRESSION
+
+
+def message_within_offline_age(
+    mode: OfflineBodySyncMode,
+    unix_ts: int | float | None,
+) -> bool:
+    """True when *unix_ts* is in range for the offline body-sync policy.
+
+    Missing or non-positive timestamps are treated as in-range so a just-arrived
+    message is not skipped because Camel has not filled MessageInfo yet.
+    """
+    if mode == OFFLINE_BODY_SYNC_OFF:
+        return False
+    if mode == OFFLINE_BODY_SYNC_ALL:
+        return True
+    if unix_ts is None:
+        return True
+    try:
+        timestamp = float(unix_ts)
+    except (TypeError, ValueError):
+        return True
+    if timestamp <= 0:
+        return True
+    now = time.time()
+    if mode == OFFLINE_BODY_SYNC_LAST_MONTH:
+        return timestamp >= now - 31 * _SECONDS_PER_DAY
+    if mode == OFFLINE_BODY_SYNC_LAST_YEAR:
+        return timestamp >= now - 366 * _SECONDS_PER_DAY
+    return True
 
 
 def apply_offline_settings_to_store(

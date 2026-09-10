@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, TYPE_CHECKING
 
@@ -17,7 +18,8 @@ gi.require_version("Camel", "1.2")
 gi.require_version("Gio", "2.0")
 from gi.repository import Camel, Gio, GLib
 
-from post.mail.folders import folder_can_contain_messages
+from post.mail.camel_util import camel_uid_is_binary, camel_uid_to_api, folder_get_message_info
+from post.mail.folders import folder_can_contain_messages, is_post_outbox_folder
 from post.mail.io_thread import get_mail_io_thread
 from post.mail.message_list_state import (
     is_heavy_folder_name,
@@ -27,6 +29,7 @@ from post.mail.offline_settings import (
     account_is_user_offline,
     apply_offline_sync_to_folder,
     downsync_expression_for_mode,
+    message_within_offline_age,
 )
 from post.preferences import (
     OFFLINE_BODY_SYNC_OFF,
@@ -41,8 +44,78 @@ log = logging.getLogger(__name__)
 
 # Bound downsync_sync so one folder cannot pin post-mail-io for minutes (#197).
 _OFFLINE_DOWNSYNC_TIMEOUT_SECONDS = 30
+# Per-UID arrival FETCH (#372). Short so interactive mail I/O is not pinned.
+ARRIVAL_PREFETCH_BURST = 20
+_ARRIVAL_PREFETCH_TIMEOUT_SECONDS = 15
 
 OfflineSyncProgressCallback = Callable[["OfflineSyncProgress"], None]
+
+
+def added_uids_from_change_info(change_info: object) -> list[str]:
+    """Return UIDs Camel reports as newly added on ``Folder::changed``."""
+    getter = getattr(change_info, "get_added_uids", None)
+    if not callable(getter):
+        return []
+    try:
+        raw = getter()
+    except Exception:
+        return []
+    if not raw:
+        return []
+    added: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item:
+            added.append(item)
+    return added
+
+
+def select_arrival_prefetch_uids(
+    uids: list[str],
+    *,
+    sort_dates: dict[str, int] | None = None,
+    limit: int = ARRIVAL_PREFETCH_BURST,
+) -> list[str]:
+    """Deduplicate *uids* and keep at most *limit*, preferring newest dates."""
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for uid in uids:
+        if not uid or uid in seen_set:
+            continue
+        seen_set.add(uid)
+        seen.append(uid)
+    if len(seen) <= limit:
+        return seen
+    if sort_dates:
+        return sorted(
+            seen,
+            key=lambda uid: sort_dates.get(uid, 0),
+            reverse=True,
+        )[:limit]
+    return seen[-limit:]
+
+
+def sort_dates_for_uids(folder: object, uids: list[str]) -> dict[str, int]:
+    """Map UIDs to Camel MessageInfo received/sent timestamps when available."""
+    dates: dict[str, int] = {}
+    for uid in uids:
+        info = folder_get_message_info(folder, uid)
+        if info is None:
+            continue
+        getter = getattr(info, "get_date_received", None)
+        sent_getter = getattr(info, "get_date_sent", None)
+        raw = getter() if callable(getter) else None
+        if not isinstance(raw, (int, float)) or raw <= 0:
+            raw = sent_getter() if callable(sent_getter) else None
+        if isinstance(raw, (int, float)) and raw > 0:
+            dates[uid] = int(raw)
+    return dates
+
+
+@dataclass(frozen=True)
+class _ArrivalPrefetchItem:
+    account_uid: str
+    folder_name: str
+    uid: str
 
 
 @dataclass(frozen=True)
@@ -62,6 +135,11 @@ class OfflineBodySyncCoordinator:
         self._running: set[str] = set()
         self._progress_callbacks: list[OfflineSyncProgressCallback] = []
         self._active_progress: OfflineSyncProgress | None = None
+        self._arrival_queue: deque[_ArrivalPrefetchItem] = deque()
+        self._arrival_queued: set[tuple[str, str, str]] = set()
+        self._arrival_running = False
+        self._arrival_fetch_cancellable: Gio.Cancellable | None = None
+        self._arrival_lock = threading.Lock()
 
     def add_progress_callback(self, callback: OfflineSyncProgressCallback) -> None:
         self._progress_callbacks.append(callback)
@@ -114,13 +192,240 @@ class OfflineBodySyncCoordinator:
             cancellable.cancel()
 
     def cancel_all(self) -> None:
+        """Cancel full-account downsync only. Arrival prefetch keeps its queue."""
         for account_uid in list(self._cancellables):
             self.cancel_account(account_uid)
         if self._running:
             self._notify_progress(None)
 
+    def cancel_arrival_in_flight(self) -> None:
+        """Cancel the current per-UID FETCH so interactive I/O can run (#372)."""
+        cancellable = self._arrival_fetch_cancellable
+        if cancellable is not None:
+            cancellable.cancel()
+
+    def resume_arrival_prefetch(self) -> None:
+        """Re-queue the arrival worker after interactive I/O finishes."""
+        with self._arrival_lock:
+            if self._arrival_running or not self._arrival_queue:
+                return
+            self._arrival_running = True
+        get_mail_io_thread().submit_background(self._arrival_prefetch_worker)
+
+    def schedule_arrival_prefetch(
+        self,
+        account_uid: str,
+        folder_name: str,
+        uids: list[str],
+        *,
+        sort_dates: dict[str, int] | None = None,
+    ) -> None:
+        """Queue best-effort MIME fetches for newly arrived UIDs (#372).
+
+        Ignores the Archive/heavy-folder hold used by full-account downsync.
+        """
+        if not uids:
+            return
+        if is_post_outbox_folder(folder_name):
+            return
+        mode = get_account_offline_body_sync(account_uid)
+        if mode == OFFLINE_BODY_SYNC_OFF:
+            return
+        if account_is_user_offline(account_uid):
+            return
+        if not self._mail.is_network_available():
+            return
+        selected = select_arrival_prefetch_uids(uids, sort_dates=sort_dates)
+        if not selected:
+            return
+        start_worker = False
+        with self._arrival_lock:
+            folder_queued = sum(
+                1
+                for item in self._arrival_queue
+                if item.account_uid == account_uid
+                and item.folder_name == folder_name
+            )
+            room = ARRIVAL_PREFETCH_BURST - folder_queued
+            for uid in selected[: max(0, room)]:
+                key = (account_uid, folder_name, uid)
+                if key in self._arrival_queued:
+                    continue
+                self._arrival_queued.add(key)
+                self._arrival_queue.append(
+                    _ArrivalPrefetchItem(account_uid, folder_name, uid)
+                )
+            if not self._arrival_running and self._arrival_queue:
+                self._arrival_running = True
+                start_worker = True
+        if start_worker:
+            get_mail_io_thread().submit_background(self._arrival_prefetch_worker)
+
     def is_active(self) -> bool:
         return bool(self._running)
+
+    def _pop_arrival_item(self) -> _ArrivalPrefetchItem | None:
+        with self._arrival_lock:
+            if not self._arrival_queue:
+                return None
+            item = self._arrival_queue.popleft()
+            self._arrival_queued.discard(
+                (item.account_uid, item.folder_name, item.uid)
+            )
+            return item
+
+    def _requeue_arrival_item(self, item: _ArrivalPrefetchItem) -> None:
+        key = (item.account_uid, item.folder_name, item.uid)
+        with self._arrival_lock:
+            if key in self._arrival_queued:
+                return
+            self._arrival_queued.add(key)
+            self._arrival_queue.appendleft(item)
+
+    def _finish_arrival_worker(self, *, resubmit: bool) -> None:
+        with self._arrival_lock:
+            has_work = bool(self._arrival_queue)
+            if resubmit and has_work:
+                self._arrival_running = True
+            else:
+                self._arrival_running = False
+                has_work = False
+        if has_work:
+            get_mail_io_thread().submit_background(self._arrival_prefetch_worker)
+
+    def _arrival_prefetch_worker(self) -> None:
+        try:
+            while True:
+                if get_mail_io_thread().has_interactive_work_pending():
+                    self._finish_arrival_worker(resubmit=True)
+                    return
+                item = self._pop_arrival_item()
+                if item is None:
+                    self._finish_arrival_worker(resubmit=False)
+                    return
+                mode = get_account_offline_body_sync(item.account_uid)
+                if (
+                    mode == OFFLINE_BODY_SYNC_OFF
+                    or account_is_user_offline(item.account_uid)
+                    or not self._mail.is_network_available()
+                ):
+                    continue
+                try:
+                    folder = self._mail._open_folder_unlocked(  # noqa: SLF001
+                        item.account_uid, item.folder_name
+                    )
+                except Exception:
+                    log.debug(
+                        "Arrival prefetch skipped open for %s/%s",
+                        item.account_uid,
+                        item.folder_name,
+                        exc_info=True,
+                    )
+                    continue
+                if folder is None:
+                    continue
+                apply_offline_sync_to_folder(folder, mode)
+                if camel_uid_is_binary(item.uid):
+                    continue
+                try:
+                    api_uid = camel_uid_to_api(item.uid)
+                except TypeError:
+                    continue
+                if self._arrival_uid_is_cached(folder, api_uid):
+                    continue
+                if not self._arrival_uid_in_age_window(folder, item.uid, mode):
+                    continue
+                preempted = self._prefetch_one_uid(folder, api_uid)
+                if preempted:
+                    self._requeue_arrival_item(item)
+                    self._finish_arrival_worker(resubmit=True)
+                    return
+        except Exception:
+            log.debug("Arrival body prefetch worker failed", exc_info=True)
+            self._finish_arrival_worker(resubmit=bool(self._arrival_queue))
+
+    def _arrival_uid_is_cached(self, folder: Camel.Folder, api_uid: str) -> bool:
+        try:
+            return self._mail._first_cached_rfc822_path(folder, api_uid) is not None  # noqa: SLF001
+        except Exception:
+            log.debug("Arrival cache probe failed for %s", api_uid, exc_info=True)
+            return False
+
+    @staticmethod
+    def _arrival_uid_in_age_window(
+        folder: Camel.Folder,
+        uid: str,
+        mode: OfflineBodySyncMode,
+    ) -> bool:
+        info = folder_get_message_info(folder, uid)
+        if info is None:
+            return message_within_offline_age(mode, None)
+        getter = getattr(info, "get_date_received", None)
+        sent_getter = getattr(info, "get_date_sent", None)
+        raw = getter() if callable(getter) else None
+        if not isinstance(raw, (int, float)) or raw <= 0:
+            raw = sent_getter() if callable(sent_getter) else None
+        return message_within_offline_age(mode, raw)
+
+    def _prefetch_one_uid(self, folder: Camel.Folder, api_uid: str) -> bool:
+        """Fetch one MIME. Return True when interactive preempt cancelled the FETCH."""
+        fetch_cancellable = Gio.Cancellable()
+        stop_watch = threading.Event()
+        self._arrival_fetch_cancellable = fetch_cancellable
+
+        def _watch_timeout() -> None:
+            deadline = time.monotonic() + _ARRIVAL_PREFETCH_TIMEOUT_SECONDS
+            while not stop_watch.is_set():
+                if fetch_cancellable.is_cancelled():
+                    return
+                if time.monotonic() >= deadline:
+                    fetch_cancellable.cancel()
+                    return
+                stop_watch.wait(0.05)
+
+        watcher = threading.Thread(
+            target=_watch_timeout,
+            name="post-arrival-prefetch-watch",
+            daemon=True,
+        )
+        started = time.monotonic()
+        watcher.start()
+        try:
+            folder.synchronize_message_sync(api_uid, fetch_cancellable)
+        except GLib.Error as exc:
+            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                elapsed = time.monotonic() - started
+                if get_mail_io_thread().has_interactive_work_pending():
+                    log.debug(
+                        "Arrival prefetch preempted for %s after %.1fs",
+                        api_uid,
+                        elapsed,
+                    )
+                    return True
+                if elapsed >= _ARRIVAL_PREFETCH_TIMEOUT_SECONDS * 0.9:
+                    log.debug(
+                        "Arrival prefetch timed out after %.1fs for %s",
+                        elapsed,
+                        api_uid,
+                    )
+                return False
+            log.debug(
+                "Arrival prefetch failed for %s",
+                api_uid,
+                exc_info=True,
+            )
+        except Exception:
+            log.debug(
+                "Arrival prefetch failed for %s",
+                api_uid,
+                exc_info=True,
+            )
+        finally:
+            stop_watch.set()
+            watcher.join(timeout=1.0)
+            if self._arrival_fetch_cancellable is fetch_cancellable:
+                self._arrival_fetch_cancellable = None
+        return False
 
     def _account_sync_worker(
         self,
