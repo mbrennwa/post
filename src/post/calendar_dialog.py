@@ -23,6 +23,18 @@ from post.mail.calendar_write import (
     ecal_available,
     list_writable_calendars,
 )
+from post.preferences import get_account_last_calendar, set_account_last_calendar
+
+
+def default_calendar_index(
+    targets: list[CalendarTarget], remembered_uid: str | None
+) -> int:
+    """Index of *remembered_uid* in *targets*, or 0 when missing/unknown."""
+    if remembered_uid:
+        for index, target in enumerate(targets):
+            if target.uid == remembered_uid:
+                return index
+    return 0
 
 
 def _parse_iso_datetime(value: str | None) -> datetime | None:
@@ -48,12 +60,14 @@ class AddToCalendarDialog:
         parent: Gtk.Window,
         invite: dict[str, Any],
         *,
+        account_uid: str | None = None,
         on_success: Callable[[str], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         run_async: Callable[[Callable[[], None]], None] | None = None,
     ) -> None:
         self._parent = parent
         self._invite = dict(invite)
+        self._account_uid = account_uid
         self._on_success = on_success
         self._on_error = on_error
         self._run_async = run_async
@@ -114,7 +128,12 @@ class AddToCalendarDialog:
         labels = [target.label for target in self._targets]
         string_list = Gtk.StringList.new(labels)
         combo = Gtk.DropDown.new(string_list, None)
-        combo.set_selected(0)
+        remembered = (
+            get_account_last_calendar(self._account_uid)
+            if self._account_uid
+            else None
+        )
+        combo.set_selected(default_calendar_index(self._targets, remembered))
         self._calendar_combo = combo
         cal_label = Gtk.Label(label="Calendar", xalign=0)
         cal_label.add_css_class("caption-heading")
@@ -186,8 +205,11 @@ class AddToCalendarDialog:
                 if error is not None:
                     if self._on_error:
                         self._on_error(str(error))
-                elif self._on_success:
-                    self._on_success(target.label)
+                else:
+                    if self._account_uid:
+                        set_account_last_calendar(self._account_uid, target.uid)
+                    if self._on_success:
+                        self._on_success(target.label)
                 return False
 
             GLib.idle_add(done)
@@ -227,6 +249,7 @@ def present_add_to_calendar(
     parent: Gtk.Window,
     invite: dict[str, Any],
     *,
+    account_uid: str | None = None,
     on_success: Callable[[str], None] | None = None,
     on_error: Callable[[str], None] | None = None,
     run_async: Callable[[Callable[[], None]], None] | None = None,
@@ -235,6 +258,7 @@ def present_add_to_calendar(
     AddToCalendarDialog(
         parent,
         invite,
+        account_uid=account_uid,
         on_success=on_success,
         on_error=on_error,
         run_async=run_async,
