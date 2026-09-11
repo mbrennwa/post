@@ -13,14 +13,17 @@ from collections.abc import Callable
 
 import gi
 
+gi.require_version("Adw", "1")
+gi.require_version("Gdk", "4.0")
 gi.require_version("Gio", "2.0")
 gi.require_version("Gtk", "4.0")
 gi.require_version("WebKit", "6.0")
 gi.require_version("JavaScriptCore", "6.0")
 
-from gi.repository import Gio, GLib, Gtk, JavaScriptCore, WebKit
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, JavaScriptCore, WebKit
 
 from post.open_uri import open_uri_externally
+from post.reader.html import ADAPT_TEXT_CSS
 from post.reader.pane import (
     apply_reader_link_hover,
     pointer_coords_in_widget,
@@ -39,18 +42,24 @@ log = logging.getLogger(__name__)
 _HANDLER_NAME = "composeChanged"
 _ACTION_HANDLER = "composeAction"
 
+# Same canvases as reader/html._COMPOSE_SHELL_* so #358 quote contrast stays valid.
+_COMPOSE_SHELL_DARK = "#1e1e1e"
+_COMPOSE_SHELL_LIGHT = "#ffffff"
+
 _EDITOR_DOCUMENT = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="__COMPOSE_COLOR_SCHEME__">
 <style>
-  :root { color-scheme: light dark; }
+  :root { color-scheme: __COMPOSE_COLOR_SCHEME__; }
   html, body {
     margin: 0;
     padding: 0;
     height: 100%;
-    background: transparent;
+    background: __COMPOSE_CANVAS__;
+    color: CanvasText;
   }
   #editor {
     box-sizing: border-box;
@@ -63,6 +72,8 @@ _EDITOR_DOCUMENT = """<!DOCTYPE html>
     font-family: system-ui, sans-serif;
     font-size: 11pt;
     line-height: 1.4;
+    background: __COMPOSE_CANVAS__;
+    color: CanvasText;
   }
   #editor blockquote {
     margin: 0.25em 0 0.25em 0.25em;
@@ -83,6 +94,7 @@ _EDITOR_DOCUMENT = """<!DOCTYPE html>
     padding-left: 1.5em;
   }
   #editor a { color: LinkText; text-decoration: underline; }
+__ADAPT_TEXT_CSS__
 </style>
 </head>
 <body>
@@ -399,6 +411,7 @@ def build_editor_document(
     body_plain: str = "",
     body_html: str | None = None,
     edit_mode: str | None = None,
+    dark: bool = False,
 ) -> str:
     """Build the trusted contenteditable shell document."""
     if body_html is not None:
@@ -409,11 +422,16 @@ def build_editor_document(
         body = html.escape(body_plain)
         if edit_mode is None:
             edit_mode = "plaintext-only"
+    color_scheme = "dark" if dark else "light"
+    canvas = _COMPOSE_SHELL_DARK if dark else _COMPOSE_SHELL_LIGHT
     return (
         _EDITOR_DOCUMENT.replace("__COMPOSE_BODY__", body)
         .replace("__COMPOSE_EDIT_MODE__", edit_mode)
         .replace("__COMPOSE_HANDLER__", _HANDLER_NAME)
         .replace("__COMPOSE_ACTION__", _ACTION_HANDLER)
+        .replace("__COMPOSE_COLOR_SCHEME__", color_scheme)
+        .replace("__COMPOSE_CANVAS__", canvas)
+        .replace("__ADAPT_TEXT_CSS__", ADAPT_TEXT_CSS)
     )
 
 
@@ -528,6 +546,7 @@ class ComposeBodyEditor(Gtk.Box):
         self._cursor_offset = 0
         self._changed_handlers: list[Callable[[], None]] = []
         self._link_request_handlers: list[Callable[[str, str], None]] = []
+        self._html_for_color_scheme: Callable[[str, bool], str] | None = None
         self._suppress_changed = True
         self._spell_action_group = Gio.SimpleActionGroup.new()
         self._spell_language_actions: dict[str, Gio.SimpleAction] = {}
@@ -572,6 +591,10 @@ class ComposeBodyEditor(Gtk.Box):
         self._web_view.insert_action_group("compose-format", format_actions)
         self._hover_link_uri: str | None = None
         self._opened_uri_time = 0
+        self._style_manager = Adw.StyleManager.get_default()
+        self._dark_handler_id = self._style_manager.connect(
+            "notify::dark", self._on_app_dark_changed
+        )
 
         self.append(self._build_format_bar())
         overlay = Gtk.Overlay()
@@ -597,6 +620,14 @@ class ComposeBodyEditor(Gtk.Box):
         self.append(overlay)
         self._load_document(body_plain="")
 
+    def do_unroot(self) -> None:
+        handler = getattr(self, "_dark_handler_id", 0)
+        manager = getattr(self, "_style_manager", None)
+        if handler and manager is not None:
+            manager.disconnect(handler)
+            self._dark_handler_id = 0
+        Gtk.Box.do_unroot(self)
+
     @property
     def web_view(self) -> WebKit.WebView:
         return self._web_view
@@ -606,6 +637,12 @@ class ComposeBodyEditor(Gtk.Box):
 
     def connect_link_request(self, callback: Callable[[str, str], None]) -> None:
         self._link_request_handlers.append(callback)
+
+    def connect_html_for_color_scheme(
+        self, callback: Callable[[str, bool], str]
+    ) -> None:
+        """Rewrite cached HTML when the app light/dark shell changes."""
+        self._html_for_color_scheme = callback
 
     def get_plain(self) -> str:
         return self._cached_plain
@@ -789,6 +826,35 @@ class ComposeBodyEditor(Gtk.Box):
         label.add_css_class("dim-label")
         label.remove_css_class("accent")
 
+    def _app_prefers_dark(self) -> bool:
+        return Adw.StyleManager.get_default().get_dark()
+
+    def _sync_web_view_background(self) -> None:
+        """Match the GTK WebView canvas to the compose shell (not UA white)."""
+        color = (
+            _COMPOSE_SHELL_DARK if self._app_prefers_dark() else _COMPOSE_SHELL_LIGHT
+        )
+        rgba = Gdk.RGBA()
+        rgba.parse(color)
+        setter = getattr(self._web_view, "set_background_color", None)
+        if setter is not None:
+            setter(rgba)
+
+    def _on_app_dark_changed(self, *_args: object) -> None:
+        self._suppress_changed = True
+        dark = self._app_prefers_dark()
+        if self._edit_mode == "rich":
+            fragment = self._cached_html
+            rewriter = self._html_for_color_scheme
+            if rewriter is not None:
+                fragment = rewriter(fragment, dark)
+                self._cached_html = fragment
+            self._load_document(body_html=fragment, edit_mode="true")
+        else:
+            self._load_document(
+                body_plain=self._cached_plain, edit_mode="plaintext-only"
+            )
+
     def _load_document(
         self,
         *,
@@ -797,10 +863,12 @@ class ComposeBodyEditor(Gtk.Box):
         edit_mode: str | None = None,
     ) -> None:
         self._loaded = False
+        self._sync_web_view_background()
         document = build_editor_document(
             body_plain=body_plain,
             body_html=body_html,
             edit_mode=edit_mode,
+            dark=self._app_prefers_dark(),
         )
         self._web_view.load_html(document, "about:blank")
 

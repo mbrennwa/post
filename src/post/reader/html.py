@@ -220,7 +220,7 @@ span.post-bracketed {
 }
 """
 
-_ADAPT_TEXT_CSS = """
+ADAPT_TEXT_CSS = """
 .message-body {
   min-height: 100%;
   background: inherit;
@@ -1630,6 +1630,21 @@ def mark_adaptation_classes(
     return _strip_sender_style_blocks(marker.get_result())
 
 
+def adapt_html_for_shell(
+    body_html: str,
+    *,
+    shell_background: str,
+    prefer_reader_shell: bool = True,
+) -> str:
+    """Adapt sender HTML and wrap it the way the reading pane mounts it."""
+    content = mark_adaptation_classes(
+        body_html,
+        shell_background=shell_background,
+        prefer_reader_shell=prefer_reader_shell,
+    )
+    return f'<div class="message-body">{content}</div>'
+
+
 def html_has_explicit_text_color(body_html: str) -> bool:
     """Return True when HTML sets an explicit foreground/text color."""
     if _FONT_COLOR_ATTR.search(body_html) or _TEXT_ATTR.search(body_html):
@@ -1820,10 +1835,9 @@ def build_reader_document(
                     "</p>"
                 )
         if effective_appearance == "adapt_text":
-            content = mark_adaptation_classes(
+            content = adapt_html_for_shell(
                 content, shell_background=shell_background
             )
-            content = f'<div class="message-body">{content}</div>'
         content = _embed_bracketed_span_literals(content)
     elif body_plain:
         content = f'<pre class="plain-body">{linkify_plain_text(body_plain)}</pre>'
@@ -1846,7 +1860,7 @@ def build_reader_document(
 
     reader_css = _READER_CSS_DARK if reader_dark else _READER_CSS_LIGHT
     if effective_appearance == "adapt_text" and html_body:
-        reader_css = f"{reader_css}\n{_ADAPT_TEXT_CSS}"
+        reader_css = f"{reader_css}\n{ADAPT_TEXT_CSS}"
 
     color_scheme = "dark" if reader_dark else "light"
     return f"""<!DOCTYPE html>

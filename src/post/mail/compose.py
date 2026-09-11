@@ -18,7 +18,8 @@ gi.require_version("Gio", "2.0")
 
 from gi.repository import Gio
 
-from post.reader.html import strip_theme_locked_text_colors
+from post.preferences import MESSAGE_APPEARANCE_ADAPT_TEXT, MessageAppearance
+from post.reader.html import adapt_html_for_shell, strip_theme_locked_text_colors
 
 from .subject_prefixes import strip_subject_prefixes as _strip_subject_prefixes
 
@@ -286,13 +287,31 @@ def _post_quote_blockquote(content: str) -> str:
     )
 
 
-def quote_html_forward(original: dict[str, Any], body_html: str) -> str:
+def _quoted_html_content(
+    body_html: str, *, adapt_shell: bool = False, shell_dark: bool = False
+) -> str:
+    """Inner quote HTML: strip theme-locked colors, optionally Adapt text for display."""
+    if not adapt_shell:
+        return strip_theme_locked_text_colors(
+            _strip_html_document_wrappers(body_html)
+        )
+    shell = "#1e1e1e" if shell_dark else "#ffffff"
+    return adapt_html_for_shell(body_html, shell_background=shell)
+
+
+def quote_html_forward(
+    original: dict[str, Any],
+    body_html: str,
+    *,
+    adapt_shell: bool = False,
+    shell_dark: bool = False,
+) -> str:
     from .helpers import format_forward_quote_header
 
     header_lines = format_forward_quote_header(original).splitlines()
     header_html = "<br>\n".join(html.escape(line) for line in header_lines)
-    content = strip_theme_locked_text_colors(
-        _strip_html_document_wrappers(body_html)
+    content = _quoted_html_content(
+        body_html, adapt_shell=adapt_shell, shell_dark=shell_dark
     )
     return (
         f"<div>{FORWARD_QUOTE_MARKER}</div>"
@@ -301,11 +320,17 @@ def quote_html_forward(original: dict[str, Any], body_html: str) -> str:
     )
 
 
-def quote_html_reply(original: dict[str, Any], body_html: str) -> str:
+def quote_html_reply(
+    original: dict[str, Any],
+    body_html: str,
+    *,
+    adapt_shell: bool = False,
+    shell_dark: bool = False,
+) -> str:
     date = original.get("date_received") or original.get("date_sent") or ""
     sender = html.escape(str(original.get("from") or ""))
-    content = strip_theme_locked_text_colors(
-        _strip_html_document_wrappers(body_html)
+    content = _quoted_html_content(
+        body_html, adapt_shell=adapt_shell, shell_dark=shell_dark
     )
     return (
         f"<div>On {html.escape(str(date))}, {sender} wrote:</div>"
@@ -319,12 +344,25 @@ def compose_html_quote_prefill(
     reply_to: dict[str, Any],
     quoted_html_source: str,
     signature: str | None,
+    dark: bool = False,
+    message_appearance: MessageAppearance | None = None,
 ) -> str:
     """HTML fragment for reply/forward: caret row, optional signature, quoted HTML."""
+    adapt_shell = message_appearance == MESSAGE_APPEARANCE_ADAPT_TEXT
     if mode == "forward":
-        quoted = quote_html_forward(reply_to, quoted_html_source)
+        quoted = quote_html_forward(
+            reply_to,
+            quoted_html_source,
+            adapt_shell=adapt_shell,
+            shell_dark=dark,
+        )
     else:
-        quoted = quote_html_reply(reply_to, quoted_html_source)
+        quoted = quote_html_reply(
+            reply_to,
+            quoted_html_source,
+            adapt_shell=adapt_shell,
+            shell_dark=dark,
+        )
     parts = ["<div><br></div>"]
     block = format_signature_block(signature or "")
     if block and mode in ("reply", "reply-all"):
@@ -332,6 +370,51 @@ def compose_html_quote_prefill(
         parts.append("<div><br></div>")
     parts.append(quoted)
     return "".join(parts)
+
+
+def reflow_editor_html_quote_for_shell(
+    editor_html: str,
+    *,
+    mode: str,
+    reply_to: dict[str, Any] | None,
+    quoted_html_source: str | None,
+    quoted_plain_expected: str,
+    dark: bool,
+    message_appearance: MessageAppearance | None,
+) -> str:
+    """Rebuild an Adapt-text quote for a new light/dark shell.
+
+    Keeps user HTML above the quote intro. Quote edits are replaced from the
+    original MIME so the shell matches the reading pane.
+    """
+    if message_appearance != MESSAGE_APPEARANCE_ADAPT_TEXT:
+        return editor_html
+    if mode not in ("reply", "reply-all", "forward"):
+        return editor_html
+    if not quoted_html_source or reply_to is None:
+        return editor_html
+    first_line = quoted_plain_expected.lstrip("\n").split("\n", 1)[0]
+    if not first_line:
+        return editor_html
+    marker = html.escape(first_line)
+    idx = editor_html.find(marker)
+    if idx < 0:
+        return editor_html
+    if mode == "forward":
+        quoted = quote_html_forward(
+            reply_to,
+            quoted_html_source,
+            adapt_shell=True,
+            shell_dark=dark,
+        )
+    else:
+        quoted = quote_html_reply(
+            reply_to,
+            quoted_html_source,
+            adapt_shell=True,
+            shell_dark=dark,
+        )
+    return f"{editor_html[:idx]}{quoted}"
 
 
 def restore_stamped_link_hrefs(fragment: str) -> str:

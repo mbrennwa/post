@@ -26,6 +26,8 @@ class BuildEditorDocumentTests(unittest.TestCase):
         self.assertNotIn("__COMPOSE_BODY__", doc)
         self.assertNotIn("__COMPOSE_HANDLER__", doc)
         self.assertNotIn("__COMPOSE_ACTION__", doc)
+        self.assertNotIn("__COMPOSE_COLOR_SCHEME__", doc)
+        self.assertNotIn("__COMPOSE_CANVAS__", doc)
         self.assertIn("increaseQuote", doc)
         self.assertIn("beginLink", doc)
         self.assertIn("KeyK", doc)
@@ -61,6 +63,29 @@ class BuildEditorDocumentTests(unittest.TestCase):
         self.assertIn("blockquote.post_quote", doc)
         self.assertIn("white-space: normal", doc)
         self.assertIn("blockquote.post_quote p", doc)
+
+    def test_dark_shell_uses_single_color_scheme_and_canvas(self) -> None:
+        doc = build_editor_document(body_plain="Hello", dark=True)
+        self.assertIn('name="color-scheme" content="dark"', doc)
+        self.assertIn("color-scheme: dark", doc)
+        self.assertNotIn("color-scheme: light dark", doc)
+        self.assertNotIn('name="color-scheme" content="light"', doc)
+        self.assertIn("#1e1e1e", doc)
+        self.assertNotIn("#ffffff", doc)
+        self.assertNotIn("#eeeeee", doc)
+        self.assertIn("CanvasText", doc)
+        self.assertIn(".message-body .post-adapt-text", doc)
+
+    def test_light_shell_uses_single_color_scheme_and_canvas(self) -> None:
+        doc = build_editor_document(body_plain="Hello", dark=False)
+        self.assertIn('name="color-scheme" content="light"', doc)
+        self.assertIn("color-scheme: light", doc)
+        self.assertNotIn("color-scheme: light dark", doc)
+        self.assertNotIn('name="color-scheme" content="dark"', doc)
+        self.assertIn("#ffffff", doc)
+        self.assertNotIn("#1e1e1e", doc)
+        self.assertNotIn("#eeeeee", doc)
+        self.assertIn("CanvasText", doc)
 
 
 class StoredBodyNeedsRichEditorTests(unittest.TestCase):
