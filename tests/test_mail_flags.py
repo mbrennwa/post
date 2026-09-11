@@ -624,6 +624,105 @@ class PersistFlagSignInTests(unittest.TestCase):
         queue_mock.assert_called_once()
         self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
 
+    @patch("post.mail.eds.MailService._queue_flag_operation_unlocked")
+    @patch("post.mail.eds.MailService._get_store_unlocked")
+    @patch("post.mail.eds.MailService._persist_folder_flags_unlocked")
+    def test_store_open_sign_in_error_queues_seen(
+        self,
+        persist_mock: MagicMock,
+        get_store_mock: MagicMock,
+        queue_mock: MagicMock,
+    ) -> None:
+        from post.mail.eds import MailService
+
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        folder = MagicMock()
+        folder.get_full_name.return_value = "INBOX"
+        get_store_mock.side_effect = RuntimeError(
+            "Failed to refresh access token (goa-error-quark, 4): AADSTS70043"
+        )
+
+        queued = service._persist_message_flag_changes_unlocked(
+            "acct-1",
+            folder,
+            ["42"],
+            op_type="set_seen",
+            seen=False,
+        )
+
+        self.assertTrue(queued)
+        persist_mock.assert_not_called()
+        queue_mock.assert_called_once()
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+    @patch("post.mail.eds.MailService._queue_flag_operation_unlocked")
+    @patch("post.mail.eds.MailService._get_store_unlocked")
+    def test_needs_sign_in_queues_without_opening_store(
+        self,
+        get_store_mock: MagicMock,
+        queue_mock: MagicMock,
+    ) -> None:
+        from post.mail.eds import MailService
+
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        service.set_account_connect_health("acct-1", "needs_sign_in")
+        folder = MagicMock()
+        folder.get_full_name.return_value = "INBOX"
+
+        queued = service._persist_message_flag_changes_unlocked(
+            "acct-1",
+            folder,
+            ["42"],
+            op_type="set_seen",
+            seen=False,
+        )
+
+        self.assertTrue(queued)
+        get_store_mock.assert_not_called()
+        queue_mock.assert_called_once()
+
+    @patch("post.mail.eds.folder_get_unread_count", return_value=1)
+    @patch("post.mail.eds.folder_get_message_info")
+    @patch("post.mail.eds.MailService._persist_message_flag_changes_unlocked")
+    @patch("post.mail.eds.MailService._apply_message_flags_unlocked")
+    @patch("post.mail.eds.MailService._require_folder_unlocked")
+    def test_set_messages_seen_returns_updates_when_queued(
+        self,
+        require_folder_mock: MagicMock,
+        apply_mock: MagicMock,
+        persist_mock: MagicMock,
+        get_info_mock: MagicMock,
+        _unread_mock: MagicMock,
+    ) -> None:
+        from post.mail.eds import MailService
+
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        folder = MagicMock()
+        folder.get_message_count.return_value = 1
+        require_folder_mock.return_value = folder
+        info = MagicMock()
+        info.get_flags.return_value = Camel.MessageFlags.SEEN
+        get_info_mock.return_value = info
+        apply_mock.return_value = True
+        persist_mock.return_value = True
+
+        result = service._set_messages_seen_unlocked(
+            "acct-1",
+            "INBOX",
+            ["42"],
+            seen=False,
+        )
+
+        self.assertEqual(
+            result["updates"],
+            [{"uid": "42", "flags": {"seen": False}}],
+        )
+        self.assertTrue(result["queued"])
+        persist_mock.assert_called_once()
+
 
 @unittest.skipUnless(
     os.environ.get("POST_EDS_TESTS"),

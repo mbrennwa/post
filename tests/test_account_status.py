@@ -23,6 +23,7 @@ from post.mail.network_errors import (
     MESSAGE_NOT_CACHED_SIGN_IN,
     SIGN_IN_FOLDER_MESSAGE,
     TOKEN_EXPIRED_FOLDER_MESSAGE,
+    format_attachment_error,
     format_folder_load_error,
     format_message_read_error,
     format_sign_in_required_log,
@@ -193,6 +194,25 @@ class MessageReadErrorFormatTests(unittest.TestCase):
         )
         self.assertNotIn("g-io-error-quark", message)
         self.assertEqual(message, "Could not read this message.")
+
+    def test_attachment_auth_error_hides_quark(self) -> None:
+        exc = RuntimeError(
+            "Failed to refresh access token (goa-error-quark, 4): AADSTS70043"
+        )
+        message = format_attachment_error(exc)
+        self.assertEqual(message, MESSAGE_NOT_CACHED_SIGN_IN)
+        self.assertNotIn("AADSTS", message)
+        self.assertNotIn("goa-error", message)
+
+    def test_attachment_unavailable_uses_user_message(self) -> None:
+        from post.mail.eds import MessageNotAvailableError, MessageUnavailableReason
+
+        exc = MessageNotAvailableError(
+            "42",
+            "INBOX",
+            reason=MessageUnavailableReason.NOT_CACHED_SIGN_IN,
+        )
+        self.assertEqual(format_attachment_error(exc), MESSAGE_NOT_CACHED_SIGN_IN)
 
 
 class FlushSendQueueResultTests(unittest.TestCase):
