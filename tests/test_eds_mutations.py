@@ -359,6 +359,68 @@ class OfflineTransferQueueTests(unittest.TestCase):
         queue_transfer.assert_called_once()
         self.assertTrue(result.get("queued"))
 
+    def test_transfer_queues_when_goa_needs_sign_in(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        service.set_account_connect_health("acct-1", "needs_sign_in")
+        folder = mock.Mock()
+        folder.get_full_name.return_value = "Trash"
+        source_folder = mock.Mock()
+        service._open_folder_unlocked = mock.Mock(return_value=source_folder)
+        service._transfer_uids_in_folder = mock.Mock(return_value=["1"])
+
+        with mock.patch.object(
+            service,
+            "_queue_transfer_operation_unlocked",
+            return_value={"moved_uids": ["1"], "queued": True},
+        ) as queue_transfer:
+            result = service._transfer_messages_unlocked(
+                "acct-1",
+                "INBOX",
+                ["1"],
+                folder,
+                op_type="move_to_trash",
+            )
+
+        queue_transfer.assert_called_once()
+        self.assertTrue(result.get("queued"))
+
+    def test_transfer_queues_on_sign_in_error(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        dest = mock.Mock()
+        dest.get_full_name.return_value = "Trash"
+        dest.freeze = mock.Mock()
+        dest.thaw = mock.Mock()
+        source = mock.Mock()
+        source.freeze = mock.Mock()
+        source.thaw = mock.Mock()
+        source.transfer_messages_to_sync.side_effect = RuntimeError(
+            "Failed to refresh access token (goa-error-quark, 4): AADSTS70043"
+        )
+        service._open_folder_unlocked = mock.Mock(return_value=source)
+        service._transfer_uids_in_folder = mock.Mock(return_value=["1"])
+        service._message_dicts_for_uids_unlocked = mock.Mock(return_value=[])
+        service.get_account_transfer_state = mock.Mock(return_value="idle")
+        service.set_account_transfer_state = mock.Mock()
+
+        with mock.patch.object(
+            service,
+            "_queue_transfer_operation_unlocked",
+            return_value={"moved_uids": ["1"], "queued": True},
+        ) as queue_transfer:
+            result = service._transfer_messages_unlocked(
+                "acct-1",
+                "INBOX",
+                ["1"],
+                dest,
+                op_type="move_to_trash",
+            )
+
+        queue_transfer.assert_called_once()
+        self.assertTrue(result.get("queued"))
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
 
 class TransferUidFilterTests(unittest.TestCase):
     def test_empty_filtered_transfer_raises(self) -> None:

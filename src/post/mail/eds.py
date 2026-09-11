@@ -5630,6 +5630,12 @@ class MailService:
             mime = self._try_message_cached(folder, api_uid)
             if mime is not None:
                 return mime
+            if offline:
+                raise MessageNotAvailableError(
+                    message_uid,
+                    folder_name,
+                    reason=MessageUnavailableReason.NOT_CACHED_OFFLINE,
+                )
             self._raise_uncached_sign_in(account_uid, folder_name, message_uid)
         try:
             mime = self._get_message_sync_with_timeout(folder, api_uid)
@@ -5803,7 +5809,11 @@ class MailService:
     def _require_folder_unlocked(
         self, account_uid: str, folder_name: str
     ) -> Camel.Folder:
-        folder = self._open_folder_unlocked(account_uid, folder_name)
+        folder = self._open_folder_unlocked(
+            account_uid,
+            folder_name,
+            allow_online=self._allow_online_store_unlocked(account_uid),
+        )
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
         from post.preferences import get_account_offline_body_sync
@@ -7546,7 +7556,7 @@ class MailService:
         destination_folder: str,
         message_uids: list[str],
     ) -> dict[str, Any]:
-        store = self._get_store_unlocked(account_uid)
+        store = self._store_for_transfer_unlocked(account_uid)
         dest = store.get_folder_sync(destination_folder, 0, None)
         if dest is None:
             raise ValueError(f"Folder not found: {destination_folder}")
@@ -7557,12 +7567,44 @@ class MailService:
     def _goa_credentials_ready_for_read_unlocked(self, account_uid: str) -> bool:
         """Return False when GOA cannot mint a token (skip Graph, try cache)."""
         source = self.registry.ref_source(account_uid)
-        if source is None or not source.has_extension("GNOME Online Accounts"):
+        if source is None:
+            return True
+        has_goa = source.has_extension("GNOME Online Accounts")
+        if has_goa is not True:
             return True
         if ensure_goa_credentials(self.registry, source, None):
             return True
         self.set_account_connect_health(account_uid, "needs_sign_in")
         return False
+
+    def _allow_network_unlocked(self, account_uid: str) -> bool:
+        """Return False when Graph must not be contacted (airplane or dead GOA)."""
+        if not self._network_available:
+            return False
+        if self.get_account_connect_health(account_uid) == "needs_sign_in":
+            return False
+        return self._goa_credentials_ready_for_read_unlocked(account_uid)
+
+    def _allow_online_store_unlocked(self, account_uid: str) -> bool:
+        """Like ``_allow_network_unlocked``, but Graph is allowed while flushing."""
+        if self._flushing_operation_queue:
+            return True
+        return self._allow_network_unlocked(account_uid)
+
+    def _store_for_transfer_unlocked(self, account_uid: str) -> Camel.Store:
+        return self._get_store_unlocked(
+            account_uid,
+            allow_online=self._allow_online_store_unlocked(account_uid),
+        )
+
+    def _folders_for_transfer_unlocked(self, account_uid: str) -> list[dict]:
+        if self._allow_online_store_unlocked(account_uid):
+            return self._list_folders_unlocked(account_uid)
+        with self._lock:
+            cached = self._folder_tree_cache.get(account_uid)
+        if cached is not None:
+            return list(cached)
+        return self._list_folders_from_local_store_unlocked(account_uid) or []
 
     def _read_message_unlocked(
         self,
@@ -7766,13 +7808,19 @@ class MailService:
     ) -> tuple[str, bytes]:
         from .helpers import get_attachment_data
 
-        store = self._get_store_unlocked(account_uid)
-        folder = store.get_folder_sync(folder_name, 0, None)
+        allow_network = self._allow_network_unlocked(account_uid)
+        folder = self._open_folder_unlocked(
+            account_uid, folder_name, allow_online=allow_network
+        )
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
 
         mime = self._get_message_mime_sync(
-            folder, account_uid, folder_name, message_uid
+            folder,
+            account_uid,
+            folder_name,
+            message_uid,
+            allow_network=allow_network,
         )
 
         return get_attachment_data(mime, attachment_index)
@@ -7783,23 +7831,26 @@ class MailService:
         folder_name: str,
         message_uid: str,
     ) -> list[ComposeAttachment]:
-        store = self._get_store_unlocked(account_uid)
-        folder = store.get_folder_sync(folder_name, 0, None)
+        allow_network = self._allow_network_unlocked(account_uid)
+        folder = self._open_folder_unlocked(
+            account_uid, folder_name, allow_online=allow_network
+        )
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
 
         mime = self._get_message_mime_sync(
-            folder, account_uid, folder_name, message_uid
+            folder,
+            account_uid,
+            folder_name,
+            message_uid,
+            allow_network=allow_network,
         )
         return read_compose_attachments_from_message(mime)
 
     def _mark_message_read_unlocked(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> tuple[int, int]:
-        store = self._get_store_unlocked(account_uid)
-        folder = store.get_folder_sync(folder_name, 0, None)
-        if folder is None:
-            raise ValueError(f"Folder not found: {folder_name}")
+        folder = self._require_folder_unlocked(account_uid, folder_name)
 
         info = folder_get_message_info(folder,message_uid)
         if info is None:
@@ -8018,7 +8069,7 @@ class MailService:
             updates.append({"uid": message_uid, "flags": {"seen": new_seen}})
         queued = False
         if changed_uids:
-            if not self._network_available and not self._flushing_operation_queue:
+            if not self._allow_online_store_unlocked(account_uid):
                 for item in updates:
                     uid = item.get("uid")
                     if uid not in changed_uids:
@@ -8079,7 +8130,7 @@ class MailService:
             updates.append({"uid": message_uid, "flags": {"flagged": new_flagged}})
         queued = False
         if changed_uids:
-            if not self._network_available and not self._flushing_operation_queue:
+            if not self._allow_online_store_unlocked(account_uid):
                 for item in updates:
                     uid = item.get("uid")
                     if uid not in changed_uids:
@@ -8116,8 +8167,8 @@ class MailService:
                 account_uid, folder_name, message_uids
             )
 
-        store = self._get_store_unlocked(account_uid)
-        folders = self._list_folders_unlocked(account_uid)
+        store = self._store_for_transfer_unlocked(account_uid)
+        folders = self._folders_for_transfer_unlocked(account_uid)
         trash_info = find_trash_folder(
             folders,
             trash_type=Camel.FolderInfoFlags.TYPE_TRASH,
@@ -8174,11 +8225,8 @@ class MailService:
     def _archive_messages_unlocked(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
-        store = self._get_store_unlocked(account_uid)
-        with self._lock:
-            folders = self._folder_tree_cache.get(account_uid)
-        if folders is None:
-            folders = self._list_folders_unlocked(account_uid)
+        store = self._store_for_transfer_unlocked(account_uid)
+        folders = self._folders_for_transfer_unlocked(account_uid)
         archive_info = find_folder_by_type(
             folders,
             Camel.FolderInfoFlags.TYPE_ARCHIVE,
@@ -8314,7 +8362,11 @@ class MailService:
         if not message_uids:
             return {"moved_uids": []}
 
-        source_folder = self._open_folder_unlocked(account_uid, source_folder_name)
+        source_folder = self._open_folder_unlocked(
+            account_uid,
+            source_folder_name,
+            allow_online=self._allow_online_store_unlocked(account_uid),
+        )
         dest_name = destination_folder.get_full_name()
         if dest_name and dest_name == source_folder_name:
             raise ValueError("Messages are already in that folder")
@@ -8323,7 +8375,7 @@ class MailService:
         if not transfer_uids:
             raise ValueError("No matching messages to move")
 
-        if not self._network_available and not self._flushing_operation_queue:
+        if not self._allow_online_store_unlocked(account_uid):
             return self._queue_transfer_operation_unlocked(
                 account_uid,
                 source_folder_name,
@@ -8428,9 +8480,14 @@ class MailService:
                             f"Move timed out after {_TRANSFER_TIMEOUT_SECONDS}s"
                         ) from exc
                 elif (
-                    is_queueable_network_error(exc)
+                    (
+                        is_queueable_network_error(exc)
+                        or is_sign_in_required_error(exc)
+                    )
                     and not self._flushing_operation_queue
                 ):
+                    if is_sign_in_required_error(exc):
+                        self.set_account_connect_health(account_uid, "needs_sign_in")
                     return self._queue_transfer_operation_unlocked(
                         account_uid,
                         source_folder_name,
@@ -8597,7 +8654,7 @@ class MailService:
     ) -> bool:
         if not message_uids:
             return False
-        if not self._network_available and not self._flushing_operation_queue:
+        if not self._allow_online_store_unlocked(account_uid):
             if op_type is None:
                 raise RuntimeError("Offline flag sync requires operation type")
             folder_name = folder.get_full_name()
@@ -8612,8 +8669,8 @@ class MailService:
                 flagged=flagged,
             )
             return True
-        store = self._get_store_unlocked(account_uid)
         try:
+            store = self._get_store_unlocked(account_uid)
             self._persist_folder_flags_unlocked(store, folder, message_uids)
         except Exception as exc:
             if not self._flushing_operation_queue and op_type is not None and (

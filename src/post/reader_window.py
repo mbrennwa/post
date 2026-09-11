@@ -40,6 +40,7 @@ from post.mail.helpers import (
 from post.mail.io_thread import get_mail_io_thread
 from post.mail.network_errors import (
     MESSAGE_NOT_CACHED_SIGN_IN,
+    format_attachment_error,
     format_message_read_error,
     is_sign_in_required_error,
     log_mail_error,
@@ -658,7 +659,7 @@ class ReaderWindow(Adw.ApplicationWindow):
                     account_uid, folder_name, message_uid, attachment_index
                 )
             except Exception as exc:
-                log.exception("Failed to read attachment")
+                log_mail_error(log, "Failed to read attachment", exc)
                 error = exc
             GLib.idle_add(self._on_attachment_fetched, filename, data, error, on_ready)
 
@@ -682,7 +683,7 @@ class ReaderWindow(Adw.ApplicationWindow):
         mime_type: str | None = None,
     ) -> None:
         if error is not None:
-            show_error_toast(self, f"Could not open attachment: {error}")
+            show_error_toast(self, format_attachment_error(error))
             return
         if data is None:
             return
@@ -704,7 +705,7 @@ class ReaderWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> None:
         if error is not None:
-            show_error_toast(self, f"Could not save attachment: {error}")
+            show_error_toast(self, format_attachment_error(error))
             return
         if data is None:
             return
@@ -739,7 +740,7 @@ class ReaderWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> None:
         if error is not None:
-            show_error_toast(self, f"Could not open attachment: {error}")
+            show_error_toast(self, format_attachment_error(error))
             return
         if data is None:
             return

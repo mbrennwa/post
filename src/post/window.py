@@ -94,6 +94,7 @@ from post.mail.operation_queue import offline_queue_status_text
 from post.mail.send_delay import OutboundSendDelayScheduler
 from post.mail.network_errors import (
     MESSAGE_NOT_CACHED_SIGN_IN,
+    format_attachment_error,
     format_folder_load_error,
     format_message_read_error,
     is_network_unavailable_error,
@@ -1461,6 +1462,7 @@ class MainWindow(Adw.ApplicationWindow):
                 self._set_status(f"{label} · {folder_count} folders from cache")
             else:
                 self._set_status(format_account_refresh_done(label, folder_count))
+                self._flush_all_offline_queues_idle()
 
         self._sidebar.reload_account(account_uid, on_complete=on_complete)
 
@@ -3664,7 +3666,7 @@ class MainWindow(Adw.ApplicationWindow):
                     account_uid, folder_name, message_uid, attachment_index
                 )
             except Exception as exc:
-                log.exception("Failed to read attachment")
+                log_mail_error(log, "Failed to read attachment", exc)
                 error = exc
             GLib.idle_add(
                 self._on_attachment_fetched,
@@ -3694,7 +3696,7 @@ class MainWindow(Adw.ApplicationWindow):
         mime_type: str | None = None,
     ) -> None:
         if error is not None:
-            show_error_toast(self, f"Attachment error: {error}")
+            show_error_toast(self, format_attachment_error(error))
             return
         if data is None:
             show_error_toast(self, "Attachment error: no data")
@@ -3717,7 +3719,7 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> None:
         if error is not None:
-            show_error_toast(self, f"Attachment error: {error}")
+            show_error_toast(self, format_attachment_error(error))
             return
         if data is None:
             show_error_toast(self, "Attachment error: no data")
@@ -3763,7 +3765,7 @@ class MainWindow(Adw.ApplicationWindow):
         error: Exception | None,
     ) -> None:
         if error is not None:
-            show_error_toast(self, f"Attachment error: {error}")
+            show_error_toast(self, format_attachment_error(error))
             return
         if data is None:
             show_error_toast(self, "Attachment error: no data")
@@ -6770,6 +6772,26 @@ class MainWindow(Adw.ApplicationWindow):
             return f"Moved {moved_count} messages to {label}"
         return f"Moved message to {label}"
 
+    def _queued_sync_status(
+        self,
+        account_uid: str | None,
+        count: int,
+        *,
+        noun: str,
+    ) -> str:
+        after_sign_in = (
+            account_uid is not None
+            and self._mail.get_account_connect_health(account_uid) == "needs_sign_in"
+        )
+        when = "after you sign in" if after_sign_in else "when online"
+        if noun == "message":
+            if count == 1:
+                return f"Queued 1 message — will sync {when}"
+            return f"Queued {count} messages — will sync {when}"
+        if count == 1:
+            return f"Queued 1 action — will sync {when}"
+        return f"Queued {count} actions — will sync {when}"
+
     def _finalize_move_status_and_undo(
         self,
         account_uid: str,
@@ -6786,12 +6808,13 @@ class MainWindow(Adw.ApplicationWindow):
 
         if result.get("queued"):
             self._clear_move_undo()
-            if moved_count == 1:
-                self._set_status("Queued 1 message — will sync when online")
-            else:
-                self._set_status(
-                    f"Queued {moved_count} messages — will sync when online"
+            self._set_status(
+                self._queued_sync_status(
+                    account_uid,
+                    moved_count,
+                    noun="message",
                 )
+            )
             self._refresh_status_display()
             return
 
@@ -7010,10 +7033,24 @@ class MainWindow(Adw.ApplicationWindow):
 
         count = len(updates_by_list_key)
         if queued:
-            if count == 1:
-                self._set_status("Queued 1 action — will sync when online")
-            elif count > 1:
-                self._set_status(f"Queued {count} actions — will sync when online")
+            account_uid = None
+            if folder_count_updates:
+                account_uid = folder_count_updates[0][0]
+            elif updates_by_list_key:
+                location = self._message_location_for_list_key(
+                    next(iter(updates_by_list_key))
+                )
+                if location is not None:
+                    account_uid = location[0]
+            if account_uid is None and self._current_account is not None:
+                account_uid = self._current_account.uid
+            self._set_status(
+                self._queued_sync_status(
+                    account_uid,
+                    count,
+                    noun="action",
+                )
+            )
             self._refresh_status_display()
             self._update_message_toolbar()
             return

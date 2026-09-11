@@ -147,6 +147,21 @@ def format_message_read_error(
     return "Could not read this message."
 
 
+def format_attachment_error(exc: BaseException) -> str:
+    """User-facing attachment failure text (never raw GLib/GOA dumps)."""
+    user_message = getattr(exc, "user_message", None)
+    if callable(user_message):
+        try:
+            text = user_message()
+        except Exception:
+            text = None
+        if text:
+            return str(text)
+    if is_sign_in_required_error(exc):
+        return format_message_read_error(exc, cached=False)
+    return f"Attachment error: {exc}"
+
+
 def format_folder_load_error(exc: BaseException) -> str:
     """User-facing folder-list failure text (never raw GLib/Camel dumps)."""
     if is_network_unavailable_error(exc):

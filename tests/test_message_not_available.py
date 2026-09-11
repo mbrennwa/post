@@ -400,10 +400,10 @@ class ReadMessageUnavailableTests(unittest.TestCase):
             MessageUnavailableReason.NOT_CACHED_OFFLINE,
         )
 
-    @patch("post.mail.eds.MailService._get_store_unlocked")
+    @patch("post.mail.eds.MailService._open_folder_unlocked")
     def test_read_attachment_raises_when_message_missing(
         self,
-        get_store_mock: MagicMock,
+        open_folder_mock: MagicMock,
     ) -> None:
         service = MailService(registry=MagicMock())
         service._network_available = True
@@ -411,9 +411,7 @@ class ReadMessageUnavailableTests(unittest.TestCase):
         folder.get_message_sync.return_value = None
         folder.get_message_cached.return_value = None
         folder.get_message_info.return_value = None
-        store = MagicMock()
-        store.get_folder_sync.return_value = folder
-        get_store_mock.return_value = store
+        open_folder_mock.return_value = folder
 
         with self.assertRaises(MessageNotAvailableError) as ctx:
             service._read_attachment_data_unlocked(
@@ -501,6 +499,79 @@ class GoaDeadCacheReadTests(unittest.TestCase):
 
         self.assertIs(mime, cached)
         self.assertEqual(service.get_account_connect_health("account"), "needs_sign_in")
+
+    def test_airplane_cache_miss_is_offline_not_sign_in(self) -> None:
+        service = MailService(registry=MagicMock())
+        service._network_available = False
+        folder = MagicMock()
+        folder.get_message_cached.return_value = None
+
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._get_message_mime_sync(
+                folder,
+                "account",
+                "INBOX",
+                "42",
+                allow_network=False,
+            )
+
+        self.assertEqual(
+            ctx.exception.reason,
+            MessageUnavailableReason.NOT_CACHED_OFFLINE,
+        )
+        self.assertNotEqual(
+            service.get_account_connect_health("account"), "needs_sign_in"
+        )
+
+    @patch("post.mail.helpers.get_attachment_data", return_value=("file.pdf", b"%PDF"))
+    @patch("post.mail.eds.MailService._get_message_mime_sync")
+    @patch("post.mail.eds.MailService._open_folder_unlocked")
+    def test_attachment_cache_when_goa_dead(
+        self,
+        open_folder_mock: MagicMock,
+        get_mime_mock: MagicMock,
+        _get_data_mock: MagicMock,
+    ) -> None:
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        service.set_account_connect_health("acct-1", "needs_sign_in")
+        folder = MagicMock()
+        open_folder_mock.return_value = folder
+        get_mime_mock.return_value = MagicMock()
+
+        filename, data = service._read_attachment_data_unlocked(
+            "acct-1", "INBOX", "42", 0
+        )
+
+        self.assertEqual((filename, data), ("file.pdf", b"%PDF"))
+        self.assertFalse(open_folder_mock.call_args.kwargs.get("allow_online", True))
+        self.assertFalse(get_mime_mock.call_args.kwargs.get("allow_network", True))
+
+    @patch("post.mail.eds.MailService._get_message_mime_sync")
+    @patch("post.mail.eds.MailService._open_folder_unlocked")
+    def test_attachment_miss_when_goa_dead_raises_sign_in(
+        self,
+        open_folder_mock: MagicMock,
+        get_mime_mock: MagicMock,
+    ) -> None:
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        service.set_account_connect_health("acct-1", "needs_sign_in")
+        open_folder_mock.return_value = MagicMock()
+        get_mime_mock.side_effect = MessageNotAvailableError(
+            "42",
+            "INBOX",
+            reason=MessageUnavailableReason.NOT_CACHED_SIGN_IN,
+        )
+
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._read_attachment_data_unlocked("acct-1", "INBOX", "42", 0)
+
+        self.assertEqual(
+            ctx.exception.reason,
+            MessageUnavailableReason.NOT_CACHED_SIGN_IN,
+        )
+        self.assertFalse(open_folder_mock.call_args.kwargs.get("allow_online", True))
 
 
 if __name__ == "__main__":

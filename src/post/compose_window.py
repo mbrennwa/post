@@ -77,6 +77,10 @@ from post.mail.correspondents import (
 )
 from post.mail.eds import MailAccount
 from post.mail.io_thread import get_mail_io_thread
+from post.mail.network_errors import (
+    format_attachment_error,
+    log_mail_error,
+)
 from post.mail.send_errors import (
     SendQueued,
     is_compose_validation_error,
@@ -855,6 +859,7 @@ class ComposeWindow(Adw.Window):
 
         def worker() -> None:
             loaded: list[ComposeAttachment] = []
+            error: Exception | None = None
             for meta in attachments_meta:
                 attachment_index = meta.get("index")
                 if attachment_index is None:
@@ -867,12 +872,13 @@ class ComposeWindow(Adw.Window):
                         int(attachment_index),
                     )
                 except Exception as exc:
-                    log.warning(
-                        "Could not load draft attachment %s: %s",
-                        attachment_index,
+                    log_mail_error(
+                        log,
+                        f"Could not load draft attachment {attachment_index}",
                         exc,
                     )
-                    continue
+                    error = exc
+                    break
                 mime_type = str(
                     meta.get("mime_type")
                     or guess_attachment_mime_type(filename, data)
@@ -884,6 +890,9 @@ class ComposeWindow(Adw.Window):
                         data=data,
                     )
                 )
+            if error is not None:
+                message = format_attachment_error(error)
+                GLib.idle_add(lambda: show_error_toast(self, message))
             GLib.idle_add(self._on_draft_attachments_loaded, loaded)
 
         get_mail_io_thread().submit(worker)
@@ -910,13 +919,10 @@ class ComposeWindow(Adw.Window):
                     message_uid,
                 )
             except Exception as exc:
-                log.warning(
-                    "Could not load forward attachments for %s/%s: %s",
-                    folder_name,
-                    message_uid,
-                    exc,
-                )
+                log_mail_error(log, "Could not load forward attachments", exc)
                 loaded = []
+                message = format_attachment_error(exc)
+                GLib.idle_add(lambda: show_error_toast(self, message))
             GLib.idle_add(self._on_draft_attachments_loaded, loaded)
 
         get_mail_io_thread().submit(worker)
