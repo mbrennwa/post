@@ -37,6 +37,7 @@ from post.mail.compose import (
     quote_plain_forward,
     quote_plain_reply,
     compose_html_quote_prefill,
+    reflow_editor_html_quote_for_shell,
     html_text_newlines_to_br,
     prepare_editor_html_for_send,
     read_compose_attachments_from_message,
@@ -1649,6 +1650,128 @@ class HtmlForwardReplyTests(unittest.TestCase):
         self.assertIn("color:#000000;background:#ffffff", quoted)
         self.assertIn("color:red", quoted)
 
+    def test_quote_html_reply_adapt_shell_dissolves_white_card(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "date_received": "2026-08-26",
+        }
+        source = '<div style="color:#222222;background:#ffffff">Der Morgen</div>'
+        quoted = quote_html_reply(
+            original, source, adapt_shell=True, shell_dark=True
+        )
+        self.assertIn("Der Morgen", quoted)
+        compact = quoted.replace(" ", "").lower()
+        self.assertIn("background-color:transparent!important", compact)
+        self.assertNotIn("background:#ffffff", compact)
+
+    def test_quote_html_reply_adapt_shell_keeps_stylesheet_black_island(self) -> None:
+        """Adapt text must see sender ``<style>`` maps, as the reader does."""
+        original = {
+            "from": "News <news@example.com>",
+            "date_received": "2026-09-11",
+        }
+        source = (
+            "<html><head><style>"
+            ".hero { background:#000000; color:#ffffff; }"
+            "</style></head>"
+            '<body><div class="hero">Der Morgen</div></body></html>'
+        )
+        quoted = quote_html_reply(
+            original, source, adapt_shell=True, shell_dark=True
+        )
+        self.assertIn("Der Morgen", quoted)
+        compact = quoted.replace(" ", "").lower()
+        self.assertIn("background-color:#000000!important", compact)
+        self.assertIn('class="message-body"', quoted)
+        self.assertNotIn("<style", compact)
+
+    def test_quote_html_reply_adapt_shell_keeps_body_black_canvas(self) -> None:
+        """Same ``adapt_html_for_shell`` wrap as the reader, including nested body."""
+        original = {
+            "from": "News <news@example.com>",
+            "date_received": "2026-09-11",
+        }
+        source = (
+            "<html><head><style>body{background:#000000;color:#ffffff}</style></head>"
+            "<body><p>Der Morgen</p></body></html>"
+        )
+        quoted = quote_html_reply(
+            original, source, adapt_shell=True, shell_dark=True
+        )
+        from post.reader.html import adapt_html_for_shell, build_reader_document
+
+        adapted = adapt_html_for_shell(source, shell_background="#1e1e1e")
+        self.assertIn(adapted, quoted)
+        reader = build_reader_document(
+            body_html=source,
+            body_plain=None,
+            allow_remote=False,
+            dark=True,
+            message_appearance="adapt_text",
+        )
+        self.assertIn(adapted, reader)
+        compact = quoted.replace(" ", "").lower()
+        self.assertIn("background-color:#000000!important", compact)
+        self.assertIn("<body", compact)
+
+    def test_quote_html_reply_adapt_shell_light_dissolves_black_body(self) -> None:
+        original = {
+            "from": "News <news@example.com>",
+            "date_received": "2026-09-11",
+        }
+        source = (
+            "<html><head><style>body{background:#000000;color:#ffffff}</style></head>"
+            "<body><p>Der Morgen</p></body></html>"
+        )
+        quoted = quote_html_reply(
+            original, source, adapt_shell=True, shell_dark=False
+        )
+        from post.reader.html import adapt_html_for_shell, build_reader_document
+
+        adapted = adapt_html_for_shell(source, shell_background="#ffffff")
+        self.assertIn(adapted, quoted)
+        reader = build_reader_document(
+            body_html=source,
+            body_plain=None,
+            allow_remote=False,
+            dark=False,
+            message_appearance="adapt_text",
+        )
+        self.assertIn(adapted, reader)
+        compact = quoted.replace(" ", "").lower()
+        self.assertIn("background-color:#ffffff!important", compact)
+        self.assertNotIn("background-color:#000000!important", compact)
+
+    def test_reflow_editor_html_quote_for_shell_dark_to_light(self) -> None:
+        original = {
+            "from": "News <news@example.com>",
+            "date_received": "2026-09-11",
+        }
+        source = (
+            "<html><head><style>body{background:#000000;color:#ffffff}</style></head>"
+            "<body><p>Der Morgen</p></body></html>"
+        )
+        quoted_plain = quote_plain_reply(original, "Der Morgen")
+        editor = (
+            "<div>My reply</div>"
+            + quote_html_reply(
+                original, source, adapt_shell=True, shell_dark=True
+            )
+        )
+        reflowed = reflow_editor_html_quote_for_shell(
+            editor,
+            mode="reply",
+            reply_to=original,
+            quoted_html_source=source,
+            quoted_plain_expected=quoted_plain,
+            dark=False,
+            message_appearance="adapt_text",
+        )
+        self.assertIn("My reply", reflowed)
+        compact = reflowed.replace(" ", "").lower()
+        self.assertIn("background-color:#ffffff!important", compact)
+        self.assertNotIn("background-color:#000000!important", compact)
+
     def test_quote_html_forward_omits_bcc_from_header(self) -> None:
         original = {
             "from": "Alice <alice@example.com>",
@@ -1910,6 +2033,26 @@ class HtmlForwardReplyTests(unittest.TestCase):
         self.assertIn("<b>hallo</b>", html)
         self.assertIn('class="post_quote"', html)
         self.assertIn("<div><br></div>", html)
+
+    def test_compose_html_quote_prefill_adapt_text_matches_reader_shell(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "date_received": "2026-08-24 11:40:05",
+        }
+        html = compose_html_quote_prefill(
+            mode="reply",
+            reply_to=original,
+            quoted_html_source=(
+                '<div style="color:#222222;background:#ffffff">Der Morgen</div>'
+            ),
+            signature=None,
+            dark=True,
+            message_appearance="adapt_text",
+        )
+        compact = html.replace(" ", "").lower()
+        self.assertIn('class="message-body"', html)
+        self.assertIn("background-color:transparent!important", compact)
+        self.assertNotIn("background:#ffffff", compact)
 
     def test_split_editor_html_at_quote_uses_first_line(self) -> None:
         quoted = quote_plain_forward(

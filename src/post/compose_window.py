@@ -61,6 +61,7 @@ from post.mail.compose import (
     is_signature_only_compose_body,
     quote_plain_forward,
     quote_plain_reply,
+    reflow_editor_html_quote_for_shell,
     html_body_fragment,
     split_compose_body_at_quote,
     split_editor_html_at_quote,
@@ -98,6 +99,7 @@ from post.preferences import (
     format_send_delay_status,
     get_account_signature,
     get_account_signatures,
+    get_message_appearance,
     get_send_delay_seconds,
 )
 from post.toast import show_error_toast, show_toast
@@ -672,6 +674,9 @@ class ComposeWindow(Adw.Window):
         self._body_view.set_vexpand(True)
         self._body_view.connect_changed(self._on_body_buffer_changed)
         self._body_view.connect_link_request(self._on_link_request)
+        self._body_view.connect_html_for_color_scheme(
+            self._html_for_color_scheme
+        )
         body_focus = Gtk.EventControllerFocus()
         body_focus.connect("enter", self._on_body_focus_in)
         self._body_view.web_view.add_controller(body_focus)
@@ -1218,6 +1223,17 @@ class ComposeWindow(Adw.Window):
         self._body_view.set_html_fragment(fragment)
         self._tracking_edits = True
 
+    def _html_for_color_scheme(self, editor_html: str, dark: bool) -> str:
+        return reflow_editor_html_quote_for_shell(
+            editor_html,
+            mode=self._mode,
+            reply_to=self._reply_to,
+            quoted_html_source=self._quoted_html_source,
+            quoted_plain_expected=self._quoted_plain_expected,
+            dark=dark,
+            message_appearance=get_message_appearance(),
+        )
+
     def _set_body_from_stored(self, plain: str, stored_html: str | None) -> None:
         if stored_body_needs_rich_editor(stored_html, plain):
             self._set_body_html_fragment(html_body_fragment(stored_html or ""))
@@ -1526,6 +1542,8 @@ class ComposeWindow(Adw.Window):
                     reply_to=self._reply_to,
                     quoted_html_source=self._quoted_html_source,
                     signature=signature,
+                    dark=Adw.StyleManager.get_default().get_dark(),
+                    message_appearance=get_message_appearance(),
                 )
                 self._set_body_html_fragment(fragment)
             else:
@@ -1552,6 +1570,8 @@ class ComposeWindow(Adw.Window):
                     reply_to=self._reply_to,
                     quoted_html_source=self._quoted_html_source,
                     signature=signature,
+                    dark=Adw.StyleManager.get_default().get_dark(),
+                    message_appearance=get_message_appearance(),
                 )
                 self._set_body_html_fragment(fragment)
             else:
@@ -1808,8 +1828,6 @@ class ComposeWindow(Adw.Window):
         editor_html = self._body_view.get_html()
         prepared = prepare_editor_html_for_send(editor_html)
         if self._mode in ("reply", "reply-all", "forward"):
-            if "post_quote" in (editor_html or ""):
-                return prepared or None
             user_html: str | None = None
             quoted_html_source = self._quoted_html_source
             _user_plain, quoted_plain = split_compose_body_at_quote(
@@ -1818,23 +1836,22 @@ class ComposeWindow(Adw.Window):
             if (
                 quoted_plain.strip()
                 and quoted_plain == self._quoted_plain_expected
+                and quoted_html_source
             ):
                 user_html, quote_in_editor = split_editor_html_at_quote(
                     editor_html, quoted_plain
                 )
-                if quote_in_editor is None:
-                    return prepared or None
-                user_html = prepare_editor_html_for_send(user_html)
-            else:
-                return prepared or None
-            return build_outbound_html_for_compose(
-                body_plain=body_plain,
-                mode=self._mode,
-                reply_to=self._reply_to,
-                quoted_html_source=quoted_html_source,
-                quoted_plain_expected=self._quoted_plain_expected,
-                user_html=user_html,
-            )
+                if quote_in_editor is not None:
+                    user_html = prepare_editor_html_for_send(user_html)
+                    return build_outbound_html_for_compose(
+                        body_plain=body_plain,
+                        mode=self._mode,
+                        reply_to=self._reply_to,
+                        quoted_html_source=quoted_html_source,
+                        quoted_plain_expected=self._quoted_plain_expected,
+                        user_html=user_html,
+                    )
+            return prepared or None
         if self._mode in ("draft", "send-again", "outbox"):
             if (
                 body_plain == self._draft_body_plain_snapshot
