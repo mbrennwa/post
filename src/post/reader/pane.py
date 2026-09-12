@@ -14,11 +14,13 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("WebKit", "6.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gio", "2.0")
+gi.require_version("GLib", "2.0")
 gi.require_version("Graphene", "1.0")
 
-from gi.repository import Gdk, Gio, Graphene, Gtk, WebKit
+from gi.repository import Gdk, Gio, GLib, Graphene, Gtk, WebKit
 
 from post.attachment_menu import ensure_popover_parent
+from post.attachment_open import open_attachment
 from post.mail.helpers import (
     ReaderHeaderRow,
     bare_email_from_address,
@@ -34,6 +36,17 @@ from post.preferences import (
     get_message_appearance,
 )
 from post.reader.html import build_reader_document
+from post.reader.image_menu import (
+    clipboard_png_bytes,
+    decode_data_url,
+    guess_image_filename,
+    is_embedded_image_uri,
+    is_http_link_uri,
+    is_remote_image_uri,
+    prepend_image_context_menu_items,
+    strip_reader_image_stock_actions,
+)
+from post.toast import show_error_toast
 from post.wrap_label import (
     EllipsizingLabel,
     WrappingLabel,
@@ -279,6 +292,11 @@ class MessageReaderPane(Gtk.Box):
         self._message_appearance: MessageAppearance = get_message_appearance()
         self._dark = False
         self._context_address: str | None = None
+        self._context_image_uri: str | None = None
+        self._context_link_uri: str | None = None
+        self._image_clipboard_text = ""
+        self._image_clipboard_keep: list[Any] = []
+        self._pending_image_ready: Callable[[str, bytes], None] | None = None
 
         self._reader_subject = WrappingLabel(
             label="",
@@ -489,12 +507,38 @@ class MessageReaderPane(Gtk.Box):
         copy_invite_action = Gio.SimpleAction.new("copy-invite", None)
         copy_invite_action.connect("activate", self._on_copy_invite_activate)
         group.add_action(copy_invite_action)
+        open_picture_action = Gio.SimpleAction.new("image-open", None)
+        open_picture_action.connect("activate", self._on_image_open_activate)
+        group.add_action(open_picture_action)
+        save_picture_action = Gio.SimpleAction.new("image-save", None)
+        save_picture_action.connect("activate", self._on_image_save_activate)
+        group.add_action(save_picture_action)
+        copy_picture_action = Gio.SimpleAction.new("image-copy", None)
+        copy_picture_action.connect("activate", self._on_image_copy_activate)
+        group.add_action(copy_picture_action)
+        copy_image_address_action = Gio.SimpleAction.new("image-copy-address", None)
+        copy_image_address_action.connect(
+            "activate", self._on_image_copy_address_activate
+        )
+        group.add_action(copy_image_address_action)
+        open_link_action = Gio.SimpleAction.new("image-open-link", None)
+        open_link_action.connect("activate", self._on_image_open_link_activate)
+        group.add_action(open_link_action)
+        copy_link_action = Gio.SimpleAction.new("image-copy-link", None)
+        copy_link_action.connect("activate", self._on_image_copy_link_activate)
+        group.add_action(copy_link_action)
         self.insert_action_group("reader", group)
         self._reader_action_group = group
         self._address_new_action = new_action
         self._address_search_action = search_action
         self._address_copy_action = copy_action
         self._copy_invite_action = copy_invite_action
+        self._image_open_action = open_picture_action
+        self._image_save_action = save_picture_action
+        self._image_copy_action = copy_picture_action
+        self._image_copy_address_action = copy_image_address_action
+        self._image_open_link_action = open_link_action
+        self._image_copy_link_action = copy_link_action
         self._address_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
         self._invite_clipboard_text = ""
         # Popovers are not always in the action widget tree; expose the group
@@ -901,6 +945,154 @@ class MessageReaderPane(Gtk.Box):
             return
         self.get_clipboard().set(email)
 
+    def _parent_window(self) -> Gtk.Window | None:
+        root = self.get_root()
+        return root if isinstance(root, Gtk.Window) else None
+
+    def _image_error(self, message: str) -> None:
+        parent = self._parent_window()
+        if parent is None:
+            return
+        show_error_toast(parent, message)
+
+    def _load_context_image_bytes(
+        self, on_ready: Callable[[str, bytes], None]
+    ) -> None:
+        uri = (self._context_image_uri or "").strip()
+        if not uri:
+            return
+        decoded = decode_data_url(uri)
+        if decoded is not None:
+            on_ready(*decoded)
+            return
+        if not is_remote_image_uri(uri):
+            self._image_error("Could not open picture")
+            return
+        self._pending_image_ready = on_ready
+        Gio.File.new_for_uri(uri).load_contents_async(
+            None, self._on_remote_image_loaded
+        )
+
+    def _on_remote_image_loaded(
+        self, file: Gio.File, result: Gio.AsyncResult
+    ) -> None:
+        on_ready = self._pending_image_ready
+        self._pending_image_ready = None
+        if on_ready is None:
+            return
+        try:
+            ok, contents, _etag = file.load_contents_finish(result)
+        except GLib.Error as exc:
+            self._image_error(f"Could not download picture: {exc.message}")
+            return
+        data = bytes(contents or b"")
+        if not ok or not data:
+            self._image_error("Could not download picture")
+            return
+        basename = file.get_basename() or ""
+        guessed, _certain = Gio.content_type_guess(basename, data)
+        mime = guessed or "application/octet-stream"
+        on_ready(mime, data)
+
+    def _on_image_open_activate(self, *_args) -> None:
+        self._load_context_image_bytes(self._open_image_bytes)
+
+    def _on_image_save_activate(self, *_args) -> None:
+        self._load_context_image_bytes(self._save_image_bytes)
+
+    def _on_image_copy_activate(self, *_args) -> None:
+        self._load_context_image_bytes(self._copy_image_bytes)
+
+    def _on_image_copy_address_activate(self, *_args) -> None:
+        uri = (self._context_image_uri or "").strip()
+        if not uri:
+            return
+        self._image_clipboard_text = uri
+        self.get_clipboard().set(self._image_clipboard_text)
+
+    def _on_image_open_link_activate(self, *_args) -> None:
+        uri = (self._context_link_uri or "").strip()
+        if not uri:
+            return
+        self._on_open_uri(uri)
+
+    def _on_image_copy_link_activate(self, *_args) -> None:
+        uri = (self._context_link_uri or "").strip()
+        if not uri:
+            return
+        self._image_clipboard_text = uri
+        self.get_clipboard().set(self._image_clipboard_text)
+
+    def _open_image_bytes(self, mime_type: str, data: bytes) -> None:
+        parent = self._parent_window()
+        if parent is None:
+            return
+        open_attachment(
+            parent,
+            filename=guess_image_filename(mime_type),
+            data=data,
+            mime_type=mime_type,
+        )
+
+    def _save_image_bytes(self, mime_type: str, data: bytes) -> None:
+        parent = self._parent_window()
+        if parent is None:
+            return
+        filename = guess_image_filename(mime_type)
+        dialog = Gtk.FileDialog(title="Save Picture")
+        dialog.set_initial_name(filename)
+        dialog.save(parent, None, self._on_image_save_finished, (filename, data))
+
+    def _on_image_save_finished(
+        self,
+        dialog: Gtk.FileDialog,
+        result: Gio.AsyncResult,
+        user_data: tuple[str, bytes],
+    ) -> None:
+        _filename, data = user_data
+        try:
+            dest = dialog.save_finish(result)
+        except GLib.Error as exc:
+            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                return
+            self._image_error(f"Save error: {exc.message}")
+            return
+        path = dest.get_path() if dest is not None else None
+        if path is None:
+            self._image_error("Save error: no path")
+            return
+        try:
+            with open(path, "wb") as handle:
+                handle.write(data)
+        except OSError as exc:
+            self._image_error(f"Save error: {exc}")
+
+    def _copy_image_bytes(self, mime_type: str, data: bytes) -> None:
+        png = clipboard_png_bytes(data)
+        if png is None:
+            self._image_error("Could not copy picture")
+            return
+        png_gbytes = GLib.Bytes.new(png)
+        providers = [Gdk.ContentProvider.new_for_bytes("image/png", png_gbytes)]
+        keep: list[Any] = [png, png_gbytes, providers[0]]
+        mime = (mime_type or "").split(";", 1)[0].strip().lower()
+        if mime == "image/jpg":
+            mime = "image/jpeg"
+        if mime in {"image/jpeg", "image/gif", "image/bmp", "image/webp"} and data:
+            orig = GLib.Bytes.new(data)
+            extra = Gdk.ContentProvider.new_for_bytes(mime, orig)
+            providers.append(extra)
+            keep.extend((data, orig, extra))
+        provider = (
+            Gdk.ContentProvider.new_union(providers)
+            if len(providers) > 1
+            else providers[0]
+        )
+        keep.append(provider)
+        self._image_clipboard_keep = keep
+        if not self.get_clipboard().set_content(provider):
+            self._image_error("Could not copy picture")
+
     def show_loading(self) -> None:
         self._current_message = None
         self._current_body = {"plain": None, "html": None}
@@ -1205,10 +1397,25 @@ class MessageReaderPane(Gtk.Box):
         hit_test_result: WebKit.HitTestResult,
     ) -> bool:
         strip_reader_context_menu(context_menu)
-        email = ""
+        is_image = (
+            hit_test_result is not None and hit_test_result.context_is_image() is True
+        )
+        image_uri = ""
+        if is_image:
+            raw_image = hit_test_result.get_image_uri()
+            if isinstance(raw_image, str):
+                image_uri = raw_image.strip()
+        self._context_image_uri = image_uri or None
+        link_uri = ""
         if hit_test_result is not None and hit_test_result.context_is_link():
-            uri = hit_test_result.get_link_uri() or ""
-            email = mailto_primary_email(uri)
+            raw_link = hit_test_result.get_link_uri()
+            if isinstance(raw_link, str):
+                link_uri = raw_link.strip()
+        self._context_link_uri = link_uri or None
+        if is_image:
+            strip_reader_image_stock_actions(context_menu, strip_link=True)
+            strip_reader_context_menu(context_menu)
+        email = mailto_primary_email(link_uri) if link_uri else ""
         if email:
             self._context_address = email
             self._sync_address_search_action()
@@ -1218,6 +1425,20 @@ class MessageReaderPane(Gtk.Box):
                 search_from_action=self._address_search_action,
                 copy_address_action=self._address_copy_action,
                 email=email,
+            )
+        if image_uri and (
+            is_embedded_image_uri(image_uri) or is_remote_image_uri(image_uri)
+        ):
+            prepend_image_context_menu_items(
+                context_menu,
+                embedded=is_embedded_image_uri(image_uri),
+                http_link=is_http_link_uri(link_uri),
+                open_picture_action=self._image_open_action,
+                save_picture_action=self._image_save_action,
+                copy_picture_action=self._image_copy_action,
+                copy_address_action=self._image_copy_address_action,
+                open_link_action=self._image_open_link_action,
+                copy_link_action=self._image_copy_link_action,
             )
         return False
 

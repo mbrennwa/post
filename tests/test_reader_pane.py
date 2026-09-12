@@ -16,6 +16,14 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Gio, Gtk, WebKit
 
 from post.preferences import MESSAGE_APPEARANCE_ADAPT_TEXT
+from post.reader.image_menu import (
+    LABEL_COPY_ADDRESS,
+    LABEL_COPY_LINK_ADDRESS,
+    LABEL_COPY_PICTURE,
+    LABEL_OPEN_LINK,
+    LABEL_OPEN_PICTURE,
+    LABEL_SAVE_PICTURE,
+)
 from post.reader.pane import (
     MessageReaderPane,
     apply_reader_link_hover,
@@ -484,6 +492,95 @@ class MessageReaderPaneTests(unittest.TestCase):
                 "Copy address",
                 "SEP",
                 int(WebKit.ContextMenuAction.COPY),
+            ],
+        )
+
+    def test_web_view_context_menu_embedded_image(self) -> None:
+        menu = WebKit.ContextMenu.new()
+        menu.append(
+            WebKit.ContextMenuItem.new_from_stock_action(
+                WebKit.ContextMenuAction.OPEN_IMAGE_IN_NEW_WINDOW
+            )
+        )
+        menu.append(
+            WebKit.ContextMenuItem.new_from_stock_action(
+                WebKit.ContextMenuAction.COPY_IMAGE_TO_CLIPBOARD
+            )
+        )
+        hit = MagicMock()
+        hit.context_is_image.return_value = True
+        hit.context_is_link.return_value = False
+        hit.get_image_uri.return_value = "data:image/png;base64,aaaa"
+        hit.get_link_uri.return_value = ""
+        handled = self.pane._on_web_view_context_menu(
+            self.pane._web_view, menu, hit
+        )
+        self.assertFalse(handled)
+        self.assertEqual(self.pane._context_image_uri, "data:image/png;base64,aaaa")
+        self.assertEqual(
+            _menu_actions(menu),
+            [LABEL_OPEN_PICTURE, LABEL_SAVE_PICTURE, LABEL_COPY_PICTURE],
+        )
+
+    def test_web_view_context_menu_remote_image(self) -> None:
+        menu = WebKit.ContextMenu.new()
+        hit = MagicMock()
+        hit.context_is_image.return_value = True
+        hit.context_is_link.return_value = False
+        hit.get_image_uri.return_value = "https://cdn.example/logo.png"
+        hit.get_link_uri.return_value = ""
+        self.pane._on_web_view_context_menu(self.pane._web_view, menu, hit)
+        self.assertEqual(
+            _menu_actions(menu),
+            [LABEL_OPEN_PICTURE, LABEL_SAVE_PICTURE, LABEL_COPY_ADDRESS],
+        )
+        self.assertNotIn(LABEL_COPY_PICTURE, _menu_actions(menu))
+
+    def test_web_view_context_menu_linked_image(self) -> None:
+        menu = WebKit.ContextMenu.new()
+        menu.append(
+            WebKit.ContextMenuItem.new_from_stock_action(
+                WebKit.ContextMenuAction.OPEN_LINK
+            )
+        )
+        hit = MagicMock()
+        hit.context_is_image.return_value = True
+        hit.context_is_link.return_value = True
+        hit.get_image_uri.return_value = "data:image/png;base64,aaaa"
+        hit.get_link_uri.return_value = "https://shop.example/campaign"
+        self.pane._on_web_view_context_menu(self.pane._web_view, menu, hit)
+        self.assertEqual(self.pane._context_link_uri, "https://shop.example/campaign")
+        self.assertEqual(
+            _menu_actions(menu),
+            [
+                LABEL_OPEN_PICTURE,
+                LABEL_SAVE_PICTURE,
+                LABEL_COPY_PICTURE,
+                "SEP",
+                LABEL_OPEN_LINK,
+                LABEL_COPY_LINK_ADDRESS,
+            ],
+        )
+
+    def test_web_view_context_menu_mailto_wrapped_image(self) -> None:
+        menu = WebKit.ContextMenu.new()
+        hit = MagicMock()
+        hit.context_is_image.return_value = True
+        hit.context_is_link.return_value = True
+        hit.get_image_uri.return_value = "data:image/png;base64,aaaa"
+        hit.get_link_uri.return_value = "mailto:sender@example.com"
+        self.pane._on_web_view_context_menu(self.pane._web_view, menu, hit)
+        self.assertEqual(self.pane._context_address, "sender@example.com")
+        self.assertEqual(
+            _menu_actions(menu),
+            [
+                LABEL_OPEN_PICTURE,
+                LABEL_SAVE_PICTURE,
+                LABEL_COPY_PICTURE,
+                "SEP",
+                "New Message to sender@example.com…",
+                "Search Messages from sender@example.com",
+                "Copy address",
             ],
         )
 
