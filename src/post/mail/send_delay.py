@@ -18,10 +18,20 @@ from gi.repository import GLib
 from .io_thread import get_mail_io_thread
 from .send_queue import (
     clear_outbound_send_delay,
+    clear_outbound_send_error,
+    is_outbound_parked,
     is_outbound_ready_to_send,
     list_queued_outbound_messages,
     load_queued_outbound_message,
+    park_outbound_message,
 )
+from .send_errors import (
+    SendQueued,
+    format_outbox_failure_toast,
+    is_permanent_send_error,
+    user_send_error_message,
+)
+from .network_errors import is_sign_in_required_error
 
 if TYPE_CHECKING:
     from .eds import MailService
@@ -37,15 +47,19 @@ class OutboundSendDelayScheduler:
         mail: MailService,
         *,
         on_outbox_changed: Callable[[], None] | None = None,
+        on_send_error: Callable[[str], None] | None = None,
     ) -> None:
         self._mail = mail
         self._on_outbox_changed = on_outbox_changed
+        self._on_send_error = on_send_error
         self._timer_ids: dict[str, int] = {}
 
     def reschedule_all(self) -> None:
         self.cancel_all()
         now = time.time()
         for queue_id, message in list_queued_outbound_messages():
+            if is_outbound_parked(message):
+                continue
             if message.send_after is None or message.send_after <= now:
                 continue
             self.schedule_item(queue_id, message.send_after)
@@ -83,6 +97,9 @@ class OutboundSendDelayScheduler:
     def _send_now_worker(self, queue_id: str) -> None:
         try:
             clear_outbound_send_delay(queue_id)
+            clear_outbound_send_error(queue_id)
+        except FileNotFoundError:
+            return
         except Exception:
             log.exception("Could not clear send delay for outbox item %s", queue_id)
             return
@@ -91,6 +108,8 @@ class OutboundSendDelayScheduler:
     def _deliver_worker(self, queue_id: str) -> None:
         try:
             message = load_queued_outbound_message(queue_id)
+            if is_outbound_parked(message):
+                return
             if not is_outbound_ready_to_send(message):
                 if message.send_after is not None:
                     GLib.idle_add(self.schedule_item, queue_id, message.send_after)
@@ -100,10 +119,57 @@ class OutboundSendDelayScheduler:
                 self._mail.deliver_outbound_queue_item(queue_id)
             finally:
                 self._mail.end_outbound_send()
-        except Exception:
-            log.exception("Delayed send failed for outbox item %s", queue_id)
+        except FileNotFoundError:
+            pass
+        except SendQueued:
+            log.debug("Delayed send deferred for outbox item %s", queue_id)
+        except Exception as exc:
+            if is_sign_in_required_error(exc):
+                log.warning(
+                    "Delayed send failed for outbox item %s: sign-in required",
+                    queue_id,
+                )
+                try:
+                    queued = load_queued_outbound_message(queue_id)
+                except FileNotFoundError:
+                    queued = None
+                if queued is not None:
+                    self._mail.set_account_connect_health(
+                        queued.account_uid, "needs_sign_in"
+                    )
+            elif is_permanent_send_error(exc):
+                reason = user_send_error_message(exc)
+                try:
+                    park_outbound_message(queue_id, reason)
+                except FileNotFoundError:
+                    pass
+                else:
+                    log.warning(
+                        "Delayed send failed for outbox item %s: %s",
+                        queue_id,
+                        reason,
+                    )
+                    self._notify_send_error_idle(
+                        format_outbox_failure_toast(
+                            reason,
+                            subject=message.subject,
+                            to=message.to,
+                        )
+                    )
+            else:
+                log.exception("Delayed send failed for outbox item %s", queue_id)
         if self._on_outbox_changed is not None:
             GLib.idle_add(self._notify_outbox_changed)
+
+    def _notify_send_error_idle(self, message: str) -> None:
+        if self._on_send_error is None:
+            return
+        GLib.idle_add(self._notify_send_error, message)
+
+    def _notify_send_error(self, message: str) -> bool:
+        if self._on_send_error is not None:
+            self._on_send_error(message)
+        return False
 
     def _notify_outbox_changed(self) -> bool:
         if self._on_outbox_changed is not None:

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 
 import gi
 
@@ -55,6 +56,12 @@ _GENERIC_SEND_FAILED = (
     "The message could not be sent. Check your account settings and try again."
 )
 
+_MESSAGE_TOO_LARGE = "This message is too large to send."
+
+_OUTBOX_STILL_THERE_SUFFIX = " It is still in Outbox."
+
+_TOAST_SUBJECT_MAX = 48
+
 MESSAGE_QUEUED = (
     "Message queued for sending when you're back online."
 )
@@ -97,13 +104,80 @@ def _is_localhost_refused(text: str) -> bool:
     )
 
 
+def _is_message_too_large_text(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "errormessagesizeexceeded" in lowered
+        or "message size exceeded" in lowered
+        or "maximum supported size" in lowered
+        or "too large to send" in lowered
+    )
+
+
+def format_outbound_item_label(
+    subject: str | None,
+    to: Sequence[str] | None = None,
+) -> str:
+    """Short label that identifies one Outbox item in a toast or dialog."""
+    text = (subject or "").strip()
+    if text:
+        return f"“{_truncate_outbound_label(text)}”"
+    if to:
+        addr = (to[0] or "").strip()
+        if addr:
+            return f"The message to {_truncate_outbound_label(addr)}"
+    return "“(no subject)”"
+
+
+def name_outbound_in_reason(
+    reason: str,
+    subject: str | None = None,
+    to: Sequence[str] | None = None,
+) -> str:
+    """Replace a vague 'this/the message' with the item's subject or recipient."""
+    text = (reason or "").strip() or _GENERIC_SEND_FAILED
+    label = format_outbound_item_label(subject, to)
+    for prefix in ("This message ", "The message "):
+        if text.startswith(prefix):
+            return f"{label} {text[len(prefix):]}"
+    return f"{label}: {text}"
+
+
+def format_outbox_failure_toast(
+    reason: str,
+    *,
+    count: int = 1,
+    subject: str | None = None,
+    to: Sequence[str] | None = None,
+) -> str:
+    """User-facing send failure that names Outbox as where the mail remains."""
+    text = (reason or "").strip() or _GENERIC_SEND_FAILED
+    if subject is not None or to:
+        text = name_outbound_in_reason(text, subject, to)
+    if count > 1:
+        return f"{text} {count} messages are still in Outbox."
+    if "still in Outbox" in text:
+        return text
+    return f"{text}{_OUTBOX_STILL_THERE_SUFFIX}"
+
+
+def _truncate_outbound_label(text: str) -> str:
+    if len(text) <= _TOAST_SUBJECT_MAX:
+        return text
+    return text[: _TOAST_SUBJECT_MAX - 1] + "…"
+
+
 def user_send_error_message(exc: BaseException) -> str:
     """Return a short, user-friendly explanation for a send failure."""
     if isinstance(exc, SendQueued):
         return exc.user_message
     if isinstance(exc, SendError):
         token_message = _token_expired_user_message(exc.user_message)
-        return token_message if token_message is not None else exc.user_message
+        if token_message is not None:
+            return token_message
+        if _is_message_too_large_text(exc.user_message):
+            return _MESSAGE_TOO_LARGE
+        return exc.user_message
 
     if isinstance(exc, TimeoutError):
         return _SEND_TIMED_OUT
@@ -139,6 +213,9 @@ def user_send_error_message(exc: BaseException) -> str:
     token_message = _token_expired_user_message(text)
     if token_message is not None:
         return token_message
+
+    if _is_message_too_large_text(text):
+        return _MESSAGE_TOO_LARGE
 
     if any(
         token in lowered
@@ -189,3 +266,38 @@ def is_compose_validation_error(exc: BaseException) -> bool:
         or "invalid address" in text
         or "no valid addresses" in text
     )
+
+
+def is_permanent_send_error(exc: BaseException) -> bool:
+    """Return True when retrying this send will not succeed without a user change."""
+    if isinstance(exc, SendQueued):
+        return False
+    if isinstance(exc, TimeoutError):
+        return False
+    from post.mail.network_errors import (
+        is_queueable_network_error,
+        is_sign_in_required_error,
+    )
+
+    if is_sign_in_required_error(exc):
+        return False
+    if is_queueable_network_error(exc):
+        return False
+    if is_compose_validation_error(exc):
+        return True
+    mapped = user_send_error_message(exc)
+    raw = _raw_error_text(exc)
+    combined = f"{mapped} {raw}".lower()
+    if _is_message_too_large_text(combined):
+        return True
+    if any(
+        token in combined
+        for token in (
+            "not set up for sending",
+            "no from address",
+            "system mail can only send",
+            "too large to send",
+        )
+    ):
+        return True
+    return isinstance(exc, (SendError, ValueError))

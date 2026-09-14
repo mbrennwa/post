@@ -109,10 +109,14 @@ from post.mail.offline_status import (
 )
 from post.mail.send_queue import (
     QueuedOutboundMessage,
+    format_parked_close_body,
+    format_parked_close_heading,
+    format_parked_startup_toast,
     format_status_send_now_tooltip,
     format_stop_sending_error_toast,
     format_stop_sending_toast,
     has_pending_send_delay,
+    list_parked_outbound_messages,
     list_pending_delayed_outbound_messages,
     list_queued_messages,
     list_queued_outbound_messages,
@@ -294,6 +298,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._close_after_outbound_send = False
         self._close_after_folder_transfer = False
         self._delayed_send_close_dialog: Adw.AlertDialog | None = None
+        self._parked_send_close_dialog: Adw.AlertDialog | None = None
+        self._close_skip_delayed_prompt = False
+        self._parked_startup_reminded = False
         self._is_closing = False
         self._pending_goa_reauth: set[str] = set()
 
@@ -302,6 +309,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._send_delay_scheduler = OutboundSendDelayScheduler(
             self._mail,
             on_outbox_changed=self._on_outbox_changed,
+            on_send_error=self._on_delayed_send_error,
         )
         self._mail.set_password_prompt(self._prompt_account_password)
         self._mail.set_account_health_changed_callback(self._on_account_health_changed)
@@ -861,15 +869,33 @@ class MainWindow(Adw.ApplicationWindow):
         self._on_outbox_changed()
         if result.failed_account_uid:
             self._sidebar.refresh_account_online_marker(result.failed_account_uid)
+        if result.sign_in_required and result.failed_account_uid:
+            self._mail.set_account_connect_health(
+                result.failed_account_uid, "needs_sign_in"
+            )
+            self._sidebar.refresh_account_online_marker(result.failed_account_uid)
+        if result.parked_count and result.error_message:
+            show_error_toast(self, result.error_message)
+            self._set_status(result.error_message)
+            self._parked_startup_reminded = True
+            return False
+        if not self._parked_startup_reminded:
+            parked = list_parked_outbound_messages()
+            if parked:
+                first = parked[0][1]
+                message = format_parked_startup_toast(
+                    len(parked),
+                    first.send_error,
+                    subject=first.subject,
+                    to=first.to,
+                )
+                show_error_toast(self, message)
+                self._set_status(message)
+                self._parked_startup_reminded = True
+                return False
+        self._parked_startup_reminded = True
         if result.error_message:
             if is_sign_in_required_error(RuntimeError(result.error_message)):
-                if result.failed_account_uid:
-                    self._mail.set_account_connect_health(
-                        result.failed_account_uid, "needs_sign_in"
-                    )
-                    self._sidebar.refresh_account_online_marker(
-                        result.failed_account_uid
-                    )
                 return False
             show_error_toast(self, result.error_message)
             self._set_status(result.error_message)
@@ -891,6 +917,12 @@ class MainWindow(Adw.ApplicationWindow):
             and is_post_outbox_folder(self._current_folder)
         ):
             self._load_messages(self._current_account.uid, POST_OUTBOX_FOLDER)
+
+    def _on_delayed_send_error(self, message: str) -> None:
+        if not message:
+            return
+        show_error_toast(self, message)
+        self._set_status(message)
 
     def _update_stop_sending_button(self) -> None:
         count = sum(
@@ -1082,8 +1114,15 @@ class MainWindow(Adw.ApplicationWindow):
             return True
 
         pending_delayed = list_pending_delayed_outbound_messages()
-        if pending_delayed and self._delayed_send_close_dialog is None:
-            self._prompt_send_delayed_before_close(pending_delayed)
+        if pending_delayed and not self._close_skip_delayed_prompt:
+            if self._delayed_send_close_dialog is None:
+                self._prompt_send_delayed_before_close(pending_delayed)
+            return True
+
+        parked = list_parked_outbound_messages()
+        if parked:
+            if self._parked_send_close_dialog is None:
+                self._prompt_parked_before_close(parked)
             return True
 
         GLib.idle_add(self._destroy_after_close_cleanup)
@@ -1140,8 +1179,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._delayed_send_close_dialog = None
         if response == "cancel":
             return
+        self._close_skip_delayed_prompt = True
         if response == "leave":
-            GLib.idle_add(self._destroy_after_close_cleanup)
+            GLib.idle_add(self._on_close_request)
             return
         if response == "send":
             self._send_delay_scheduler.cancel_all()
@@ -1159,20 +1199,74 @@ class MainWindow(Adw.ApplicationWindow):
 
             get_mail_io_thread().submit(worker)
 
+    def _prompt_parked_before_close(
+        self,
+        parked: list[tuple[str, QueuedOutboundMessage]],
+    ) -> None:
+        count = len(parked)
+        first = parked[0][1] if parked else None
+        dialog = Adw.AlertDialog(
+            heading=format_parked_close_heading(
+                count,
+                subject=first.subject if first else None,
+                to=first.to if first else None,
+            ),
+            body=format_parked_close_body(
+                count,
+                first.send_error if first else None,
+                subject=first.subject if first else None,
+                to=first.to if first else None,
+            ),
+            close_response="cancel",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("quit", "Quit anyway")
+        dialog.add_response("review", "Review in Outbox")
+        dialog.set_response_appearance("quit", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_response_appearance("review", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("review")
+        self._parked_send_close_dialog = dialog
+        dialog.connect("response", self._on_parked_close_response, parked)
+        dialog.present(self)
+
+    def _on_parked_close_response(
+        self,
+        dialog: Adw.AlertDialog,
+        response: str,
+        parked: list[tuple[str, QueuedOutboundMessage]],
+    ) -> None:
+        self._parked_send_close_dialog = None
+        if response == "cancel":
+            self._close_skip_delayed_prompt = False
+            return
+        if response == "quit":
+            GLib.idle_add(self._destroy_after_close_cleanup)
+            return
+        if response == "review":
+            self._close_skip_delayed_prompt = False
+            self._show_parked_outbox(parked)
+
+    def _show_parked_outbox(
+        self,
+        parked: list[tuple[str, QueuedOutboundMessage]],
+    ) -> None:
+        if not parked:
+            return
+        account_uid = parked[0][1].account_uid
+        try:
+            account = self._mail.get_account(account_uid)
+        except ValueError:
+            return
+        if not self._sidebar.restore_folder_selection(account_uid, POST_OUTBOX_FOLDER):
+            self._on_folder_selected(account, POST_OUTBOX_FOLDER)
+
     def _continue_close_after_outbound_send(self) -> None:
         self._close_after_outbound_send = False
-        # A move may have started while we waited for send.
-        if self._mail.folder_transfers_pending():
-            self._on_close_request()
-            return
-        GLib.idle_add(self._destroy_after_close_cleanup)
+        self._on_close_request()
 
     def _continue_close_after_folder_transfer(self) -> None:
         self._close_after_folder_transfer = False
-        if self._mail.outbound_sends_pending():
-            self._on_close_request()
-            return
-        GLib.idle_add(self._destroy_after_close_cleanup)
+        self._on_close_request()
 
     def _destroy_after_close_cleanup(self) -> bool:
         self._abort_inflight_search()

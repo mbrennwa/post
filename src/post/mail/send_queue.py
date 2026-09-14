@@ -34,6 +34,7 @@ class QueuedOutboundMessage:
     queued_at: float = 0.0
     send_after: float | None = None
     attachments: list[dict[str, str]] | None = None
+    send_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -75,7 +76,17 @@ class QueuedOutboundMessage:
                 else None
             ),
             attachments=attachments,
+            send_error=(
+                str(data["send_error"])
+                if data.get("send_error")
+                else None
+            ),
         )
+
+
+def is_outbound_parked(message: QueuedOutboundMessage) -> bool:
+    """Return True when a queued message is held after a permanent send failure."""
+    return bool(message.send_error)
 
 
 def is_outbound_ready_to_send(
@@ -279,6 +290,10 @@ def enqueue_outbound_message(
     payload["queued_at"] = message.queued_at or time.time()
     if message.send_after is not None:
         payload["send_after"] = message.send_after
+    if message.send_error:
+        payload["send_error"] = message.send_error
+    else:
+        payload.pop("send_error", None)
     path = os.path.join(directory, f"{queue_id}.json")
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".post-", suffix=".tmp")
     try:
@@ -302,6 +317,10 @@ def _rewrite_queued_outbound_message(
     payload["queued_at"] = message.queued_at or time.time()
     if message.send_after is not None:
         payload["send_after"] = message.send_after
+    if message.send_error:
+        payload["send_error"] = message.send_error
+    else:
+        payload.pop("send_error", None)
     path = os.path.join(directory, f"{queue_id}.json")
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".post-", suffix=".tmp")
     try:
@@ -320,6 +339,23 @@ def clear_outbound_send_delay(queue_id: str) -> bool:
     if not has_pending_send_delay(message):
         return False
     message.send_after = None
+    _rewrite_queued_outbound_message(queue_id, message)
+    return True
+
+
+def park_outbound_message(queue_id: str, error: str) -> None:
+    """Record a permanent send failure so auto-flush skips this item."""
+    message = load_queued_outbound_message(queue_id)
+    message.send_error = error
+    _rewrite_queued_outbound_message(queue_id, message)
+
+
+def clear_outbound_send_error(queue_id: str) -> bool:
+    """Clear a parked send error so the item may be delivered again."""
+    message = load_queued_outbound_message(queue_id)
+    if not is_outbound_parked(message):
+        return False
+    message.send_error = None
     _rewrite_queued_outbound_message(queue_id, message)
     return True
 
@@ -370,8 +406,72 @@ def list_pending_delayed_outbound_messages() -> list[tuple[str, QueuedOutboundMe
     return [
         (queue_id, message)
         for queue_id, message in list_queued_outbound_messages()
-        if message.send_after is not None
+        if message.send_after is not None and not is_outbound_parked(message)
     ]
+
+
+def list_parked_outbound_messages() -> list[tuple[str, QueuedOutboundMessage]]:
+    """Outbox items held after a permanent send failure."""
+    return [
+        (queue_id, message)
+        for queue_id, message in list_queued_outbound_messages()
+        if is_outbound_parked(message)
+    ]
+
+
+def format_parked_close_heading(
+    count: int,
+    subject: str | None = None,
+    to: Sequence[str] | None = None,
+) -> str:
+    """Quit-dialog heading when Outbox holds blocked messages."""
+    if count <= 1:
+        from .send_errors import format_outbound_item_label
+
+        if subject is not None or to:
+            return f"{format_outbound_item_label(subject, to)} could not be sent"
+        return "Message could not be sent"
+    return f"{count} messages could not be sent"
+
+
+def format_parked_close_body(
+    count: int,
+    reason: str | None,
+    *,
+    subject: str | None = None,
+    to: Sequence[str] | None = None,
+) -> str:
+    """Quit-dialog body: name the failure and warn that quitting forgets it."""
+    from .send_errors import name_outbound_in_reason
+
+    detail = (reason or "").strip() or "A message could not be sent."
+    if subject is not None or to:
+        detail = name_outbound_in_reason(detail, subject, to)
+    if count <= 1:
+        return (
+            f"{detail} It is still in Outbox. "
+            "Review it before quitting, or it may never be sent."
+        )
+    return (
+        f"{detail} {count} messages are still in Outbox. "
+        "Review them before quitting, or they may never be sent."
+    )
+
+
+def format_parked_startup_toast(
+    count: int,
+    reason: str | None,
+    *,
+    subject: str | None = None,
+    to: Sequence[str] | None = None,
+) -> str:
+    """Toast when Post starts with blocked Outbox messages from a previous session."""
+    from .send_errors import format_outbox_failure_toast
+
+    detail = (reason or "").strip() or "A message could not be sent."
+    return format_outbox_failure_toast(
+        detail, count=count, subject=subject, to=to
+    )
 
 
 def list_queued_for_account(
