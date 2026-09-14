@@ -15,7 +15,6 @@ import gi
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib
 
-from .io_thread import get_mail_io_thread
 from .send_queue import (
     clear_outbound_send_delay,
     clear_outbound_send_error,
@@ -68,7 +67,9 @@ class OutboundSendDelayScheduler:
         self.cancel(queue_id)
         delay_ms = max(0, int((send_after - time.time()) * 1000))
         if delay_ms == 0:
-            get_mail_io_thread().submit(self._deliver_worker, queue_id)
+            self._mail.submit_interactive(
+                "deliver_outbound", self._deliver_worker, queue_id
+            )
             return
         self._timer_ids[queue_id] = GLib.timeout_add(
             delay_ms, self._on_timer_fired, queue_id
@@ -82,7 +83,9 @@ class OutboundSendDelayScheduler:
     def send_now(self, queue_id: str) -> None:
         """Cancel send delay and deliver one outbox item immediately."""
         self.cancel(queue_id)
-        get_mail_io_thread().submit(self._send_now_worker, queue_id)
+        self._mail.submit_interactive(
+            "send_now_outbound", self._send_now_worker, queue_id
+        )
 
     def cancel_all(self) -> None:
         for timer_id in self._timer_ids.values():
@@ -91,7 +94,9 @@ class OutboundSendDelayScheduler:
 
     def _on_timer_fired(self, queue_id: str) -> bool:
         self._timer_ids.pop(queue_id, None)
-        get_mail_io_thread().submit(self._deliver_worker, queue_id)
+        self._mail.submit_interactive(
+            "deliver_outbound", self._deliver_worker, queue_id
+        )
         return False
 
     def _send_now_worker(self, queue_id: str) -> None:

@@ -267,18 +267,12 @@ class HeavyFolderPrepareSkipTests(unittest.TestCase):
 
 
 class OfflineSyncNoHeavyIndexTests(unittest.TestCase):
-    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
-    def test_run_account_sync_does_not_call_heavy_folder_index(
-        self, get_io: mock.Mock,
-    ) -> None:
+    def test_run_account_sync_does_not_call_heavy_folder_index(self) -> None:
         """Offline body sync may re-index local summary only (no refresh_info)."""
         from post.mail.offline_sync import OfflineBodySyncCoordinator
 
-        io_thread = mock.Mock()
-        io_thread.has_interactive_work_pending.return_value = False
-        get_io.return_value = io_thread
-
         mail = mock.Mock()
+        mail.has_interactive_work_pending.return_value = False
         mail.get_account.return_value = mock.Mock(display_label="Test")
         mail.continue_heavy_folder_index = mock.Mock()
         mail.offline_body_sync_is_held.return_value = False

@@ -5,19 +5,20 @@ Post runs blocking Camel / Evolution Data Server (EDS) work on a **single dedica
 ## Architecture
 
 ```
-┌─────────────────────┐    submit / run_sync     ┌──────────────────────────┐
-│  GTK main thread    │ ───────────────────────► │  post-mail-io thread     │
-│  (UI only)          │ ◄── GLib.idle_add ────── │  (Camel Session owner) │
+┌─────────────────────┐  MailService job facade  ┌──────────────────────────┐
+│  GTK main thread    │  *_async / submit_*     │  post-mail-io thread     │
+│  (UI only)          │ ───────────────────────► │  (Camel Session owner) │
+│                     │ ◄── GLib.idle_add ────── │                         │
 └─────────────────────┘                          └──────────────────────────┘
 ```
 
-- **`post.mail.io_thread`** — serial queue + private `GMainContext`; bootstraps `Camel.init` once.
-- **`MailService`** (`post.mail.eds`) — facade; public methods dispatch blocking work via `run_on_mail_thread()` or `get_mail_io_thread().run_sync()` / `submit()`.
-- **UI modules** (`window.py`, `sidebar.py`, `compose_window.py`, `sync_watcher.py`) — call `get_mail_io_thread().submit(worker)` for background mail work; update GTK via `GLib.idle_add` only.
+- **`post.mail.io_thread`** — serial queue + private `GMainContext`; bootstraps `Camel.init` once. One thread (`post-mail-io`) still owns the Camel session.
+- **`MailService`** (`post.mail.eds`) — job facade (#425). GTK calls named jobs: `submit_interactive` / `submit_front` / `submit_background` (today’s queues, unchanged) or `*_async` wrappers (`read_message_async`, `move_messages_async`, …). Internals still use `run_on_mail_thread()` / `get_mail_io_thread().run_sync()` / `submit()`. `on_done` for `*_async` runs on GTK via `GLib.idle_add`.
+- **UI / mail modules** (`window.py`, `sidebar.py`, `compose_window.py`, `reader_window.py`, `send_delay.py`, `offline_sync.py`, `sync_watcher.py`) — must not call `get_mail_io_thread()`. They queue work through `MailService` and keep generation/stale checks (`load_id`, `read_id`) in their own `on_done` / idle handlers. `app.py` may start the thread at startup.
 
 ## Rules for contributors
 
-1. **Never call `MailIoThread.run_sync()` from the GTK thread** — it blocks the UI. Use `submit()` + `idle_add` from UI code.
+1. **Never call `MailIoThread.run_sync()` from the GTK thread** — it blocks the UI. From GTK use `MailService.submit_interactive` / `submit_front` / `submit_background` or `*_async` (not `get_mail_io_thread()`).
 2. **Never call `Camel.*_sync` directly from UI or ad-hoc worker threads** — go through `MailService` or `run_on_mail_thread()`.
 3. **One `MailSession` per process** — owned on the mail I/O thread (`MailService._session`, `_stores`, `_transports`). Do not reintroduce per-thread worker sessions.
 4. **Password / OAuth prompts** — use `GLib.idle_add` to show dialogs on the GTK thread; mail thread waits on the result. Do **not** call GOA `EnsureCredentials` synchronously from the GTK thread (compose must not preflight on the UI thread; see #156).
@@ -65,7 +66,8 @@ Without `POST_LOG_LEVEL`, stderr stays at WARNING+; the on-disk log still record
 ## Unit tests
 
 Mail-thread dispatcher behaviour is covered in `tests/test_io_thread.py`.  
-`MailService` dispatch to the mail thread is covered in `tests/test_eds_*.py` and `tests/test_send_background.py`.
+`MailService` job facade and dispatch are covered in `tests/test_mail_job_api.py`, `tests/test_eds_*.py`, and `tests/test_send_background.py`.  
+`tests/test_mail_threading_contract.py` forbids UI/mail modules from calling `get_mail_io_thread`.
 
 Run the suite:
 

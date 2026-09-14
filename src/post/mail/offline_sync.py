@@ -20,7 +20,6 @@ from gi.repository import Camel, Gio, GLib
 
 from post.mail.camel_util import camel_uid_is_binary, camel_uid_to_api, folder_get_message_info
 from post.mail.folders import folder_can_contain_messages, is_post_outbox_folder
-from post.mail.io_thread import get_mail_io_thread
 from post.mail.message_list_state import (
     is_heavy_folder_name,
     offline_folder_priority,
@@ -183,7 +182,8 @@ class OfflineBodySyncCoordinator:
         self._cancellables[account_uid] = cancellable
         self._running.add(account_uid)
 
-        get_mail_io_thread().submit_background(
+        self._mail.submit_background(
+            "offline_body_sync",
             self._account_sync_worker, account_uid, mode, cancellable
         )
 
@@ -211,7 +211,9 @@ class OfflineBodySyncCoordinator:
             if self._arrival_running or not self._arrival_queue:
                 return
             self._arrival_running = True
-        get_mail_io_thread().submit_background(self._arrival_prefetch_worker)
+        self._mail.submit_background(
+            "arrival_prefetch", self._arrival_prefetch_worker
+        )
 
     def schedule_arrival_prefetch(
         self,
@@ -267,7 +269,9 @@ class OfflineBodySyncCoordinator:
                 self._arrival_running = True
                 start_worker = True
         if start_worker:
-            get_mail_io_thread().submit_background(self._arrival_prefetch_worker)
+            self._mail.submit_background(
+                "arrival_prefetch", self._arrival_prefetch_worker
+            )
 
     def is_active(self) -> bool:
         return bool(self._running)
@@ -299,12 +303,14 @@ class OfflineBodySyncCoordinator:
                 self._arrival_running = False
                 has_work = False
         if has_work:
-            get_mail_io_thread().submit_background(self._arrival_prefetch_worker)
+            self._mail.submit_background(
+                "arrival_prefetch", self._arrival_prefetch_worker
+            )
 
     def _arrival_prefetch_worker(self) -> None:
         try:
             while True:
-                if get_mail_io_thread().has_interactive_work_pending():
+                if self._mail.has_interactive_work_pending():
                     self._finish_arrival_worker(resubmit=True)
                     return
                 item = self._pop_arrival_item()
@@ -422,7 +428,7 @@ class OfflineBodySyncCoordinator:
         except GLib.Error as exc:
             if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
                 elapsed = time.monotonic() - started
-                if get_mail_io_thread().has_interactive_work_pending():
+                if self._mail.has_interactive_work_pending():
                     log.debug(
                         "Arrival prefetch preempted for %s after %.1fs",
                         api_uid,
@@ -514,8 +520,9 @@ class OfflineBodySyncCoordinator:
                 return True
             if self._mail.offline_body_sync_is_held():
                 return True
-            if get_mail_io_thread().has_interactive_work_pending():
-                get_mail_io_thread().submit_background(
+            if self._mail.has_interactive_work_pending():
+                self._mail.submit_background(
+                    "offline_body_sync",
                     self._account_sync_worker,
                     account_uid,
                     mode,

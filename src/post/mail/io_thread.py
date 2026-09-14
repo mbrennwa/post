@@ -8,11 +8,12 @@ Threading contract
 * The mail I/O thread owns a private ``GMainContext`` and runs a continuous
   ``iteration()`` loop so Camel ``*_sync`` calls do not marshal onto the GTK
   main loop.
-* UI and other threads must dispatch blocking mail work through
+* GTK must dispatch blocking mail work through :class:`~post.mail.eds.MailService`
+  (``submit_interactive`` / ``*_async``).  :class:`MailService` owns
   :func:`get_mail_io_thread` — use :meth:`MailIoThread.submit` for fire-and-forget
   work and :meth:`MailIoThread.run_sync` when the caller can block.
 * Never call :meth:`MailIoThread.run_sync` from the GTK main thread (blocks the UI).
-  Prefer :meth:`MailIoThread.submit` from GTK, or :func:`run_on_mail_thread` which
+  Prefer MailService named jobs from GTK, or :func:`run_on_mail_thread` which
   runs inline when already on the mail I/O thread.
 * Use :meth:`MailIoThread.submit_background` for long-running offline body download
   and Camel sync-watcher setup; interactive tasks are always scheduled ahead of

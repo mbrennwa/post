@@ -40,7 +40,6 @@ from post.mail.eds import (
     OfflineSyncProgress,
     _log_heavy_pipeline,
 )
-from post.mail.io_thread import get_mail_io_thread
 from post.mail.mailto import MailtoCompose, parse_mailto_uri
 from post.mail.sync_watcher import MailSyncWatcher
 from post.message_list_view import VirtualMessageList
@@ -802,7 +801,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._flush_draft_queue_idle()
 
     def _flush_send_queue_idle(self, *, force: bool = False) -> bool:
-        get_mail_io_thread().submit(self._flush_send_queue_worker, force=force)
+        self._mail.submit_interactive(
+            "flush_send_queue", self._flush_send_queue_worker, force=force
+        )
         return False
 
     def _flush_send_queue_worker(self, *, force: bool = False) -> None:
@@ -814,7 +815,9 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._on_send_queue_flushed, result)
 
     def _flush_operation_queue_idle(self) -> bool:
-        get_mail_io_thread().submit(self._flush_operation_queue_worker)
+        self._mail.submit_interactive(
+            "flush_operation_queue", self._flush_operation_queue_worker
+        )
         return False
 
     def _flush_operation_queue_worker(self) -> None:
@@ -838,7 +841,9 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _flush_draft_queue_idle(self) -> bool:
-        get_mail_io_thread().submit(self._flush_draft_queue_worker)
+        self._mail.submit_interactive(
+            "flush_draft_queue", self._flush_draft_queue_worker
+        )
         return False
 
     def _flush_draft_queue_worker(self) -> None:
@@ -1197,7 +1202,7 @@ class MainWindow(Adw.ApplicationWindow):
                     log.exception("Failed to send delayed messages before quit")
                 GLib.idle_add(self._continue_close_after_outbound_send)
 
-            get_mail_io_thread().submit(worker)
+            self._mail.submit_interactive("flush_send_queue_before_quit", worker)
 
     def _prompt_parked_before_close(
         self,
@@ -1220,7 +1225,7 @@ class MainWindow(Adw.ApplicationWindow):
             close_response="cancel",
         )
         dialog.add_response("cancel", "Cancel")
-        dialog.add_response("quit", "Quit anyway")
+        dialog.add_response("quit", "Quit Anyway")
         dialog.add_response("review", "Review in Outbox")
         dialog.set_response_appearance("quit", Adw.ResponseAppearance.DESTRUCTIVE)
         dialog.set_response_appearance("review", Adw.ResponseAppearance.SUGGESTED)
@@ -1537,7 +1542,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._mail._invalidate_account_connection_unlocked(account_uid)
             GLib.idle_add(self._finish_goa_reauth_reconnect, account_uid)
 
-        get_mail_io_thread().submit_front(work)
+        self._mail.submit_front("goa_reauth_reconnect", work)
 
     def _finish_goa_reauth_reconnect(self, account_uid: str) -> bool:
         self._on_sidebar_refresh_account(account_uid)
@@ -2260,7 +2265,6 @@ class MainWindow(Adw.ApplicationWindow):
         self, invite: dict, *, list_key: str | None = None
     ) -> None:
         from post.calendar_dialog import present_add_to_calendar
-        from post.mail.io_thread import get_mail_io_thread
 
         account_uid = None
         key = list_key or self._current_message_uid
@@ -2275,7 +2279,9 @@ class MainWindow(Adw.ApplicationWindow):
             account_uid=account_uid,
             on_success=lambda label: show_toast(self, f"Added to {label}"),
             on_error=lambda message: show_error_toast(self, message),
-            run_async=lambda worker: get_mail_io_thread().submit(worker),
+            run_async=lambda worker: self._mail.submit_interactive(
+                "add_to_calendar", worker
+            ),
         )
 
     def _can_archive_list_key(self, list_key: str | None) -> bool:
@@ -2346,7 +2352,7 @@ class MainWindow(Adw.ApplicationWindow):
                 error = exc
             GLib.idle_add(self._on_one_click_unsubscribe_done, error, list_key)
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("unsubscribe", worker)
 
     def _on_one_click_unsubscribe_done(
         self,
@@ -2475,7 +2481,7 @@ class MainWindow(Adw.ApplicationWindow):
                 message_uid,
             )
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("load_compose_message", worker)
 
     def _on_compose_message_loaded(
         self,
@@ -3775,7 +3781,7 @@ class MainWindow(Adw.ApplicationWindow):
                 on_ready,
             )
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("read_attachment", worker)
 
     def _on_attachment_fetched(
         self,
@@ -4190,7 +4196,7 @@ class MainWindow(Adw.ApplicationWindow):
             )
 
         # Background so folder switches can preempt long refresh_info_sync calls.
-        get_mail_io_thread().submit_background(worker_sync)
+        self._mail.submit_background("folder_message_sync", worker_sync)
 
     def _start_background_heavy_folder_index(
         self,
@@ -4209,7 +4215,8 @@ class MainWindow(Adw.ApplicationWindow):
             folder_name,
             sorted((cursor or {}).keys()),
         )
-        get_mail_io_thread().submit_background(
+        self._mail.submit_background(
+            "heavy_folder_index",
             self._run_heavy_folder_index_slice,
             load_id,
             account_uid,
@@ -4363,7 +4370,8 @@ class MainWindow(Adw.ApplicationWindow):
             GLib.timeout_add(250, _resume_after_yield)
             return
         # Yield to interactive work, then resume from cursor.
-        get_mail_io_thread().submit_background(
+        self._mail.submit_background(
+            "heavy_folder_index",
             self._run_heavy_folder_index_slice,
             load_id,
             account_uid,
@@ -4880,7 +4888,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
         if snapshot is None:
             self._mail.cancel_folder_refresh()
-            get_mail_io_thread().submit_front(fallback_worker)
+            self._mail.submit_front("search_fallback", fallback_worker)
             return
         search_query = self._search_query
         if search_query is None:
@@ -5457,12 +5465,14 @@ class MainWindow(Adw.ApplicationWindow):
                         worker_initial,
                     )
 
-                get_mail_io_thread().submit_front(worker_load_cached_header_index)
+                self._mail.submit_front(
+                    "load_cached_header_index", worker_load_cached_header_index
+                )
                 return
             if search_query is not None:
                 self._mail.cancel_folder_refresh()
             search_trace("search_worker_submit_front", load_id=load_id)
-            get_mail_io_thread().submit_front(worker_initial)
+            self._mail.submit_front("load_folder_messages", worker_initial)
 
         def worker_cache() -> None:
             if load_id != self._messages_load_generation:
@@ -5522,7 +5532,7 @@ class MainWindow(Adw.ApplicationWindow):
             GLib.idle_add(on_main)
 
         if has_disk_cache:
-            get_mail_io_thread().submit(worker_cache)
+            self._mail.submit_interactive("load_folder_disk_cache", worker_cache)
         else:
             if defer_mail_io:
                 search_trace(
@@ -5690,7 +5700,7 @@ class MainWindow(Adw.ApplicationWindow):
                             None,
                         )
 
-                    get_mail_io_thread().submit(cache_worker)
+                    self._mail.submit_interactive("write_folder_index_cache", cache_worker)
                     return False
                 self._message_empty_label.set_label(OFFLINE_MAIL_MESSAGE)
                 self._message_stack.set_visible_child_name("empty")
@@ -6403,7 +6413,7 @@ class MainWindow(Adw.ApplicationWindow):
                 error = exc
             GLib.idle_add(self._on_outbox_moved_to_drafts, error)
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("outbox_to_drafts", worker)
 
     def _on_outbox_moved_to_drafts(self, error: Exception | None) -> bool:
         if error is not None:
@@ -6482,7 +6492,7 @@ class MainWindow(Adw.ApplicationWindow):
                     failed[key] = failed.get(key, 0) + 1
             GLib.idle_add(self._on_stop_sending_finished, moved, failed)
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("stop_sending", worker)
 
     def _on_stop_sending_finished(
         self,
@@ -6629,7 +6639,7 @@ class MainWindow(Adw.ApplicationWindow):
                 )
 
             self._mail.begin_folder_transfer()
-            get_mail_io_thread().submit(worker)
+            self._mail.submit_interactive("move_messages", worker)
 
     def _on_messages_dropped(
         self,
@@ -6694,7 +6704,7 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             self._set_status(f"Moving {len(uids)} messages to {display}…")
         self._mail.begin_folder_transfer()
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("move_messages_to_folder", worker)
 
     def _on_folder_messages_moved(
         self,
@@ -6822,7 +6832,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._set_status("Restoring messages…")
         self._mail.begin_folder_transfer()
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("undo_message_move", worker)
 
     def _on_move_undo_finished(
         self,
@@ -7424,7 +7434,7 @@ class MainWindow(Adw.ApplicationWindow):
                 error,
             )
 
-        get_mail_io_thread().submit_front(worker)
+        self._mail.submit_front("read_message", worker)
 
     def _open_draft_for_editing(
         self,
@@ -7471,7 +7481,7 @@ class MainWindow(Adw.ApplicationWindow):
                 error,
             )
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("open_draft", worker)
 
     def _on_draft_compose_loaded(
         self,
@@ -7534,7 +7544,7 @@ class MainWindow(Adw.ApplicationWindow):
                 error,
             )
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("send_again", worker)
 
     def _on_send_again_compose_loaded(
         self,

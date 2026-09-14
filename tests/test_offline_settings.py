@@ -154,17 +154,11 @@ class RefreshOfflineSettingsTests(unittest.TestCase):
 
 
 class OfflineSyncYieldTests(unittest.TestCase):
-    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
-    def test_run_account_sync_yields_when_interactive_work_pending(
-        self, get_io: mock.Mock,
-    ) -> None:
+    def test_run_account_sync_yields_when_interactive_work_pending(self) -> None:
         from post.mail.offline_sync import OfflineBodySyncCoordinator
 
-        io_thread = mock.Mock()
-        io_thread.has_interactive_work_pending.return_value = True
-        get_io.return_value = io_thread
-
         mail = mock.Mock()
+        mail.has_interactive_work_pending.return_value = True
         mail.get_account.return_value = mock.Mock(display_label="Test")
         mail.offline_body_sync_is_held.return_value = False
         coordinator = OfflineBodySyncCoordinator(mail)
@@ -182,7 +176,7 @@ class OfflineSyncYieldTests(unittest.TestCase):
         )
 
         self.assertFalse(complete)
-        io_thread.submit_background.assert_called_once()
+        mail.submit_background.assert_called_once()
 
 
 class OfflineDownsyncTimeoutTests(unittest.TestCase):
