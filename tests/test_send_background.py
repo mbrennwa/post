@@ -136,7 +136,7 @@ class RunOutboundSendTests(unittest.TestCase):
 
         show_error_toast.assert_called_once_with(
             parent,
-            "SMTP failed Message saved in Outbox.",
+            "“Hello”: SMTP failed It is still in Outbox.",
         )
         self.assertEqual(self.status_messages, [])
         outbox_changed.assert_called()
@@ -284,15 +284,15 @@ class FinishOutboundSendTests(unittest.TestCase):
 
         show_error_toast.assert_called_once_with(
             parent,
-            "Could not send Message saved in Outbox.",
+            "“Hello”: Could not send It is still in Outbox.",
         )
         set_status.assert_not_called()
         outbox_changed.assert_called_once()
 
-    @mock.patch("post.compose_window.remove_queued_outbound_message")
+    @mock.patch("post.compose_window.park_outbound_message")
     @mock.patch("post.compose_window.show_error_toast")
-    def test_finish_validation_error_omits_outbox_suffix(
-        self, show_error_toast, remove_queued
+    def test_finish_validation_error_parks_in_outbox(
+        self, show_error_toast, park
     ) -> None:
         parent = mock.Mock()
         request = OutboundSendRequest(
@@ -321,9 +321,9 @@ class FinishOutboundSendTests(unittest.TestCase):
 
         show_error_toast.assert_called_once_with(
             parent,
-            "Subject must not contain line breaks.",
+            "“Hello”: Subject must not contain line breaks. It is still in Outbox.",
         )
-        remove_queued.assert_called_once_with("queue-1")
+        park.assert_called_once_with("queue-1", "Subject must not contain line breaks.")
 
 
 if __name__ == "__main__":

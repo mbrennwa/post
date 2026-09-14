@@ -80,11 +80,13 @@ from post.mail.eds import MailAccount
 from post.mail.io_thread import get_mail_io_thread
 from post.mail.network_errors import (
     format_attachment_error,
+    is_sign_in_required_error,
     log_mail_error,
 )
 from post.mail.send_errors import (
     SendQueued,
-    is_compose_validation_error,
+    format_outbox_failure_toast,
+    is_permanent_send_error,
     user_send_error_message,
 )
 from post.mail.draft_queue import is_queued_draft_id
@@ -92,8 +94,8 @@ from post.mail.send_queue import (
     load_queued_attachments,
     load_queued_outbound_message,
     new_outbound_queue_id,
+    park_outbound_message,
     persist_outbound_send,
-    remove_queued_outbound_message,
 )
 from post.preferences import (
     format_send_delay_status,
@@ -184,9 +186,6 @@ class OutboundSendRequest:
     draft_uid: str | None = None
     queue_id: str | None = None
     send_immediately: bool = False
-
-
-_OUTBOX_FAILURE_SUFFIX = " Message saved in Outbox."
 
 
 def run_outbound_send(
@@ -380,10 +379,18 @@ def _finish_outbound_send(
     if error is not None:
         message = user_send_error_message(error)
         if request.queue_id:
-            if is_compose_validation_error(error):
-                remove_queued_outbound_message(request.queue_id)
-            else:
-                message = f"{message}{_OUTBOX_FAILURE_SUFFIX}"
+            if is_permanent_send_error(error):
+                try:
+                    park_outbound_message(request.queue_id, message)
+                except FileNotFoundError:
+                    pass
+                message = format_outbox_failure_toast(
+                    message, subject=request.subject, to=request.to
+                )
+            elif not is_sign_in_required_error(error):
+                message = format_outbox_failure_toast(
+                    message, subject=request.subject, to=request.to
+                )
         if parent is not None:
             show_error_toast(parent, message)
         else:

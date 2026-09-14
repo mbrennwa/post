@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from collections.abc import Iterator
 import unittest
 from unittest import mock
 
@@ -18,7 +20,7 @@ from post.mail.account_status import (
     account_not_online_badge,
 )
 from post.mail.eds import FlushSendQueueResult, MailService
-from post.mail.send_errors import SendError
+from post.mail.send_errors import SendError, SendQueued
 from post.mail.network_errors import (
     MESSAGE_NOT_CACHED_SIGN_IN,
     SIGN_IN_FOLDER_MESSAGE,
@@ -216,10 +218,9 @@ class MessageReadErrorFormatTests(unittest.TestCase):
 
 
 class FlushSendQueueResultTests(unittest.TestCase):
-    def test_flush_surfaces_send_error(self) -> None:
-        service = MailService(registry=mock.Mock())
+    def _queued(self, account_uid: str = "acct-1") -> mock.Mock:
         queued = mock.Mock()
-        queued.account_uid = "acct-1"
+        queued.account_uid = account_uid
         queued.to = ["to@example.com"]
         queued.cc = None
         queued.bcc = None
@@ -228,15 +229,28 @@ class FlushSendQueueResultTests(unittest.TestCase):
         queued.body_html = None
         queued.in_reply_to = None
         queued.references = None
+        queued.send_error = None
+        queued.send_after = None
+        return queued
 
+    @contextmanager
+    def _flush_patches(self, queued_items: list) -> Iterator[mock.Mock]:
         with (
             mock.patch(
                 "post.mail.eds.list_queued_outbound_messages",
-                return_value=[("q1", queued)],
+                return_value=queued_items,
             ),
             mock.patch("post.mail.eds.is_outbound_ready_to_send", return_value=True),
             mock.patch("post.mail.eds.load_queued_attachments", return_value=[]),
+            mock.patch("post.mail.eds.park_outbound_message") as park,
         ):
+            yield park
+
+    def test_flush_surfaces_send_error(self) -> None:
+        service = MailService(registry=mock.Mock())
+        queued = self._queued()
+
+        with self._flush_patches([("q1", queued)]):
             service._is_outbound_delivery_claimed = mock.Mock(return_value=False)
             service._begin_outbound_send = mock.Mock()
             service._end_outbound_send = mock.Mock()
@@ -247,8 +261,90 @@ class FlushSendQueueResultTests(unittest.TestCase):
 
         self.assertIsInstance(result, FlushSendQueueResult)
         self.assertEqual(result.sent, 0)
-        self.assertEqual(result.error_message, "Sign-in required")
+        self.assertTrue(result.sign_in_required)
         self.assertEqual(result.failed_account_uid, "acct-1")
+        self.assertEqual(result.parked_count, 0)
+        self.assertIsNone(result.error_message)
+
+    def test_flush_continues_after_permanent_error(self) -> None:
+        service = MailService(registry=mock.Mock())
+        first = self._queued("acct-1")
+        second = self._queued("acct-2")
+
+        with self._flush_patches([("q1", first), ("q2", second)]) as park:
+            service._is_outbound_delivery_claimed = mock.Mock(return_value=False)
+            service._begin_outbound_send = mock.Mock()
+            service._end_outbound_send = mock.Mock()
+            service._send_message_unlocked = mock.Mock(
+                side_effect=[
+                    SendError("This message is too large to send."),
+                    None,
+                ]
+            )
+            result = service._flush_send_queue_unlocked(force=True)
+
+        self.assertEqual(result.sent, 1)
+        self.assertEqual(result.parked_count, 1)
+        self.assertIn("too large to send", result.error_message or "")
+        self.assertIn("still in Outbox", result.error_message or "")
+        self.assertIn("Hi", result.error_message or "")
+        park.assert_called_once_with("q1", "This message is too large to send.")
+        self.assertEqual(service._send_message_unlocked.call_count, 2)
+
+    def test_flush_skips_rest_of_account_on_sign_in(self) -> None:
+        service = MailService(registry=mock.Mock())
+        first = self._queued("acct-1")
+        second = self._queued("acct-1")
+        other = self._queued("acct-2")
+
+        with self._flush_patches(
+            [("q1", first), ("q2", second), ("q3", other)]
+        ):
+            service._is_outbound_delivery_claimed = mock.Mock(return_value=False)
+            service._begin_outbound_send = mock.Mock()
+            service._end_outbound_send = mock.Mock()
+            service._send_message_unlocked = mock.Mock(
+                side_effect=[SendError("Sign-in required"), None]
+            )
+            result = service._flush_send_queue_unlocked(force=True)
+
+        self.assertTrue(result.sign_in_required)
+        self.assertEqual(result.sent, 1)
+        self.assertEqual(service._send_message_unlocked.call_count, 2)
+
+    def test_flush_stops_on_send_queued(self) -> None:
+        service = MailService(registry=mock.Mock())
+        first = self._queued("acct-1")
+        second = self._queued("acct-2")
+
+        with self._flush_patches([("q1", first), ("q2", second)]):
+            service._is_outbound_delivery_claimed = mock.Mock(return_value=False)
+            service._begin_outbound_send = mock.Mock()
+            service._end_outbound_send = mock.Mock()
+            service._send_message_unlocked = mock.Mock(
+                side_effect=SendQueued("Message queued for sending when you're back online.")
+            )
+            result = service._flush_send_queue_unlocked(force=True)
+
+        self.assertEqual(result.sent, 0)
+        self.assertEqual(service._send_message_unlocked.call_count, 1)
+
+    def test_flush_skips_parked_unless_forced(self) -> None:
+        service = MailService(registry=mock.Mock())
+        queued = self._queued()
+        queued.send_error = "This message is too large to send."
+
+        with self._flush_patches([("q1", queued)]):
+            service._is_outbound_delivery_claimed = mock.Mock(return_value=False)
+            service._begin_outbound_send = mock.Mock()
+            service._end_outbound_send = mock.Mock()
+            service._send_message_unlocked = mock.Mock()
+            skipped = service._flush_send_queue_unlocked(force=False)
+            retried = service._flush_send_queue_unlocked(force=True)
+
+        self.assertEqual(skipped.sent, 0)
+        service._send_message_unlocked.assert_called_once()
+        self.assertEqual(retried.sent, 1)
 
     def test_connect_health_round_trip(self) -> None:
         service = MailService(registry=mock.Mock())

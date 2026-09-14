@@ -10,7 +10,9 @@ from gi.repository import GLib
 from post.mail.send_errors import (
     SendError,
     SYSTEM_MAIL_EXTERNAL_RECIPIENTS,
+    format_outbox_failure_toast,
     is_compose_validation_error,
+    is_permanent_send_error,
     user_send_error_message,
 )
 
@@ -107,4 +109,72 @@ class SendErrorMessageTests(unittest.TestCase):
         self.assertEqual(
             user_send_error_message(SendError(exc.message)),
             TOKEN_EXPIRED_FOLDER_MESSAGE,
+        )
+        self.assertFalse(is_permanent_send_error(exc))
+        self.assertFalse(is_permanent_send_error(SendError(exc.message)))
+
+    def test_message_too_large(self) -> None:
+        exc = GLib.Error.new_literal(
+            GLib.quark_from_string("g-io-error-quark"),
+            "ErrorMessageSizeExceeded: The message exceeds the maximum "
+            "supported size., The message exceeds the maximum supported size.",
+            36,
+        )
+        self.assertEqual(
+            user_send_error_message(exc),
+            "This message is too large to send.",
+        )
+        self.assertTrue(is_permanent_send_error(exc))
+        self.assertTrue(
+            is_permanent_send_error(
+                SendError(
+                    "ErrorMessageSizeExceeded: The message exceeds the "
+                    "maximum supported size."
+                )
+            )
+        )
+
+    def test_is_permanent_send_error(self) -> None:
+        from post.mail.send_errors import MESSAGE_QUEUED, SendQueued
+
+        self.assertTrue(is_permanent_send_error(SendError("SMTP failed")))
+        self.assertTrue(
+            is_permanent_send_error(SendError(SYSTEM_MAIL_EXTERNAL_RECIPIENTS))
+        )
+        self.assertTrue(
+            is_permanent_send_error(ValueError("Subject must not contain line breaks."))
+        )
+        self.assertFalse(is_permanent_send_error(SendQueued(MESSAGE_QUEUED)))
+        self.assertFalse(is_permanent_send_error(TimeoutError()))
+
+    def test_outbox_failure_toast(self) -> None:
+        self.assertEqual(
+            format_outbox_failure_toast("This message is too large to send."),
+            "This message is too large to send. It is still in Outbox.",
+        )
+        self.assertEqual(
+            format_outbox_failure_toast(
+                "This message is too large to send.",
+                subject="Coauthors draft",
+            ),
+            "“Coauthors draft” is too large to send. It is still in Outbox.",
+        )
+        self.assertEqual(
+            format_outbox_failure_toast(
+                "This message is too large to send.",
+                to=["alice@example.com"],
+            ),
+            "The message to alice@example.com is too large to send. It is still in Outbox.",
+        )
+        self.assertEqual(
+            format_outbox_failure_toast("This message is too large to send.", count=3),
+            "This message is too large to send. 3 messages are still in Outbox.",
+        )
+        self.assertEqual(
+            format_outbox_failure_toast(
+                "This message is too large to send.",
+                count=3,
+                subject="Coauthors draft",
+            ),
+            "“Coauthors draft” is too large to send. 3 messages are still in Outbox.",
         )

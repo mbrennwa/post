@@ -89,7 +89,8 @@ from .send_errors import (
     SYSTEM_MAIL_EXTERNAL_RECIPIENTS,
     SendError,
     SendQueued,
-    is_compose_validation_error,
+    format_outbox_failure_toast,
+    is_permanent_send_error,
     user_send_error_message,
 )
 from .draft_queue import (
@@ -119,10 +120,12 @@ from .network_errors import (
 from .send_queue import (
     QueuedOutboundMessage,
     enqueue_outbound_message,
+    is_outbound_parked,
     is_outbound_ready_to_send,
     list_queued_outbound_messages,
     load_queued_attachments,
     load_queued_outbound_message,
+    park_outbound_message,
     remove_queued_outbound_message,
 )
 from post.preferences import get_show_evolution_local
@@ -624,6 +627,8 @@ class FlushSendQueueResult:
     sent: int = 0
     error_message: str | None = None
     failed_account_uid: str | None = None
+    parked_count: int = 0
+    sign_in_required: bool = False
 
 
 EDS_REGISTRY_CONNECT_ERROR = (
@@ -2613,7 +2618,17 @@ class MailService:
         sent = 0
         error_message: str | None = None
         failed_account_uid: str | None = None
+        parked_count = 0
+        first_park_reason: str | None = None
+        first_park_subject: str | None = None
+        first_park_to: list[str] | None = None
+        sign_in_required = False
+        skip_accounts: set[str] = set()
         for queue_id, queued in list_queued_outbound_messages():
+            if queued.account_uid in skip_accounts:
+                continue
+            if not force and is_outbound_parked(queued):
+                continue
             if not force and not is_outbound_ready_to_send(queued):
                 continue
             if self._is_outbound_delivery_claimed(queue_id):
@@ -2638,29 +2653,93 @@ class MailService:
                 except SendQueued:
                     break
                 except SendError as exc:
-                    if is_compose_validation_error(exc):
-                        remove_queued_outbound_message(queue_id)
+                    if is_sign_in_required_error(exc):
+                        log.warning(
+                            "Queued message %s was not sent: %s",
+                            queue_id,
+                            exc.user_message,
+                        )
+                        skip_accounts.add(queued.account_uid)
+                        sign_in_required = True
+                        failed_account_uid = queued.account_uid
+                        continue
+                    if is_permanent_send_error(exc):
+                        reason = user_send_error_message(exc)
+                        try:
+                            park_outbound_message(queue_id, reason)
+                        except FileNotFoundError:
+                            log.debug(
+                                "Outbox item %s vanished before park", queue_id
+                            )
+                            continue
+                        log.warning(
+                            "Queued message %s was not sent: %s",
+                            queue_id,
+                            reason,
+                        )
+                        parked_count += 1
+                        if first_park_reason is None:
+                            first_park_reason = reason
+                            first_park_subject = queued.subject
+                            first_park_to = queued.to
+                        if failed_account_uid is None:
+                            failed_account_uid = queued.account_uid
+                        continue
                     log.warning(
                         "Queued message %s was not sent: %s",
                         queue_id,
                         exc.user_message,
                     )
-                    error_message = exc.user_message
-                    failed_account_uid = queued.account_uid
-                    break
+                    continue
                 except Exception as exc:
+                    if is_sign_in_required_error(exc):
+                        log.warning(
+                            "Queued message %s was not sent: %s",
+                            queue_id,
+                            user_send_error_message(exc),
+                        )
+                        skip_accounts.add(queued.account_uid)
+                        sign_in_required = True
+                        failed_account_uid = queued.account_uid
+                        continue
+                    if is_permanent_send_error(exc):
+                        reason = user_send_error_message(exc)
+                        try:
+                            park_outbound_message(queue_id, reason)
+                        except FileNotFoundError:
+                            continue
+                        log.warning(
+                            "Queued message %s was not sent: %s",
+                            queue_id,
+                            reason,
+                        )
+                        parked_count += 1
+                        if first_park_reason is None:
+                            first_park_reason = reason
+                            first_park_subject = queued.subject
+                            first_park_to = queued.to
+                        if failed_account_uid is None:
+                            failed_account_uid = queued.account_uid
+                        continue
                     log.exception("Failed to send queued message %s", queue_id)
-                    error_message = user_send_error_message(exc)
-                    failed_account_uid = queued.account_uid
-                    break
+                    continue
                 else:
                     sent += 1
             finally:
                 self._end_outbound_send()
+        if parked_count and first_park_reason:
+            error_message = format_outbox_failure_toast(
+                first_park_reason,
+                count=parked_count,
+                subject=first_park_subject,
+                to=first_park_to,
+            )
         return FlushSendQueueResult(
             sent=sent,
             error_message=error_message,
             failed_account_uid=failed_account_uid,
+            parked_count=parked_count,
+            sign_in_required=sign_in_required,
         )
 
     def _flush_operation_queue_unlocked(self) -> int:

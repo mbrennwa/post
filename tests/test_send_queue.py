@@ -25,19 +25,26 @@ from post.mail.offline_status import offline_cache_status_text
 from post.mail.send_queue import (
     QueuedOutboundMessage,
     clear_outbound_send_delay,
+    clear_outbound_send_error,
     count_queued_for_account,
     enqueue_outbound_message,
+    format_parked_close_body,
+    format_parked_close_heading,
+    format_parked_startup_toast,
     format_status_send_now_tooltip,
     format_stop_sending_error_toast,
     format_stop_sending_toast,
     has_pending_send_delay,
+    is_outbound_parked,
     is_outbound_ready_to_send,
+    list_parked_outbound_messages,
     list_pending_delayed_outbound_messages,
     list_queued_for_account,
     list_queued_messages_page,
     list_queued_outbound_messages,
     load_queued_attachments,
     load_queued_outbound_message,
+    park_outbound_message,
     persist_outbound_send,
     queued_to_list_dict,
     read_queued_message,
@@ -345,6 +352,18 @@ class OutboxAccountFilterTests(unittest.TestCase):
                     body="Body",
                     send_after=time.time() + 120,
                 )
+                parked_delayed_id = persist_outbound_send(
+                    account_uid="account-1",
+                    to=["parked@example.com"],
+                    cc=None,
+                    bcc=None,
+                    subject="Parked delayed",
+                    body="Body",
+                    send_after=time.time() + 120,
+                )
+                park_outbound_message(
+                    parked_delayed_id, "This message is too large to send."
+                )
                 pending = list_pending_delayed_outbound_messages()
                 self.assertEqual(len(pending), 1)
                 self.assertEqual(pending[0][0], delayed_id)
@@ -575,4 +594,125 @@ class StopSendingToastTests(unittest.TestCase):
             ),
             "Could not move messages to Drafts: info@example.com (2), "
             "mbrennwa@gmail.com (3)",
+        )
+
+
+class ParkOutboundMessageTests(unittest.TestCase):
+    def test_park_and_clear_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                queue_id = enqueue_outbound_message(
+                    QueuedOutboundMessage(
+                        account_uid="account-1",
+                        to=["user@example.com"],
+                        cc=None,
+                        bcc=None,
+                        subject="Hello",
+                        body="Body text",
+                    )
+                )
+                loaded = load_queued_outbound_message(queue_id)
+                self.assertFalse(is_outbound_parked(loaded))
+                park_outbound_message(queue_id, "This message is too large to send.")
+                parked = load_queued_outbound_message(queue_id)
+                self.assertTrue(is_outbound_parked(parked))
+                self.assertEqual(
+                    parked.send_error, "This message is too large to send."
+                )
+                self.assertTrue(clear_outbound_send_error(queue_id))
+                cleared = load_queued_outbound_message(queue_id)
+                self.assertFalse(is_outbound_parked(cleared))
+                self.assertIsNone(cleared.send_error)
+
+    def test_persist_clears_park(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                queue_id = enqueue_outbound_message(
+                    QueuedOutboundMessage(
+                        account_uid="account-1",
+                        to=["user@example.com"],
+                        cc=None,
+                        bcc=None,
+                        subject="Hello",
+                        body="Body text",
+                    )
+                )
+                park_outbound_message(queue_id, "too large")
+                persist_outbound_send(
+                    account_uid="account-1",
+                    to=["user@example.com"],
+                    cc=None,
+                    bcc=None,
+                    subject="Hello",
+                    body="Body text",
+                    queue_id=queue_id,
+                )
+                loaded = load_queued_outbound_message(queue_id)
+                self.assertFalse(is_outbound_parked(loaded))
+
+    def test_list_parked_outbound_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                ready_id = enqueue_outbound_message(
+                    QueuedOutboundMessage(
+                        account_uid="account-1",
+                        to=["user@example.com"],
+                        cc=None,
+                        bcc=None,
+                        subject="Ready",
+                        body="Body",
+                    )
+                )
+                parked_id = enqueue_outbound_message(
+                    QueuedOutboundMessage(
+                        account_uid="account-2",
+                        to=["other@example.com"],
+                        cc=None,
+                        bcc=None,
+                        subject="Stuck",
+                        body="Body",
+                    )
+                )
+                park_outbound_message(parked_id, "This message is too large to send.")
+                parked = list_parked_outbound_messages()
+                self.assertEqual(len(parked), 1)
+                self.assertEqual(parked[0][0], parked_id)
+                self.assertEqual(parked[0][1].subject, "Stuck")
+                self.assertNotEqual(ready_id, parked_id)
+
+    def test_parked_close_and_startup_copy(self) -> None:
+        self.assertEqual(
+            format_parked_close_heading(1),
+            "Message could not be sent",
+        )
+        self.assertEqual(
+            format_parked_close_heading(1, subject="Coauthors draft"),
+            "“Coauthors draft” could not be sent",
+        )
+        self.assertEqual(
+            format_parked_close_heading(2),
+            "2 messages could not be sent",
+        )
+        body = format_parked_close_body(
+            1,
+            "This message is too large to send.",
+            subject="Coauthors draft",
+        )
+        self.assertIn("Coauthors draft", body)
+        self.assertIn("too large to send", body)
+        self.assertIn("Review it before quitting", body)
+        self.assertIn(
+            "may never be sent",
+            format_parked_close_body(3, "This message is too large to send."),
+        )
+        toast = format_parked_startup_toast(
+            1,
+            "This message is too large to send.",
+            subject="Coauthors draft",
+        )
+        self.assertIn("Coauthors draft", toast)
+        self.assertIn("still in Outbox", toast)
+        self.assertIn(
+            "2 messages are still in Outbox",
+            format_parked_startup_toast(2, "This message is too large to send."),
         )
