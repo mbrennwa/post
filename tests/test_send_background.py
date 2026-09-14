@@ -26,14 +26,6 @@ def _run_idle_add(func, *args):
     return 0
 
 
-class _ImmediateMailIoThread:
-    def submit(self, func, /, *args, **kwargs) -> None:
-        func(*args, **kwargs)
-
-    def run_sync(self, func, /, *args, **kwargs):
-        return func(*args, **kwargs)
-
-
 class RunOutboundSendTests(unittest.TestCase):
     def setUp(self) -> None:
         delay_patcher = mock.patch(
@@ -58,15 +50,16 @@ class RunOutboundSendTests(unittest.TestCase):
         self.mail = mock.Mock()
         self.mail.get_account.return_value = mock.Mock(from_name="Alice")
 
-    @mock.patch(
-        "post.compose_window.get_mail_io_thread",
-        return_value=_ImmediateMailIoThread(),
-    )
+        def _run_named(_name, func, /, *args, **kwargs):
+            func(*args, **kwargs)
+
+        self.mail.submit_interactive.side_effect = _run_named
+
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_success_sets_message_sent(
-        self, _idle_add, _persist, _queue_id, _io
+        self, _idle_add, _persist, _queue_id
     ) -> None:
         outbox_changed = mock.Mock()
         run_outbound_send(
@@ -85,15 +78,11 @@ class RunOutboundSendTests(unittest.TestCase):
         self.mail.deliver_outbound_queue_item.assert_called_once_with("queue-1")
         self.assertEqual(self.status_messages, ["Message sent"])
 
-    @mock.patch(
-        "post.compose_window.get_mail_io_thread",
-        return_value=_ImmediateMailIoThread(),
-    )
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_send_queued_updates_status_and_outbox(
-        self, _idle_add, _persist, _queue_id, _io
+        self, _idle_add, _persist, _queue_id
     ) -> None:
         self.mail.deliver_outbound_queue_item.side_effect = SendQueued(MESSAGE_QUEUED)
         outbox_changed = mock.Mock()
@@ -110,16 +99,12 @@ class RunOutboundSendTests(unittest.TestCase):
         self.assertGreaterEqual(outbox_changed.call_count, 1)
         self.assertEqual(self.status_messages, [MESSAGE_QUEUED])
 
-    @mock.patch(
-        "post.compose_window.get_mail_io_thread",
-        return_value=_ImmediateMailIoThread(),
-    )
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.show_error_toast")
     @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_error_shows_toast_on_parent(
-        self, _idle_add, _persist, show_error_toast, _queue_id, _io
+        self, _idle_add, _persist, show_error_toast, _queue_id
     ) -> None:
         self.mail.deliver_outbound_queue_item.side_effect = SendError("SMTP failed")
         parent = mock.Mock()
@@ -141,16 +126,12 @@ class RunOutboundSendTests(unittest.TestCase):
         self.assertEqual(self.status_messages, [])
         outbox_changed.assert_called()
 
-    @mock.patch(
-        "post.compose_window.get_mail_io_thread",
-        return_value=_ImmediateMailIoThread(),
-    )
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.show_error_toast")
     @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_compose_validation_skips_outbox(
-        self, _idle_add, persist, show_error_toast, _queue_id, _io
+        self, _idle_add, persist, show_error_toast, _queue_id
     ) -> None:
         parent = mock.Mock()
         request = OutboundSendRequest(
@@ -181,15 +162,11 @@ class RunOutboundSendTests(unittest.TestCase):
             "Subject must not contain line breaks.",
         )
 
-    @mock.patch(
-        "post.compose_window.get_mail_io_thread",
-        return_value=_ImmediateMailIoThread(),
-    )
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_success_deletes_draft_before_status(
-        self, _idle_add, _persist, _queue_id, _io
+        self, _idle_add, _persist, _queue_id
     ) -> None:
         request = OutboundSendRequest(
             account_uid="acct-1",
@@ -224,10 +201,6 @@ class RunOutboundSendTests(unittest.TestCase):
         self.assertEqual(notification.previous_uid, "42")
         self.assertEqual(self.status_messages, ["Message sent"])
 
-    @mock.patch(
-        "post.compose_window.get_mail_io_thread",
-        return_value=_ImmediateMailIoThread(),
-    )
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.show_error_toast")
     @mock.patch(
@@ -236,7 +209,7 @@ class RunOutboundSendTests(unittest.TestCase):
     )
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_persist_failure_shows_toast(
-        self, _idle_add, persist, show_error_toast, _queue_id, _io
+        self, _idle_add, persist, show_error_toast, _queue_id
     ) -> None:
         parent = mock.Mock()
         run_outbound_send(

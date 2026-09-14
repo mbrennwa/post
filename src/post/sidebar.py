@@ -21,7 +21,6 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 from post.mail import MailService
 from post.mail import folder_status_cache
 from post.mail.eds import MailAccount
-from post.mail.io_thread import get_mail_io_thread
 from post.folder_dialogs import confirm_action, prompt_folder_name, show_error
 from post.gtk_schedule import schedule_on_gtk_main
 from post.mail.dnd import (
@@ -416,7 +415,7 @@ class MailSidebar:
                 error,
             )
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("refresh_inbox_counts", worker)
 
     def refresh_all_folder_counts(self) -> None:
         """Re-fetch unread/total for all sidebar message folders (badge-only).
@@ -459,7 +458,7 @@ class MailSidebar:
         def worker() -> None:
             if generation != self._folder_count_poll_generation:
                 return
-            if get_mail_io_thread().has_interactive_work_pending():
+            if self._mail.has_interactive_work_pending():
                 schedule_on_gtk_main(
                     self._defer_account_folder_count_poll,
                     generation,
@@ -489,7 +488,7 @@ class MailSidebar:
                 error,
             )
 
-        get_mail_io_thread().submit_background(worker)
+        self._mail.submit_background("poll_account_folder_counts", worker)
 
     def _defer_account_folder_count_poll(
         self,
@@ -634,7 +633,7 @@ class MailSidebar:
                 error,
             )
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("refresh_folder_counts", worker)
 
     def _on_folder_counts_refreshed(
         self,
@@ -747,7 +746,7 @@ class MailSidebar:
         worker.__qualname__ = (
             f"MailSidebar.refresh_folder_row[{short}/{folder_name}]"
         )
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("refresh_folder_row", worker)
 
     @staticmethod
     def _dispatch_folder_refresh_complete(
@@ -1280,7 +1279,7 @@ class MailSidebar:
 
         if folder_transfer:
             self._mail.begin_folder_transfer()
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("folder_operation", worker)
 
     def _on_folder_operation_finished(
         self,
@@ -1497,7 +1496,7 @@ class MailSidebar:
                 error,
             )
 
-        get_mail_io_thread().submit_background(worker)
+        self._mail.submit_background("load_folder_tree", worker)
 
     def _on_folder_load_cancelled(self, load_id: int, account_uid: str) -> bool:
         # Stale generations must not touch the current pending counter — that

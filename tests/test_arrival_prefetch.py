@@ -68,21 +68,20 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         mail._first_cached_rfc822_path.return_value = None
         folder = mock.Mock()
         mail._open_folder_unlocked.return_value = folder
+        mail.has_interactive_work_pending.return_value = False
         coordinator = OfflineBodySyncCoordinator(mail)
         return coordinator, mail, folder
 
-    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
     @mock.patch(
         "post.mail.offline_sync.get_account_offline_body_sync",
         return_value=OFFLINE_BODY_SYNC_OFF,
     )
-    def test_off_does_not_queue(self, _mode: mock.Mock, get_io: mock.Mock) -> None:
-        coordinator, _mail, _folder = self._coordinator()
+    def test_off_does_not_queue(self, _mode: mock.Mock) -> None:
+        coordinator, mail, _folder = self._coordinator()
         coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["1"])
-        get_io.return_value.submit_background.assert_not_called()
+        mail.submit_background.assert_not_called()
         self.assertEqual(len(coordinator._arrival_queue), 0)
 
-    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
     @mock.patch(
         "post.mail.offline_sync.account_is_user_offline",
         return_value=True,
@@ -92,25 +91,21 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return_value=OFFLINE_BODY_SYNC_ALL,
     )
     def test_user_offline_does_not_queue(
-        self, _mode: mock.Mock, _offline: mock.Mock, get_io: mock.Mock
+        self, _mode: mock.Mock, _offline: mock.Mock
     ) -> None:
-        coordinator, _mail, _folder = self._coordinator()
+        coordinator, mail, _folder = self._coordinator()
         coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["1"])
-        get_io.return_value.submit_background.assert_not_called()
+        mail.submit_background.assert_not_called()
 
-    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
     @mock.patch(
         "post.mail.offline_sync.get_account_offline_body_sync",
         return_value=OFFLINE_BODY_SYNC_ALL,
     )
-    def test_no_network_does_not_queue(
-        self, _mode: mock.Mock, get_io: mock.Mock
-    ) -> None:
-        coordinator, _mail, _folder = self._coordinator(network=False)
+    def test_no_network_does_not_queue(self, _mode: mock.Mock) -> None:
+        coordinator, mail, _folder = self._coordinator(network=False)
         coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["1"])
-        get_io.return_value.submit_background.assert_not_called()
+        mail.submit_background.assert_not_called()
 
-    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
     @mock.patch(
         "post.mail.offline_sync.account_is_user_offline",
         return_value=False,
@@ -120,16 +115,15 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return_value=OFFLINE_BODY_SYNC_ALL,
     )
     def test_hold_does_not_block_arrival_schedule(
-        self, _mode: mock.Mock, _offline: mock.Mock, get_io: mock.Mock
+        self, _mode: mock.Mock, _offline: mock.Mock
     ) -> None:
         coordinator, mail, _folder = self._coordinator()
         mail.offline_body_sync_is_held.return_value = True
         coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["1"])
-        get_io.return_value.submit_background.assert_called_once()
+        mail.submit_background.assert_called_once()
         coordinator.schedule_account("acct-1")
         self.assertIn("acct-1", coordinator._running)
 
-    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
     @mock.patch(
         "post.mail.offline_sync.account_is_user_offline",
         return_value=False,
@@ -139,7 +133,7 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return_value=OFFLINE_BODY_SYNC_ALL,
     )
     def test_burst_caps_at_twenty(
-        self, _mode: mock.Mock, _offline: mock.Mock, get_io: mock.Mock
+        self, _mode: mock.Mock, _offline: mock.Mock
     ) -> None:
         coordinator, _mail, _folder = self._coordinator()
         uids = [str(i) for i in range(25)]
@@ -147,7 +141,6 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         self.assertEqual(len(coordinator._arrival_queue), ARRIVAL_PREFETCH_BURST)
 
     @mock.patch("post.mail.offline_sync.folder_get_message_info", return_value=None)
-    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
     @mock.patch(
         "post.mail.offline_sync.account_is_user_offline",
         return_value=False,
@@ -160,16 +153,12 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         self,
         _mode: mock.Mock,
         _offline: mock.Mock,
-        get_io: mock.Mock,
         _info: mock.Mock,
     ) -> None:
-        io_thread = mock.Mock()
-        io_thread.has_interactive_work_pending.return_value = False
-        get_io.return_value = io_thread
         coordinator, mail, folder = self._coordinator()
         mail._first_cached_rfc822_path.return_value = "/tmp/nonempty"
         coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["1"])
-        worker = io_thread.submit_background.call_args[0][0]
+        worker = mail.submit_background.call_args[0][1]
         worker()
         folder.synchronize_message_sync.assert_not_called()
         mail.classify_cached_visible_attachments.assert_called_once_with(
@@ -177,7 +166,6 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         )
 
     @mock.patch("post.mail.offline_sync.folder_get_message_info", return_value=None)
-    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
     @mock.patch(
         "post.mail.offline_sync.account_is_user_offline",
         return_value=False,
@@ -190,16 +178,12 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         self,
         _mode: mock.Mock,
         _offline: mock.Mock,
-        get_io: mock.Mock,
         _info: mock.Mock,
     ) -> None:
-        io_thread = mock.Mock()
-        io_thread.has_interactive_work_pending.return_value = False
-        get_io.return_value = io_thread
         coordinator, mail, folder = self._coordinator()
         mail._first_cached_rfc822_path.return_value = None
         coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["42"])
-        worker = io_thread.submit_background.call_args[0][0]
+        worker = mail.submit_background.call_args[0][1]
         worker()
         folder.synchronize_message_sync.assert_called_once()
         args, kwargs = folder.synchronize_message_sync.call_args
@@ -209,7 +193,6 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         )
 
     @mock.patch("post.mail.offline_sync.folder_get_message_info", return_value=None)
-    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
     @mock.patch(
         "post.mail.offline_sync.account_is_user_offline",
         return_value=False,
@@ -222,21 +205,17 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         self,
         _mode: mock.Mock,
         _offline: mock.Mock,
-        get_io: mock.Mock,
         _info: mock.Mock,
     ) -> None:
-        io_thread = mock.Mock()
-        io_thread.has_interactive_work_pending.return_value = True
-        get_io.return_value = io_thread
-        coordinator, _mail, folder = self._coordinator()
+        coordinator, mail, folder = self._coordinator()
+        mail.has_interactive_work_pending.return_value = True
         coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["1"])
-        worker = io_thread.submit_background.call_args[0][0]
+        worker = mail.submit_background.call_args[0][1]
         worker()
         folder.synchronize_message_sync.assert_not_called()
-        self.assertEqual(io_thread.submit_background.call_count, 2)
+        self.assertEqual(mail.submit_background.call_count, 2)
         self.assertEqual(len(coordinator._arrival_queue), 1)
 
-    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
     @mock.patch(
         "post.mail.offline_sync.account_is_user_offline",
         return_value=False,
@@ -246,18 +225,17 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return_value=OFFLINE_BODY_SYNC_OFF,
     )
     def test_force_queues_when_offline_sync_is_off(
-        self, _mode: mock.Mock, _offline: mock.Mock, get_io: mock.Mock
+        self, _mode: mock.Mock, _offline: mock.Mock
     ) -> None:
-        coordinator, _mail, _folder = self._coordinator()
+        coordinator, mail, _folder = self._coordinator()
         coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["1"])
-        get_io.return_value.submit_background.assert_not_called()
+        mail.submit_background.assert_not_called()
         coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["1"], force=True)
-        get_io.return_value.submit_background.assert_called_once()
+        mail.submit_background.assert_called_once()
         self.assertEqual(len(coordinator._arrival_queue), 1)
         self.assertTrue(coordinator._arrival_queue[0].force)
 
     @mock.patch("post.mail.offline_sync.folder_get_message_info", return_value=None)
-    @mock.patch("post.mail.offline_sync.get_mail_io_thread")
     @mock.patch(
         "post.mail.offline_sync.account_is_user_offline",
         return_value=False,
@@ -270,16 +248,12 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         self,
         _mode: mock.Mock,
         _offline: mock.Mock,
-        get_io: mock.Mock,
         _info: mock.Mock,
     ) -> None:
-        io_thread = mock.Mock()
-        io_thread.has_interactive_work_pending.return_value = False
-        get_io.return_value = io_thread
         coordinator, mail, folder = self._coordinator()
         mail._first_cached_rfc822_path.return_value = None
         coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["7"], force=True)
-        worker = io_thread.submit_background.call_args[0][0]
+        worker = mail.submit_background.call_args[0][1]
         worker()
         folder.synchronize_message_sync.assert_called_once()
         mail.classify_cached_visible_attachments.assert_called_once()

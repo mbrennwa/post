@@ -8,10 +8,11 @@
 Mail I/O threading
 ------------------
 Blocking Camel calls must run on the dedicated mail I/O thread
-(``post.mail.io_thread``).  :class:`MailService` is the facade: public methods
-either execute on the mail thread already or dispatch via
+(``post.mail.io_thread``).  :class:`MailService` is the facade: GTK must call
+named job methods (``submit_interactive`` / ``submit_front`` /
+``submit_background`` / ``*_async``).  Internals still use
 ``get_mail_io_thread().run_sync`` / ``submit``.  UI code must not call
-``run_sync`` from the GTK thread.
+``get_mail_io_thread`` or ``run_sync`` from the GTK thread.
 """
 
 from __future__ import annotations
@@ -232,6 +233,16 @@ _TRANSFER_DEST_SYNC_MAX = 20
 
 def _run_on_gtk_thread(callback: Callable[[], None]) -> bool:
     callback()
+    return False
+
+
+def _invoke_job_done(
+    on_done: Callable[[Any, BaseException | None], Any],
+    value: Any,
+    error: BaseException | None,
+) -> bool:
+    """GTK idle wrapper for MailService async jobs (#425)."""
+    on_done(value, error)
     return False
 
 
@@ -1096,6 +1107,59 @@ class MailService:
                 return operation()
         finally:
             self._leave_mail_op()
+
+    def has_interactive_work_pending(self) -> bool:
+        """True when interactive mail jobs are queued on ``post-mail-io``."""
+        return get_mail_io_thread().has_interactive_work_pending()
+
+    def submit_interactive(
+        self, name: str, func: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> None:
+        """Queue named interactive mail work (today's ``submit`` queue)."""
+        log.debug("Mail job queue=interactive name=%s", name)
+        get_mail_io_thread().submit(func, *args, **kwargs)
+
+    def submit_front(
+        self, name: str, func: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> None:
+        """Queue named interactive mail work ahead of other interactive jobs."""
+        log.debug("Mail job queue=front name=%s", name)
+        get_mail_io_thread().submit_front(func, *args, **kwargs)
+
+    def submit_background(
+        self, name: str, func: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> None:
+        """Queue named background mail work (preempted by interactive jobs)."""
+        log.debug("Mail job queue=background name=%s", name)
+        get_mail_io_thread().submit_background(func, *args, **kwargs)
+
+    def run_job_async(
+        self,
+        name: str,
+        func: Callable[..., Any],
+        /,
+        *args: Any,
+        queue: Literal["interactive", "front", "background"] = "interactive",
+        on_done: Callable[[Any, BaseException | None], Any],
+        **kwargs: Any,
+    ) -> None:
+        """Run ``func`` on the mail thread; ``on_done(value, error)`` on GTK."""
+
+        def worker() -> None:
+            error: BaseException | None = None
+            value: Any = None
+            try:
+                value = func(*args, **kwargs)
+            except BaseException as exc:
+                error = exc
+            GLib.idle_add(_invoke_job_done, on_done, value, error)
+
+        if queue == "front":
+            self.submit_front(name, worker)
+        elif queue == "background":
+            self.submit_background(name, worker)
+        else:
+            self.submit_interactive(name, worker)
 
     def outbound_sends_pending(self) -> bool:
         with self._outbound_sends_cond:
@@ -7729,6 +7793,300 @@ class MailService:
             account_uid,
             folder_name,
             message_uid,
+        )
+
+    def read_message_async(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        mark_seen: bool = True,
+        on_done: Callable[[Any, BaseException | None], Any],
+        queue: Literal["interactive", "front", "background"] = "front",
+    ) -> None:
+        self.run_job_async(
+            "read_message",
+            self.read_message,
+            account_uid,
+            folder_name,
+            message_uid,
+            mark_seen=mark_seen,
+            queue=queue,
+            on_done=on_done,
+        )
+
+    def read_attachment_data_async(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        attachment_index: int,
+        *,
+        on_done: Callable[[Any, BaseException | None], Any],
+    ) -> None:
+        self.run_job_async(
+            "read_attachment_data",
+            self.read_attachment_data,
+            account_uid,
+            folder_name,
+            message_uid,
+            attachment_index,
+            on_done=on_done,
+        )
+
+    def read_compose_attachments_async(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        on_done: Callable[[Any, BaseException | None], Any],
+    ) -> None:
+        self.run_job_async(
+            "read_compose_attachments",
+            self.read_compose_attachments,
+            account_uid,
+            folder_name,
+            message_uid,
+            on_done=on_done,
+        )
+
+    def save_draft_async(
+        self,
+        *args: Any,
+        on_done: Callable[[Any, BaseException | None], Any],
+        **kwargs: Any,
+    ) -> None:
+        self.run_job_async(
+            "save_draft", self.save_draft, *args, on_done=on_done, **kwargs
+        )
+
+    def move_messages_async(
+        self,
+        account_uid: str,
+        source_folder: str,
+        destination_folder: str,
+        message_uids: list[str],
+        *,
+        on_done: Callable[[Any, BaseException | None], Any],
+    ) -> None:
+        self.run_job_async(
+            "move_messages",
+            self.move_messages,
+            account_uid,
+            source_folder,
+            destination_folder,
+            message_uids,
+            on_done=on_done,
+        )
+
+    def archive_messages_async(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        on_done: Callable[[Any, BaseException | None], Any],
+    ) -> None:
+        self.run_job_async(
+            "archive_messages",
+            self.archive_messages,
+            account_uid,
+            folder_name,
+            message_uids,
+            on_done=on_done,
+        )
+
+    def move_messages_to_trash_async(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        on_done: Callable[[Any, BaseException | None], Any],
+    ) -> None:
+        self.run_job_async(
+            "move_messages_to_trash",
+            self.move_messages_to_trash,
+            account_uid,
+            folder_name,
+            message_uids,
+            on_done=on_done,
+        )
+
+    def get_folder_stats_async(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        on_done: Callable[[Any, BaseException | None], Any],
+    ) -> None:
+        self.run_job_async(
+            "get_folder_stats",
+            self.get_folder_stats,
+            account_uid,
+            folder_name,
+            on_done=on_done,
+        )
+
+    def get_account_folder_stats_async(
+        self,
+        account_uid: str,
+        *,
+        on_done: Callable[[Any, BaseException | None], Any],
+        queue: Literal["interactive", "front", "background"] = "interactive",
+    ) -> None:
+        self.run_job_async(
+            "get_account_folder_stats",
+            self.get_account_folder_stats,
+            account_uid,
+            queue=queue,
+            on_done=on_done,
+        )
+
+    def flush_send_queue_async(
+        self,
+        *,
+        force: bool = False,
+        on_done: Callable[[Any, BaseException | None], Any],
+    ) -> None:
+        self.run_job_async(
+            "flush_send_queue",
+            self.flush_send_queue,
+            force=force,
+            on_done=on_done,
+        )
+
+    def toggle_message_seen_async(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        on_done: Callable[[Any, BaseException | None], Any],
+    ) -> None:
+        self.run_job_async(
+            "toggle_message_seen",
+            self.toggle_message_seen,
+            account_uid,
+            folder_name,
+            message_uid,
+            on_done=on_done,
+        )
+
+    def toggle_message_flagged_async(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        on_done: Callable[[Any, BaseException | None], Any],
+    ) -> None:
+        self.run_job_async(
+            "toggle_message_flagged",
+            self.toggle_message_flagged,
+            account_uid,
+            folder_name,
+            message_uid,
+            on_done=on_done,
+        )
+
+    def set_messages_seen_async(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        seen: bool,
+        on_done: Callable[[Any, BaseException | None], Any],
+    ) -> None:
+        self.run_job_async(
+            "set_messages_seen",
+            self.set_messages_seen,
+            account_uid,
+            folder_name,
+            message_uids,
+            seen=seen,
+            on_done=on_done,
+        )
+
+    def set_messages_flagged_async(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        flagged: bool,
+        on_done: Callable[[Any, BaseException | None], Any],
+    ) -> None:
+        self.run_job_async(
+            "set_messages_flagged",
+            self.set_messages_flagged,
+            account_uid,
+            folder_name,
+            message_uids,
+            flagged=flagged,
+            on_done=on_done,
+        )
+
+    def list_folders_async(
+        self,
+        account_uid: str,
+        *,
+        cancellable: Gio.Cancellable | None = None,
+        on_done: Callable[[Any, BaseException | None], Any],
+        queue: Literal["interactive", "front", "background"] = "background",
+    ) -> None:
+        self.run_job_async(
+            "list_folders",
+            self.list_folders,
+            account_uid,
+            cancellable=cancellable,
+            queue=queue,
+            on_done=on_done,
+        )
+
+    def list_messages_async(
+        self,
+        account_uid: str,
+        folder_name: str,
+        limit: int = DEFAULT_MESSAGE_PAGE_SIZE,
+        *,
+        on_done: Callable[[Any, BaseException | None], Any],
+        queue: Literal["interactive", "front", "background"] = "interactive",
+    ) -> None:
+        self.run_job_async(
+            "list_messages",
+            self.list_messages,
+            account_uid,
+            folder_name,
+            limit,
+            queue=queue,
+            on_done=on_done,
+        )
+
+    def continue_heavy_folder_index_async(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        cursor: dict[str, Any] | None = None,
+        allow_refresh: bool = True,
+        on_progress: Callable[[Any], None] | None = None,
+        on_done: Callable[[Any, BaseException | None], Any],
+        queue: Literal["interactive", "front", "background"] = "background",
+    ) -> None:
+        self.run_job_async(
+            "continue_heavy_folder_index",
+            self.continue_heavy_folder_index,
+            account_uid,
+            folder_name,
+            cursor=cursor,
+            allow_refresh=allow_refresh,
+            on_progress=on_progress,
+            queue=queue,
+            on_done=on_done,
         )
 
     def _move_messages_unlocked(

@@ -28,17 +28,13 @@ class MailSyncWatcherTests(unittest.TestCase):
         )
 
     def test_start_registers_resume_callback(self) -> None:
-        with mock.patch("post.mail.sync_watcher.get_mail_io_thread") as get_thread:
-            get_thread.return_value = mock.Mock()
-            self.watcher.start()
+        self.watcher.start()
         self.mail.set_sync_setup_resume_callback.assert_called_once()
         self.watcher.stop()
 
     def test_stop_clears_resume_callback(self) -> None:
-        with mock.patch("post.mail.sync_watcher.get_mail_io_thread") as get_thread:
-            get_thread.return_value = mock.Mock()
-            self.watcher.start()
-            self.watcher.stop()
+        self.watcher.start()
+        self.watcher.stop()
         self.mail.set_sync_setup_resume_callback.assert_called_with(None)
 
     def test_yield_schedules_setup_retry(self) -> None:
@@ -49,19 +45,15 @@ class MailSyncWatcherTests(unittest.TestCase):
             return len(idle_callbacks)
 
         with mock.patch(
-            "post.mail.sync_watcher.get_mail_io_thread"
-        ) as get_thread, mock.patch(
             "post.mail.sync_watcher.GLib.idle_add", side_effect=capture_idle
         ), mock.patch(
             "post.mail.sync_watcher.account_is_user_offline", return_value=False
         ):
-            io_thread = mock.Mock()
-            io_thread.has_interactive_work_pending.return_value = True
-            get_thread.return_value = io_thread
+            self.mail.has_interactive_work_pending.return_value = True
 
             self.watcher.set_accounts(["acct-1"])
             self.watcher.start()
-            worker = io_thread.submit_background.call_args[0][0]
+            worker = self.mail.submit_background.call_args[0][1]
             worker()
 
         retry_calls = [args for _func, args in idle_callbacks if args and args[0] == "yield"]
@@ -76,19 +68,15 @@ class MailSyncWatcherTests(unittest.TestCase):
             return len(idle_callbacks)
 
         with mock.patch(
-            "post.mail.sync_watcher.get_mail_io_thread"
-        ) as get_thread, mock.patch(
             "post.mail.sync_watcher.GLib.idle_add", side_effect=capture_idle
         ), mock.patch(
             "post.mail.sync_watcher.account_is_user_offline", return_value=False
         ):
-            io_thread = mock.Mock()
-            io_thread.has_interactive_work_pending.return_value = False
-            get_thread.return_value = io_thread
+            self.mail.has_interactive_work_pending.return_value = False
 
             self.watcher.set_accounts(["acct-1"])
             self.watcher.start()
-            worker = io_thread.submit_background.call_args[0][0]
+            worker = self.mail.submit_background.call_args[0][1]
             worker()
 
         retry_calls = [

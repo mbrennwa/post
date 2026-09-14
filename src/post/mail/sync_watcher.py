@@ -20,7 +20,6 @@ from gi.repository import Camel, Gio, GLib, GObject
 
 from .eds import MailService
 from .folders import is_post_local_folder
-from .io_thread import get_mail_io_thread
 from .offline_settings import account_is_user_offline
 from .offline_sync import added_uids_from_change_info
 from .search_debug import search_trace
@@ -145,7 +144,7 @@ class MailSyncWatcher:
                             "cancelled",
                         )
                         return
-                    if get_mail_io_thread().has_interactive_work_pending():
+                    if self._mail.has_interactive_work_pending():
                         search_trace(
                             "sync_watcher_setup_yield",
                             generation=generation,
@@ -192,7 +191,7 @@ class MailSyncWatcher:
                 setups,
             )
 
-        get_mail_io_thread().submit_background(worker)
+        self._mail.submit_background("sync_watcher_setup", worker)
 
     def _on_background_resume_retry(self) -> None:
         self._schedule_setup_retry("background_resume")

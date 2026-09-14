@@ -533,22 +533,17 @@ class FetchAttachmentSearchLocationTests(unittest.TestCase):
         window = self._window_for_search_hit(sent_match, sidebar_folder="INBOX")
         window._mail.read_attachment_data.return_value = ("file.pdf", b"%PDF")
 
-        class _ImmediateMailIoThread:
-            def submit(self, func, /, *args, **kwargs) -> None:
-                func(*args, **kwargs)
+        def _run_named(_name, func, /, *args, **kwargs) -> None:
+            func(*args, **kwargs)
+
+        window._mail.submit_interactive.side_effect = _run_named
 
         def _run_idle_add(func, *args):
             func(*args)
             return False
 
         on_ready = mock.Mock()
-        with (
-            mock.patch(
-                "post.window.get_mail_io_thread",
-                return_value=_ImmediateMailIoThread(),
-            ),
-            mock.patch("post.window.GLib.idle_add", side_effect=_run_idle_add),
-        ):
+        with mock.patch("post.window.GLib.idle_add", side_effect=_run_idle_add):
             MainWindow._fetch_attachment(window, 0, on_ready)
 
         window._mail.read_attachment_data.assert_called_once_with(
@@ -1114,7 +1109,6 @@ class MarkSeenClickIntentTests(unittest.TestCase):
         from unittest import mock
 
         from post.window import MainWindow
-        from post.mail.io_thread import get_mail_io_thread
 
         message = {"uid": "42", "subject": "Digest", "flags": {"seen": False}}
         window = self._window_stub(message=message)
@@ -1127,20 +1121,18 @@ class MarkSeenClickIntentTests(unittest.TestCase):
             seen_kwargs.update(kwargs)
             return {"uid": "42", "body_plain": "Hi", "flags": {"seen": True}}
 
-        def run_front(worker) -> None:
+        def run_front(_name, worker, /, *args, **kwargs) -> None:
             worker()
 
         window._mail.get_account = mock.Mock(return_value=window._current_account)
         window._mail.read_message = fake_read
         window._on_message_read = mock.Mock(return_value=False)
         window._on_message_read_worker_stale = mock.Mock(return_value=False)
-        with mock.patch.object(
-            get_mail_io_thread(), "submit_front", side_effect=run_front
+        window._mail.submit_front.side_effect = run_front
+        with mock.patch(
+            "post.window.GLib.idle_add", side_effect=lambda *_a, **_k: False
         ):
-            with mock.patch(
-                "post.window.GLib.idle_add", side_effect=lambda *_a, **_k: False
-            ):
-                MainWindow._load_message_body_for_uid(window, "42", mark_seen=False)
+            MainWindow._load_message_body_for_uid(window, "42", mark_seen=False)
 
         self.assertEqual(window._pending_message_read_uid, "42")
         self.assertTrue(seen_kwargs.get("mark_seen"))

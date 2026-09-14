@@ -37,7 +37,6 @@ from post.mail.helpers import (
     perform_one_click_unsubscribe,
     reader_toggle_button_state,
 )
-from post.mail.io_thread import get_mail_io_thread
 from post.mail.network_errors import (
     MESSAGE_NOT_CACHED_SIGN_IN,
     format_attachment_error,
@@ -281,7 +280,7 @@ class ReaderWindow(Adw.ApplicationWindow):
                 error = exc
             GLib.idle_add(self._on_message_read, read_id, msg, error)
 
-        get_mail_io_thread().submit_front(worker)
+        self._mail.submit_front("read_message", worker)
 
     def _on_message_read(
         self,
@@ -439,7 +438,7 @@ class ReaderWindow(Adw.ApplicationWindow):
                 error,
             )
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("set_message_flag", worker)
 
     def _on_message_flag_updated(
         self,
@@ -524,7 +523,7 @@ class ReaderWindow(Adw.ApplicationWindow):
                 error = exc
             GLib.idle_add(self._on_one_click_unsubscribe_done, error)
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("unsubscribe", worker)
 
     def _on_add_to_calendar(self, invite: dict) -> None:
         from post.calendar_dialog import present_add_to_calendar
@@ -535,7 +534,9 @@ class ReaderWindow(Adw.ApplicationWindow):
             account_uid=self._account.uid,
             on_success=lambda label: show_toast(self, f"Added to {label}"),
             on_error=lambda message: show_error_toast(self, message),
-            run_async=lambda worker: get_mail_io_thread().submit(worker),
+            run_async=lambda worker: self._mail.submit_interactive(
+                "add_to_calendar", worker
+            ),
         )
 
     def _archive_after_unsubscribe(self) -> None:
@@ -663,7 +664,7 @@ class ReaderWindow(Adw.ApplicationWindow):
                 error = exc
             GLib.idle_add(self._on_attachment_fetched, filename, data, error, on_ready)
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("read_attachment", worker)
 
     def _on_attachment_fetched(
         self,

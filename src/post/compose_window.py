@@ -77,7 +77,6 @@ from post.mail.correspondents import (
     match_correspondents,
 )
 from post.mail.eds import MailAccount
-from post.mail.io_thread import get_mail_io_thread
 from post.mail.network_errors import (
     format_attachment_error,
     is_sign_in_required_error,
@@ -200,7 +199,8 @@ def run_outbound_send(
 ) -> None:
     """Persist to outbox and send on the mail I/O thread; never block the UI thread."""
 
-    get_mail_io_thread().submit(
+    mail.submit_interactive(
+        "outbound_send",
         _run_outbound_send_worker,
         mail=mail,
         parent=parent,
@@ -424,7 +424,7 @@ def _finish_outbound_send(
                 request,
             )
 
-        get_mail_io_thread().submit(delete_worker)
+        mail.submit_interactive("delete_draft_after_send", delete_worker)
         return False
 
     _complete_outbound_send_success(
@@ -907,7 +907,7 @@ class ComposeWindow(Adw.Window):
                 GLib.idle_add(lambda: show_error_toast(self, message))
             GLib.idle_add(self._on_draft_attachments_loaded, loaded)
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("load_draft_attachments", worker)
         return False
 
     def _begin_load_forward_attachments(self) -> bool:
@@ -937,7 +937,7 @@ class ComposeWindow(Adw.Window):
                 GLib.idle_add(lambda: show_error_toast(self, message))
             GLib.idle_add(self._on_draft_attachments_loaded, loaded)
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("load_forward_attachments", worker)
         return False
 
     def _on_draft_attachments_loaded(
@@ -1339,7 +1339,7 @@ class ComposeWindow(Adw.Window):
                 self._on_correspondents_loaded, generation, correspondents
             )
 
-        get_mail_io_thread().submit(worker)
+        self._mail.submit_interactive("load_correspondents", worker)
 
     def _on_correspondents_loaded(
         self, generation: int, correspondents: list[Correspondent]
@@ -2020,7 +2020,8 @@ class ComposeWindow(Adw.Window):
         if self._on_draft_save_started is not None:
             self._on_draft_save_started(account_uid, drafts_folder_name)
 
-        get_mail_io_thread().submit(
+        self._mail.submit_interactive(
+            "save_draft",
             self._run_save_draft_on_mail_thread,
             generation=generation,
             cancellable=cancellable,

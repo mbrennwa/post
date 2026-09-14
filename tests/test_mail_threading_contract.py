@@ -1,7 +1,7 @@
 # Copyright (C) 2026 mbrennwa
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Regression checks for the dedicated mail I/O thread architecture (#44)."""
+"""Regression checks for the dedicated mail I/O thread architecture (#44, #425)."""
 
 from __future__ import annotations
 
@@ -15,6 +15,18 @@ _UI_MAIL_MODULES = (
     _REPO_ROOT / "src" / "post" / "window.py",
     _REPO_ROOT / "src" / "post" / "sidebar.py",
     _REPO_ROOT / "src" / "post" / "compose_window.py",
+    _REPO_ROOT / "src" / "post" / "reader_window.py",
+    _REPO_ROOT / "src" / "post" / "mail" / "send_delay.py",
+    _REPO_ROOT / "src" / "post" / "mail" / "offline_sync.py",
+    _REPO_ROOT / "src" / "post" / "mail" / "sync_watcher.py",
+)
+# Timeout helper threads in offline_sync.py are allowed; mail I/O must not spawn its own.
+_NO_MAIL_WORKER_THREAD_MODULES = (
+    _REPO_ROOT / "src" / "post" / "window.py",
+    _REPO_ROOT / "src" / "post" / "sidebar.py",
+    _REPO_ROOT / "src" / "post" / "compose_window.py",
+    _REPO_ROOT / "src" / "post" / "reader_window.py",
+    _REPO_ROOT / "src" / "post" / "mail" / "send_delay.py",
     _REPO_ROOT / "src" / "post" / "mail" / "sync_watcher.py",
 )
 
@@ -67,10 +79,25 @@ class MailThreadingContractTests(unittest.TestCase):
             )
 
     def test_ui_mail_modules_do_not_spawn_threading_thread(self) -> None:
-        for path in _UI_MAIL_MODULES:
+        for path in _NO_MAIL_WORKER_THREAD_MODULES:
             self.assertFalse(
                 _uses_threading_thread(path),
-                msg=f"{path.relative_to(_REPO_ROOT)} must use get_mail_io_thread().submit(), not threading.Thread",
+                msg=(
+                    f"{path.relative_to(_REPO_ROOT)} must use MailService "
+                    "job methods, not threading.Thread"
+                ),
+            )
+
+    def test_ui_mail_modules_do_not_call_get_mail_io_thread(self) -> None:
+        for path in _UI_MAIL_MODULES:
+            source = path.read_text(encoding="utf-8")
+            self.assertNotIn(
+                "get_mail_io_thread",
+                source,
+                msg=(
+                    f"{path.relative_to(_REPO_ROOT)} must call MailService "
+                    "submit_interactive / *_async, not get_mail_io_thread"
+                ),
             )
 
     def test_mail_threading_doc_exists(self) -> None:
@@ -79,3 +106,5 @@ class MailThreadingContractTests(unittest.TestCase):
         text = doc.read_text(encoding="utf-8")
         self.assertIn("post-mail-io", text)
         self.assertIn("Manual regression matrix", text)
+        self.assertIn("submit_interactive", text)
+        self.assertIn("job", text.lower())

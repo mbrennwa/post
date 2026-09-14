@@ -50,7 +50,7 @@ class ComposeForwardAttachmentsTests(unittest.TestCase):
             self._idle_callbacks.append((callback, args))
             return 0
 
-        def capture_submit(fn, *args, **kwargs):
+        def capture_submit(_name, fn, *args, **kwargs):
             self._io_workers.append((fn, args, kwargs))
             return None
 
@@ -59,11 +59,7 @@ class ComposeForwardAttachmentsTests(unittest.TestCase):
             side_effect=capture_idle,
         )
         self._idle_patch.start()
-        self._io_patch = mock.patch(
-            "post.compose_window.get_mail_io_thread",
-        )
-        io_mock = self._io_patch.start()
-        io_mock.return_value.submit.side_effect = capture_submit
+        self.mail.submit_interactive.side_effect = capture_submit
         self._sig_patch = mock.patch(
             "post.compose_window.get_account_signature",
             return_value="",
@@ -83,7 +79,6 @@ class ComposeForwardAttachmentsTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._idle_patch.stop()
-        self._io_patch.stop()
         self._sig_patch.stop()
         self._corr_patch.stop()
         self._icon_patch.stop()
