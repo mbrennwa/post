@@ -124,5 +124,45 @@ class EmptyFolderLoadCallbackTests(unittest.TestCase):
         window._release_offline_sync_for_folder_work.assert_not_called()
 
 
+class HeavyFolderOfflineHoldTests(unittest.TestCase):
+    def _window(self, *, indexing: bool) -> mock.Mock:
+        window = mock.Mock()
+        window._messages_load_generation = 7
+        window._offline_held_for_load_generation = 7
+        window._current_account = _account()
+        window._current_folder = "Archive"
+        window._heavy_index_in_progress = (
+            ("acct-1", "Archive") if indexing else None
+        )
+        window._offline_download_status = "Downloading…"
+        window._mail = mock.Mock()
+        window._heavy_index_blocks_offline_sync = (
+            lambda load_id: MainWindow._heavy_index_blocks_offline_sync(
+                window, load_id
+            )
+        )
+        return window
+
+    def test_keeps_hold_while_heavy_index_in_progress(self) -> None:
+        """Archive indexing must keep the global downsync hold (#407)."""
+        window = self._window(indexing=True)
+
+        MainWindow._release_offline_sync_for_folder_work(window, 7)
+
+        window._mail.hold_offline_body_sync.assert_not_called()
+        self.assertEqual(window._offline_held_for_load_generation, 7)
+        window._sync_watcher_current_folder.assert_not_called()
+
+    def test_releases_hold_when_archive_selected_but_index_done(self) -> None:
+        """Caught-up Archive must not keep other accounts' backfill paused (#407)."""
+        window = self._window(indexing=False)
+
+        MainWindow._release_offline_sync_for_folder_work(window, 7)
+
+        window._mail.hold_offline_body_sync.assert_called_once_with(False)
+        self.assertIsNone(window._offline_held_for_load_generation)
+        window._sync_watcher_current_folder.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()

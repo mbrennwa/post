@@ -1867,8 +1867,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._mail.hold_offline_body_sync(True)
         self._refresh_status_display()
 
-    def _heavy_folder_still_selected(self, load_id: int) -> bool:
-        """True while the open folder is still this heavy-folder load (#208)."""
+    def _heavy_index_blocks_offline_sync(self, load_id: int) -> bool:
+        """True while this load's heavy-folder indexer still owns mail I/O (#407)."""
         if load_id != self._messages_load_generation:
             return False
         account = self._current_account
@@ -1876,15 +1876,16 @@ class MainWindow(Adw.ApplicationWindow):
         return (
             account is not None
             and folder is not None
-            and is_heavy_folder_name(folder)
+            and self._heavy_index_in_progress == (account.uid, folder)
         )
 
     def _release_offline_sync_for_folder_work(self, load_id: int) -> None:
         if self._offline_held_for_load_generation != load_id:
             return
-        # Keep holding while the clicked heavy folder stays selected so Gmail
-        # (or any other account) offline backfill cannot steal status / mail I/O.
-        if self._heavy_folder_still_selected(load_id):
+        # Keep holding while Archive/etc. Graph catch-up is in progress so
+        # other accounts' downsync cannot steal the background FIFO (#407).
+        # Sitting in a caught-up heavy folder must not keep the hold.
+        if self._heavy_index_blocks_offline_sync(load_id):
             self._offline_download_status = ""
             self._refresh_status_display()
             return
@@ -5201,13 +5202,15 @@ class MainWindow(Adw.ApplicationWindow):
                         load_id, account_uid, folder_name
                     )
                 elif sync_after_send:
+                    # Claim before the send wait so a cache paint with
+                    # sync_pending=False cannot release the offline hold (#407).
+                    self._heavy_index_in_progress = (account_uid, folder_name)
 
                     def heavy_after_send() -> None:
                         if load_id != self._messages_load_generation:
                             return
-                        if self._heavy_index_in_progress == (
-                            account_uid,
-                            folder_name,
+                        if not self._heavy_index_still_active(
+                            account_uid, folder_name
                         ):
                             return
                         self._start_background_heavy_folder_index(
@@ -5467,8 +5470,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_sync_in_progress = False
         account = self._current_account
         folder = self._current_folder
-        # Keep ``_heavy_index_in_progress`` until catch-up or leave; the release
-        # path still holds offline sync while a heavy folder stays selected.
+        # Indexer clears ``_heavy_index_in_progress`` on catch-up; release then
+        # lifts the offline hold even if Archive is still selected (#407).
         self._release_offline_sync_for_folder_work(load_id)
         if changed:
             return False
