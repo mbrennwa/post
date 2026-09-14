@@ -131,6 +131,7 @@ from post.mail.helpers import (
     format_from_search_query,
     insert_messages_newest_first,
     message_matches_bulk_archive_scope,
+    message_row_is_signature_suspect,
     perform_one_click_unsubscribe,
     read_menu_items,
     read_menu_label,
@@ -304,6 +305,9 @@ class MainWindow(Adw.ApplicationWindow):
         )
         self._mail.set_password_prompt(self._prompt_account_password)
         self._mail.set_account_health_changed_callback(self._on_account_health_changed)
+        self._mail.set_visible_attachments_changed_callback(
+            self._on_visible_attachments_classified
+        )
         self._sync_watcher = MailSyncWatcher(
             self._mail,
             on_folder_changed=self._on_sync_folder_changed,
@@ -3787,6 +3791,47 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             GLib.idle_add(self._reload_sidebar)
 
+    def _queue_signature_clip_prefetch(
+        self,
+        account: MailAccount,
+        folder_name: str,
+        messages: list[dict],
+    ) -> None:
+        grouped: dict[tuple[str, str], list[str]] = {}
+        for msg in messages:
+            if not message_row_is_signature_suspect(msg):
+                continue
+            uid = str(msg.get("uid") or "")
+            if not uid:
+                continue
+            account_uid = str(msg.get("_search_account_uid") or account.uid)
+            folder = str(msg.get("_search_folder") or folder_name)
+            grouped.setdefault((account_uid, folder), []).append(uid)
+        for (account_uid, folder), uids in grouped.items():
+            self._mail.schedule_signature_clip_prefetch(account_uid, folder, uids)
+
+    def _on_visible_attachments_classified(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        attachments: bool,
+    ) -> None:
+        keys = [message_uid]
+        if account_uid and folder_name:
+            keys.append(make_search_row_key(account_uid, folder_name, message_uid))
+        seen: set[str] = set()
+        for key in keys:
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            self._message_list_view.update_message_flags(
+                key, {"attachments": attachments}
+            )
+            row = self._message_list_view.get_message(key)
+            if row is not None:
+                self._upsert_message_in_folder_cache(dict(row), None)
+
     def _apply_folder_messages(
         self,
         messages: list[dict],
@@ -3808,6 +3853,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_list_view.prepend_messages(prepended, folder_name=folder_name)
         if account is not None:
             self._update_message_status(account, folder_name)
+            self._queue_signature_clip_prefetch(account, folder_name, prepended)
 
     def _apply_messages_to_list(
         self,
@@ -3823,6 +3869,7 @@ class MainWindow(Adw.ApplicationWindow):
         # main thread. More rows append when the user scrolls near the end (#208).
         bind_messages = messages[:MESSAGE_LIST_UI_BIND_CAP]
         self._message_list_bound_count = len(bind_messages)
+        self._queue_signature_clip_prefetch(account, folder_name, messages)
         batch_size = MESSAGE_LIST_UI_BATCH_SIZE
         if len(bind_messages) <= batch_size:
             self._apply_folder_messages(bind_messages, folder_name, account=account)
@@ -7553,6 +7600,14 @@ class MainWindow(Adw.ApplicationWindow):
             uid = self._remap_list_key(uid, {previous_uid: recovered_uid}) or uid
 
         self._reconcile_folder_index_headers_after_read(uid, msg)
+        loaded_flags = msg.get("flags") or {}
+        if "attachments" in loaded_flags:
+            self._message_list_view.update_message_flags(
+                uid, {"attachments": bool(loaded_flags["attachments"])}
+            )
+            list_row = self._message_list_view.get_message(uid)
+            if list_row is not None:
+                self._upsert_message_in_folder_cache(dict(list_row), None)
 
         self._current_message_uid = uid
         set_active_message_uid(uid)

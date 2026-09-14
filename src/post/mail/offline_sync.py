@@ -116,6 +116,7 @@ class _ArrivalPrefetchItem:
     account_uid: str
     folder_name: str
     uid: str
+    force: bool = False
 
 
 @dataclass(frozen=True)
@@ -219,22 +220,27 @@ class OfflineBodySyncCoordinator:
         uids: list[str],
         *,
         sort_dates: dict[str, int] | None = None,
+        force: bool = False,
     ) -> None:
         """Queue best-effort MIME fetches for newly arrived UIDs (#372).
 
         Ignores the Archive/heavy-folder hold used by full-account downsync.
+        ``force=True`` is the paperclip classify path (#417): skip the Off
+        policy and age window, and still queue when offline so a cached body
+        can be classified without FETCH.
         """
         if not uids:
             return
         if is_post_outbox_folder(folder_name):
             return
-        mode = get_account_offline_body_sync(account_uid)
-        if mode == OFFLINE_BODY_SYNC_OFF:
-            return
-        if account_is_user_offline(account_uid):
-            return
-        if not self._mail.is_network_available():
-            return
+        if not force:
+            mode = get_account_offline_body_sync(account_uid)
+            if mode == OFFLINE_BODY_SYNC_OFF:
+                return
+            if account_is_user_offline(account_uid):
+                return
+            if not self._mail.is_network_available():
+                return
         selected = select_arrival_prefetch_uids(uids, sort_dates=sort_dates)
         if not selected:
             return
@@ -253,7 +259,9 @@ class OfflineBodySyncCoordinator:
                     continue
                 self._arrival_queued.add(key)
                 self._arrival_queue.append(
-                    _ArrivalPrefetchItem(account_uid, folder_name, uid)
+                    _ArrivalPrefetchItem(
+                        account_uid, folder_name, uid, force=force
+                    )
                 )
             if not self._arrival_running and self._arrival_queue:
                 self._arrival_running = True
@@ -304,10 +312,12 @@ class OfflineBodySyncCoordinator:
                     self._finish_arrival_worker(resubmit=False)
                     return
                 mode = get_account_offline_body_sync(item.account_uid)
-                if (
+                user_offline = account_is_user_offline(item.account_uid)
+                network = self._mail.is_network_available()
+                if not item.force and (
                     mode == OFFLINE_BODY_SYNC_OFF
-                    or account_is_user_offline(item.account_uid)
-                    or not self._mail.is_network_available()
+                    or user_offline
+                    or not network
                 ):
                     continue
                 try:
@@ -324,7 +334,8 @@ class OfflineBodySyncCoordinator:
                     continue
                 if folder is None:
                     continue
-                apply_offline_sync_to_folder(folder, mode)
+                if not item.force:
+                    apply_offline_sync_to_folder(folder, mode)
                 if camel_uid_is_binary(item.uid):
                     continue
                 try:
@@ -332,14 +343,30 @@ class OfflineBodySyncCoordinator:
                 except TypeError:
                     continue
                 if self._arrival_uid_is_cached(folder, api_uid):
+                    self._mail.classify_cached_visible_attachments(
+                        item.account_uid,
+                        item.folder_name,
+                        item.uid,
+                        folder=folder,
+                    )
                     continue
-                if not self._arrival_uid_in_age_window(folder, item.uid, mode):
+                if user_offline or not network:
+                    continue
+                if not item.force and not self._arrival_uid_in_age_window(
+                    folder, item.uid, mode
+                ):
                     continue
                 preempted = self._prefetch_one_uid(folder, api_uid)
                 if preempted:
                     self._requeue_arrival_item(item)
                     self._finish_arrival_worker(resubmit=True)
                     return
+                self._mail.classify_cached_visible_attachments(
+                    item.account_uid,
+                    item.folder_name,
+                    item.uid,
+                    folder=folder,
+                )
         except Exception:
             log.debug("Arrival body prefetch worker failed", exc_info=True)
             self._finish_arrival_worker(resubmit=bool(self._arrival_queue))

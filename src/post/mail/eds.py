@@ -692,6 +692,9 @@ class MailService:
     _account_health_changed: Callable[[str], None] | None = field(
         default=None, init=False, repr=False
     )
+    _visible_attachments_changed: Callable[[str, str, str, bool], None] | None = field(
+        default=None, init=False, repr=False
+    )
     _pending_mail_ops: int = field(default=0, init=False)
     _pending_mail_ops_cond: threading.Condition = field(
         default_factory=threading.Condition, init=False, repr=False
@@ -964,6 +967,87 @@ class MailService:
             sort_dates=sort_dates,
         )
 
+    def schedule_signature_clip_prefetch(
+        self,
+        account_uid: str,
+        folder_name: str,
+        uids: list[str],
+    ) -> None:
+        """FETCH or classify cached MIME so the paperclip matches the reader (#417).
+
+        Runs even when offline body-sync is Off. Cached bodies classify locally
+        without a network FETCH.
+        """
+        self.offline_sync.schedule_arrival_prefetch(
+            account_uid,
+            folder_name,
+            uids,
+            force=True,
+        )
+
+    def classify_cached_visible_attachments(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        folder: Camel.Folder | None = None,
+    ) -> bool | None:
+        """Set ``flags.attachments`` from cached RFC822 when a body is on disk."""
+        import email
+        import email.policy
+
+        from .helpers import (
+            extract_attachments_from_email_message,
+            has_visible_attachments,
+        )
+
+        if folder is None:
+            try:
+                folder = self._open_folder_unlocked(account_uid, folder_name)
+            except Exception:
+                log.debug(
+                    "Visible-attachment classify skipped open for %s/%s",
+                    account_uid,
+                    folder_name,
+                    exc_info=True,
+                )
+                return None
+        if folder is None:
+            return None
+        try:
+            api_uid = camel_uid_to_api(message_uid)
+        except TypeError:
+            return None
+        path = self._first_cached_rfc822_path(folder, api_uid)
+        if path is None:
+            return None
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        try:
+            parsed = email.message_from_bytes(raw, policy=email.policy.default)
+            visible = has_visible_attachments(
+                extract_attachments_from_email_message(parsed)
+            )
+        except Exception:
+            log.debug(
+                "Visible-attachment classify failed for %s",
+                api_uid,
+                exc_info=True,
+            )
+            return None
+        self._update_cached_message_flags(
+            account_uid, folder_name, message_uid, attachments=visible
+        )
+        self._notify_visible_attachments_changed(
+            account_uid, folder_name, message_uid, visible
+        )
+        return visible
+
     def cancel_offline_body_sync(self, account_uid: str) -> None:
         self.offline_sync.cancel_account(account_uid)
 
@@ -1211,6 +1295,12 @@ class MailService:
         """UI callback invoked on the GTK idle loop when connect health changes."""
         self._account_health_changed = callback
 
+    def set_visible_attachments_changed_callback(
+        self, callback: Callable[[str, str, str, bool], None] | None
+    ) -> None:
+        """UI callback when MIME classify updates the paperclip flag (#417)."""
+        self._visible_attachments_changed = callback
+
     def get_account_connect_health(self, account_uid: str) -> AccountConnectHealth:
         with self._lock:
             return self._account_connect_health.get(account_uid, "ok")
@@ -1270,6 +1360,18 @@ class MailService:
         if callback is None:
             return
         GLib.idle_add(callback, account_uid)
+
+    def _notify_visible_attachments_changed(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        attachments: bool,
+    ) -> None:
+        callback = self._visible_attachments_changed
+        if callback is None:
+            return
+        GLib.idle_add(callback, account_uid, folder_name, message_uid, attachments)
 
     def _account_uid_for_service(self, service_uid: str) -> str | None:
         if not service_uid:
@@ -7619,6 +7721,7 @@ class MailService:
             extract_attachments,
             extract_inline_images,
             extract_message_bodies,
+            has_visible_attachments,
         )
 
         if self.get_account_connect_health(account_uid) == "needs_sign_in":
@@ -7713,7 +7816,13 @@ class MailService:
             )
         result["body_plain"] = bodies["plain"]
         result["body_html"] = bodies["html"]
-        result["attachments"] = extract_attachments(mime)
+        attachments = extract_attachments(mime)
+        result["attachments"] = attachments
+        visible = has_visible_attachments(attachments)
+        result.setdefault("flags", {})["attachments"] = visible
+        self._update_cached_message_flags(
+            account_uid, folder_name, actual_uid, attachments=visible
+        )
         result["inline_images"] = extract_inline_images(mime)
         invite = self._calendar_invite_for_mime(
             mime,
@@ -9042,6 +9151,7 @@ class MailService:
         *,
         seen: bool | None = None,
         flagged: bool | None = None,
+        attachments: bool | None = None,
     ) -> None:
         # Copy-on-write: never mutate flags dicts that may still be referenced by
         # MessageListItem rows. In-place updates make the context menu read the
@@ -9056,6 +9166,8 @@ class MailService:
                     merged["seen"] = seen
                 if flagged is not None:
                     merged["flagged"] = flagged
+                if attachments is not None:
+                    merged["attachments"] = attachments
                 updated = dict(message)
                 updated["flags"] = merged
                 index.messages[position] = updated
