@@ -541,6 +541,52 @@ def _rfc_message_id_from_message_info(info: Any) -> str | None:
     return None
 
 
+def _content_type_from_message_info(info: Any) -> str | None:
+    """Return the Content-Type header from Camel summary metadata, if present."""
+    headers = None
+    getter = getattr(info, "get_headers", None)
+    if callable(getter):
+        try:
+            headers = getter()
+        except (TypeError, ValueError, AttributeError):
+            headers = None
+    if headers is not None:
+        get_length = getattr(headers, "get_length", None)
+        get_name = getattr(headers, "get_name", None)
+        get_value = getattr(headers, "get_value", None)
+        if (
+            callable(get_length)
+            and callable(get_name)
+            and callable(get_value)
+        ):
+            try:
+                length = get_length()
+            except (TypeError, ValueError):
+                length = None
+            if isinstance(length, int) and length > 0:
+                for index in range(length):
+                    try:
+                        name = get_name(index)
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    if not isinstance(name, str) or name.lower() != "content-type":
+                        continue
+                    try:
+                        return _decode_header_value(get_value(index))
+                    except (TypeError, ValueError, IndexError):
+                        return None
+    user_header = getattr(info, "get_user_header", None)
+    if callable(user_header):
+        for name in ("Content-Type", "Content-type", "content-type"):
+            try:
+                value = user_header(name)
+            except (TypeError, ValueError):
+                continue
+            if value:
+                return _decode_header_value(value)
+    return None
+
+
 def _message_id_hash_from_message_info(info: Any) -> int | None:
     """Return Camel's non-zero summary Message-ID hash, if available."""
     getter = getattr(info, "get_message_id", None)
@@ -578,7 +624,9 @@ def message_info_to_dict(
             uid = _decode_header_value(info.get_uid())
         except UnicodeDecodeError:
             uid = None
-    return {
+    secure_bit = getattr(Camel.MessageFlags, "SECURE", 0)
+    content_type = _simple_mime_type(_content_type_from_message_info(info))
+    result: dict[str, Any] = {
         "uid": uid,
         "subject": _decode_header_value(info.get_subject()) or "(no subject)",
         "from": format_recipient_header(info.get_from()),
@@ -599,8 +647,12 @@ def message_info_to_dict(
             "flagged": message_info_is_flagged(info, backend=backend),
             "deleted": bool(flags & Camel.MessageFlags.DELETED),
             "attachments": bool(flags & Camel.MessageFlags.ATTACHMENTS),
+            "secure": bool(secure_bit and flags & secure_bit),
         },
     }
+    if content_type:
+        result["content_type"] = content_type
+    return result
 
 
 def message_is_unread(msg: dict[str, Any]) -> bool:
@@ -719,6 +771,74 @@ def message_matches_bulk_archive_scope(msg: dict[str, Any], scope: str) -> bool:
 def message_has_attachments(msg: dict[str, Any]) -> bool:
     flags = msg.get("flags") or {}
     return bool(flags.get("attachments"))
+
+
+_CRYPTO_SIGNATURE_SUBTYPES = frozenset(
+    {
+        "pkcs7-signature",
+        "x-pkcs7-signature",
+        "xpkcs7-signature",
+        "xpkcs7signature",
+        "pgp-signature",
+    }
+)
+_CRYPTO_SIGNATURE_FILENAMES = frozenset({"smime.p7s", "signature.asc"})
+_SIGNED_OR_ENCRYPTED_ROOT = frozenset(
+    {"multipart/signed", "multipart/encrypted"}
+)
+
+
+def _simple_mime_type(value: str | None) -> str:
+    if not value:
+        return ""
+    return value.split(";", 1)[0].strip().lower()
+
+
+def looks_like_crypto_signature_part(
+    mime_type: str | None, filename: str | None = None
+) -> bool:
+    """True for S/MIME or OpenPGP protocol signature parts (#417)."""
+    simple = _simple_mime_type(mime_type)
+    if simple.startswith("application/"):
+        subtype = simple.split("/", 1)[1]
+        if subtype in _CRYPTO_SIGNATURE_SUBTYPES:
+            return True
+    name = (filename or "").strip().lower()
+    if name in _CRYPTO_SIGNATURE_FILENAMES:
+        return True
+    return name.endswith(".p7s")
+
+
+def skip_multipart_signed_signature(
+    mime_type: str | None,
+    filename: str | None,
+    parent_mime_type: str | None,
+) -> bool:
+    """Skip protocol signatures only when the parent is ``multipart/signed``.
+
+    A leftover ``smime.p7s`` under ``multipart/mixed`` stays a real file.
+    """
+    if not looks_like_crypto_signature_part(mime_type, filename):
+        return False
+    return _simple_mime_type(parent_mime_type) == "multipart/signed"
+
+
+def has_visible_attachments(attachments: list[Any] | None) -> bool:
+    """True when the filtered extract list has at least one real file."""
+    return bool(attachments)
+
+
+def message_row_is_signature_suspect(msg: dict[str, Any]) -> bool:
+    """True when the paperclip may be a protocol signature, not a file (#417)."""
+    flags = msg.get("flags") or {}
+    if not flags.get("attachments"):
+        return False
+    if flags.get("secure"):
+        return True
+    content_type = msg.get("content_type")
+    if not isinstance(content_type, str):
+        return False
+    return _simple_mime_type(content_type) in _SIGNED_OR_ENCRYPTED_ROOT
 
 
 def format_message_list_date(msg: dict[str, Any]) -> str:
@@ -1214,7 +1334,7 @@ def message_dict_from_rfc822_bytes(raw: bytes) -> dict[str, Any]:
         "body_html": bodies["html"],
         "attachments": attachments,
         "inline_images": extract_inline_images_from_email_message(msg),
-        "flags": {},
+        "flags": {"attachments": has_visible_attachments(attachments)},
     }
     reply_to = format_recipient_header(msg.get("Reply-To"))
     if reply_to:
@@ -1275,7 +1395,9 @@ def extract_inline_images_from_email_message(
     return images
 
 
-def _iter_email_attachment_parts(part: Any, *, is_root: bool = True) -> Any:
+def _iter_email_attachment_parts(
+    part: Any, *, is_root: bool = True, parent_ctype: str | None = None
+) -> Any:
     """Yield attachment parts; do not walk into encapsulated messages."""
     from post.mail.calendar_invite import email_part_counts_as_attachment
 
@@ -1284,13 +1406,15 @@ def _iter_email_attachment_parts(part: Any, *, is_root: bool = True) -> Any:
         payload = part.get_payload()
         if isinstance(payload, list):
             for child in payload:
-                yield from _iter_email_attachment_parts(child, is_root=False)
+                yield from _iter_email_attachment_parts(
+                    child, is_root=False, parent_ctype=ctype
+                )
         return
     if is_rfc822_mime(ctype):
         if not is_root:
             yield part
         return
-    if email_part_counts_as_attachment(part):
+    if email_part_counts_as_attachment(part, parent_ctype=parent_ctype):
         yield part
 
 
@@ -1640,6 +1764,7 @@ def _walk_attachment_parts(
     part: Any,
     attachments: list[dict[str, Any]],
     parts: list[Any] | None = None,
+    parent_content_type: Any | None = None,
 ) -> None:
     import gi
 
@@ -1659,17 +1784,23 @@ def _walk_attachment_parts(
             for i in range(part.get_number()):
                 child = part.get_part(i)
                 if child is not None:
-                    _walk_attachment_parts(child, attachments, parts)
+                    _walk_attachment_parts(
+                        child, attachments, parts, parent_content_type=content_type
+                    )
             return
         wrapper = part.get_content()
         if wrapper is not None and hasattr(wrapper, "get_number"):
             for i in range(wrapper.get_number()):
                 child = wrapper.get_part(i)
                 if child is not None:
-                    _walk_attachment_parts(child, attachments, parts)
+                    _walk_attachment_parts(
+                        child, attachments, parts, parent_content_type=content_type
+                    )
         return
 
-    if not _mime_part_is_attachment(part, mime_type):
+    if not _mime_part_is_attachment(
+        part, mime_type, parent_content_type=parent_content_type
+    ):
         return
 
     from post.mail.calendar_invite import default_calendar_filename, is_calendar_mime
@@ -1701,8 +1832,22 @@ def _walk_attachment_parts(
         parts.append(part)
 
 
-def _mime_part_is_attachment(part: Any, mime_type: str) -> bool:
+def _mime_part_is_attachment(
+    part: Any, mime_type: str, parent_content_type: Any | None = None
+) -> bool:
     from post.mail.calendar_invite import is_calendar_mime
+
+    filename = part.get_filename() if hasattr(part, "get_filename") else None
+    parent_simple = None
+    if parent_content_type is not None:
+        simple = getattr(parent_content_type, "simple", None)
+        if callable(simple):
+            try:
+                parent_simple = simple()
+            except Exception:
+                parent_simple = None
+    if skip_multipart_signed_signature(mime_type, filename, parent_simple):
+        return False
 
     if is_calendar_mime(mime_type):
         return True
@@ -1719,13 +1864,20 @@ def _mime_part_is_attachment(part: Any, mime_type: str) -> bool:
     if hasattr(part, "get_content_disposition"):
         disposition = part.get_content_disposition()
         if disposition is not None and content_type is not None:
-            if disposition.is_attachment(content_type):
+            checker = getattr(disposition, "is_attachment_ex", None)
+            if callable(checker):
+                try:
+                    if checker(content_type, parent_content_type):
+                        return True
+                except TypeError:
+                    if disposition.is_attachment(content_type):
+                        return True
+            elif disposition.is_attachment(content_type):
                 return True
 
     if disposition_lower == "attachment":
         return True
 
-    filename = part.get_filename() if hasattr(part, "get_filename") else None
     if filename and mime_type not in ("text/plain", "text/html"):
         return True
 

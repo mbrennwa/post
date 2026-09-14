@@ -732,15 +732,21 @@ def merge_invite_details(
     return invite
 
 
-def email_part_counts_as_attachment(part: Any) -> bool:
+def email_part_counts_as_attachment(
+    part: Any, parent_ctype: str | None = None
+) -> bool:
     """Match attachment heuristics used by helpers email fallback."""
+    from post.mail.helpers import skip_multipart_signed_signature
+
     ctype = part.get_content_type()
+    filename = part.get_filename()
+    if skip_multipart_signed_signature(ctype, filename, parent_ctype):
+        return False
     if ctype.startswith("multipart/"):
         return False
     if is_calendar_mime(ctype):
         return True
     disposition = part.get_content_disposition()
-    filename = part.get_filename()
     if disposition != "attachment" and not filename:
         return False
     if disposition == "inline" and ctype.startswith("text/") and not is_calendar_mime(ctype):
@@ -755,16 +761,14 @@ def email_part_counts_as_attachment(part: Any) -> bool:
 
 def extract_ics_text_from_email_message(msg: Any) -> tuple[str | None, int | None]:
     """Return (ics_text, attachment_index) from an ``email.message`` object."""
+    from post.mail.helpers import _iter_email_attachment_parts
+
     index = -1
     first_text: str | None = None
     first_index: int | None = None
-    for part in msg.walk():
-        ctype = part.get_content_type()
-        if ctype.startswith("multipart/"):
-            continue
-        if not email_part_counts_as_attachment(part):
-            continue
+    for part in _iter_email_attachment_parts(msg):
         index += 1
+        ctype = part.get_content_type()
         filename = part.get_filename() if hasattr(part, "get_filename") else None
         if not looks_like_calendar_attachment(ctype, filename):
             continue

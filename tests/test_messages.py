@@ -1609,6 +1609,28 @@ class MessageInfoToDictTests(unittest.TestCase):
         result = message_info_to_dict(info, backend="imapx")
         self.assertTrue(result["flags"]["flagged"])
 
+    def test_secure_flag_and_root_content_type(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        info = self._base_info()
+        info.get_flags.return_value = (
+            Camel.MessageFlags.ATTACHMENTS | Camel.MessageFlags.SECURE
+        )
+        headers = MagicMock()
+        headers.get_length.return_value = 1
+        headers.get_name.return_value = "Content-Type"
+        headers.get_value.return_value = (
+            "multipart/signed; protocol=application/pkcs7-signature"
+        )
+        info.get_headers.return_value = headers
+        result = message_info_to_dict(info)
+        self.assertTrue(result["flags"]["attachments"])
+        self.assertTrue(result["flags"]["secure"])
+        self.assertEqual(result["content_type"], "multipart/signed")
+
 
 class EnrichMessageDictFromMimeTests(unittest.TestCase):
     def test_fills_missing_cc(self) -> None:
