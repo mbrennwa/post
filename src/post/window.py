@@ -1225,7 +1225,7 @@ class MainWindow(Adw.ApplicationWindow):
             close_response="cancel",
         )
         dialog.add_response("cancel", "Cancel")
-        dialog.add_response("quit", "Quit anyway")
+        dialog.add_response("quit", "Quit Anyway")
         dialog.add_response("review", "Review in Outbox")
         dialog.set_response_appearance("quit", Adw.ResponseAppearance.DESTRUCTIVE)
         dialog.set_response_appearance("review", Adw.ResponseAppearance.SUGGESTED)
