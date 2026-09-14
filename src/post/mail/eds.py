@@ -928,7 +928,8 @@ class MailService:
         """Pause or resume background offline body caching for interactive UI.
 
         While held, folder opens / Archive indexing keep the mail I/O thread;
-        other accounts' offline backfill must not resume until released.
+        other accounts' full-account backfill must not resume until released
+        (#407: hold lasts for heavy-folder indexing, not the whole selection).
         """
         self._offline_body_sync_held = bool(hold)
         if hold:
