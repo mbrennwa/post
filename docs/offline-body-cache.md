@@ -17,7 +17,8 @@ Policy:
 
 | Mode | Behavior |
 |------|----------|
-| Off | Headers only (default for existing users until changed) |
+| *(unset)* | No choice yet — Post prompts when the account appears in the sidebar; treated like Off for downloads until set ([#427](https://github.com/mbrennwa/post/issues/427)) |
+| Off | Headers only (explicit choice; stored as `"off"`) |
 | Last month | `stay_synchronized` + age limit 1 month |
 | Last year | `stay_synchronized` + age limit 1 year |
 | Everything | `stay_synchronized`, no age limit |
@@ -34,9 +35,9 @@ Background body backfill order (same policy; priority only):
 3. Trash
 4. Junk (lowest)
 
-**Everything** can use significant disk space and bandwidth on large mailboxes. The first-run prompt and Settings both explain this trade-off.
+**Everything** can use significant disk space and bandwidth on large mailboxes. The first-choice prompt and Settings both explain this trade-off.
 
-On first launch, Post offers a one-time prompt to enable offline download.
+When a remote account is still **unset**, Post shows a required per-account dialog (Off / Last month / Last year / Everything) as soon as that account is listed in the sidebar. There is no Not Now; Escape chooses Off. Settings → Offline lists only accounts that already have an explicit mode ([#427](https://github.com/mbrennwa/post/issues/427)).
 
 ## Architecture
 

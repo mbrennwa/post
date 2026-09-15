@@ -6062,9 +6062,9 @@ class MailService:
         )
         if folder is None:
             raise ValueError(f"Folder not found: {folder_name}")
-        from post.preferences import get_account_offline_body_sync
+        from post.preferences import effective_offline_body_sync
 
-        apply_offline_sync_to_folder(folder, get_account_offline_body_sync(account_uid))
+        apply_offline_sync_to_folder(folder, effective_offline_body_sync(account_uid))
         return folder
 
     def _build_folder_index_unlocked(

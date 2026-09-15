@@ -18,7 +18,7 @@ from post.preferences import (
     OFFLINE_BODY_SYNC_LAST_YEAR,
     OFFLINE_BODY_SYNC_OFF,
     OfflineBodySyncMode,
-    get_account_offline_body_sync,
+    effective_offline_body_sync,
     get_account_user_online,
 )
 
@@ -74,7 +74,7 @@ def apply_offline_settings_to_store(
 ) -> OfflineBodySyncMode:
     """Configure Camel OfflineSettings from Post preference. Returns effective mode."""
     if mode is None:
-        mode = get_account_offline_body_sync(account_uid)
+        mode = effective_offline_body_sync(account_uid)
 
     settings = store.ref_settings()
     if settings is None:

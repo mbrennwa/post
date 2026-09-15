@@ -315,11 +315,27 @@ def _offline_body_sync_raw() -> dict[str, Any]:
     return {}
 
 
-def get_account_offline_body_sync(account_uid: str) -> OfflineBodySyncMode:
-    value = _offline_body_sync_raw().get(account_uid, OFFLINE_BODY_SYNC_OFF)
+def get_account_offline_body_sync(account_uid: str) -> OfflineBodySyncMode | None:
+    """Return the explicit Offline Mail mode, or None when unset (#427)."""
+    if account_uid not in _offline_body_sync_raw():
+        return None
+    value = _offline_body_sync_raw().get(account_uid)
     if isinstance(value, str) and value in _OFFLINE_BODY_SYNC_VALUES:
         return value  # type: ignore[return-value]
-    return OFFLINE_BODY_SYNC_OFF
+    return None
+
+
+def is_account_offline_body_sync_unset(account_uid: str) -> bool:
+    """True when this account has no explicit Offline Mail choice yet (#427)."""
+    return get_account_offline_body_sync(account_uid) is None
+
+
+def effective_offline_body_sync(account_uid: str) -> OfflineBodySyncMode:
+    """Mode used for Camel download: unset behaves like Off (#427)."""
+    mode = get_account_offline_body_sync(account_uid)
+    if mode is None:
+        return OFFLINE_BODY_SYNC_OFF
+    return mode
 
 
 def set_account_offline_body_sync(
@@ -329,10 +345,7 @@ def set_account_offline_body_sync(
         raise ValueError(f"Invalid offline body sync mode: {mode!r}")
     data = _load_raw()
     modes = _offline_body_sync_raw()
-    if mode == OFFLINE_BODY_SYNC_OFF:
-        modes.pop(account_uid, None)
-    else:
-        modes[account_uid] = mode
+    modes[account_uid] = mode
     data["offline_body_sync"] = modes
     _save_raw(data)
 
@@ -343,39 +356,6 @@ def get_all_offline_body_sync_modes() -> dict[str, OfflineBodySyncMode]:
         if isinstance(uid, str) and isinstance(value, str) and value in _OFFLINE_BODY_SYNC_VALUES:
             modes[uid] = value  # type: ignore[assignment]
     return modes
-
-
-def set_offline_body_sync_prompt_seen(seen: bool = True) -> None:
-    data = _load_raw()
-    data["offline_body_sync_prompt_seen"] = bool(seen)
-    _save_raw(data)
-
-
-def get_offline_body_sync_prompt_seen() -> bool:
-    return bool(_load_raw().get("offline_body_sync_prompt_seen"))
-
-
-def set_offline_body_sync_prompt_declined(declined: bool = True) -> None:
-    """Remember that the user dismissed the first-run offline sync dialog."""
-    data = _load_raw()
-    data["offline_body_sync_prompt_declined"] = bool(declined)
-    _save_raw(data)
-
-
-def get_offline_body_sync_prompt_declined() -> bool:
-    return bool(_load_raw().get("offline_body_sync_prompt_declined"))
-
-
-def should_show_offline_body_sync_prompt(remote_account_uids: list[str]) -> bool:
-    """Return whether the first-run offline body sync dialog should appear."""
-    if get_offline_body_sync_prompt_declined():
-        return False
-    if not remote_account_uids:
-        return False
-    return any(
-        get_account_offline_body_sync(uid) == OFFLINE_BODY_SYNC_OFF
-        for uid in remote_account_uids
-    )
 
 
 def set_show_evolution_local(value: bool) -> None:

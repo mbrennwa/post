@@ -168,11 +168,10 @@ from post.preferences import (
     get_search_scope,
     get_sidebar_state,
     get_window_state,
+    is_account_offline_body_sync_unset,
     set_account_offline_body_sync,
     set_active_message_uid,
-    set_offline_body_sync_prompt_declined,
     set_search_scope,
-    should_show_offline_body_sync_prompt,
     set_window_state,
 )
 from post.mail.offline_settings import account_is_user_offline
@@ -302,6 +301,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._parked_startup_reminded = False
         self._is_closing = False
         self._pending_goa_reauth: set[str] = set()
+        self._offline_prompt_queue: list[str] = []
+        self._offline_prompt_queued: set[str] = set()
+        self._offline_prompt_active_uid: str | None = None
+        self._offline_prompt_dialog: Adw.MessageDialog | None = None
 
         self._mail = MailService.connect()
         self._stop_sending_in_flight = False
@@ -1883,64 +1886,88 @@ class MainWindow(Adw.ApplicationWindow):
     def _remote_sync_account_backends(self) -> frozenset[str]:
         return frozenset({"imap", "imapx", "ews", "microsoft365", "pop3"})
 
-    def _apply_offline_body_sync_to_accounts(
-        self, account_uids: list[str], mode: OfflineBodySyncMode
+    def _apply_offline_body_sync_choice(
+        self, account_uid: str, mode: OfflineBodySyncMode
     ) -> None:
-        for account_uid in account_uids:
-            account = self._mail.get_account(account_uid)
-            if account.backend not in self._remote_sync_account_backends():
-                continue
-            set_account_offline_body_sync(account_uid, mode)
-            self._mail.refresh_offline_settings(account_uid)
+        set_account_offline_body_sync(account_uid, mode)
+        self._mail.refresh_offline_settings(account_uid)
 
     def _maybe_show_offline_body_sync_prompt(self, account_uids: list[str]) -> None:
-        remote_accounts = [
-            uid
-            for uid in account_uids
-            if self._mail.get_account(uid).backend in self._remote_sync_account_backends()
-        ]
-        if not should_show_offline_body_sync_prompt(remote_accounts):
+        """Queue a required Offline Mail choice for each unset remote account (#427)."""
+        for uid in account_uids:
+            try:
+                account = self._mail.get_account(uid)
+            except ValueError:
+                continue
+            if account.backend not in self._remote_sync_account_backends():
+                continue
+            if not is_account_offline_body_sync_unset(uid):
+                continue
+            if uid in self._offline_prompt_queued:
+                continue
+            self._offline_prompt_queued.add(uid)
+            self._offline_prompt_queue.append(uid)
+        self._present_next_offline_body_sync_prompt()
+
+    def _present_next_offline_body_sync_prompt(self) -> None:
+        if self._offline_prompt_dialog is not None:
             return
+        while self._offline_prompt_queue:
+            account_uid = self._offline_prompt_queue.pop(0)
+            if not is_account_offline_body_sync_unset(account_uid):
+                self._offline_prompt_queued.discard(account_uid)
+                continue
+            try:
+                account = self._mail.get_account(account_uid)
+            except ValueError:
+                self._offline_prompt_queued.discard(account_uid)
+                continue
+            label = account.display_label or account.name or account_uid
+            self._offline_prompt_active_uid = account_uid
+            dialog = Adw.MessageDialog(
+                transient_for=self,
+                heading="Offline Mail",
+                body=(
+                    f"Choose how Post downloads message bodies for {label}. "
+                    "Downloaded bodies stay readable offline and power body "
+                    "search. Header search uses the folder index and does not "
+                    "need this. This uses extra disk space and network bandwidth."
+                ),
+            )
+            dialog.add_response("off", "Off")
+            dialog.add_response("last_month", "Last Month")
+            dialog.add_response("last_year", "Last Year")
+            dialog.add_response("all", "Everything")
+            dialog.set_response_appearance("all", Adw.ResponseAppearance.DESTRUCTIVE)
+            dialog.set_default_response("last_month")
+            # Escape / window close must still pick an explicit mode (#427).
+            dialog.set_close_response("off")
 
-        dialog = Adw.MessageDialog(
-            transient_for=self,
-            heading="Offline Mail",
-            body=(
-                "Post can download message bodies from all folders so you can "
-                "read mail and search message text while offline. Header search "
-                "uses the folder index and does not need this. This uses extra "
-                "disk space and network bandwidth."
-            ),
-        )
-        dialog.add_response("not_now", "Not Now")
-        dialog.add_response("last_month", "Last Month")
-        dialog.add_response("last_year", "Last Year")
-        dialog.add_response("all", "Everything")
-        dialog.set_response_appearance("all", Adw.ResponseAppearance.DESTRUCTIVE)
-        dialog.set_default_response("last_month")
-        dialog.set_close_response("not_now")
+            def on_response(
+                _dialog: Adw.MessageDialog, response: str, *, uid: str = account_uid
+            ) -> None:
+                self._offline_prompt_dialog = None
+                self._offline_prompt_active_uid = None
+                self._offline_prompt_queued.discard(uid)
+                mode_by_response = {
+                    "off": OFFLINE_BODY_SYNC_OFF,
+                    "last_month": OFFLINE_BODY_SYNC_LAST_MONTH,
+                    "last_year": OFFLINE_BODY_SYNC_LAST_YEAR,
+                    "all": OFFLINE_BODY_SYNC_ALL,
+                }
+                mode = mode_by_response.get(response, OFFLINE_BODY_SYNC_OFF)
 
-        def on_response(_dialog: Adw.MessageDialog, response: str) -> None:
-            if response == "not_now":
-                set_offline_body_sync_prompt_declined(True)
-                return
-            mode_by_response = {
-                "last_month": OFFLINE_BODY_SYNC_LAST_MONTH,
-                "last_year": OFFLINE_BODY_SYNC_LAST_YEAR,
-                "all": OFFLINE_BODY_SYNC_ALL,
-            }
-            mode = mode_by_response.get(response)
-            if mode is None:
-                return
+                def apply_mode() -> bool:
+                    self._apply_offline_body_sync_choice(uid, mode)
+                    self._present_next_offline_body_sync_prompt()
+                    return False
 
-            def apply_mode() -> bool:
-                self._apply_offline_body_sync_to_accounts(remote_accounts, mode)
-                return False
+                GLib.idle_add(apply_mode)
 
-            GLib.idle_add(apply_mode)
-
-        dialog.connect("response", on_response)
-        dialog.present()
+            dialog.connect("response", on_response)
+            self._offline_prompt_dialog = dialog
+            dialog.present()
+            return
 
     def _on_offline_sync_progress(self, progress: OfflineSyncProgress | None) -> None:
         def update() -> bool:
