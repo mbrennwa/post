@@ -87,7 +87,7 @@ class ApplyOfflineSettingsTests(unittest.TestCase):
         settings = mock.Mock(spec=Camel.OfflineSettings)
         store.ref_settings.return_value = settings
         with mock.patch(
-            "post.mail.offline_settings.get_account_offline_body_sync",
+            "post.mail.offline_settings.effective_offline_body_sync",
             return_value=OFFLINE_BODY_SYNC_LAST_MONTH,
         ):
             with mock.patch(
@@ -105,7 +105,7 @@ class ApplyOfflineSettingsTests(unittest.TestCase):
         settings = mock.Mock()
         store.ref_settings.return_value = settings
         with mock.patch(
-            "post.mail.offline_settings.get_account_offline_body_sync",
+            "post.mail.offline_settings.effective_offline_body_sync",
             return_value=OFFLINE_BODY_SYNC_ALL,
         ):
             with mock.patch(

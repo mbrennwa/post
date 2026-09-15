@@ -49,6 +49,7 @@ from post.preferences import (
     get_message_appearance,
     get_send_delay_seconds,
     get_show_evolution_local,
+    is_account_offline_body_sync_unset,
     send_delay_label,
     set_account_offline_body_sync,
     set_account_signature,
@@ -188,13 +189,15 @@ class SettingsDialog(Adw.PreferencesWindow):
             account
             for account in self._mail.list_accounts()
             if account.backend in _REMOTE_OFFLINE_BACKENDS
+            and not is_account_offline_body_sync_unset(account.uid)
         ]
         self._offline_mode_rows: dict[str, Adw.ComboRow] = {}
 
         if not self._offline_accounts:
-            empty_row = Adw.ActionRow(title="No Remote Mail Accounts")
+            empty_row = Adw.ActionRow(title="No Configured Accounts")
             empty_row.set_subtitle(
-                "Offline body download applies to IMAP and Exchange accounts"
+                "Choose Offline Mail for each account when Post asks, "
+                "then change it here"
             )
             group.add(empty_row)
             page.add(group)
@@ -205,6 +208,8 @@ class SettingsDialog(Adw.PreferencesWindow):
             row = Adw.ComboRow(title=account.display_label)
             row.set_model(mode_model)
             mode = get_account_offline_body_sync(account.uid)
+            if mode is None:
+                continue
             try:
                 index = _OFFLINE_SYNC_VALUES.index(mode)
             except ValueError:

@@ -73,7 +73,7 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return coordinator, mail, folder
 
     @mock.patch(
-        "post.mail.offline_sync.get_account_offline_body_sync",
+        "post.mail.offline_sync.effective_offline_body_sync",
         return_value=OFFLINE_BODY_SYNC_OFF,
     )
     def test_off_does_not_queue(self, _mode: mock.Mock) -> None:
@@ -87,7 +87,7 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return_value=True,
     )
     @mock.patch(
-        "post.mail.offline_sync.get_account_offline_body_sync",
+        "post.mail.offline_sync.effective_offline_body_sync",
         return_value=OFFLINE_BODY_SYNC_ALL,
     )
     def test_user_offline_does_not_queue(
@@ -98,7 +98,7 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         mail.submit_background.assert_not_called()
 
     @mock.patch(
-        "post.mail.offline_sync.get_account_offline_body_sync",
+        "post.mail.offline_sync.effective_offline_body_sync",
         return_value=OFFLINE_BODY_SYNC_ALL,
     )
     def test_no_network_does_not_queue(self, _mode: mock.Mock) -> None:
@@ -111,7 +111,7 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return_value=False,
     )
     @mock.patch(
-        "post.mail.offline_sync.get_account_offline_body_sync",
+        "post.mail.offline_sync.effective_offline_body_sync",
         return_value=OFFLINE_BODY_SYNC_ALL,
     )
     def test_hold_does_not_block_arrival_schedule(
@@ -129,7 +129,7 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return_value=False,
     )
     @mock.patch(
-        "post.mail.offline_sync.get_account_offline_body_sync",
+        "post.mail.offline_sync.effective_offline_body_sync",
         return_value=OFFLINE_BODY_SYNC_ALL,
     )
     def test_burst_caps_at_twenty(
@@ -146,7 +146,7 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return_value=False,
     )
     @mock.patch(
-        "post.mail.offline_sync.get_account_offline_body_sync",
+        "post.mail.offline_sync.effective_offline_body_sync",
         return_value=OFFLINE_BODY_SYNC_ALL,
     )
     def test_skips_nonempty_cache(
@@ -171,7 +171,7 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return_value=False,
     )
     @mock.patch(
-        "post.mail.offline_sync.get_account_offline_body_sync",
+        "post.mail.offline_sync.effective_offline_body_sync",
         return_value=OFFLINE_BODY_SYNC_ALL,
     )
     def test_fetches_zero_byte_or_missing_cache(
@@ -198,7 +198,7 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return_value=False,
     )
     @mock.patch(
-        "post.mail.offline_sync.get_account_offline_body_sync",
+        "post.mail.offline_sync.effective_offline_body_sync",
         return_value=OFFLINE_BODY_SYNC_ALL,
     )
     def test_yields_when_interactive_pending(
@@ -221,7 +221,7 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return_value=False,
     )
     @mock.patch(
-        "post.mail.offline_sync.get_account_offline_body_sync",
+        "post.mail.offline_sync.effective_offline_body_sync",
         return_value=OFFLINE_BODY_SYNC_OFF,
     )
     def test_force_queues_when_offline_sync_is_off(
@@ -241,7 +241,7 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         return_value=False,
     )
     @mock.patch(
-        "post.mail.offline_sync.get_account_offline_body_sync",
+        "post.mail.offline_sync.effective_offline_body_sync",
         return_value=OFFLINE_BODY_SYNC_OFF,
     )
     def test_force_fetches_when_uncached_and_offline_sync_is_off(

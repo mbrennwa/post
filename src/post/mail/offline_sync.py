@@ -33,7 +33,7 @@ from post.mail.offline_settings import (
 from post.preferences import (
     OFFLINE_BODY_SYNC_OFF,
     OfflineBodySyncMode,
-    get_account_offline_body_sync,
+    effective_offline_body_sync,
 )
 
 if TYPE_CHECKING:
@@ -164,7 +164,7 @@ class OfflineBodySyncCoordinator:
             self.schedule_account(account.uid)
 
     def schedule_account(self, account_uid: str) -> None:
-        mode = get_account_offline_body_sync(account_uid)
+        mode = effective_offline_body_sync(account_uid)
         if mode == OFFLINE_BODY_SYNC_OFF:
             return
         if account_is_user_offline(account_uid):
@@ -236,7 +236,7 @@ class OfflineBodySyncCoordinator:
         if is_post_outbox_folder(folder_name):
             return
         if not force:
-            mode = get_account_offline_body_sync(account_uid)
+            mode = effective_offline_body_sync(account_uid)
             if mode == OFFLINE_BODY_SYNC_OFF:
                 return
             if account_is_user_offline(account_uid):
@@ -317,7 +317,7 @@ class OfflineBodySyncCoordinator:
                 if item is None:
                     self._finish_arrival_worker(resubmit=False)
                     return
-                mode = get_account_offline_body_sync(item.account_uid)
+                mode = effective_offline_body_sync(item.account_uid)
                 user_offline = account_is_user_offline(item.account_uid)
                 network = self._mail.is_network_available()
                 if not item.force and (
