@@ -23,7 +23,7 @@ gi.require_version("JavaScriptCore", "6.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, JavaScriptCore, WebKit
 
 from post.open_uri import open_uri_externally
-from post.reader.html import ADAPT_TEXT_CSS
+from post.reader.html import ADAPT_TEXT_CSS, IMG_FIT_CSS
 from post.reader.pane import (
     apply_reader_link_hover,
     pointer_coords_in_widget,
@@ -94,6 +94,7 @@ _EDITOR_DOCUMENT = """<!DOCTYPE html>
     padding-left: 1.5em;
   }
   #editor a { color: LinkText; text-decoration: underline; }
+__IMG_FIT_CSS__
 __ADAPT_TEXT_CSS__
 </style>
 </head>
@@ -431,6 +432,7 @@ def build_editor_document(
         .replace("__COMPOSE_ACTION__", _ACTION_HANDLER)
         .replace("__COMPOSE_COLOR_SCHEME__", color_scheme)
         .replace("__COMPOSE_CANVAS__", canvas)
+        .replace("__IMG_FIT_CSS__", IMG_FIT_CSS)
         .replace("__ADAPT_TEXT_CSS__", ADAPT_TEXT_CSS)
     )
 

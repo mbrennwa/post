@@ -220,6 +220,16 @@ span.post-bracketed {
 }
 """
 
+# Downscale wide inline pictures to the pane/editor width (#431).
+# !important beats sender style="width/height"; do not set width:100%
+# (that would enlarge signatures and tracking pixels).
+IMG_FIT_CSS = """
+img {
+  max-width: 100% !important;
+  height: auto !important;
+}
+"""
+
 ADAPT_TEXT_CSS = """
 .message-body {
   min-height: 100%;
@@ -1859,6 +1869,7 @@ def build_reader_document(
         )
 
     reader_css = _READER_CSS_DARK if reader_dark else _READER_CSS_LIGHT
+    reader_css = f"{reader_css}\n{IMG_FIT_CSS}"
     if effective_appearance == "adapt_text" and html_body:
         reader_css = f"{reader_css}\n{ADAPT_TEXT_CSS}"
 
