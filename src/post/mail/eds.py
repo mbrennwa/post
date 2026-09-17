@@ -1289,9 +1289,28 @@ class MailService:
         timeout: float | None = 120.0,
     ) -> Any:
         """Invoke ``method`` in the per-account Camel helper (#437)."""
-        return self._camel_pool.call(
-            account_uid, method, args, kwargs or {}, timeout=timeout
-        )
+        try:
+            return self._camel_pool.call(
+                account_uid, method, args, kwargs or {}, timeout=timeout
+            )
+        except CamelHelperError as exc:
+            text = str(exc)
+            if text.startswith("MessageNotAvailableError:"):
+                uid = str(args[2]) if len(args) >= 3 else text
+                folder = str(args[1]) if len(args) >= 2 else None
+                raise MessageNotAvailableError(uid, folder) from exc
+            # One retry after a crashed helper (common under multi-process Camel).
+            if "camel helper process exited" in text or "not running" in text:
+                log.warning(
+                    "Retrying camel helper call after exit account=%s method=%s",
+                    account_uid,
+                    method,
+                )
+                self._camel_pool.kill_account(account_uid)
+                return self._camel_pool.call(
+                    account_uid, method, args, kwargs or {}, timeout=timeout
+                )
+            raise
 
     def kill_account_camel_helper(self, account_uid: str) -> None:
         """Hard-kill the Camel helper for ``account_uid`` (wedged account)."""

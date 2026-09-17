@@ -28,13 +28,15 @@ _DEFAULT_JOB_TIMEOUT = 120.0
 def camel_helpers_enabled() -> bool:
     """True when the UI should spawn per-account Camel helpers.
 
-    Disabled inside helper processes and when ``POST_MAIL_CAMEL_HELPERS=0``.
-    Default: enabled in the UI process (#437).
+    Disabled inside helper processes. **Default off** in the UI: multiple helper
+    processes sharing ``~/.local/share/evolution`` proved unstable (helper exits
+    mid-read → "Could not read this message" / Loading timeouts). Opt in with
+    ``POST_MAIL_CAMEL_HELPERS=1`` for experiments (#437).
     """
     if os.environ.get(_HELPER_PROCESS_ENV) == "1":
         return False
-    raw = (os.environ.get(_HELPERS_ENV) or "1").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+    raw = (os.environ.get(_HELPERS_ENV) or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 class CamelHelperError(RuntimeError):
@@ -131,11 +133,10 @@ class AccountCamelRuntime:
             for line in iter(proc.stderr.readline, b""):
                 if not line:
                     break
-                log.debug(
-                    "camel-helper[%s]: %s",
-                    self.account_uid[:8],
-                    line.decode("utf-8", errors="replace").rstrip(),
-                )
+                text = line.decode("utf-8", errors="replace").rstrip()
+                # Promote helper diagnostics: crashes otherwise only show up as
+                # "camel helper process exited" on the UI side (#437).
+                log.warning("camel-helper[%s]: %s", self.account_uid[:8], text)
         except Exception:
             log.debug("stderr drain failed account=%s", self.account_uid, exc_info=True)
 
@@ -143,6 +144,7 @@ class AccountCamelRuntime:
         proc = self._proc
         if proc is None or proc.stdout is None:
             return
+        exit_code: int | None = None
         try:
             while True:
                 msg = read_message(proc.stdout)
@@ -162,6 +164,13 @@ class AccountCamelRuntime:
                 "helper reader exited account=%s", self.account_uid, exc_info=True
             )
         finally:
+            if proc is not None:
+                exit_code = proc.poll()
+            log.warning(
+                "camel helper reader stopped account=%s exit_code=%s",
+                self.account_uid,
+                exit_code,
+            )
             with self._lock:
                 self._alive = False
                 for pending in self._pending.values():
@@ -242,18 +251,22 @@ class AccountCamelRuntime:
         return msg.get("result")
 
     def submit_worker(self, func: Callable[[], None]) -> None:
-        """Run a UI-side worker serially for this account (may block on ``call``)."""
+        """Run a UI-side worker for this account.
+
+        Does **not** hold the IPC serial lock for the whole worker — only
+        ``call()`` serializes helper RPC — so a long background folder sync
+        cannot pin the lock before ``read_message`` is even sent (#437).
+        """
 
         def runner() -> None:
-            with self._serial:
-                try:
-                    func()
-                except Exception:
-                    log.debug(
-                        "account worker failed account=%s",
-                        self.account_uid,
-                        exc_info=True,
-                    )
+            try:
+                func()
+            except Exception:
+                log.debug(
+                    "account worker failed account=%s",
+                    self.account_uid,
+                    exc_info=True,
+                )
 
         threading.Thread(
             target=runner,

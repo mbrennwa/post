@@ -97,6 +97,21 @@ class CamelHelpersEnabledTests(unittest.TestCase):
         ):
             self.assertFalse(camel_helpers_enabled())
 
+    def test_helpers_default_off(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("POST_MAIL_CAMEL_HELPERS", None)
+            os.environ.pop("POST_MAIL_CAMEL_HELPER_PROCESS", None)
+            self.assertFalse(camel_helpers_enabled())
+
+    def test_helpers_opt_in(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"POST_MAIL_CAMEL_HELPERS": "1"},
+            clear=False,
+        ):
+            os.environ.pop("POST_MAIL_CAMEL_HELPER_PROCESS", None)
+            self.assertTrue(camel_helpers_enabled())
+
 
 class FakeHelperRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
