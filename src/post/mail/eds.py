@@ -48,6 +48,11 @@ from .lane_dispatch import (
     gmail_camel_overlap_enabled,
     graph_http_worker,
 )
+from .camel_runtime import (
+    CamelHelperError,
+    CamelRuntimePool,
+    camel_helpers_enabled,
+)
 from .account_cache_gc import drop_orphan_account_caches
 from .evolution_cache_path import (
     cached_rfc822_candidates,
@@ -786,6 +791,9 @@ class MailService:
     _folder_list_state_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
+    _camel_pool: CamelRuntimePool = field(
+        default_factory=CamelRuntimePool, init=False, repr=False
+    )
 
     @property
     def offline_sync(self) -> OfflineBodySyncCoordinator:
@@ -1132,6 +1140,16 @@ class MailService:
     ) -> None:
         """Queue named interactive mail work (today's ``submit`` queue)."""
         log.debug("Mail job queue=interactive name=%s", name)
+        if camel_helpers_enabled():
+            # Do not pin shared post-mail-io on helper IPC (#437).
+            threading.Thread(
+                target=func,
+                args=args,
+                kwargs=kwargs,
+                name=f"mail-job-interactive-{name}",
+                daemon=True,
+            ).start()
+            return
         get_mail_io_thread().submit(func, *args, **kwargs)
 
     def submit_front(
@@ -1139,6 +1157,15 @@ class MailService:
     ) -> None:
         """Queue named interactive mail work ahead of other interactive jobs."""
         log.debug("Mail job queue=front name=%s", name)
+        if camel_helpers_enabled():
+            threading.Thread(
+                target=func,
+                args=args,
+                kwargs=kwargs,
+                name=f"mail-job-front-{name}",
+                daemon=True,
+            ).start()
+            return
         get_mail_io_thread().submit_front(func, *args, **kwargs)
 
     def submit_background(
@@ -1146,6 +1173,15 @@ class MailService:
     ) -> None:
         """Queue named background mail work (preempted by interactive jobs)."""
         log.debug("Mail job queue=background name=%s", name)
+        if camel_helpers_enabled():
+            threading.Thread(
+                target=func,
+                args=args,
+                kwargs=kwargs,
+                name=f"mail-job-background-{name}",
+                daemon=True,
+            ).start()
+            return
         get_mail_io_thread().submit_background(func, *args, **kwargs)
 
     def submit_job(
@@ -1169,8 +1205,10 @@ class MailService:
         for open-folder refresh so it stays on today's background Camel queue.
 
         ``runner="graph_http"`` (or ``auto`` for M365 background count jobs) runs
-        on ``post-graph-http`` so Camel ``post-mail-io`` is free. Gmail Camel
-        overlap stays fail-closed (see ``gmail_camel_overlap_enabled``).
+        on ``post-graph-http`` so Camel ``post-mail-io`` is free. When Camel
+        helpers are enabled (#437), account-scoped Camel work runs on that
+        account's helper worker (not the shared UI ``post-mail-io``). Gmail
+        Camel overlap stays fail-closed (see ``gmail_camel_overlap_enabled``).
         """
         resolved_queue = queue or default_queue_for_lane(
             epic_lane, preemptible=preemptible
@@ -1208,7 +1246,18 @@ class MailService:
             "Mail job epic_lane=%s queue=%s runner=%s name=%s account=%s folder=%s",
             epic_lane,
             resolved_queue,
-            "graph_http" if use_graph else "camel",
+            "graph_http"
+            if use_graph
+            else (
+                "camel_helper"
+                if (
+                    camel_helpers_enabled()
+                    and account_uid
+                    and runner != "graph_http"
+                    and not use_graph
+                )
+                else "camel"
+            ),
             name,
             account_uid,
             folder,
@@ -1216,12 +1265,39 @@ class MailService:
         if use_graph:
             graph_http_worker().submit(locked_worker)
             return
+        if (
+            camel_helpers_enabled()
+            and account_uid
+            and runner != "graph_http"
+        ):
+            self._camel_pool.submit_worker(account_uid, locked_worker)
+            return
         if resolved_queue == "front":
             self.submit_front(name, locked_worker)
         elif resolved_queue == "background":
             self.submit_background(name, locked_worker)
         else:
             self.submit_interactive(name, locked_worker)
+
+    def _camel_helper_call(
+        self,
+        method: str,
+        account_uid: str,
+        args: list[Any],
+        kwargs: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = 120.0,
+    ) -> Any:
+        """Invoke ``method`` in the per-account Camel helper (#437)."""
+        return self._camel_pool.call(
+            account_uid, method, args, kwargs or {}, timeout=timeout
+        )
+
+    def kill_account_camel_helper(self, account_uid: str) -> None:
+        """Hard-kill the Camel helper for ``account_uid`` (wedged account)."""
+        log.warning("Killing camel helper for account %s", account_uid)
+        self._camel_pool.kill_account(account_uid)
+        self.set_account_connect_health(account_uid, "not_responding")
 
     def _account_backend_is_microsoft365(self, account_uid: str) -> bool:
         try:
@@ -1251,7 +1327,13 @@ class MailService:
     def get_oauth2_access_token_for_account(
         self, account_uid: str
     ) -> str | None:
-        """Return a Graph/OAuth access token; must run on the mail I/O thread."""
+        """Return a Graph/OAuth access token (helper or mail I/O thread)."""
+        if camel_helpers_enabled():
+            return self._camel_helper_call(
+                "get_oauth2_access_token_for_account",
+                account_uid,
+                [account_uid],
+            )
         return run_on_mail_thread(
             self._get_oauth2_access_token_for_account_unlocked, account_uid
         )
@@ -1553,6 +1635,8 @@ class MailService:
         self.offline_sync.cancel_all()
         self.offline_sync.cancel_arrival_in_flight()
         self.wait_for_pending_mail_ops(timeout=2.0 if offline_sync_active else 1.0)
+        if camel_helpers_enabled():
+            self._camel_pool.shutdown_all()
         # Never block GTK exit behind a long in-flight search or folder scan.
         get_mail_io_thread().submit_background(self._flush_stores_on_shutdown)
 
@@ -1581,6 +1665,10 @@ class MailService:
         service = cls(registry=registry)
         service._ensure_mail_io_callbacks()
         service._drop_orphan_account_caches()
+        if camel_helpers_enabled():
+            service._camel_pool.set_account_died_callback(
+                lambda uid: service.set_account_connect_health(uid, "not_responding")
+            )
         return service
 
     def set_password_prompt(self, callback: PasswordPromptCallback | None) -> None:
@@ -2266,6 +2354,29 @@ class MailService:
 
     def invalidate_account_connection(self, account_uid: str) -> None:
         """Drop cached Camel store/transport so the next open uses fresh credentials."""
+        if camel_helpers_enabled():
+            try:
+                self._camel_helper_call(
+                    "invalidate_account_connection",
+                    account_uid,
+                    [account_uid],
+                    timeout=30.0,
+                )
+            except CamelHelperError:
+                log.debug(
+                    "helper invalidate failed for %s; killing helper",
+                    account_uid,
+                    exc_info=True,
+                )
+            self._camel_pool.kill_account(account_uid)
+            # Clear UI-side caches even when Camel lives in the helper.
+            with self._lock:
+                self._folder_tree_cache.pop(account_uid, None)
+                for key in list(self._folder_indexes):
+                    if key[0] == account_uid:
+                        self._folder_indexes.pop(key, None)
+                self._correspondent_indexes.pop(account_uid, None)
+            return
         run_on_mail_thread(self._invalidate_account_connection_unlocked, account_uid)
 
     def _invalidate_account_connection_unlocked(self, account_uid: str) -> None:
@@ -3772,6 +3883,11 @@ class MailService:
         *,
         cancellable: Gio.Cancellable | None = None,
     ) -> list[dict]:
+        if camel_helpers_enabled():
+            # Cancellable is local to the helper process; UI passes None over IPC.
+            return self._camel_helper_call(
+                "list_folders", account_uid, [account_uid], {}
+            )
         if is_mail_io_thread():
             return self._list_folders_unlocked(
                 account_uid, cancellable=cancellable
@@ -3973,6 +4089,15 @@ class MailService:
         self, account_uid: str, folder_name: str
     ) -> tuple[int, int]:
         """Return live (unread, total) counts by opening the folder."""
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "get_folder_stats",
+                account_uid,
+                [account_uid, folder_name],
+            )
+            if isinstance(result, (list, tuple)) and len(result) == 2:
+                return int(result[0]), int(result[1])
+            return (-1, -1)
         return run_on_mail_thread(
             self._get_folder_stats_unlocked, account_uid, folder_name
         )
@@ -3985,6 +4110,17 @@ class MailService:
         Uses IMAP STATUS-style folder info instead of opening each Camel.Folder
         (avoids Folder::changed storms and heavy per-folder refresh_info_sync).
         """
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "get_account_folder_stats", account_uid, [account_uid]
+            )
+            if not isinstance(result, dict):
+                return {}
+            out: dict[str, tuple[int, int]] = {}
+            for key, value in result.items():
+                if isinstance(value, (list, tuple)) and len(value) == 2:
+                    out[str(key)] = (int(value[0]), int(value[1]))
+            return out
         return run_on_mail_thread(
             self._get_account_folder_stats_unlocked, account_uid
         )
@@ -4516,6 +4652,17 @@ class MailService:
         limit: int = DEFAULT_MESSAGE_PAGE_SIZE,
         sync: bool = True,
     ) -> tuple[list[dict], int, int, bool]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "list_messages_page",
+                account_uid,
+                [account_uid, folder_name],
+                {"offset": offset, "limit": limit, "sync": sync},
+            )
+            if isinstance(result, (list, tuple)) and len(result) == 4:
+                messages, unread, total, has_more = result
+                return list(messages or []), int(unread), int(total), bool(has_more)
+            return [], -1, -1, False
         if is_mail_io_thread():
             return self._list_messages_page_unlocked(
                 account_uid,
@@ -4558,6 +4705,22 @@ class MailService:
         *,
         sync: bool = True,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "get_folder_messages",
+                account_uid,
+                [account_uid, folder_name],
+                {"sync": sync},
+            )
+            if isinstance(result, (list, tuple)) and len(result) == 4:
+                messages, unread, total, source = result
+                return (
+                    list(messages or []),
+                    int(unread),
+                    int(total),
+                    source,  # type: ignore[return-value]
+                )
+            return [], -1, -1, "local"
         if is_mail_io_thread():
             return self._get_folder_messages_unlocked(
                 account_uid, folder_name, sync=sync
@@ -8005,6 +8168,13 @@ class MailService:
         *,
         mark_seen: bool = True,
     ) -> dict:
+        if camel_helpers_enabled():
+            return self._camel_helper_call(
+                "read_message",
+                account_uid,
+                [account_uid, folder_name, message_uid],
+                {"mark_seen": mark_seen},
+            )
         return run_on_mail_thread(
             self._read_message_unlocked,
             account_uid,
@@ -8141,6 +8311,13 @@ class MailService:
         destination_folder: str,
         message_uids: list[str],
     ) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "move_messages",
+                account_uid,
+                [account_uid, source_folder, destination_folder, message_uids],
+            )
+            return result if isinstance(result, dict) else {}
         return run_on_mail_thread(
             self._move_messages_unlocked,
             account_uid,
