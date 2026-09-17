@@ -4222,7 +4222,15 @@ class MainWindow(Adw.ApplicationWindow):
             )
 
         # Background so folder switches can preempt long refresh_info_sync calls.
-        self._mail.submit_background("folder_message_sync", worker_sync)
+        # Epic lane is foreground (open folder); keep preemptible Camel queue (#435).
+        self._mail.submit_job(
+            "folder_message_sync",
+            worker_sync,
+            epic_lane="foreground",
+            account_uid=account_uid,
+            folder=folder_name,
+            preemptible=True,
+        )
 
     def _start_background_heavy_folder_index(
         self,

@@ -402,7 +402,14 @@ class MailSidebar:
             unread = -1
             total = -1
             try:
-                unread, total = self._mail.get_folder_stats(account_uid, inbox_name)
+                if self._mail.uses_graph_http_folder_counts(account_uid):
+                    unread, total = self._mail.get_folder_stats_via_graph(
+                        account_uid, inbox_name
+                    )
+                else:
+                    unread, total = self._mail.get_folder_stats(
+                        account_uid, inbox_name
+                    )
             except Exception as exc:
                 log_mail_error(log, f"Failed to refresh inbox counts for {account_uid}", exc)
                 error = exc
@@ -415,7 +422,14 @@ class MailSidebar:
                 error,
             )
 
-        self._mail.submit_interactive("refresh_inbox_counts", worker)
+        # Epic background (STATUS), not open-mail (#424 / #435).
+        self._mail.submit_job(
+            "refresh_inbox_counts",
+            worker,
+            epic_lane="background",
+            account_uid=account_uid,
+            folder=inbox_name,
+        )
 
     def refresh_all_folder_counts(self) -> None:
         """Re-fetch unread/total for all sidebar message folders (badge-only).
@@ -470,7 +484,12 @@ class MailSidebar:
             stats: dict[str, tuple[int, int]] = {}
             error: Exception | None = None
             try:
-                stats = self._mail.get_account_folder_stats(account_uid)
+                if self._mail.uses_graph_http_folder_counts(account_uid):
+                    stats = self._mail.get_account_folder_stats_via_graph(
+                        account_uid
+                    )
+                else:
+                    stats = self._mail.get_account_folder_stats(account_uid)
             except Exception as exc:
                 log_mail_error(
                     log,
@@ -488,7 +507,13 @@ class MailSidebar:
                 error,
             )
 
-        self._mail.submit_background("poll_account_folder_counts", worker)
+        # Epic background maintenance; M365 uses Graph HTTP off Camel (#435).
+        self._mail.submit_job(
+            "poll_account_folder_counts",
+            worker,
+            epic_lane="background",
+            account_uid=account_uid,
+        )
 
     def _defer_account_folder_count_poll(
         self,
@@ -616,7 +641,14 @@ class MailSidebar:
             unread = -1
             total = -1
             try:
-                unread, total = self._mail.get_folder_stats(account_uid, folder_name)
+                if self._mail.uses_graph_http_folder_counts(account_uid):
+                    unread, total = self._mail.get_folder_stats_via_graph(
+                        account_uid, folder_name
+                    )
+                else:
+                    unread, total = self._mail.get_folder_stats(
+                        account_uid, folder_name
+                    )
             except Exception as exc:
                 log_mail_error(
                     log,
@@ -633,7 +665,13 @@ class MailSidebar:
                 error,
             )
 
-        self._mail.submit_interactive("refresh_folder_counts", worker)
+        self._mail.submit_job(
+            "refresh_folder_counts",
+            worker,
+            epic_lane="background",
+            account_uid=account_uid,
+            folder=folder_name,
+        )
 
     def _on_folder_counts_refreshed(
         self,
@@ -723,7 +761,14 @@ class MailSidebar:
             unread = -1
             total = -1
             try:
-                unread, total = self._mail.get_folder_stats(account_uid, folder_name)
+                if self._mail.uses_graph_http_folder_counts(account_uid):
+                    unread, total = self._mail.get_folder_stats_via_graph(
+                        account_uid, folder_name
+                    )
+                else:
+                    unread, total = self._mail.get_folder_stats(
+                        account_uid, folder_name
+                    )
             except Exception as exc:
                 log_mail_error(
                     log,
@@ -746,7 +791,13 @@ class MailSidebar:
         worker.__qualname__ = (
             f"MailSidebar.refresh_folder_row[{short}/{folder_name}]"
         )
-        self._mail.submit_interactive("refresh_folder_row", worker)
+        self._mail.submit_job(
+            "refresh_folder_row",
+            worker,
+            epic_lane="background",
+            account_uid=account_uid,
+            folder=folder_name,
+        )
 
     @staticmethod
     def _dispatch_folder_refresh_complete(
