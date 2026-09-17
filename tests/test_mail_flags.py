@@ -481,11 +481,14 @@ class ReadMessageEmptyBodyMarkSeenTests(unittest.TestCase):
         get_mime_mock: MagicMock,
         attachments: list,
         mark_seen: bool = True,
+        connect_health: str | None = None,
     ) -> dict:
         from post.mail.eds import MailService
 
         service = MailService(registry=MagicMock())
         service.registry.ref_source.return_value = None
+        if connect_health is not None:
+            service.set_account_connect_health("acct-1", connect_health)
         folder = MagicMock()
         info = MagicMock()
         info.get_flags.return_value = 0
@@ -590,6 +593,27 @@ class ReadMessageEmptyBodyMarkSeenTests(unittest.TestCase):
 
         mark_seen_mock.assert_not_called()
         self.assertFalse((result.get("flags") or {}).get("seen"))
+
+    @patch("post.mail.eds.MailService._mark_message_seen_unlocked")
+    @patch("post.mail.eds.MailService._get_message_mime_sync")
+    @patch("post.mail.eds.MailService._get_store_unlocked")
+    def test_empty_body_when_goa_dead_still_returns(
+        self,
+        get_store_mock: MagicMock,
+        get_mime_mock: MagicMock,
+        mark_seen_mock: MagicMock,
+    ) -> None:
+        mark_seen_mock.return_value = (0, 1)
+        result = self._read_empty_body(
+            get_store_mock=get_store_mock,
+            get_mime_mock=get_mime_mock,
+            attachments=[],
+            connect_health="needs_sign_in",
+        )
+
+        self.assertIsNone(result["body_plain"])
+        self.assertIsNone(result["body_html"])
+        mark_seen_mock.assert_called_once()
 
 
 class PersistFlagSignInTests(unittest.TestCase):

@@ -441,10 +441,15 @@ _INBOX_FOLDER_ALIASES = ("INBOX", "Inbox", "inbox")
 
 
 def _inbox_folder_name_aliases(folder_name: str) -> tuple[str, ...]:
-    """Camel M365 stores Inbox on disk; Post may open INBOX after a GOA failure."""
-    if folder_name in _INBOX_FOLDER_ALIASES:
-        return _INBOX_FOLDER_ALIASES
-    return (folder_name,)
+    """Try the requested spelling first, then Inbox/INBOX variants.
+
+    Preferring a larger alias count first can open a leftover ``INBOX``
+    summary and hide the live M365 ``Inbox`` (#432).
+    """
+    if folder_name not in _INBOX_FOLDER_ALIASES:
+        return (folder_name,)
+    others = tuple(name for name in _INBOX_FOLDER_ALIASES if name != folder_name)
+    return (folder_name,) + others
 
 
 def _should_save_heavy_folder_index(
@@ -2108,6 +2113,33 @@ class MailService:
         names = folder_index_cache.cached_folder_names(account_uid)
         if not names:
             return None
+        inbox_names = [
+            name for name in names if name.upper() in ("INBOX", "INBOX/")
+        ]
+        if len(inbox_names) > 1:
+            best_name: str | None = None
+            best_sort = -1.0
+            for name in inbox_names:
+                cached = folder_index_cache.load(account_uid, name)
+                if cached is None or not cached[0]:
+                    continue
+                newest = 0.0
+                for message in cached[0]:
+                    for key in (
+                        "sort_date",
+                        "date_received",
+                        "date_sent",
+                        "date",
+                    ):
+                        raw = message.get(key)
+                        if isinstance(raw, (int, float)) and raw > newest:
+                            newest = float(raw)
+                            break
+                if best_name is None or newest > best_sort:
+                    best_name = name
+                    best_sort = newest
+            if best_name is not None:
+                return best_name
         return guess_inbox_name(
             [{"full_name": name, "display_name": name} for name in names]
         )
@@ -2141,6 +2173,8 @@ class MailService:
         if account_uid in self._stores:
             store = self._stores[account_uid]
             if not allow_online:
+                # Leave a CONNECTED store connected. set_online_sync(False) can
+                # expose a leftover INBOX summary and hide the live Inbox (#432).
                 if (
                     store.get_connection_status()
                     != Camel.ServiceConnectionStatus.CONNECTED
@@ -2151,8 +2185,7 @@ class MailService:
                         account_uid,
                         cancellable=cancellable,
                     )
-                else:
-                    self._configure_store_settings_unlocked(store, account_uid)
+                self._configure_store_settings_unlocked(store, account_uid)
                 return store
             if store.get_connection_status() == Camel.ServiceConnectionStatus.CONNECTED:
                 self._call_without_service_lock(
@@ -5066,36 +5099,57 @@ class MailService:
         folder_name: str,
         index: _FolderMessageIndex,
     ) -> tuple[_FolderMessageIndex, FolderIndexSource | None]:
-        """Keep a larger RAM/disk index when Camel's summary came back empty."""
-        if index.messages:
-            return index, None
+        """Keep RAM/disk when Camel's summary is empty or a stale other-folder set."""
         key = (account_uid, folder_name)
         ram = self._folder_indexes.get(key)
-        if ram is not None and ram.messages:
-            log.warning(
-                "Keeping in-memory folder index for %s/%s after empty Camel summary "
-                "(memory=%d)",
-                account_uid,
-                folder_name,
-                len(ram.messages),
-            )
-            return ram, "memory"
         cached = folder_index_cache.load(account_uid, folder_name)
-        if cached is not None and cached[0]:
+
+        def _from_cache() -> _FolderMessageIndex | None:
+            if cached is None or not cached[0]:
+                return None
             messages, unread, total = cached
+            return _FolderMessageIndex(
+                messages=messages, unread=unread, total=total
+            )
+
+        if not index.messages:
+            if ram is not None and ram.messages:
+                log.warning(
+                    "Keeping in-memory folder index for %s/%s after empty Camel summary "
+                    "(memory=%d)",
+                    account_uid,
+                    folder_name,
+                    len(ram.messages),
+                )
+                return ram, "memory"
+            disk = _from_cache()
+            if disk is not None:
+                log.warning(
+                    "Keeping on-disk folder index for %s/%s after empty Camel summary "
+                    "(disk=%d)",
+                    account_uid,
+                    folder_name,
+                    len(disk.messages),
+                )
+                return disk, "disk_cache"
+            return index, None
+
+        disk = _from_cache()
+        for source, other in (("memory", ram), ("disk_cache", disk)):
+            if other is None or not other.messages:
+                continue
+            if folder_index_covers_identities(index.messages, other.messages):
+                continue
             log.warning(
-                "Keeping on-disk folder index for %s/%s after empty Camel summary "
-                "(disk=%d)",
+                "Keeping %s folder index for %s/%s after uncovered Camel summary "
+                "(camel=%d, kept=%d)",
+                source,
                 account_uid,
                 folder_name,
-                len(messages),
+                len(index.messages),
+                len(other.messages),
             )
-            return (
-                _FolderMessageIndex(
-                    messages=messages, unread=unread, total=total
-                ),
-                "disk_cache",
-            )
+            return other, source
         return index, None
 
     def _get_folder_index_unlocked(
@@ -5859,6 +5913,52 @@ class MailService:
             raise error from cause
         raise error
 
+    def _raise_local_message_unavailable(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        offline: bool,
+        cause: BaseException | None = None,
+    ) -> NoReturn:
+        if offline:
+            error = MessageNotAvailableError(
+                message_uid,
+                folder_name,
+                reason=MessageUnavailableReason.NOT_CACHED_OFFLINE,
+            )
+            if cause is not None:
+                raise error from cause
+            raise error
+        self._raise_uncached_sign_in(
+            account_uid, folder_name, message_uid, cause=cause
+        )
+
+    def _get_message_mime_from_local_store(
+        self,
+        folder: Camel.Folder,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        api_uid: str,
+        *,
+        offline: bool,
+    ) -> Any:
+        """Read MIME without Graph: RFC822 / get_message_cached only (#432).
+
+        Camel M365 ``get_message_sync`` calls ``ensure_connected`` before the
+        data cache. Taking the store offline then calling it fails with
+        "must be working online" and a failed Graph write can leave a 0-byte
+        cache stub. Never call it (or synchronize_message_sync) here.
+        """
+        mime = self._try_message_cached(folder, api_uid)
+        if mime is not None:
+            return mime
+        self._raise_local_message_unavailable(
+            account_uid, folder_name, message_uid, offline=offline
+        )
+
     def _get_message_mime_sync(
         self,
         folder: Camel.Folder,
@@ -5873,16 +5973,14 @@ class MailService:
         self._recovered_read_uid = None
         api_uid = camel_uid_to_api(message_uid)
         if not allow_network:
-            mime = self._try_message_cached(folder, api_uid)
-            if mime is not None:
-                return mime
-            if offline:
-                raise MessageNotAvailableError(
-                    message_uid,
-                    folder_name,
-                    reason=MessageUnavailableReason.NOT_CACHED_OFFLINE,
-                )
-            self._raise_uncached_sign_in(account_uid, folder_name, message_uid)
+            return self._get_message_mime_from_local_store(
+                folder,
+                account_uid,
+                folder_name,
+                message_uid,
+                api_uid,
+                offline=offline,
+            )
         try:
             mime = self._get_message_sync_with_timeout(folder, api_uid)
         except TimeoutError:
@@ -6019,6 +6117,48 @@ class MailService:
             return self._get_named_folder_unlocked(
                 store, folder_name, cancellable
             )
+
+    def _open_folder_for_message_read_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        allow_online: bool,
+    ) -> Camel.Folder:
+        """Open a folder for reading, retrying local-only before sign-in (#432)."""
+        folder = None
+        open_error: BaseException | None = None
+        try:
+            folder = self._open_folder_unlocked(
+                account_uid, folder_name, allow_online=allow_online
+            )
+        except Exception as extra:
+            open_error = extra
+        if folder is None:
+            try:
+                folder = self._open_folder_unlocked(
+                    account_uid, folder_name, allow_online=False
+                )
+            except Exception as retry_exc:
+                open_error = retry_exc
+        if folder is None:
+            blocked = open_error is not None and (
+                is_sign_in_required_error(open_error)
+                or is_network_unavailable_error(open_error)
+            )
+            if not allow_online or blocked:
+                self._raise_local_message_unavailable(
+                    account_uid,
+                    folder_name,
+                    message_uid,
+                    offline=not self._network_available,
+                    cause=open_error,
+                )
+            if open_error is not None:
+                raise open_error
+            raise ValueError(f"Folder not found: {folder_name}")
+        return folder
 
     def _try_get_folder_for_search_unlocked(
         self, account_uid: str, folder_name: str
@@ -8168,20 +8308,12 @@ class MailService:
             allow_network = self._goa_credentials_ready_for_read_unlocked(
                 account_uid
             )
-        try:
-            folder = self._open_folder_unlocked(
-                account_uid, folder_name, allow_online=allow_network
-            )
-        except Exception as exc:
-            if not allow_network or is_sign_in_required_error(exc):
-                self._raise_uncached_sign_in(
-                    account_uid, folder_name, message_uid, cause=exc
-                )
-            raise
-        if folder is None:
-            if not allow_network:
-                self._raise_uncached_sign_in(account_uid, folder_name, message_uid)
-            raise ValueError(f"Folder not found: {folder_name}")
+        folder = self._open_folder_for_message_read_unlocked(
+            account_uid,
+            folder_name,
+            message_uid,
+            allow_online=allow_network,
+        )
         if self.get_account_connect_health(account_uid) == "needs_sign_in":
             allow_network = False
 
@@ -8248,10 +8380,7 @@ class MailService:
                     from .helpers import extract_message_bodies_from_bytes
 
                     bodies = extract_message_bodies_from_bytes(raw)
-        if not (bodies.get("plain") or bodies.get("html")) and not allow_network:
-            self._raise_uncached_sign_in(
-                account_uid, folder_name, actual_uid
-            )
+        # Empty extracted body still displays (#377); local MIME is not "uncached" (#432).
         result["body_plain"] = bodies["plain"]
         result["body_html"] = bodies["html"]
         attachments = extract_attachments(mime)

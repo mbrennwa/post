@@ -243,6 +243,8 @@ class OfflineBodySyncCoordinator:
                 return
             if not self._mail.is_network_available():
                 return
+            if self._mail.get_account_connect_health(account_uid) == "needs_sign_in":
+                return
         selected = select_arrival_prefetch_uids(uids, sort_dates=sort_dates)
         if not selected:
             return
@@ -357,6 +359,11 @@ class OfflineBodySyncCoordinator:
                     )
                     continue
                 if user_offline or not network:
+                    continue
+                if (
+                    self._mail.get_account_connect_health(item.account_uid)
+                    == "needs_sign_in"
+                ):
                     continue
                 if not item.force and not self._arrival_uid_in_age_window(
                     folder, item.uid, mode
