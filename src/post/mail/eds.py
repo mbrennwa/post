@@ -6265,9 +6265,14 @@ class MailService:
                     raise err from cause
                 raise err
 
-            # Still listed / known: keep the row and let the user retry (#265).
-            err = RuntimeError(
-                f"Could not load message {message_uid} in {folder_name!r}"
+            # Still listed / known but Camel cannot serve MIME yet (common while
+            # Archive heavy-folder refresh has folder-index rows and
+            # ``camel_uids=0`` / incomplete Graph delta). Soft-fail so the row
+            # stays and the user can retry — not a hard "Could not read" (#265).
+            err = MessageNotAvailableError(
+                message_uid,
+                folder_name,
+                reason=MessageUnavailableReason.NOT_FETCHABLE_YET,
             )
             if cause is not None:
                 raise err from cause
