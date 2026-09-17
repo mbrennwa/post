@@ -6,19 +6,24 @@ Post runs blocking Camel / Evolution Data Server (EDS) work on a **single dedica
 
 ```
 ┌─────────────────────┐  MailService job facade  ┌──────────────────────────┐
-│  GTK main thread    │  *_async / submit_*     │  post-mail-io thread     │
-│  (UI only)          │ ───────────────────────► │  (Camel Session owner) │
+│  GTK main thread    │  submit_job / *_async    │  post-mail-io (Camel)    │
+│  (UI only)          │ ───────────────────────► │  one MailSession         │
+│                     │  M365 bg STATUS (HTTP)   ├──────────────────────────┤
+│                     │ ───────────────────────► │  post-graph-http (Soup)  │
 │                     │ ◄── GLib.idle_add ────── │                         │
 └─────────────────────┘                          └──────────────────────────┘
 ```
 
 - **`post.mail.io_thread`** — serial queue + private `GMainContext`; bootstraps `Camel.init` once. One thread (`post-mail-io`) still owns the Camel session.
-- **`MailService`** (`post.mail.eds`) — job facade (#425). GTK calls named jobs: `submit_interactive` / `submit_front` / `submit_background` (today’s queues, unchanged) or `*_async` wrappers (`read_message_async`, `move_messages_async`, …). Internals still use `run_on_mail_thread()` / `get_mail_io_thread().run_sync()` / `submit()`. `on_done` for `*_async` runs on GTK via `GLib.idle_add`.
+- **`MailService`** (`post.mail.eds`) — job facade (#425 / #435). GTK calls named jobs: `submit_interactive` / `submit_front` / `submit_background` / **`submit_job`** (epic lane + optional same-folder lock) or `*_async` wrappers. Internals still use `run_on_mail_thread()` / `get_mail_io_thread().run_sync()` / `submit()`. `on_done` for `*_async` runs on GTK via `GLib.idle_add`.
+- **Epic lanes (#422 / #435)** — `foreground` = folder you’re in, open, send; `background` = maintenance (STATUS polls, crawl). Same `(account, folder)` stays one-at-a-time (`FolderJobLock`). Today’s interactive vs background Camel queues remain the preempt mechanism; open-folder refresh is epic foreground but may stay on the preemptible Camel queue (`preemptible=True`).
+- **M365 background STATUS** — Graph folder counts for sidebar / heavy-folder STATUS run on **`post-graph-http`** (Soup), not a second Camel `*_sync`. OAuth token is obtained with a short mail-thread call; the HTTP fetch itself does not hold `post-mail-io`. Foreground M365 mail (open, send, move) stays on Camel.
+- **Gmail concurrent Camel** — **fail-closed** in this spike: no second in-process `MailSession`, and same-session dual-thread Camel is **not** enabled. `POST_MAIL_GMAIL_CAMEL_OVERLAP=1` only logs that overlap is unavailable; background Gmail work stays serialized on `post-mail-io`. True isolation is Phase 3.
 - **UI / mail modules** (`window.py`, `sidebar.py`, `compose_window.py`, `reader_window.py`, `send_delay.py`, `offline_sync.py`, `sync_watcher.py`) — must not call `get_mail_io_thread()`. They queue work through `MailService` and keep generation/stale checks (`load_id`, `read_id`) in their own `on_done` / idle handlers. `app.py` may start the thread at startup.
 
 ## Rules for contributors
 
-1. **Never call `MailIoThread.run_sync()` from the GTK thread** — it blocks the UI. From GTK use `MailService.submit_interactive` / `submit_front` / `submit_background` or `*_async` (not `get_mail_io_thread()`).
+1. **Never call `MailIoThread.run_sync()` from the GTK thread** — it blocks the UI. From GTK use `MailService.submit_interactive` / `submit_front` / `submit_background` / `submit_job` or `*_async` (not `get_mail_io_thread()`).
 2. **Never call `Camel.*_sync` directly from UI or ad-hoc worker threads** — go through `MailService` or `run_on_mail_thread()`.
 3. **One `MailSession` per process** — owned on the mail I/O thread (`MailService._session`, `_stores`, `_transports`). Do not reintroduce per-thread worker sessions.
 4. **Password / OAuth prompts** — use `GLib.idle_add` to show dialogs on the GTK thread; mail thread waits on the result. Do **not** call GOA `EnsureCredentials` synchronously from the GTK thread (compose must not preflight on the UI thread; see #156).
@@ -31,8 +36,8 @@ Post runs blocking Camel / Evolution Data Server (EDS) work on a **single dedica
 11. **Per-account Take offline** — first connect / `set_online_sync` must honor `get_account_user_online`, not only global network availability. From GTK use `submit_front` (never `run_sync`).
 12. **Network monitor reconnect (#400)** — `Gio.NetworkMonitor` callbacks run on GTK. `MailService.set_network_available` / `go_online_sync` must **`submit_front`** (never `run_sync` from GTK). Per-store `set_online_sync` uses a **15s** cancellable; one failed/expired OAuth account must not block the rest. Prefer a single offline→online pass (flag + clear folder indexes + timed sync); do not call `go_online_sync` after `set_network_available` from the window.
 13. **Folder transfer / Archive (#189/#404)** — `transfer_messages_to_sync` uses a finite `Gio.Cancellable` timeout; soft-succeed when source UIDs are already gone. After move (including soft-succeed), prune Camel `FolderSummary` UIDs locally (Evolution-style) and update Post’s folder-index cache with **destination RestIds only**. Do **not** park Inbox RestIds as openable Archive rows. For a small interactive move, a **bounded** dest `refresh_info` (8s) plus per-UID `synchronize_message_sync` learns dest ids; do **not** block UI completion on unbounded Graph `refresh_info_sync` of a 29k Archive. For `microsoft365` / `ews` bulk, skip post-transfer full-folder `synchronize_sync` / `refresh_info_sync` (#189). Account transfer-busy / not-responding badges escalate on timeout; refuse new moves for that account while busy. **Quit waits** for in-flight Archive/move/trash (same pattern as outbound send) so a mid-move exit does not drop work. **Residual:** if the Graph provider ignores cancel, `post-mail-io` stays pinned until the native call returns or the wait times out; true kill-isolation needs a helper process (follow-up), not a second in-process Camel session.
-14. **Folder stats / count refresh (#197)** — per-folder `refresh_info_sync` uses a registered refresh cancellable with a **15s** timeout and falls back to cached unread/total on cancel. Folder switches call `cancel_folder_refresh()` so interactive loads are not stuck behind sidebar count polls.
-15. **Heavy-folder header index (#208)** — Archive / All Mail / Trash / Junk open with disk/memory cache first, then a **chunked** background `continue_heavy_folder_index` (UID batches). Indexes are grow-only on disk (never replace a larger cache with a smaller partial summary). **Do not** call this indexer with server refresh from offline body sync. Opening a heavy folder: (1) index local summary immediately, (2) async `refresh_info` with `pump_until` so interactive mail I/O can run during Graph fetch (**without** sidebar `cancel_folder_refresh` aborting it — heavy index uses a separate cancellable), (3) index any new UIDs. M365 often stalls at a partial local summary; Post calls `prepare_content_refresh` and retries while the folder stays open until headers grow or several no-growth stalls. Folder::changed during that refresh must not invalidate the in-progress index. Cancel/timeout indexes the local summary but **does not** set `refresh_done` — the indexer keeps retrying while the folder stays open (full-account offline body sync stays held until that indexer finishes, #407). Interactive work pending before refresh yields with `yield_for_interactive` and leaves `refresh_done=False` (never permanently skips server refresh). Offline body sync may re-index local summary only (`allow_refresh=False`) after downsync. UI initially binds at most 500 rows (`MESSAGE_LIST_UI_BIND_CAP`) and appends more when the user scrolls near the end; status may show `Showing N of M`. Search uses the full in-memory index. **Sidebar STATUS** for heavy folders comes from store FolderInfo REFRESH only, persisted as a **grow-only** high-water mark (`folder-status` cache): only trusted STATUS-sized observations may lock in, and nothing may shrink a larger total (poisoned ~1000 REFRESH must not overwrite ~28k). Camel local-summary sizes must never be labeled “on server.”
+14. **Folder stats / count refresh (#197 / #435)** — Non-M365: per-folder `refresh_info_sync` / store FolderInfo REFRESH on `post-mail-io` with timeouts; folder switches call `cancel_folder_refresh()`. **M365:** sidebar / STATUS-style counts prefer Graph HTTP on `post-graph-http` so Inbox Camel work is not stuck behind Archive STATUS. Grow-only `folder-status` cache rules still apply.
+15. **Heavy-folder header index (#208)** — Archive / All Mail / Trash / Junk open with disk/memory cache first, then a **chunked** background `continue_heavy_folder_index` (UID batches). Indexes are grow-only on disk (never replace a larger cache with a smaller partial summary). **Do not** call this indexer with server refresh from offline body sync. Opening a heavy folder: (1) index local summary immediately, (2) async `refresh_info` with `pump_until` so interactive mail I/O can run during Graph fetch (**without** sidebar `cancel_folder_refresh` aborting it — heavy index uses a separate cancellable), (3) index any new UIDs. M365 often stalls at a partial local summary; Post calls `prepare_content_refresh` and retries while the folder stays open until headers grow or several no-growth stalls. Folder::changed during that refresh must not invalidate the in-progress index. Cancel/timeout indexes the local summary but **does not** set `refresh_done` — the indexer keeps retrying while the folder stays open (full-account offline body sync stays held until that indexer finishes, #407). Interactive work pending before refresh yields with `yield_for_interactive` and leaves `refresh_done=False` (never permanently skips server refresh). Offline body sync may re-index local summary only (`allow_refresh=False`) after downsync. UI initially binds at most 500 rows (`MESSAGE_LIST_UI_BIND_CAP`) and appends more when the user scrolls near the end; status may show `Showing N of M`. Search uses the full in-memory index. **Sidebar STATUS** for heavy folders: M365 prefers Graph `totalItemCount` (#435); otherwise store FolderInfo REFRESH, persisted as a **grow-only** high-water mark (`folder-status` cache). Camel local-summary sizes must never be labeled “on server.”
 
 ## Debugging
 
@@ -67,6 +72,7 @@ Without `POST_LOG_LEVEL`, stderr stays at WARNING+; the on-disk log still record
 
 Mail-thread dispatcher behaviour is covered in `tests/test_io_thread.py`.  
 `MailService` job facade and dispatch are covered in `tests/test_mail_job_api.py`, `tests/test_eds_*.py`, and `tests/test_send_background.py`.  
+Epic lanes / folder lock / M365 Graph HTTP routing: `tests/test_lane_dispatch.py` (#435).  
 `tests/test_mail_threading_contract.py` forbids UI/mail modules from calling `get_mail_io_thread`.
 
 Run the suite:
@@ -78,6 +84,15 @@ PYTHONPATH=src python3 -m pytest
 ## Manual regression matrix
 
 Run after changes to mail threading, send, or shutdown. Check boxes when verified.
+
+### Phase 2 spike (#435)
+
+| Scenario | Account | Pass |
+|----------|---------|------|
+| Open Inbox + send while Archive STATUS / count poll runs | M365 | ☐ |
+| Sidebar counts stay grow-only-correct after Graph HTTP STATUS | M365 | ☐ |
+| Open Inbox while background sync runs (still serial Camel) | Gmail | ☐ |
+| Quit during background STATUS / sync | Either | ☐ |
 
 ### Send path
 

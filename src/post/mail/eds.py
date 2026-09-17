@@ -10,9 +10,12 @@ Mail I/O threading
 Blocking Camel calls must run on the dedicated mail I/O thread
 (``post.mail.io_thread``).  :class:`MailService` is the facade: GTK must call
 named job methods (``submit_interactive`` / ``submit_front`` /
-``submit_background`` / ``*_async``).  Internals still use
+``submit_background`` / ``submit_job`` / ``*_async``).  Internals still use
 ``get_mail_io_thread().run_sync`` / ``submit``.  UI code must not call
 ``get_mail_io_thread`` or ``run_sync`` from the GTK thread.
+
+Phase 2 (#435): ``submit_job`` carries epic lane + optional same-folder lock.
+M365 background STATUS may run on ``post-graph-http`` (Soup), not Camel.
 """
 
 from __future__ import annotations
@@ -38,6 +41,13 @@ from . import correspondent_cache
 from . import folder_index_cache
 from . import folder_status_cache
 from . import graph_folder_counts
+from .lane_dispatch import (
+    EpicLane,
+    default_queue_for_lane,
+    folder_job_lock,
+    gmail_camel_overlap_enabled,
+    graph_http_worker,
+)
 from .account_cache_gc import drop_orphan_account_caches
 from .evolution_cache_path import (
     cached_rfc822_candidates,
@@ -1137,6 +1147,220 @@ class MailService:
         """Queue named background mail work (preempted by interactive jobs)."""
         log.debug("Mail job queue=background name=%s", name)
         get_mail_io_thread().submit_background(func, *args, **kwargs)
+
+    def submit_job(
+        self,
+        name: str,
+        func: Callable[..., Any],
+        /,
+        *args: Any,
+        epic_lane: EpicLane,
+        account_uid: str | None = None,
+        folder: str | None = None,
+        preemptible: bool | None = None,
+        queue: Literal["interactive", "front", "background"] | None = None,
+        runner: Literal["auto", "camel", "graph_http"] = "auto",
+        **kwargs: Any,
+    ) -> None:
+        """Dispatch a named job with epic lane + optional same-folder lock (#435).
+
+        ``epic_lane`` is #422 foreground (open folder / open / send) vs background
+        (maintenance). ``queue`` defaults from the lane; set ``preemptible=True``
+        for open-folder refresh so it stays on today's background Camel queue.
+
+        ``runner="graph_http"`` (or ``auto`` for M365 background count jobs) runs
+        on ``post-graph-http`` so Camel ``post-mail-io`` is free. Gmail Camel
+        overlap stays fail-closed (see ``gmail_camel_overlap_enabled``).
+        """
+        resolved_queue = queue or default_queue_for_lane(
+            epic_lane, preemptible=preemptible
+        )
+        use_graph = runner == "graph_http" or (
+            runner == "auto"
+            and epic_lane == "background"
+            and account_uid is not None
+            and self._account_backend_is_microsoft365(account_uid)
+            and name
+            in {
+                "poll_account_folder_counts",
+                "refresh_inbox_counts",
+                "refresh_folder_counts",
+                "refresh_folder_row",
+            }
+        )
+        if (
+            epic_lane == "background"
+            and account_uid is not None
+            and self._account_backend_looks_gmail(account_uid)
+            and gmail_camel_overlap_enabled()
+        ):
+            log.warning(
+                "Gmail Camel overlap gate is on but same-session dual Camel is "
+                "not enabled (#435 fail-closed); serializing on post-mail-io "
+                "name=%s",
+                name,
+            )
+
+        def locked_worker() -> None:
+            folder_job_lock().run(account_uid, folder, func, *args, **kwargs)
+
+        log.debug(
+            "Mail job epic_lane=%s queue=%s runner=%s name=%s account=%s folder=%s",
+            epic_lane,
+            resolved_queue,
+            "graph_http" if use_graph else "camel",
+            name,
+            account_uid,
+            folder,
+        )
+        if use_graph:
+            graph_http_worker().submit(locked_worker)
+            return
+        if resolved_queue == "front":
+            self.submit_front(name, locked_worker)
+        elif resolved_queue == "background":
+            self.submit_background(name, locked_worker)
+        else:
+            self.submit_interactive(name, locked_worker)
+
+    def _account_backend_is_microsoft365(self, account_uid: str) -> bool:
+        try:
+            account = self.get_account(account_uid)
+        except Exception:
+            return False
+        return (account.backend or "").lower() == "microsoft365"
+
+    def uses_graph_http_folder_counts(self, account_uid: str) -> bool:
+        """True when background STATUS for this account uses Graph HTTP (#435)."""
+        return self._account_backend_is_microsoft365(account_uid)
+
+    def _account_backend_looks_gmail(self, account_uid: str) -> bool:
+        try:
+            account = self.get_account(account_uid)
+        except Exception:
+            return False
+        backend = (account.backend or "").lower()
+        if backend in {"gmail", "google"}:
+            return True
+        email = (account.email or account.from_address or "").lower()
+        if email.endswith("@gmail.com") or email.endswith("@googlemail.com"):
+            return True
+        label = (account.name or "").lower()
+        return "gmail" in label or "google mail" in label
+
+    def get_oauth2_access_token_for_account(
+        self, account_uid: str
+    ) -> str | None:
+        """Return a Graph/OAuth access token; must run on the mail I/O thread."""
+        return run_on_mail_thread(
+            self._get_oauth2_access_token_for_account_unlocked, account_uid
+        )
+
+    def _get_oauth2_access_token_for_account_unlocked(
+        self, account_uid: str
+    ) -> str | None:
+        store = self._get_store_unlocked(account_uid)
+        session = self._ensure_session()
+        cancellable = Gio.Cancellable()
+        try:
+            ok, token, _expires = session.get_oauth2_access_token_sync(
+                store, cancellable
+            )
+        except Exception:
+            log.debug(
+                "OAuth token failed for %s", account_uid, exc_info=True
+            )
+            return None
+        if not ok or not token:
+            return None
+        return str(token)
+
+    def get_account_folder_stats_via_graph(
+        self, account_uid: str
+    ) -> dict[str, tuple[int, int]]:
+        """STATUS-style counts via Graph HTTP (#435). Safe off ``post-mail-io``.
+
+        Obtains the OAuth token with a short mail-thread call, then performs
+        Soup Graph requests on the caller thread (``post-graph-http``).
+        """
+        token = self.get_oauth2_access_token_for_account(account_uid)
+        if not token:
+            return run_on_mail_thread(
+                self._get_account_folder_stats_unlocked, account_uid
+            )
+        by_display = graph_folder_counts.fetch_mail_folder_counts_by_display_name(
+            token
+        )
+        if not by_display:
+            return run_on_mail_thread(
+                self._get_account_folder_stats_unlocked, account_uid
+            )
+        with self._lock:
+            cached = list(self._folder_tree_cache.get(account_uid) or [])
+        stats: dict[str, tuple[int, int]] = {}
+        for folder in cached:
+            full_name = folder.get("full_name")
+            if not full_name:
+                continue
+            leaf = str(full_name).rsplit("/", 1)[-1].strip()
+            counts = by_display.get(leaf.casefold())
+            if counts is None:
+                unread = int(folder.get("unread", -1))
+                total = int(folder.get("total", -1))
+                if is_heavy_folder_name(str(full_name)):
+                    stats[str(full_name)] = folder_status_cache.resolve_sidebar(
+                        account_uid, str(full_name), unread, total
+                    )
+                else:
+                    stats[str(full_name)] = (unread, total)
+                continue
+            unread, total = counts
+            if is_heavy_folder_name(str(full_name)):
+                folder_status_cache.observe(
+                    account_uid,
+                    str(full_name),
+                    unread,
+                    total,
+                    trusted=True,
+                )
+                stats[str(full_name)] = folder_status_cache.resolve_sidebar(
+                    account_uid, str(full_name), unread, total
+                )
+            else:
+                stats[str(full_name)] = (unread, total)
+        stats = _apply_heavy_status_high_water(account_uid, stats)
+        with self._lock:
+            tree = self._folder_tree_cache.get(account_uid)
+            if tree is not None:
+                self._folder_tree_cache[account_uid] = (
+                    _merge_heavy_folder_status_into_tree(account_uid, tree)
+                )
+        return stats
+
+    def get_folder_stats_via_graph(
+        self, account_uid: str, folder_name: str
+    ) -> tuple[int, int]:
+        """Single-folder Graph STATUS (#435); falls back to Camel on failure."""
+        token = self.get_oauth2_access_token_for_account(account_uid)
+        if token:
+            counts = graph_folder_counts.fetch_mail_folder_counts(
+                token, folder_name
+            )
+            if counts is not None:
+                unread, total = counts
+                if is_heavy_folder_name(folder_name):
+                    folder_status_cache.observe(
+                        account_uid,
+                        folder_name,
+                        unread,
+                        total,
+                        trusted=True,
+                    )
+                    return folder_status_cache.resolve_sidebar(
+                        account_uid, folder_name, unread, total
+                    )
+                return unread, total
+        return self.get_folder_stats(account_uid, folder_name)
 
     def run_job_async(
         self,

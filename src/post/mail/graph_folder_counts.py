@@ -74,6 +74,42 @@ def fetch_mail_folder_counts(
     )
 
 
+def fetch_mail_folder_counts_by_display_name(
+    access_token: str,
+    *,
+    cancellable: Gio.Cancellable | None = None,
+) -> dict[str, tuple[int, int]]:
+    """Return ``displayName.casefold() → (unread, total)`` for top-level Graph folders.
+
+    Used by Phase 2 (#435) M365 background STATUS so Camel ``post-mail-io`` is
+    not held for store FolderInfo REFRESH.
+    """
+    out: dict[str, tuple[int, int]] = {}
+    if not access_token:
+        return out
+    url = (
+        f"{_GRAPH_BASE}/me/mailFolders"
+        f"?$select=displayName,totalItemCount,unreadItemCount"
+        f"&$top=100"
+    )
+    while url:
+        if cancellable is not None and cancellable.is_cancelled():
+            break
+        payload = _send_json(access_token, url, cancellable=cancellable)
+        if payload is None:
+            break
+        for item in payload.get("value") or []:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("displayName")
+            counts = _counts_from_graph_folder(item)
+            if isinstance(name, str) and name.strip() and counts is not None:
+                out[name.casefold()] = counts
+        next_url = payload.get("@odata.nextLink")
+        url = next_url if isinstance(next_url, str) and next_url else None
+    return out
+
+
 def _find_folder_counts_by_display_name(
     access_token: str,
     display_name: str,
