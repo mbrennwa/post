@@ -1,0 +1,367 @@
+# Copyright (C) 2026 mbrennwa
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""UI-side supervisor for per-account Camel helper processes (#437 / #422)."""
+
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from .camel_ipc import read_message, write_message
+
+log = logging.getLogger(__name__)
+
+_HELPERS_ENV = "POST_MAIL_CAMEL_HELPERS"
+_HELPER_PROCESS_ENV = "POST_MAIL_CAMEL_HELPER_PROCESS"
+_DEFAULT_JOB_TIMEOUT = 120.0
+
+
+def camel_helpers_enabled() -> bool:
+    """True when the UI should spawn per-account Camel helpers.
+
+    Disabled inside helper processes and when ``POST_MAIL_CAMEL_HELPERS=0``.
+    Default: enabled in the UI process (#437).
+    """
+    if os.environ.get(_HELPER_PROCESS_ENV) == "1":
+        return False
+    raw = (os.environ.get(_HELPERS_ENV) or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+class CamelHelperError(RuntimeError):
+    """Raised when a helper call fails or the process is killed."""
+
+
+class CamelHelperTimeout(CamelHelperError):
+    """Raised when a helper job exceeds the watchdog timeout."""
+
+
+@dataclass
+class AccountCamelRuntime:
+    """One helper child for a single ``account_uid``."""
+
+    account_uid: str
+    _proc: subprocess.Popen[bytes] | None = field(default=None, init=False, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _serial: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _pending: dict[str, dict[str, Any]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _reader_thread: threading.Thread | None = field(
+        default=None, init=False, repr=False
+    )
+    _alive: bool = field(default=False, init=False)
+    _on_died: Callable[[str], None] | None = field(default=None, init=False, repr=False)
+
+    def set_died_callback(self, callback: Callable[[str], None] | None) -> None:
+        self._on_died = callback
+
+    def ensure_started(self) -> None:
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None and self._alive:
+                return
+            self._start_unlocked()
+
+    def _helper_command(self) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "post.mail.camel_helper",
+            "--account-uid",
+            self.account_uid,
+        ]
+
+    def _start_unlocked(self) -> None:
+        self._stop_unlocked(kill=True)
+        env = os.environ.copy()
+        env[_HELPER_PROCESS_ENV] = "1"
+        env[_HELPERS_ENV] = "0"
+        # Ensure src layout works the same as ``python3 -m post.main``.
+        cmd = self._helper_command()
+        log.info(
+            "spawning camel helper account=%s cmd=%s",
+            self.account_uid,
+            cmd,
+        )
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            bufsize=0,
+        )
+        self._alive = False
+        self._pending.clear()
+        assert self._proc.stdout is not None
+        ready = read_message(self._proc.stdout)
+        if ready is None or ready.get("type") != "ready":
+            self._stop_unlocked(kill=True)
+            raise CamelHelperError(
+                f"camel helper for {self.account_uid} did not become ready"
+            )
+        self._alive = True
+        self._reader_thread = threading.Thread(
+            target=self._reader_main,
+            name=f"camel-helper-reader-{self.account_uid[:8]}",
+            daemon=True,
+        )
+        self._reader_thread.start()
+        # Drain stderr so a chatty helper cannot block.
+        threading.Thread(
+            target=self._drain_stderr,
+            name=f"camel-helper-stderr-{self.account_uid[:8]}",
+            daemon=True,
+        ).start()
+
+    def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for line in iter(proc.stderr.readline, b""):
+                if not line:
+                    break
+                log.debug(
+                    "camel-helper[%s]: %s",
+                    self.account_uid[:8],
+                    line.decode("utf-8", errors="replace").rstrip(),
+                )
+        except Exception:
+            log.debug("stderr drain failed account=%s", self.account_uid, exc_info=True)
+
+    def _reader_main(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            while True:
+                msg = read_message(proc.stdout)
+                if msg is None:
+                    break
+                if msg.get("type") != "result":
+                    continue
+                req_id = str(msg.get("id") or "")
+                with self._lock:
+                    pending = self._pending.pop(req_id, None)
+                if pending is None:
+                    continue
+                pending["msg"] = msg
+                pending["event"].set()
+        except Exception:
+            log.debug(
+                "helper reader exited account=%s", self.account_uid, exc_info=True
+            )
+        finally:
+            with self._lock:
+                self._alive = False
+                for pending in self._pending.values():
+                    pending["msg"] = {
+                        "type": "result",
+                        "ok": False,
+                        "error": "camel helper process exited",
+                        "error_type": "CamelHelperError",
+                    }
+                    pending["event"].set()
+                self._pending.clear()
+            callback = self._on_died
+            if callback is not None:
+                try:
+                    callback(self.account_uid)
+                except Exception:
+                    log.debug("on_died callback failed", exc_info=True)
+
+    def call(
+        self,
+        method: str,
+        args: list[Any] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = _DEFAULT_JOB_TIMEOUT,
+    ) -> Any:
+        """Run ``method`` in the helper; raise on failure / timeout / kill."""
+        with self._serial:
+            return self._call_unlocked(
+                method, args or [], kwargs or {}, timeout=timeout
+            )
+
+    def _call_unlocked(
+        self,
+        method: str,
+        args: list[Any],
+        kwargs: dict[str, Any],
+        *,
+        timeout: float | None,
+    ) -> Any:
+        self.ensure_started()
+        req_id = uuid.uuid4().hex
+        event = threading.Event()
+        pending: dict[str, Any] = {"event": event, "msg": None}
+        with self._lock:
+            if self._proc is None or self._proc.stdin is None or not self._alive:
+                raise CamelHelperError(f"camel helper not running for {self.account_uid}")
+            self._pending[req_id] = pending
+            write_message(
+                self._proc.stdin,
+                {
+                    "type": "call",
+                    "id": req_id,
+                    "method": method,
+                    "args": args,
+                    "kwargs": kwargs,
+                },
+            )
+        finished = event.wait(timeout=None if timeout is None else max(0.1, timeout))
+        if not finished:
+            log.warning(
+                "camel helper timeout account=%s method=%s timeout=%s",
+                self.account_uid,
+                method,
+                timeout,
+            )
+            self.kill()
+            raise CamelHelperTimeout(
+                f"camel helper timed out for {self.account_uid} method={method}"
+            )
+        msg = pending.get("msg") or {}
+        if not msg.get("ok"):
+            err = str(msg.get("error") or "camel helper call failed")
+            err_type = str(msg.get("error_type") or "CamelHelperError")
+            if err_type == "CamelHelperTimeout":
+                raise CamelHelperTimeout(err)
+            raise CamelHelperError(f"{err_type}: {err}")
+        return msg.get("result")
+
+    def submit_worker(self, func: Callable[[], None]) -> None:
+        """Run a UI-side worker serially for this account (may block on ``call``)."""
+
+        def runner() -> None:
+            with self._serial:
+                try:
+                    func()
+                except Exception:
+                    log.debug(
+                        "account worker failed account=%s",
+                        self.account_uid,
+                        exc_info=True,
+                    )
+
+        threading.Thread(
+            target=runner,
+            name=f"camel-account-worker-{self.account_uid[:8]}",
+            daemon=True,
+        ).start()
+
+    def kill(self) -> None:
+        with self._lock:
+            self._stop_unlocked(kill=True)
+
+    def shutdown(self, *, timeout: float = 5.0) -> None:
+        with self._lock:
+            proc = self._proc
+            if proc is None:
+                return
+            if proc.poll() is None and proc.stdin is not None and self._alive:
+                try:
+                    write_message(proc.stdin, {"type": "shutdown", "id": "shutdown"})
+                except Exception:
+                    log.debug("shutdown write failed", exc_info=True)
+            deadline = time.monotonic() + max(0.1, timeout)
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self._stop_unlocked(kill=True)
+
+    def _stop_unlocked(self, *, kill: bool) -> None:
+        proc = self._proc
+        self._alive = False
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                if kill:
+                    proc.kill()
+                else:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    proc.kill()
+        finally:
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:
+                    pass
+            self._proc = None
+
+
+@dataclass
+class CamelRuntimePool:
+    """Spawn / route / kill per-account Camel helpers."""
+
+    _runtimes: dict[str, AccountCamelRuntime] = field(default_factory=dict, init=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _on_account_died: Callable[[str], None] | None = field(
+        default=None, init=False, repr=False
+    )
+
+    def set_account_died_callback(
+        self, callback: Callable[[str], None] | None
+    ) -> None:
+        self._on_account_died = callback
+
+    def get(self, account_uid: str) -> AccountCamelRuntime:
+        with self._lock:
+            runtime = self._runtimes.get(account_uid)
+            if runtime is None:
+                runtime = AccountCamelRuntime(account_uid=account_uid)
+                runtime.set_died_callback(self._handle_died)
+                self._runtimes[account_uid] = runtime
+            return runtime
+
+    def _handle_died(self, account_uid: str) -> None:
+        callback = self._on_account_died
+        if callback is not None:
+            try:
+                callback(account_uid)
+            except Exception:
+                log.debug("account died callback failed", exc_info=True)
+
+    def call(
+        self,
+        account_uid: str,
+        method: str,
+        args: list[Any] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = _DEFAULT_JOB_TIMEOUT,
+    ) -> Any:
+        return self.get(account_uid).call(
+            method, args, kwargs, timeout=timeout
+        )
+
+    def submit_worker(self, account_uid: str, func: Callable[[], None]) -> None:
+        self.get(account_uid).submit_worker(func)
+
+    def kill_account(self, account_uid: str) -> None:
+        with self._lock:
+            runtime = self._runtimes.pop(account_uid, None)
+        if runtime is not None:
+            runtime.kill()
+
+    def shutdown_all(self) -> None:
+        with self._lock:
+            runtimes = list(self._runtimes.values())
+            self._runtimes.clear()
+        for runtime in runtimes:
+            runtime.shutdown()

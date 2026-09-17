@@ -14,6 +14,7 @@ dev = ["reuse>=5"]
 [project.scripts]
 post = "post.main:main"
 post-probe = "post.probe:main"
+post-camel-helper = "post.mail.camel_helper:main"
 
 [build-system]
 requires = ["setuptools>=61"]
