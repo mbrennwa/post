@@ -151,13 +151,17 @@ class ReadMessageUnavailableTests(unittest.TestCase):
         folder.get_message_info.return_value = MagicMock()
         folder.synchronize_message_sync.return_value = True
 
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(MessageNotAvailableError) as ctx:
             service._get_message_mime_sync(
                 folder, "account", "Archive", "53054"
             )
 
-        self.assertIn("Could not load message", str(ctx.exception))
-        self.assertFalse(isinstance(ctx.exception, MessageNotAvailableError))
+        self.assertEqual(ctx.exception.message_uid, "53054")
+        self.assertEqual(ctx.exception.folder_name, "Archive")
+        self.assertEqual(
+            ctx.exception.reason, MessageUnavailableReason.NOT_FETCHABLE_YET
+        )
+        self.assertIn("available yet", ctx.exception.user_message().lower())
         folder.synchronize_message_sync.assert_called_once_with("53054", None)
 
     def test_online_invalid_uid_recovers_when_only_folder_index_knows_uid(
