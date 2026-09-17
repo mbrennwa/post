@@ -167,6 +167,27 @@ class InboxFolderNameTests(unittest.TestCase):
                 service.guess_inbox_from_folder_index("acct-1"), "Inbox"
             )
 
+    def test_guess_inbox_from_folder_index_prefers_newer_spelling(self) -> None:
+        service = MailService(registry=mock.Mock())
+
+        def _load(_account: str, folder_name: str):
+            if folder_name == "INBOX":
+                return ([{"uid": "old", "sort_date": 100}], 0, 56)
+            if folder_name == "Inbox":
+                return ([{"uid": "new", "sort_date": 200}], 0, 8)
+            return None
+
+        with mock.patch(
+            "post.mail.eds.folder_index_cache.cached_folder_names",
+            return_value=["INBOX", "Inbox", "Archive"],
+        ), mock.patch(
+            "post.mail.eds.folder_index_cache.load",
+            side_effect=_load,
+        ):
+            self.assertEqual(
+                service.guess_inbox_from_folder_index("acct-1"), "Inbox"
+            )
+
 
 class ListFoldersOfflineBootstrapTests(unittest.TestCase):
     def test_offline_uses_local_bootstrap_when_no_memory_cache(self) -> None:

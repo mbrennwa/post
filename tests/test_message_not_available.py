@@ -423,7 +423,7 @@ class ReadMessageUnavailableTests(unittest.TestCase):
 
 
 class GoaDeadCacheReadTests(unittest.TestCase):
-    def test_skips_get_message_sync_when_network_disallowed(self) -> None:
+    def test_prefers_cache_when_network_disallowed(self) -> None:
         service = MailService(registry=MagicMock())
         folder = MagicMock()
         cached = MagicMock(name="cached_mime")
@@ -439,9 +439,10 @@ class GoaDeadCacheReadTests(unittest.TestCase):
 
         self.assertIs(mime, cached)
         folder.get_message_sync.assert_not_called()
+        folder.synchronize_message_sync.assert_not_called()
         folder.get_message_cached.assert_called_once()
 
-    def test_uncached_without_network_raises_sign_in(self) -> None:
+    def test_cache_miss_without_network_is_sign_in(self) -> None:
         service = MailService(registry=MagicMock())
         folder = MagicMock()
         folder.get_message_cached.return_value = None
@@ -460,6 +461,7 @@ class GoaDeadCacheReadTests(unittest.TestCase):
             MessageUnavailableReason.NOT_CACHED_SIGN_IN,
         )
         folder.get_message_sync.assert_not_called()
+        folder.synchronize_message_sync.assert_not_called()
         self.assertEqual(service.get_account_connect_health("account"), "needs_sign_in")
 
     def test_online_auth_error_without_cache_is_sign_in(self) -> None:
@@ -505,6 +507,7 @@ class GoaDeadCacheReadTests(unittest.TestCase):
         service._network_available = False
         folder = MagicMock()
         folder.get_message_cached.return_value = None
+        folder.get_message_sync.return_value = None
 
         with self.assertRaises(MessageNotAvailableError) as ctx:
             service._get_message_mime_sync(
@@ -519,9 +522,128 @@ class GoaDeadCacheReadTests(unittest.TestCase):
             ctx.exception.reason,
             MessageUnavailableReason.NOT_CACHED_OFFLINE,
         )
+        folder.get_message_sync.assert_not_called()
+        folder.synchronize_message_sync.assert_not_called()
         self.assertNotEqual(
             service.get_account_connect_health("account"), "needs_sign_in"
         )
+
+    def test_open_folder_for_read_retries_local_only(self) -> None:
+        service = MailService(registry=MagicMock())
+        folder = MagicMock()
+        auth_err = GLib.Error.new_literal(
+            Gio.io_error_quark(),
+            "Failed to refresh access token (goa-error-quark, 4)",
+            int(Gio.IOErrorEnum.FAILED),
+        )
+        service._open_folder_unlocked = MagicMock(side_effect=[auth_err, folder])
+
+        result = service._open_folder_for_message_read_unlocked(
+            "acct-1", "INBOX", "42", allow_online=False
+        )
+
+        self.assertIs(result, folder)
+        self.assertEqual(service._open_folder_unlocked.call_count, 2)
+        self.assertFalse(
+            service._open_folder_unlocked.call_args_list[1].kwargs.get(
+                "allow_online", True
+            )
+        )
+
+    def test_open_folder_for_read_both_fail_is_sign_in(self) -> None:
+        service = MailService(registry=MagicMock())
+        auth_err = GLib.Error.new_literal(
+            Gio.io_error_quark(),
+            "Failed to refresh access token (goa-error-quark, 4)",
+            int(Gio.IOErrorEnum.FAILED),
+        )
+        service._open_folder_unlocked = MagicMock(side_effect=auth_err)
+
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._open_folder_for_message_read_unlocked(
+                "acct-1", "INBOX", "42", allow_online=False
+            )
+
+        self.assertEqual(
+            ctx.exception.reason,
+            MessageUnavailableReason.NOT_CACHED_SIGN_IN,
+        )
+        self.assertEqual(service._open_folder_unlocked.call_count, 2)
+
+    def test_open_folder_working_online_is_sign_in_not_offline_banner(self) -> None:
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        online_err = GLib.Error.new_literal(
+            Gio.io_error_quark(),
+            "Store must be working online",
+            int(Gio.IOErrorEnum.FAILED),
+        )
+        service._open_folder_unlocked = MagicMock(side_effect=online_err)
+
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._open_folder_for_message_read_unlocked(
+                "acct-1", "INBOX", "42", allow_online=True
+            )
+
+        self.assertEqual(
+            ctx.exception.reason,
+            MessageUnavailableReason.NOT_CACHED_SIGN_IN,
+        )
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+    def test_inbox_aliases_try_requested_name_first(self) -> None:
+        from post.mail.eds import _inbox_folder_name_aliases
+
+        self.assertEqual(
+            _inbox_folder_name_aliases("Inbox")[0],
+            "Inbox",
+        )
+        self.assertEqual(
+            _inbox_folder_name_aliases("INBOX")[0],
+            "INBOX",
+        )
+
+    def test_named_folder_keeps_requested_inbox_when_alias_is_larger(self) -> None:
+        service = MailService(registry=MagicMock())
+        store = MagicMock()
+        live = MagicMock(name="Inbox")
+        stale = MagicMock(name="INBOX")
+        live.get_message_count.return_value = 8
+        stale.get_message_count.return_value = 56
+
+        def _get_folder(name: str, _flags: int, _canc) -> MagicMock:
+            return stale if name == "INBOX" else live
+
+        store.get_folder_sync.side_effect = _get_folder
+        service._try_get_folder_sync_unlocked = MagicMock(
+            side_effect=lambda store, name, cancellable=None: _get_folder(
+                name, 0, cancellable
+            )
+        )
+
+        folder = service._get_named_folder_unlocked(store, "Inbox")
+        self.assertIs(folder, live)
+
+    def test_prefer_nonempty_keeps_disk_when_camel_is_other_set(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = MailService(registry=MagicMock())
+        camel_index = _FolderMessageIndex(
+            messages=[{"uid": "old-1", "subject": "old"}],
+            unread=11,
+            total=56,
+        )
+        disk = (
+            [{"uid": "new-1", "subject": "SA fieldwork"}],
+            7,
+            8,
+        )
+        with patch("post.mail.eds.folder_index_cache.load", return_value=disk):
+            kept, source = service._prefer_nonempty_folder_index(
+                "acct-1", "Inbox", camel_index
+            )
+        self.assertEqual(source, "disk_cache")
+        self.assertEqual(kept.messages[0]["uid"], "new-1")
 
     @patch("post.mail.helpers.get_attachment_data", return_value=("file.pdf", b"%PDF"))
     @patch("post.mail.eds.MailService._get_message_mime_sync")

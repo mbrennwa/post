@@ -92,6 +92,30 @@ class ServiceLockReleaseTests(unittest.TestCase):
         service._sync_store_online_state_unlocked.assert_not_called()
         service._apply_local_only_store_state_unlocked.assert_called_once()
 
+    def test_get_store_local_only_leaves_connected_store_online(self) -> None:
+        import gi
+
+        gi.require_version("Camel", "1.2")
+        from gi.repository import Camel
+
+        service = MailService(registry=mock.Mock())
+        store = mock.Mock()
+        store.get_connection_status.return_value = (
+            Camel.ServiceConnectionStatus.CONNECTED
+        )
+        service._stores = {"acct-1": store}
+        service._configure_store_settings_unlocked = mock.Mock()
+        service._apply_local_only_store_state_unlocked = mock.Mock()
+        service._sync_store_online_state_unlocked = mock.Mock()
+
+        with service._lock:
+            result = service._get_store_unlocked("acct-1", allow_online=False)
+
+        self.assertIs(result, store)
+        service._apply_local_only_store_state_unlocked.assert_not_called()
+        service._sync_store_online_state_unlocked.assert_not_called()
+        service._configure_store_settings_unlocked.assert_called_once()
+
     def test_apply_local_only_sets_offline_store_online_false(self) -> None:
         import gi
 

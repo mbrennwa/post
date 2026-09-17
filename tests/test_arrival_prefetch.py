@@ -69,6 +69,7 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         folder = mock.Mock()
         mail._open_folder_unlocked.return_value = folder
         mail.has_interactive_work_pending.return_value = False
+        mail.get_account_connect_health.return_value = "ok"
         coordinator = OfflineBodySyncCoordinator(mail)
         return coordinator, mail, folder
 
@@ -105,6 +106,17 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         coordinator, mail, _folder = self._coordinator(network=False)
         coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["1"])
         mail.submit_background.assert_not_called()
+
+    @mock.patch(
+        "post.mail.offline_sync.effective_offline_body_sync",
+        return_value=OFFLINE_BODY_SYNC_ALL,
+    )
+    def test_goa_dead_does_not_queue(self, _mode: mock.Mock) -> None:
+        coordinator, mail, _folder = self._coordinator()
+        mail.get_account_connect_health.return_value = "needs_sign_in"
+        coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["1"])
+        mail.submit_background.assert_not_called()
+        self.assertEqual(len(coordinator._arrival_queue), 0)
 
     @mock.patch(
         "post.mail.offline_sync.account_is_user_offline",
@@ -191,6 +203,28 @@ class ArrivalPrefetchCoordinatorTests(unittest.TestCase):
         mail.classify_cached_visible_attachments.assert_called_once_with(
             "acct-1", "INBOX", "42", folder=folder
         )
+
+    @mock.patch("post.mail.offline_sync.folder_get_message_info", return_value=None)
+    @mock.patch(
+        "post.mail.offline_sync.account_is_user_offline",
+        return_value=False,
+    )
+    @mock.patch(
+        "post.mail.offline_sync.effective_offline_body_sync",
+        return_value=OFFLINE_BODY_SYNC_ALL,
+    )
+    def test_worker_skips_graph_when_goa_dies(
+        self,
+        _mode: mock.Mock,
+        _offline: mock.Mock,
+        _info: mock.Mock,
+    ) -> None:
+        coordinator, mail, folder = self._coordinator()
+        coordinator.schedule_arrival_prefetch("acct-1", "INBOX", ["42"])
+        mail.get_account_connect_health.return_value = "needs_sign_in"
+        worker = mail.submit_background.call_args[0][1]
+        worker()
+        folder.synchronize_message_sync.assert_not_called()
 
     @mock.patch("post.mail.offline_sync.folder_get_message_info", return_value=None)
     @mock.patch(

@@ -92,7 +92,6 @@ from post.mail.search_debug import list_reader_trace, search_trace, search_trace
 from post.mail.operation_queue import offline_queue_status_text
 from post.mail.send_delay import OutboundSendDelayScheduler
 from post.mail.network_errors import (
-    MESSAGE_NOT_CACHED_SIGN_IN,
     format_attachment_error,
     format_folder_load_error,
     format_message_read_error,
@@ -7691,28 +7690,6 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         assert msg is not None
-        if not (
-            (msg.get("body_plain") or "").strip()
-            or (msg.get("body_html") or "").strip()
-        ):
-            location = self._message_location_for_list_key(uid)
-            account_uid = (
-                location[0]
-                if location is not None
-                else (
-                    self._current_account.uid
-                    if self._current_account is not None
-                    else None
-                )
-            )
-            if (
-                account_uid is not None
-                and self._mail.get_account_connect_health(account_uid)
-                == "needs_sign_in"
-            ):
-                self._show_message_unavailable_reader(MESSAGE_NOT_CACHED_SIGN_IN)
-                return False
-
         previous_uid = str(msg.get("_previous_uid") or "")
         recovered_uid = str(msg.get("uid") or "")
         requested_location = self._message_location_for_list_key(uid)
