@@ -98,6 +98,29 @@ class BuildReaderDocumentTests(unittest.TestCase):
                 r"pre\s*\{[^}]*max-width:\s*100%",
             )
 
+    def test_html_images_fit_pane_width(self) -> None:
+        # Large inline pictures must downscale to the reader pane (#431).
+        html = '<p>Hi</p><img src="cid:hero@local" width="4000" height="2000">'
+        for dark in (False, True):
+            doc = build_reader_document(
+                body_html=html,
+                body_plain=None,
+                allow_remote=False,
+                dark=dark,
+            )
+            self.assertRegex(
+                doc,
+                r"img\s*\{[^}]*max-width:\s*100%\s*!important",
+            )
+            self.assertRegex(
+                doc,
+                r"img\s*\{[^}]*height:\s*auto\s*!important",
+            )
+            self.assertRegex(
+                doc,
+                r'img\[src=""\]\s*\{[^}]*display:\s*none',
+            )
+
     def test_blocks_remote_images_when_disabled(self) -> None:
         html = '<p>Hi</p><img src="https://tracker.example/pixel.png">'
         doc = build_reader_document(

@@ -28,6 +28,7 @@ class BuildEditorDocumentTests(unittest.TestCase):
         self.assertNotIn("__COMPOSE_ACTION__", doc)
         self.assertNotIn("__COMPOSE_COLOR_SCHEME__", doc)
         self.assertNotIn("__COMPOSE_CANVAS__", doc)
+        self.assertNotIn("__IMG_FIT_CSS__", doc)
         self.assertIn("increaseQuote", doc)
         self.assertIn("beginLink", doc)
         self.assertIn("KeyK", doc)
@@ -63,6 +64,17 @@ class BuildEditorDocumentTests(unittest.TestCase):
         self.assertIn("blockquote.post_quote", doc)
         self.assertIn("white-space: normal", doc)
         self.assertIn("blockquote.post_quote p", doc)
+
+    def test_images_fit_editor_width(self) -> None:
+        doc = build_editor_document()
+        self.assertRegex(
+            doc,
+            r"img\s*\{[^}]*max-width:\s*100%\s*!important",
+        )
+        self.assertRegex(
+            doc,
+            r"img\s*\{[^}]*height:\s*auto\s*!important",
+        )
 
     def test_dark_shell_uses_single_color_scheme_and_canvas(self) -> None:
         doc = build_editor_document(body_plain="Hello", dark=True)
