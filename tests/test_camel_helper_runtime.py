@@ -88,6 +88,29 @@ class CamelIpcTests(unittest.TestCase):
         assert msg is not None
         self.assertEqual(msg["result"], b"hi")
 
+    def test_read_message_tolerates_short_reads(self) -> None:
+        """Raw pipes may return less than requested; must loop (#445)."""
+        import io
+
+        class ShortRead(io.BytesIO):
+            def __init__(self, data: bytes, chunk: int) -> None:
+                super().__init__(data)
+                self._chunk = chunk
+
+            def read(self, size: int | None = -1) -> bytes:  # noqa: A003
+                if size is None or size < 0:
+                    return super().read(size)
+                return super().read(min(size, self._chunk))
+
+        payload = {"type": "result", "ok": True, "result": {"body": "x" * 100_000}}
+        full = io.BytesIO()
+        write_message(full, payload)
+        blob = full.getvalue()
+        msg = read_message(ShortRead(blob, chunk=4096))
+        assert msg is not None
+        self.assertTrue(msg["ok"])
+        self.assertEqual(len(msg["result"]["body"]), 100_000)
+
 
 class CamelHelpersEnabledTests(unittest.TestCase):
     def test_disabled_in_helper_process(self) -> None:
@@ -197,4 +220,22 @@ class FakeHelperRuntimeTests(unittest.TestCase):
             pool.kill_account("acct-a")
             self.assertTrue(pool.call("acct-b", "ping", ["acct-b"], timeout=10.0)["ok"])
         finally:
-            pool.shutdown_all()
+            pool.kill_account("acct-a")
+            pool.kill_account("acct-b")
+
+    def test_restart_after_death_without_extra_kill(self) -> None:
+        """Dead helper must respawn on next call; reap must not SIGKILL (#445)."""
+        runtime = self._patch_runtime(AccountCamelRuntime(account_uid="acct-a"))
+        try:
+            self.assertTrue(runtime.call("ping", ["acct-a"], timeout=10.0)["ok"])
+            first_pid = runtime._proc.pid if runtime._proc else None
+            self.assertIsNotNone(first_pid)
+            runtime.kill()
+            # Process gone; next call must start a fresh helper.
+            result = runtime.call("ping", ["acct-a"], timeout=10.0)
+            self.assertTrue(result["ok"])
+            second_pid = runtime._proc.pid if runtime._proc else None
+            self.assertIsNotNone(second_pid)
+            self.assertNotEqual(first_pid, second_pid)
+        finally:
+            runtime.kill()
