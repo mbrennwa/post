@@ -1179,19 +1179,52 @@ class MailSidebar:
         folder_name = self._context_target["folder_name"]
         if not folder_name:
             return
-        try:
-            read_unflagged_count = self._mail.count_read_unflagged_messages(
-                account_uid, folder_name
+        # Count on mail I/O — never run_sync / run_on_mail_thread from GTK (#443).
+        self._set_status("Counting read and unflagged messages…")
+
+        def worker() -> None:
+            count = 0
+            error: Exception | None = None
+            try:
+                count = self._mail.count_read_unflagged_messages(
+                    account_uid, folder_name
+                )
+            except Exception as exc:
+                log_mail_error(log, "Could not count read/unflagged messages", exc)
+                error = exc
+            GLib.idle_add(
+                self._after_count_read_unflagged,
+                account_uid,
+                folder_name,
+                count,
+                error,
             )
-        except Exception as exc:
-            show_error(
-                parent,
-                heading="Could not archive messages",
-                body=str(exc),
-            )
-            return
+
+        self._mail.submit_interactive("count_read_unflagged", worker)
+
+    def _after_count_read_unflagged(
+        self,
+        account_uid: str,
+        folder_name: str,
+        read_unflagged_count: int,
+        error: Exception | None,
+    ) -> bool:
+        parent = self._dialog_parent(self._widget)
+        if error is not None:
+            if parent is not None:
+                show_error(
+                    parent,
+                    heading="Could not archive messages",
+                    body=str(error),
+                )
+            else:
+                self._set_status(f"Could not archive messages: {error}")
+            return False
         if read_unflagged_count <= 0:
-            return
+            self._set_status("")
+            return False
+        if parent is None:
+            return False
         noun = "message" if read_unflagged_count == 1 else "messages"
         if not confirm_action(
             parent,
@@ -1202,7 +1235,8 @@ class MailSidebar:
             ),
             confirm_label="Archive",
         ):
-            return
+            self._set_status("")
+            return False
         status_label = f"Archived {read_unflagged_count} read and unflagged {noun}"
         progress_label = (
             f"Archiving {read_unflagged_count} read and unflagged {noun}…"
@@ -1222,10 +1256,11 @@ class MailSidebar:
             ),
             error_heading="Could not archive messages",
             folder_transfer=True,
-            on_error=lambda error: self._after_bulk_archive_error(
-                account_uid, folder_name, error
+            on_error=lambda err: self._after_bulk_archive_error(
+                account_uid, folder_name, err
             ),
         )
+        return False
 
     def _on_archive_all_activate(self, *_args) -> None:
         if self._context_target is None:

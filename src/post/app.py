@@ -18,6 +18,7 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Adw, Gio, GLib, Gtk
 
 from post.icon_utils import APP_ICON_NAME, register_bundled_icons
+from post.mail import MailService
 from post.window import MainWindow
 
 log = logging.getLogger("post.app")
@@ -56,13 +57,12 @@ def _show_startup_failure(application: Adw.Application, message: str) -> None:
         application.release()
 
 
-def _ensure_main_window(application: Adw.Application) -> MainWindow | None:
-    for win in application.get_windows():
-        if isinstance(win, MainWindow):
-            win.present()
-            return win
+def _finish_main_window(
+    application: Adw.Application,
+    mail: MailService,
+) -> MainWindow | None:
     try:
-        win = MainWindow(application=application)
+        win = MainWindow(application=application, mail=mail)
     except RuntimeError as exc:
         log.error("%s", exc)
         _destroy_half_built_main_windows(application)
@@ -71,7 +71,52 @@ def _ensure_main_window(application: Adw.Application) -> MainWindow | None:
         return None
     win.present()
     win.begin_load()
+    pending = getattr(application, "_pending_mailtos", None)
+    if pending:
+        application._pending_mailtos = None  # type: ignore[attr-defined]
+
+        def _open_mailtos() -> bool:
+            for uri in pending:
+                log.debug("opening mailto compose for %r", uri)
+                try:
+                    win.open_compose_mailto(uri)
+                except Exception:
+                    log.exception("Failed to open mailto compose for %r", uri)
+            return False
+
+        GLib.idle_add(_open_mailtos)
     return win
+
+
+def _ensure_main_window(application: Adw.Application) -> MainWindow | None:
+    for win in application.get_windows():
+        if isinstance(win, MainWindow):
+            win.present()
+            return win
+
+    # Avoid overlapping EDS connects when activate + command-line race (#443).
+    connecting = getattr(application, "_post_mail_connecting", False)
+    if connecting:
+        return None
+    application._post_mail_connecting = True  # type: ignore[attr-defined]
+    application.hold()
+
+    def on_connected(
+        mail: MailService | None, error: BaseException | None
+    ) -> None:
+        application._post_mail_connecting = False  # type: ignore[attr-defined]
+        application.release()
+        if error is not None:
+            log.error("%s", error)
+            _show_startup_failure(application, str(error))
+            application.quit()
+            return
+        assert mail is not None
+        _finish_main_window(application, mail)
+
+    # EDS SourceRegistry.new_sync off GTK (#443).
+    MailService.connect_async(on_connected)
+    return None
 
 
 class PostApplication(Adw.Application):
@@ -123,19 +168,21 @@ class PostApplication(Adw.Application):
         # (signal-only handlers can race with an older primary instance).
         argv = command_line.get_arguments()
         log.debug("command-line argv=%r", list(argv))
-        win = _ensure_main_window(self)
-        if win is None:
-            command_line.set_exit_status(1)
-            return 1
         mailtos = [
             arg
             for arg in argv[1:]
             if isinstance(arg, str) and arg.lower().startswith("mailto:")
         ]
         if mailtos:
+            existing = getattr(self, "_pending_mailtos", None) or []
+            self._pending_mailtos = list(existing) + mailtos  # type: ignore[attr-defined]
+        win = _ensure_main_window(self)
+        if win is not None and mailtos:
 
             def _open_mailtos() -> bool:
-                for uri in mailtos:
+                pending = getattr(self, "_pending_mailtos", None)
+                self._pending_mailtos = None  # type: ignore[attr-defined]
+                for uri in pending or mailtos:
                     log.debug("opening mailto compose for %r", uri)
                     try:
                         win.open_compose_mailto(uri)

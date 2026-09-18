@@ -276,7 +276,7 @@ list.navigation-sidebar row.drop-highlight {{
 
 
 class MainWindow(Adw.ApplicationWindow):
-    def __init__(self, **kwargs):
+    def __init__(self, *, mail: MailService | None = None, **kwargs):
         super().__init__(**kwargs)
         self._install_message_list_style()
         self.set_title("Post")
@@ -299,13 +299,15 @@ class MainWindow(Adw.ApplicationWindow):
         self._close_skip_delayed_prompt = False
         self._parked_startup_reminded = False
         self._is_closing = False
+        self._shutdown_in_progress = False
         self._pending_goa_reauth: set[str] = set()
         self._offline_prompt_queue: list[str] = []
         self._offline_prompt_queued: set[str] = set()
         self._offline_prompt_active_uid: str | None = None
         self._offline_prompt_dialog: Adw.MessageDialog | None = None
 
-        self._mail = MailService.connect()
+        # Prefer a service built off GTK via MailService.connect_async (#443).
+        self._mail = mail if mail is not None else MailService.connect()
         self._stop_sending_in_flight = False
         self._send_delay_scheduler = OutboundSendDelayScheduler(
             self._mail,
@@ -1276,14 +1278,25 @@ class MainWindow(Adw.ApplicationWindow):
         self._on_close_request()
 
     def _destroy_after_close_cleanup(self) -> bool:
+        if self._shutdown_in_progress:
+            return False
+        self._shutdown_in_progress = True
         self._abort_inflight_search()
-        self._finish_close()
+        self._stop_send_delay_tick()
+        self._stop_sync_watcher()
+        self._persist_window_state()
         self._close_auxiliary_windows()
+        self.set_sensitive(False)
+        self._set_status("Closing…")
+        # Wait/flush on a worker so GTK keeps pumping (#443).
+        self._mail.shutdown_async(self._complete_destroy_after_shutdown)
+        return False
+
+    def _complete_destroy_after_shutdown(self) -> None:
         application = self.get_application()
         self.destroy()
         if application is not None:
             application.quit()
-        return False
 
     def _close_auxiliary_windows(self) -> None:
         if self._settings_dialog is not None:
@@ -1295,6 +1308,7 @@ class MainWindow(Adw.ApplicationWindow):
             window.destroy()
 
     def _finish_close(self) -> bool:
+        """Legacy sync cleanup; prefer :meth:`_destroy_after_close_cleanup` (#443)."""
         self._stop_send_delay_tick()
         self._stop_sync_watcher()
         try:

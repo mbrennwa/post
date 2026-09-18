@@ -1662,7 +1662,11 @@ class MailService:
                 self._pending_mail_ops_cond.wait(timeout=remaining)
 
     def shutdown_sync(self) -> None:
-        """Best-effort store flush before exit; never wait for offline body download."""
+        """Best-effort store flush before exit; never wait for offline body download.
+
+        Must not be called from the GTK main thread (#443) — use
+        :meth:`shutdown_async` from UI close paths.
+        """
         self.wait_for_outbound_sends()
         # Finish in-flight Archive/move/trash before tearing down Camel (#189).
         self.wait_for_folder_transfers()
@@ -1675,6 +1679,48 @@ class MailService:
             self._camel_pool.shutdown_all()
         # Never block GTK exit behind a long in-flight search or folder scan.
         get_mail_io_thread().submit_background(self._flush_stores_on_shutdown)
+
+    def shutdown_async(self, callback: Callable[[], None]) -> None:
+        """Run :meth:`shutdown_sync` off GTK; invoke *callback* on the main loop (#443)."""
+
+        def worker() -> None:
+            try:
+                self.shutdown_sync()
+            except Exception:
+                log.exception("Mail shutdown failed")
+            GLib.idle_add(_run_on_gtk_thread, callback)
+
+        threading.Thread(
+            target=worker, daemon=True, name="post-mail-shutdown"
+        ).start()
+
+    @classmethod
+    def connect_async(
+        cls,
+        callback: Callable[[MailService | None, BaseException | None], None],
+    ) -> None:
+        """Build a :class:`MailService` off the GTK thread (#443).
+
+        *callback* runs on the GTK idle loop as ``callback(service, error)``.
+        """
+
+        def worker() -> None:
+            service: MailService | None = None
+            error: BaseException | None = None
+            try:
+                service = cls.connect()
+            except BaseException as exc:
+                error = exc
+
+            def done() -> bool:
+                callback(service, error)
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(
+            target=worker, daemon=True, name="post-mail-connect"
+        ).start()
 
     def _flush_stores_on_shutdown(self) -> None:
         with self._lock:
