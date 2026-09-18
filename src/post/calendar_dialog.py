@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
@@ -86,17 +87,38 @@ class AddToCalendarDialog:
                 )
             return
 
-        try:
-            self._targets = list_writable_calendars()
-        except Exception as exc:
-            if self._on_error:
-                self._on_error(f"Could not list calendars: {exc}")
-            return
+        # EDS SourceRegistry.new_sync must not run on GTK (#443).
+        def load() -> None:
+            targets: list[CalendarTarget] = []
+            error: Exception | None = None
+            try:
+                targets = list_writable_calendars()
+            except Exception as exc:
+                error = exc
+            GLib.idle_add(self._present_with_targets, targets, error)
 
+        if self._run_async is not None:
+            self._run_async(load)
+        else:
+            threading.Thread(
+                target=load, daemon=True, name="post-list-calendars"
+            ).start()
+
+    def _present_with_targets(
+        self,
+        targets: list[CalendarTarget],
+        error: Exception | None,
+    ) -> bool:
+        if error is not None:
+            if self._on_error:
+                self._on_error(f"Could not list calendars: {error}")
+            return False
+
+        self._targets = targets
         if not self._targets:
             if self._on_error:
                 self._on_error("No writable calendars found.")
-            return
+            return False
 
         needs_time = not self._invite.get("start")
         body_lines = [
@@ -118,6 +140,10 @@ class AddToCalendarDialog:
             close_response="cancel",
         )
         dialog.add_response("cancel", "Cancel")
+        self._build_dialog_body(dialog, needs_time)
+        return False
+
+    def _build_dialog_body(self, dialog: Adw.AlertDialog, needs_time: bool) -> None:
         dialog.add_response("add", "Add")
         dialog.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
         dialog.set_default_response("add")

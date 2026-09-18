@@ -108,3 +108,42 @@ class MailThreadingContractTests(unittest.TestCase):
         self.assertIn("Manual regression matrix", text)
         self.assertIn("submit_interactive", text)
         self.assertIn("job", text.lower())
+        self.assertIn("shutdown_async", text)
+        self.assertIn("connect_async", text)
+        self.assertIn("POST_MAIL_CAMEL_HELPERS=0", text)
+
+    def test_sidebar_archive_read_unflagged_counts_async(self) -> None:
+        """GTK must not block on count before the confirm dialog (#443)."""
+        source = (_REPO_ROOT / "src" / "post" / "sidebar.py").read_text(
+            encoding="utf-8"
+        )
+        activate = source.split("def _on_archive_read_unflagged_activate", 1)[1]
+        activate = activate.split("\n    def ", 1)[0]
+        self.assertIn('submit_interactive("count_read_unflagged"', activate)
+        self.assertNotIn(
+            "confirm_action",
+            activate,
+            msg="confirm dialog must run after async count on GTK idle",
+        )
+        after = source.split("def _after_count_read_unflagged", 1)[1]
+        after = after.split("\n    def ", 1)[0]
+        self.assertIn("confirm_action", after)
+        self.assertIn("archive_read_unflagged_messages", after)
+
+    def test_window_quit_uses_shutdown_async(self) -> None:
+        source = (_REPO_ROOT / "src" / "post" / "window.py").read_text(
+            encoding="utf-8"
+        )
+        destroy = source.split("def _destroy_after_close_cleanup", 1)[1]
+        destroy = destroy.split("\n    def ", 1)[0]
+        self.assertIn("shutdown_async", destroy)
+        self.assertNotIn("shutdown_sync", destroy)
+
+    def test_app_connects_mail_async(self) -> None:
+        source = (_REPO_ROOT / "src" / "post" / "app.py").read_text(encoding="utf-8")
+        self.assertIn("connect_async", source)
+        self.assertNotIn(
+            "MailService.connect()",
+            source,
+            msg="app startup must use connect_async, not sync connect on GTK",
+        )

@@ -198,6 +198,18 @@ class OutboundSendTrackingTests(unittest.TestCase):
         threading.Event().wait(0.2)
         callback.assert_called_once()
 
+    @mock.patch("post.mail.eds.GLib.idle_add", side_effect=lambda fn, *a: fn(*a) or 0)
+    @mock.patch.object(MailService, "shutdown_sync")
+    def test_shutdown_async_runs_off_caller_then_callback(
+        self, shutdown_sync, _idle_add
+    ) -> None:
+        service = MailService(registry=mock.Mock())
+        callback = mock.Mock()
+        service.shutdown_async(callback)
+        threading.Event().wait(0.2)
+        shutdown_sync.assert_called_once()
+        callback.assert_called_once()
+
 
 class FolderTransferTrackingTests(unittest.TestCase):
     def test_wait_for_folder_transfers_blocks_until_complete(self) -> None:
