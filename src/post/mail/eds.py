@@ -533,6 +533,23 @@ def _heavy_folder_camel_behind_server(camel_uids: int, known_total: int) -> bool
     return (known_total - max(0, camel_uids)) >= _HEAVY_FOLDER_INCOMPLETE_CAMEL_GAP
 
 
+def _heavy_folder_catastrophic_camel_wipe(
+    camel_uids_before: int, camel_uids_after: int
+) -> bool:
+    """True when refresh emptied a previously populated Camel summary.
+
+    IMAP ``refresh_info`` / ``prepare_content_refresh`` can clear ``folders.db``
+    and finish with ``camel_uids=0`` while folder-index + STATUS still show
+    thousands of messages. Incomplete-delta keep-alive then force-prepares and
+    re-refreshes every few hundred ms, which never rebuilds UIDs and blocks
+    message reads (INVALID_UID / not-fetchable-yet).
+    """
+    return (
+        camel_uids_before >= _HEAVY_FOLDER_INCOMPLETE_CAMEL_GAP
+        and camel_uids_after <= 0
+    )
+
+
 def _read_unflagged_uids(index: _FolderMessageIndex) -> list[str]:
     return [
         message["uid"]
@@ -5505,10 +5522,18 @@ class MailService:
         folder_name: str,
         index: _FolderMessageIndex,
     ) -> tuple[_FolderMessageIndex, FolderIndexSource | None]:
-        """Keep RAM/disk when Camel's summary is empty or a stale other-folder set."""
+        """Keep RAM/disk when Camel's summary is empty or a stale other-folder set.
+
+        For IMAP, an empty Camel summary after sync is authoritative — keeping a
+        ghost folder-index lists UIDs that cannot be opened (#441).
+        """
         key = (account_uid, folder_name)
         ram = self._folder_indexes.get(key)
         cached = folder_index_cache.load(account_uid, folder_name)
+        backend = (self._backend_for_account(account_uid) or "").lower()
+        imap_empty_is_authoritative = backend in {"imap", "imapx"} and (
+            not index.messages
+        )
 
         def _from_cache() -> _FolderMessageIndex | None:
             if cached is None or not cached[0]:
@@ -5519,6 +5544,22 @@ class MailService:
             )
 
         if not index.messages:
+            if imap_empty_is_authoritative:
+                # Drop ghosts so Drafts/Sent/etc. don't list dead UIDs (#441).
+                if (ram is not None and ram.messages) or (
+                    cached is not None and cached[0]
+                ):
+                    log.info(
+                        "Dropping ghost folder-index for IMAP %s/%s after "
+                        "empty Camel summary (memory=%d disk=%d)",
+                        account_uid,
+                        folder_name,
+                        len(ram.messages) if ram is not None else 0,
+                        len(cached[0]) if cached is not None else 0,
+                    )
+                    folder_index_cache.invalidate(account_uid, folder_name)
+                    folder_status_cache.clear(account_uid, folder_name)
+                return index, None
             if ram is not None and ram.messages:
                 log.warning(
                     "Keeping in-memory folder index for %s/%s after empty Camel summary "
@@ -5557,6 +5598,34 @@ class MailService:
             )
             return other, source
         return index, None
+
+    def _clear_ghost_folder_index_after_empty_camel(
+        self,
+        account_uid: str,
+        folder_name: str,
+        by_uid: dict[str, dict] | None = None,
+        by_identity: dict[str, str] | None = None,
+    ) -> None:
+        """Remove Post folder-index + STATUS when Camel summary is confirmed empty (#441).
+
+        Bypasses heavy-folder invalidate skip — those ghosts are exactly what
+        block readable state after an IMAP summary wipe.
+        """
+        if by_uid is not None:
+            by_uid.clear()
+        if by_identity is not None:
+            by_identity.clear()
+        empty = _FolderMessageIndex(messages=[], unread=0, total=0)
+        with self._lock:
+            self._store_folder_index(account_uid, folder_name, empty)
+        folder_index_cache.invalidate(account_uid, folder_name)
+        folder_status_cache.clear(account_uid, folder_name)
+        log.warning(
+            "Cleared ghost folder-index/STATUS for %s/%s after empty Camel "
+            "summary (#441)",
+            account_uid,
+            folder_name,
+        )
 
     def _get_folder_index_unlocked(
         self,
@@ -6761,16 +6830,24 @@ class MailService:
         if backend not in {"imap", "imapx"}:
             return []
         camel_n = len(folder_get_uids(folder))
-        if not _heavy_folder_camel_behind_server(camel_n, known_total):
-            cached = folder_status_cache.load(account_uid, folder_name)
-            status_total = cached[1] if cached is not None else known_total
-            if not _heavy_folder_camel_behind_server(camel_n, status_total):
-                if folder_status_cache.index_caught_up(
+        cached = folder_status_cache.load(account_uid, folder_name)
+        status_total = cached[1] if cached is not None else known_total
+        # Skip SEARCH only when a *trusted* STATUS says we have caught up.
+        # After ghost STATUS/index clear, known_total collapses to the few
+        # Camel UIDs (Archive stuck at 4) and the old gate skipped SEARCH
+        # forever even though server UIDs go to ~19k (#441).
+        if folder_status_cache.status_total_is_trusted(
+            folder_name, status_total
+        ):
+            if (
+                not _heavy_folder_camel_behind_server(camel_n, status_total)
+                and folder_status_cache.index_caught_up(
                     len(by_uid), status_total, folder_name
-                ):
-                    return []
-                if status_total <= 0 or camel_n >= status_total:
-                    return []
+                )
+            ):
+                return []
+            if camel_n >= status_total and len(by_uid) >= status_total:
+                return []
         try:
             session["did_server_uid_search"] = True
             found = folder_search_all_uids(
@@ -6786,6 +6863,20 @@ class MailService:
                 exc_info=True,
             )
             return []
+        found_n = len([uid for uid in found if uid])
+        # Lock in server size from SEARCH when STATUS was wiped (#441).
+        min_trusted = getattr(
+            folder_status_cache, "MIN_TRUSTED_STATUS_TOTAL", 1000
+        )
+        if isinstance(min_trusted, int) and found_n >= min_trusted:
+            folder_status_cache.observe(
+                account_uid,
+                folder_name,
+                -1,
+                found_n,
+                trusted=True,
+                local_indexed=len(by_uid),
+            )
         extra = [
             str(uid)
             for uid in found
@@ -6912,6 +7003,11 @@ class MailService:
         did_server_uid_search = did_server_uid_search or bool(
             session.get("did_server_uid_search")
         )
+        if state.get("incomplete_delta_abandoned") or session.get(
+            "incomplete_delta_abandoned"
+        ):
+            session["incomplete_delta_abandoned"] = True
+            session["force_prepare_incomplete_delta"] = False
         uids: list[str] | None = state.get("uids")
         if uids is not None and not isinstance(uids, list):
             uids = None
@@ -6919,6 +7015,36 @@ class MailService:
         pending_server_refresh = bool(state.get("pending_server_refresh"))
         # Offline / explicit skip: local Camel summary only (no Graph refresh).
         local_only = (not allow_refresh) or bool(state.get("refresh_skipped"))
+
+        # IMAP: first open with empty/tiny Camel and no trusted STATUS used to
+        # finish in one slice (attempts=0) without refresh_info — so a Hoststar
+        # Archive restore never appeared in Post (#441). Force one server
+        # refresh so FolderInfo can seed STATUS and Camel can rebuild.
+        if (
+            not pending_server_refresh
+            and not local_only
+            and allow_refresh
+            and not refresh_done
+            and is_heavy_folder_name(folder_name)
+            and (backend or "").lower() in {"imap", "imapx"}
+            and not session.get("imap_status_refresh_forced")
+        ):
+            cached_st = folder_status_cache.load(account_uid, folder_name)
+            seed_total = cached_st[1] if cached_st is not None else -1
+            camel_n = len(folder_get_uids(folder))
+            if camel_n == 0 or not folder_status_cache.status_total_is_trusted(
+                folder_name, seed_total
+            ):
+                session["imap_status_refresh_forced"] = True
+                pending_server_refresh = True
+                log.info(
+                    "Heavy-folder IMAP forcing refresh_info %s/%s "
+                    "camel_uids=%d status_total=%d",
+                    account_uid,
+                    folder_name,
+                    camel_n,
+                    seed_total,
+                )
 
         # Seed STATUS from Microsoft Graph totalItemCount (real ~28k), not Camel
         # summary (~1.3k). Scrub any poisoned high-water that only echoes the
@@ -6948,6 +7074,16 @@ class MailService:
                         account_uid,
                         folder_name,
                         exc_info=True,
+                    )
+                seeded = folder_status_cache.load(account_uid, folder_name)
+                if seeded is not None:
+                    log.info(
+                        "Heavy-folder IMAP STATUS seeded from FolderInfo "
+                        "%s/%s unread=%d total=%d",
+                        account_uid,
+                        folder_name,
+                        seeded[0],
+                        seeded[1],
                     )
             status = self._cached_folder_stats_unlocked(account_uid, folder_name)
             if status is not None:
@@ -7056,19 +7192,37 @@ class MailService:
                         )
                         indexed_for_prepare = max(len(by_uid), disk_indexed)
                         force_prepare = bool(
-                            state.get("force_prepare_incomplete_delta")
-                            or session.get("force_prepare_incomplete_delta")
+                            (
+                                state.get("force_prepare_incomplete_delta")
+                                or session.get("force_prepare_incomplete_delta")
+                            )
+                            and not session.get("incomplete_delta_abandoned")
                         )
-                        should_prepare = force_prepare or (
-                            not did_prepare
-                            and pages == 0
-                            and indexed_for_prepare
-                            < _HEAVY_FOLDER_PREPARE_MIN_INDEXED
-                        ) or (
-                            not force_prepare
+                        backend_l = (backend or "").lower()
+                        is_imap = backend_l in {"imap", "imapx"}
+                        # Stall-triggered prepare was meant for small M365
+                        # indexes. On IMAP it re-runs every 2 empty refreshes
+                        # (even after did_prepare), wiping the few UIDs that
+                        # arrived and resetting stalls — Archive stuck at ~4
+                        # forever (#441). IMAP rebuilds via refresh_info only
+                        # (plus one wipe-recovery prepare); never thrash-prepare.
+                        stall_prepare = (
+                            not is_imap
+                            and not force_prepare
+                            and not did_prepare
                             and refresh_stalls >= 2
                             and indexed_for_prepare
                             < _HEAVY_FOLDER_PREPARE_MIN_INDEXED
+                        )
+                        initial_prepare = (
+                            not is_imap
+                            and not did_prepare
+                            and pages == 0
+                            and indexed_for_prepare
+                            < _HEAVY_FOLDER_PREPARE_MIN_INDEXED
+                        )
+                        should_prepare = (
+                            force_prepare or initial_prepare or stall_prepare
                         )
                         if should_prepare:
                             prepare = getattr(
@@ -7449,10 +7603,19 @@ class MailService:
                         refresh_attempts += 1
                         pages += 1
                         camel_unread = folder_get_unread_count(folder)
-                        camel_total = folder.get_message_count()
-                        if not (known_total > 0 and camel_total < known_total):
+                        camel_total_raw = folder.get_message_count()
+                        camel_total = (
+                            camel_total_raw
+                            if isinstance(camel_total_raw, int)
+                            else -1
+                        )
+                        if not (
+                            known_total > 0
+                            and camel_total >= 0
+                            and camel_total < known_total
+                        ):
                             unread = camel_unread
-                            total = camel_total
+                            total = camel_total if camel_total >= 0 else total
                         if is_heavy_folder_name(folder_name) and total >= 0:
                             folder_status_cache.observe(
                                 account_uid,
@@ -7509,117 +7672,526 @@ class MailService:
                                 # while STATUS still says we are far behind —
                                 # incomplete/stale delta. Force prepare a few
                                 # times, then keep retrying refresh (#208).
+                                # Cap: catastrophic wipe (N→0), IMAP empty
+                                # summary, or prepare limit with still-empty
+                                # Camel must abandon — otherwise Archive spins
+                                # forever and bodies stay unreadable (#441).
                                 prepares_done = int(
                                     session.get("incomplete_prepare_count")
                                     or 0
                                 )
-                                force_again = (
-                                    prepares_done
-                                    < _HEAVY_FOLDER_INCOMPLETE_PREPARE_LIMIT
+                                wiped = _heavy_folder_catastrophic_camel_wipe(
+                                    camel_uids_before, camel_uid_count
                                 )
-                                if force_again:
-                                    session[
-                                        "force_prepare_incomplete_delta"
-                                    ] = True
-                                    session["did_prepare_content_refresh"] = (
-                                        False
+                                already_abandoned = bool(
+                                    session.get("incomplete_delta_abandoned")
+                                )
+                                backend_l = (backend or "").lower()
+                                is_imap = backend_l in {"imap", "imapx"}
+                                imap_empty_summary = False
+                                empty_after_prepares = False
+                                run_graph_incomplete = True
+                                # IMAP with a partial summary is not a Graph
+                                # incomplete-delta. Keep-alive would refresh
+                                # forever at camel_uids=4 (#441). Use stalls +
+                                # one deep recovery instead.
+                                if (
+                                    is_imap
+                                    and camel_uid_count > 0
+                                    and not wiped
+                                ):
+                                    run_graph_incomplete = False
+                                    refresh_stalls += 1
+                                    _log_heavy_pipeline(
+                                        "arrive",
+                                        account_uid,
+                                        folder_name,
+                                        pipeline_id=pipeline_id,
+                                        camel_uids=camel_uid_count,
+                                        camel_uids_delta=0,
+                                        known_total=known_total,
+                                        pending_new=0,
+                                        note="imap_partial_stall",
                                     )
-                                    session["incomplete_prepare_count"] = (
-                                        prepares_done + 1
+                                    if (
+                                        refresh_stalls
+                                        < _HEAVY_FOLDER_REFRESH_STALL_LIMIT
+                                    ):
+                                        continue
+                                    if not session.get(
+                                        "imap_deep_recovery_done"
+                                    ):
+                                        session[
+                                            "imap_deep_recovery_done"
+                                        ] = True
+                                        deep_prepare = getattr(
+                                            folder,
+                                            "prepare_content_refresh",
+                                            None,
+                                        )
+                                        if callable(deep_prepare):
+                                            try:
+                                                log.info(
+                                                    "Heavy-folder IMAP deep "
+                                                    "recovery prepare %s/%s "
+                                                    "camel_uids=%d "
+                                                    "(partial stall)",
+                                                    account_uid,
+                                                    folder_name,
+                                                    camel_uid_count,
+                                                )
+                                                deep_prepare()
+                                            except Exception:
+                                                log.debug(
+                                                    "IMAP deep recovery "
+                                                    "prepare failed for %s/%s",
+                                                    account_uid,
+                                                    folder_name,
+                                                    exc_info=True,
+                                                )
+                                        deep_sync = getattr(
+                                            folder, "refresh_info_sync", None
+                                        )
+                                        if callable(deep_sync):
+                                            try:
+                                                deep_sync(None)
+                                            except Exception:
+                                                log.warning(
+                                                    "IMAP deep recovery "
+                                                    "refresh failed for %s/%s",
+                                                    account_uid,
+                                                    folder_name,
+                                                    exc_info=True,
+                                                )
+                                        all_uids = folder_get_uids(folder)
+                                        camel_uid_count = len(all_uids)
+                                        log.info(
+                                            "Heavy-folder IMAP deep recovery "
+                                            "result %s/%s camel_uids=%d",
+                                            account_uid,
+                                            folder_name,
+                                            camel_uid_count,
+                                        )
+                                        pending = [
+                                            u
+                                            for u in all_uids
+                                            if str(u) not in by_uid
+                                        ]
+                                        if pending:
+                                            refresh_stalls = 0
+                                            page_grew = True
+                                            _log_heavy_pipeline(
+                                                "arrive",
+                                                account_uid,
+                                                folder_name,
+                                                pipeline_id=pipeline_id,
+                                                level=logging.INFO,
+                                                camel_uids=camel_uid_count,
+                                                pending_new=len(pending),
+                                                note="imap_deep_recovery",
+                                            )
+                                            # Fall through to materialize.
+                                        else:
+                                            break
+                                    else:
+                                        break
+                                if run_graph_incomplete:
+                                    imap_empty_summary = (
+                                        is_imap and camel_uid_count <= 0
                                     )
-                                    did_prepare = False
-                                else:
-                                    session[
-                                        "force_prepare_incomplete_delta"
-                                    ] = False
+                                    empty_after_prepares = (
+                                        camel_uid_count <= 0
+                                        and prepares_done
+                                        >= _HEAVY_FOLDER_INCOMPLETE_PREPARE_LIMIT
+                                    )
+                                    if (
+                                        wiped
+                                        or already_abandoned
+                                        or empty_after_prepares
+                                        or imap_empty_summary
+                                    ):
+                                        session[
+                                            "incomplete_delta_abandoned"
+                                        ] = True
+                                        session[
+                                            "force_prepare_incomplete_delta"
+                                        ] = False
+                                        session[
+                                            "did_prepare_content_refresh"
+                                        ] = True
+                                        did_prepare = True
+                                        force_again = False
+                                        note = "incomplete_delta_abandoned"
+                                        if wiped and not already_abandoned:
+                                            log.warning(
+                                                "Heavy-folder catastrophic "
+                                                "Camel summary wipe %s/%s "
+                                                "before=%d after=%d — "
+                                                "abandoning incomplete "
+                                                "keep-alive",
+                                                account_uid,
+                                                folder_name,
+                                                camel_uids_before,
+                                                camel_uid_count,
+                                            )
+                                        elif (
+                                            imap_empty_summary
+                                            and not already_abandoned
+                                            and not wiped
+                                        ):
+                                            log.info(
+                                                "Heavy-folder IMAP empty "
+                                                "Camel summary %s/%s — "
+                                                "abandoning Graph-style "
+                                                "prepare keep-alive (#441)",
+                                                account_uid,
+                                                folder_name,
+                                            )
+                                        else:
+                                            log.info(
+                                                "Heavy-folder incomplete "
+                                                "delta abandoned %s/%s "
+                                                "camel_uids=%d "
+                                                "known_total=%d prepares=%d",
+                                                account_uid,
+                                                folder_name,
+                                                camel_uid_count,
+                                                known_total,
+                                                prepares_done,
+                                            )
+                                        # One uninterrupted rebuild. Rapid
+                                        # async refresh_info keep-alive leaves
+                                        # IMAP summaries empty and blocks body
+                                        # fetches.
+                                        if (
+                                            camel_uid_count <= 0
+                                            and not session.get(
+                                                "camel_wipe_recovery_done"
+                                            )
+                                        ):
+                                            session[
+                                                "camel_wipe_recovery_done"
+                                            ] = True
+                                            recover_prepare = getattr(
+                                                folder,
+                                                "prepare_content_refresh",
+                                                None,
+                                            )
+                                            if callable(recover_prepare):
+                                                try:
+                                                    recover_prepare()
+                                                except Exception:
+                                                    log.debug(
+                                                        "Wipe-recovery "
+                                                        "prepare failed for "
+                                                        "%s/%s",
+                                                        account_uid,
+                                                        folder_name,
+                                                        exc_info=True,
+                                                    )
+                                            recover_sync = getattr(
+                                                folder,
+                                                "refresh_info_sync",
+                                                None,
+                                            )
+                                            if callable(recover_sync):
+                                                try:
+                                                    log.info(
+                                                        "Heavy-folder wipe "
+                                                        "recovery "
+                                                        "refresh_info_sync "
+                                                        "%s/%s",
+                                                        account_uid,
+                                                        folder_name,
+                                                    )
+                                                    recover_sync(None)
+                                                except Exception:
+                                                    log.warning(
+                                                        "Heavy-folder wipe "
+                                                        "recovery refresh "
+                                                        "failed for %s/%s",
+                                                        account_uid,
+                                                        folder_name,
+                                                        exc_info=True,
+                                                    )
+                                            all_uids = folder_get_uids(folder)
+                                            camel_uid_count = len(all_uids)
+                                            log.info(
+                                                "Heavy-folder wipe recovery "
+                                                "result %s/%s camel_uids=%d",
+                                                account_uid,
+                                                folder_name,
+                                                camel_uid_count,
+                                            )
+                                            if camel_uid_count > 0:
+                                                session[
+                                                    "incomplete_delta_"
+                                                    "abandoned"
+                                                ] = False
+                                                session[
+                                                    "incomplete_prepare_count"
+                                                ] = 0
+                                                pending = [
+                                                    u
+                                                    for u in all_uids
+                                                    if str(u) not in by_uid
+                                                ]
+                                                note = (
+                                                    "wipe_recovery_rebuilt"
+                                                    if pending
+                                                    else (
+                                                        "wipe_recovery_"
+                                                        "caught_up"
+                                                    )
+                                                )
+                                    else:
+                                        # M365: force prepare a few times.
+                                        # IMAP with some local UIDs still
+                                        # behind STATUS keeps refreshing
+                                        # without prepare (#208/#441).
+                                        force_again = (
+                                            not is_imap
+                                            and prepares_done
+                                            < _HEAVY_FOLDER_INCOMPLETE_PREPARE_LIMIT
+                                        )
+                                        if force_again:
+                                            session[
+                                                "force_prepare_incomplete_"
+                                                "delta"
+                                            ] = True
+                                            session[
+                                                "did_prepare_content_refresh"
+                                            ] = False
+                                            session[
+                                                "incomplete_prepare_count"
+                                            ] = prepares_done + 1
+                                            did_prepare = False
+                                            note = (
+                                                "incomplete_delta_keep_alive"
+                                            )
+                                        else:
+                                            session[
+                                                "force_prepare_incomplete_"
+                                                "delta"
+                                            ] = False
+                                            note = (
+                                                "incomplete_delta_keep_alive"
+                                            )
+                                    if note == "wipe_recovery_rebuilt":
+                                        _log_heavy_pipeline(
+                                            "arrive",
+                                            account_uid,
+                                            folder_name,
+                                            pipeline_id=pipeline_id,
+                                            level=logging.INFO,
+                                            camel_uids=camel_uid_count,
+                                            camel_uids_delta=(
+                                                camel_uid_count
+                                                - camel_uids_before
+                                            ),
+                                            known_total=known_total,
+                                            pending_new=len(pending),
+                                            note=note,
+                                        )
+                                        # Fall through to materialize pending.
+                                        refresh_stalls = 0
+                                        page_grew = True
+                                    else:
+                                        _log_heavy_pipeline(
+                                            "arrive",
+                                            account_uid,
+                                            folder_name,
+                                            pipeline_id=pipeline_id,
+                                            level=logging.INFO,
+                                            camel_uids=camel_uid_count,
+                                            camel_uids_delta=0,
+                                            known_total=known_total,
+                                            camel_gap=max(
+                                                0,
+                                                known_total - camel_uid_count,
+                                            ),
+                                            pending_new=0,
+                                            force_prepare=force_again,
+                                            incomplete_prepares=prepares_done
+                                            + (1 if force_again else 0),
+                                            note=note,
+                                        )
+                                        if (
+                                            note
+                                            == "incomplete_delta_keep_alive"
+                                        ):
+                                            log.info(
+                                                "Heavy-folder incomplete "
+                                                "delta keep-alive %s/%s "
+                                                "camel_uids=%d "
+                                                "known_total=%d gap=%d "
+                                                "force_prepare=%s prepares=%d",
+                                                account_uid,
+                                                folder_name,
+                                                camel_uid_count,
+                                                known_total,
+                                                max(
+                                                    0,
+                                                    known_total
+                                                    - camel_uid_count,
+                                                ),
+                                                force_again,
+                                                prepares_done
+                                                + (1 if force_again else 0),
+                                            )
+                                        break
+                                    # wipe_recovery_rebuilt continues into
+                                    # materialize below (pending non-empty).
+                            else:
+                                refresh_stalls += 1
                                 _log_heavy_pipeline(
                                     "arrive",
                                     account_uid,
                                     folder_name,
                                     pipeline_id=pipeline_id,
-                                    level=logging.INFO,
                                     camel_uids=camel_uid_count,
                                     camel_uids_delta=0,
-                                    known_total=known_total,
-                                    camel_gap=max(
-                                        0, known_total - camel_uid_count
-                                    ),
                                     pending_new=0,
-                                    force_prepare=force_again,
-                                    incomplete_prepares=prepares_done
-                                    + (1 if force_again else 0),
-                                    note="incomplete_delta_keep_alive",
+                                    note="refresh_finished_no_new_uids",
                                 )
-                                log.info(
-                                    "Heavy-folder incomplete delta keep-alive "
-                                    "%s/%s camel_uids=%d known_total=%d "
-                                    "gap=%d force_prepare=%s prepares=%d",
-                                    account_uid,
-                                    folder_name,
-                                    camel_uid_count,
-                                    known_total,
-                                    max(0, known_total - camel_uid_count),
-                                    force_again,
-                                    prepares_done + (1 if force_again else 0),
-                                )
-                                break
-                            refresh_stalls += 1
-                            _log_heavy_pipeline(
-                                "arrive",
-                                account_uid,
-                                folder_name,
-                                pipeline_id=pipeline_id,
-                                camel_uids=camel_uid_count,
-                                camel_uids_delta=0,
-                                pending_new=0,
-                                note="refresh_finished_no_new_uids",
-                            )
-                            if refresh_stalls >= _HEAVY_FOLDER_REFRESH_STALL_LIMIT:
-                                break
-                            # Stall: may prepare_content_refresh only while
-                            # the local index is still small (#208).
-                            continue
-                        refresh_stalls = 0
-                        page_grew = True
-                        # Growth means the delta is moving again (#208).
-                        if session.get("force_prepare_incomplete_delta") or (
-                            session.get("incomplete_prepare_count")
-                        ):
-                            session["force_prepare_incomplete_delta"] = False
-                            session["incomplete_prepare_count"] = 0
-                        # Materialize every new UID from this page now (usually
-                        # tens, not thousands) so the next refresh can run soon.
-                        materialized_page = 0
-                        for uid in pending:
-                            if get_mail_io_thread().has_interactive_work_pending():
-                                uids = [
-                                    u
-                                    for u in pending
-                                    if str(u) not in by_uid
-                                ]
-                                uid_offset = 0
-                                refresh_done = True
-                                break
-                            info = folder_get_message_info(folder, uid)
-                            if info is None:
-                                continue
-                            try:
-                                _upsert_message_into_folder_index(
-                                    by_uid,
-                                    message_info_to_dict(info, uid=uid, backend=backend),
-                                    prefer_uids={str(u) for u in all_uids},
-                                    uid_remaps=uid_remaps,
-                                    by_identity=by_identity,
-                                )
-                                materialized_page += 1
-                            except (OSError, OverflowError, ValueError):
-                                log.debug(
-                                    "Skipping message %r in %r due to invalid "
-                                    "metadata",
-                                    uid,
-                                    folder_name,
-                                    exc_info=True,
-                                )
+                                if (
+                                    refresh_stalls
+                                    >= _HEAVY_FOLDER_REFRESH_STALL_LIMIT
+                                ):
+                                    # IMAP summary stuck tiny after wipe: one
+                                    # uninterrupted prepare+sync before we stop
+                                    # spinning empty refresh_info (#441).
+                                    backend_stall = (backend or "").lower()
+                                    if (
+                                        backend_stall in {"imap", "imapx"}
+                                        and camel_uid_count
+                                        < _HEAVY_FOLDER_PREPARE_MIN_INDEXED
+                                        and not session.get(
+                                            "imap_deep_recovery_done"
+                                        )
+                                    ):
+                                        session[
+                                            "imap_deep_recovery_done"
+                                        ] = True
+                                        deep_prepare = getattr(
+                                            folder,
+                                            "prepare_content_refresh",
+                                            None,
+                                        )
+                                        if callable(deep_prepare):
+                                            try:
+                                                log.info(
+                                                    "Heavy-folder IMAP deep "
+                                                    "recovery prepare %s/%s "
+                                                    "camel_uids=%d",
+                                                    account_uid,
+                                                    folder_name,
+                                                    camel_uid_count,
+                                                )
+                                                deep_prepare()
+                                            except Exception:
+                                                log.debug(
+                                                    "IMAP deep recovery "
+                                                    "prepare failed for %s/%s",
+                                                    account_uid,
+                                                    folder_name,
+                                                    exc_info=True,
+                                                )
+                                        deep_sync = getattr(
+                                            folder, "refresh_info_sync", None
+                                        )
+                                        if callable(deep_sync):
+                                            try:
+                                                deep_sync(None)
+                                            except Exception:
+                                                log.warning(
+                                                    "IMAP deep recovery "
+                                                    "refresh failed for %s/%s",
+                                                    account_uid,
+                                                    folder_name,
+                                                    exc_info=True,
+                                                )
+                                        all_uids = folder_get_uids(folder)
+                                        camel_uid_count = len(all_uids)
+                                        log.info(
+                                            "Heavy-folder IMAP deep recovery "
+                                            "result %s/%s camel_uids=%d",
+                                            account_uid,
+                                            folder_name,
+                                            camel_uid_count,
+                                        )
+                                        pending = [
+                                            u
+                                            for u in all_uids
+                                            if str(u) not in by_uid
+                                        ]
+                                        if pending:
+                                            refresh_stalls = 0
+                                            page_grew = True
+                                            _log_heavy_pipeline(
+                                                "arrive",
+                                                account_uid,
+                                                folder_name,
+                                                pipeline_id=pipeline_id,
+                                                level=logging.INFO,
+                                                camel_uids=camel_uid_count,
+                                                pending_new=len(pending),
+                                                note="imap_deep_recovery",
+                                            )
+                                            # Fall through to materialize.
+                                        else:
+                                            break
+                                    else:
+                                        break
+                                else:
+                                    # Stall under limit — retry refresh.
+                                    continue
+                            # Growth after refresh, wipe recovery, or IMAP deep
+                            # recovery — materialize pending UIDs below.
+                        if pending:
+                            refresh_stalls = 0
+                            page_grew = True
+                            # Growth means the delta is moving again (#208).
+                            if session.get("force_prepare_incomplete_delta") or (
+                                session.get("incomplete_prepare_count")
+                            ):
+                                session["force_prepare_incomplete_delta"] = False
+                                session["incomplete_prepare_count"] = 0
+                            # Materialize every new UID from this page now (usually
+                            # tens, not thousands) so the next refresh can run soon.
+                            materialized_page = 0
+                            for uid in pending:
+                                if get_mail_io_thread().has_interactive_work_pending():
+                                    uids = [
+                                        u
+                                        for u in pending
+                                        if str(u) not in by_uid
+                                    ]
+                                    uid_offset = 0
+                                    refresh_done = True
+                                    break
+                                info = folder_get_message_info(folder, uid)
+                                if info is None:
+                                    continue
+                                try:
+                                    _upsert_message_into_folder_index(
+                                        by_uid,
+                                        message_info_to_dict(
+                                            info, uid=uid, backend=backend
+                                        ),
+                                        prefer_uids={str(u) for u in all_uids},
+                                        uid_remaps=uid_remaps,
+                                        by_identity=by_identity,
+                                    )
+                                    materialized_page += 1
+                                except (OSError, OverflowError, ValueError):
+                                    log.debug(
+                                        "Skipping message %r in %r due to invalid "
+                                        "metadata",
+                                        uid,
+                                        folder_name,
+                                        exc_info=True,
+                                    )
                         else:
                             uids = []
                             uid_offset = 0
@@ -7777,6 +8349,8 @@ class MailService:
             not uids
             and allow_refresh
             and not local_only
+            and not session.get("incomplete_delta_abandoned")
+            and not state.get("incomplete_delta_abandoned")
         ):
             extra_uids = self._heavy_folder_imap_extra_uids(
                 folder,
@@ -7882,19 +8456,23 @@ class MailService:
                 if cached_status is not None:
                     status_total = max(status_total, cached_status[1])
                     total = max(total, cached_status[1])
-            behind_status = not folder_status_cache.index_caught_up(
-                len(messages), status_total, folder_name
+            status_trusted = folder_status_cache.status_total_is_trusted(
+                folder_name, status_total
+            )
+            # Unknown STATUS (-1 after ghost clear) must not count as "behind" —
+            # that spun refresh_info forever with camel stuck at a handful of
+            # UIDs (#441 Archive).
+            behind_status = status_trusted and (
+                not folder_status_cache.index_caught_up(
+                    len(messages), status_total, folder_name
+                )
             )
             # Spam/Trash/Junk are often <1000 messages. Without a locked STATUS
-            # total, behind_status stays true forever and the indexer never
-            # finishes (status flickers "from server" ↔ "so far"). After several
+            # total, the indexer never finishes (status flickers). After several
             # no-growth refreshes, lock STATUS from the local index (#208).
             if (
-                behind_status
+                not status_trusted
                 and is_trash_or_junk_folder_name(folder_name)
-                and not folder_status_cache.status_total_is_trusted(
-                    folder_name, status_total
-                )
                 and refresh_stalls >= 2
             ):
                 folder_status_cache.observe(
@@ -7918,63 +8496,180 @@ class MailService:
             # Keep chasing while behind STATUS or incomplete-delta keep-alive.
             # Do not continue solely because stalls < limit — that left caught-up
             # folders refreshing and flickering status forever (#208 Spam).
+            # Stop when incomplete-delta was abandoned after a Camel wipe or
+            # empty summary — further refresh_info thrash prevents rebuild.
             force_incomplete = bool(
                 session.get("force_prepare_incomplete_delta")
             )
-            if allow_refresh and not local_only and (
-                behind_status or force_incomplete
+            abandoned_incomplete = bool(
+                session.get("incomplete_delta_abandoned")
+            )
+            if (
+                allow_refresh
+                and not local_only
+                and not abandoned_incomplete
+                and (behind_status or force_incomplete)
             ):
-                log.debug(
-                    "Heavy-folder slice continue refresh %s/%s indexed=%d "
-                    "status_total=%d behind=%s stalls=%d attempts=%d "
-                    "force_incomplete=%s",
+                # Prefer materializing Camel UIDs already present over another
+                # refresh_info. Hoststar Archive was stuck in refresh_info×40
+                # with camel_uids=18914 / indexed=18315 while the GUI froze (#441).
+                camel_pending = [
+                    u
+                    for u in folder_get_uids(folder)
+                    if str(u) not in by_uid
+                ]
+                if camel_pending:
+                    log.info(
+                        "Heavy-folder materialize %d pending Camel UIDs "
+                        "before refresh %s/%s indexed=%d",
+                        len(camel_pending),
+                        account_uid,
+                        folder_name,
+                        len(messages),
+                    )
+                    return HeavyFolderIndexProgress(
+                        messages=messages,
+                        unread=unread,
+                        total=max(total, status_total, len(messages)),
+                        done=False,
+                        cursor=_cursor_with_pipeline(
+                            {
+                                "refresh_done": True,
+                                "pending_server_refresh": False,
+                                "refresh_attempts": refresh_attempts,
+                                "refresh_stalls": refresh_stalls,
+                                "uid_count_after_refresh": prev_uid_count,
+                                "indexed_after_refresh": len(messages),
+                                "status_seeded": status_seeded,
+                                "did_prepare_content_refresh": did_prepare,
+                                "did_server_uid_search": did_server_uid_search,
+                                "uids": camel_pending,
+                                "uid_offset": 0,
+                                "incomplete_delta_abandoned": False,
+                            }
+                        ),
+                        uid_remaps=dict(uid_remaps),
+                    )
+                backend_l = (backend or "").lower()
+                is_imap = backend_l in {"imap", "imapx"}
+                camel_n = len(folder_get_uids(folder))
+                # IMAP: Camel already matches STATUS but headers failed to
+                # materialize (info=None). Further refresh_info only pins mail
+                # I/O and freezes interactive folder opens.
+                imap_camel_caught = (
+                    is_imap
+                    and status_trusted
+                    and folder_status_cache.index_caught_up(
+                        camel_n, status_total, folder_name
+                    )
+                )
+                imap_no_growth = (
+                    is_imap
+                    and refresh_stalls >= _HEAVY_FOLDER_REFRESH_STALL_LIMIT
+                    and len(messages) <= max(int(prev_indexed or 0), 0)
+                )
+                if not imap_camel_caught and not imap_no_growth:
+                    log.debug(
+                        "Heavy-folder slice continue refresh %s/%s indexed=%d "
+                        "status_total=%d behind=%s stalls=%d attempts=%d "
+                        "force_incomplete=%s",
+                        account_uid,
+                        folder_name,
+                        len(messages),
+                        status_total,
+                        behind_status,
+                        refresh_stalls,
+                        refresh_attempts,
+                        force_incomplete,
+                    )
+                    return HeavyFolderIndexProgress(
+                        messages=messages,
+                        unread=unread,
+                        total=max(total, status_total, len(messages)),
+                        done=False,
+                        cursor=_cursor_with_pipeline(
+                            {
+                                "refresh_done": False,
+                                "pending_server_refresh": True,
+                                "refresh_attempts": refresh_attempts,
+                                "refresh_stalls": refresh_stalls,
+                                "uid_count_after_refresh": prev_uid_count,
+                                "indexed_after_refresh": len(messages),
+                                "status_seeded": status_seeded,
+                                "did_prepare_content_refresh": did_prepare,
+                                "did_server_uid_search": did_server_uid_search,
+                                "force_prepare_incomplete_delta": force_incomplete,
+                                "incomplete_delta": force_incomplete
+                                or behind_status,
+                                "incomplete_delta_abandoned": False,
+                            }
+                        ),
+                        uid_remaps=dict(uid_remaps),
+                    )
+                log.info(
+                    "Heavy-folder IMAP stop refresh chase %s/%s indexed=%d "
+                    "camel_uids=%d status_total=%d stalls=%d attempts=%d "
+                    "camel_caught=%s no_growth=%s",
+                    account_uid,
+                    folder_name,
+                    len(messages),
+                    camel_n,
+                    status_total,
+                    refresh_stalls,
+                    refresh_attempts,
+                    imap_camel_caught,
+                    imap_no_growth,
+                )
+                # Tell the UI not to 2s-retry refresh_info (#441 Archive freeze).
+                session["incomplete_delta_abandoned"] = True
+                abandoned_incomplete = True
+            if abandoned_incomplete:
+                camel_now = len(folder_get_uids(folder))
+                if camel_now <= 0 and messages:
+                    self._clear_ghost_folder_index_after_empty_camel(
+                        account_uid,
+                        folder_name,
+                        by_uid,
+                        by_identity,
+                    )
+                    messages = []
+                    unread = 0
+                    total = 0
+                    status_total = 0
+                log.info(
+                    "Heavy-folder slice done (incomplete delta abandoned) "
+                    "%s/%s indexed=%d camel_uids=%d status_total=%d "
+                    "attempts=%d",
+                    account_uid,
+                    folder_name,
+                    len(messages),
+                    camel_now,
+                    status_total,
+                    refresh_attempts,
+                )
+            else:
+                log.info(
+                    "Heavy-folder slice done %s/%s indexed=%d status_total=%d "
+                    "stalls=%d attempts=%d",
                     account_uid,
                     folder_name,
                     len(messages),
                     status_total,
-                    behind_status,
                     refresh_stalls,
                     refresh_attempts,
-                    force_incomplete,
                 )
-                return HeavyFolderIndexProgress(
-                    messages=messages,
-                    unread=unread,
-                    total=max(total, status_total, len(messages)),
-                    done=False,
-                    cursor=_cursor_with_pipeline(
-                        {
-                            "refresh_done": False,
-                            "pending_server_refresh": True,
-                            "refresh_attempts": refresh_attempts,
-                            "refresh_stalls": refresh_stalls,
-                            "uid_count_after_refresh": prev_uid_count,
-                            "indexed_after_refresh": len(messages),
-                            "status_seeded": status_seeded,
-                            "did_prepare_content_refresh": did_prepare,
-                            "did_server_uid_search": did_server_uid_search,
-                            "force_prepare_incomplete_delta": force_incomplete,
-                            "incomplete_delta": force_incomplete or behind_status,
-                        }
-                    ),
-                    uid_remaps=dict(uid_remaps),
-                )
-            log.info(
-                "Heavy-folder slice done %s/%s indexed=%d status_total=%d "
-                "stalls=%d attempts=%d",
-                account_uid,
-                folder_name,
-                len(messages),
-                status_total,
-                refresh_stalls,
-                refresh_attempts,
-            )
             return HeavyFolderIndexProgress(
                 messages=messages,
                 unread=unread,
                 total=total,
                 done=True,
-                cursor=_cursor_with_pipeline({}),
+                cursor=_cursor_with_pipeline(
+                    {
+                        "incomplete_delta_abandoned": abandoned_incomplete,
+                    }
+                    if abandoned_incomplete
+                    else {}
+                ),
                 uid_remaps=dict(uid_remaps),
             )
 
