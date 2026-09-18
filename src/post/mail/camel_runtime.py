@@ -28,15 +28,17 @@ _DEFAULT_JOB_TIMEOUT = 120.0
 def camel_helpers_enabled() -> bool:
     """True when the UI should spawn per-account Camel helpers.
 
-    Disabled inside helper processes. **Default off** in the UI: multiple helper
-    processes sharing ``~/.local/share/evolution`` proved unstable (helper exits
-    mid-read → "Could not read this message" / Loading timeouts). Opt in with
-    ``POST_MAIL_CAMEL_HELPERS=1`` for experiments (#437).
+    Disabled inside helper processes. **Default on** in the UI (#445): each
+    helper uses private Camel data/cache dirs so processes do not share
+    ``~/.local/share/evolution`` (the #439 mid-read failure mode). Opt out with
+    ``POST_MAIL_CAMEL_HELPERS=0``.
     """
     if os.environ.get(_HELPER_PROCESS_ENV) == "1":
         return False
-    raw = (os.environ.get(_HELPERS_ENV) or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    raw = os.environ.get(_HELPERS_ENV)
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class CamelHelperError(RuntimeError):

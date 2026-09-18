@@ -105,6 +105,17 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["POST_MAIL_CAMEL_HELPER_PROCESS"] = "1"
     os.environ["POST_MAIL_CAMEL_HELPERS"] = "0"
 
+    from post.mail.camel_paths import configure_helper_camel_dirs
+
+    # Private Camel dirs — do not share ~/.local/share/evolution across helpers (#445).
+    data_dir, cache_dir = configure_helper_camel_dirs(account_uid)
+    log.info(
+        "camel helper dirs account=%s data=%s cache=%s",
+        account_uid,
+        data_dir,
+        cache_dir,
+    )
+
     from post.mail.camel_ipc import read_message, write_message
 
     log.info("starting camel helper account=%s pid=%s", account_uid, os.getpid())

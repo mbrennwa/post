@@ -78,10 +78,12 @@ def _bootstrap_camel_on_mail_thread() -> None:
     global _camel_initialized
     if _camel_initialized:
         return
-    user_data = os.path.expanduser("~/.local/share/evolution")
+    from post.mail.camel_paths import resolve_camel_dirs
+
+    user_data, _user_cache = resolve_camel_dirs()
     Camel.init(user_data, False)
     _camel_initialized = True
-    log.debug("Camel.init completed on mail I/O thread")
+    log.debug("Camel.init completed on mail I/O thread data=%s", user_data)
 
 
 class _TaskPriority(IntEnum):

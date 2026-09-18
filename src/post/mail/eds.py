@@ -2205,8 +2205,9 @@ class MailService:
             self._session.set_online(self._network_available)
             return self._session
 
-        user_data = os.path.expanduser("~/.local/share/evolution")
-        user_cache = os.path.expanduser("~/.cache/evolution")
+        from post.mail.camel_paths import resolve_camel_dirs
+
+        user_data, user_cache = resolve_camel_dirs()
         if not is_mail_io_thread():
             Camel.init(user_data, False)
 
