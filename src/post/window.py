@@ -3996,7 +3996,9 @@ class MainWindow(Adw.ApplicationWindow):
         # main thread. More rows append when the user scrolls near the end (#208).
         bind_messages = messages[:MESSAGE_LIST_UI_BIND_CAP]
         self._message_list_bound_count = len(bind_messages)
-        self._queue_signature_clip_prefetch(account, folder_name, messages)
+        # Prefetch only bound rows — walking 18k Archive headers on open stalls
+        # the UI and floods offline body sync.
+        self._queue_signature_clip_prefetch(account, folder_name, bind_messages)
         batch_size = MESSAGE_LIST_UI_BATCH_SIZE
         if len(bind_messages) <= batch_size:
             self._apply_folder_messages(bind_messages, folder_name, account=account)
@@ -4084,11 +4086,12 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_list_view.after_content_appended()
 
     def _schedule_bind_unbound_heavy_messages(self, load_id: int) -> None:
-        """Bind already-indexed older rows without rebuilding the top (#208).
+        """Bind a small buffer of older rows without rebuilding the top (#208).
 
         Graph backfill does not change the newest window, so a full rebind looks
-        idle. Append unbound rows in batches so the list length grows and scroll
-        reaches newly indexed mail even while refresh_info is still running.
+        idle. Append at most one ``MESSAGE_LIST_UI_BIND_MORE`` page so scroll can
+        reach newly indexed mail — never auto-bind the whole Archive into Gtk
+        (that freezes the UI when opening a ~18k folder).
         """
         if self._heavy_bind_catchup_load_id == load_id:
             return
@@ -4114,7 +4117,17 @@ class MainWindow(Adw.ApplicationWindow):
                 return False
             if self._message_list_populating:
                 return True
-            more = messages[already : already + MESSAGE_LIST_UI_BIND_MORE]
+            # Soft cap: keep a modest unbound buffer for near-end scroll; do not
+            # materialize tens of thousands of GObjects on folder open.
+            bind_ceiling = max(
+                MESSAGE_LIST_UI_BIND_CAP,
+                already + MESSAGE_LIST_UI_BIND_MORE,
+            )
+            if already >= bind_ceiling:
+                self._heavy_bind_catchup_load_id = None
+                return False
+            take = min(MESSAGE_LIST_UI_BIND_MORE, bind_ceiling - already)
+            more = messages[already : already + take]
             if not more:
                 self._heavy_bind_catchup_load_id = None
                 return False
@@ -4149,8 +4162,6 @@ class MainWindow(Adw.ApplicationWindow):
                 store_n,
             )
             self._update_message_status(account, folder_name)
-            if self._message_list_bound_count < len(messages):
-                return True
             self._heavy_bind_catchup_load_id = None
             return False
 
@@ -4468,9 +4479,17 @@ class MainWindow(Adw.ApplicationWindow):
 
             # Indexer may finish after a partial Graph refresh while STATUS is
             # still much larger — keep chasing while this folder stays open.
-            if status_total_is_trusted(
-                folder_name, server_total
-            ) and not index_caught_up(indexed, server_total, folder_name):
+            # Stop when incomplete-delta was abandoned (Camel wipe / empty IMAP
+            # summary): 2s retries only thrash refresh_info and block body
+            # fetches (#441).
+            abandoned_incomplete = bool(
+                cursor.get("incomplete_delta_abandoned")
+            )
+            if (
+                not abandoned_incomplete
+                and status_total_is_trusted(folder_name, server_total)
+                and not index_caught_up(indexed, server_total, folder_name)
+            ):
                 keep_indexing = True
                 self._message_sync_in_progress = True
                 self._set_status(
@@ -7123,55 +7142,121 @@ class MainWindow(Adw.ApplicationWindow):
         if not groups:
             return
 
+        # Optimistic UI first — sync set_messages_* blocks GTK on the mail I/O
+        # thread while Archive/heavy background work runs (#441 freeze).
+        optimistic: dict[str, dict] = {}
+        for list_key in list_keys:
+            if flag_name == "seen":
+                assert seen is not None
+                optimistic[list_key] = {"seen": seen}
+            else:
+                assert flagged is not None
+                optimistic[list_key] = {"flagged": flagged}
+        self._apply_message_flag_updates(
+            optimistic,
+            flag_name,
+            folder_count_updates=[],
+            queued=False,
+            error=None,
+        )
+
+        pending = len(groups)
         updates_by_list_key: dict[str, dict] = {}
         folder_count_updates: list[tuple[str, str, int, int]] = []
         any_queued = False
-        error: Exception | None = None
+        first_error: Exception | None = None
+
+        def _finish_group(
+            result: object,
+            exc: BaseException | None,
+            *,
+            account_uid: str,
+            folder_name: str,
+            list_key_by_uid: dict[str, str],
+        ) -> None:
+            nonlocal pending, any_queued, first_error
+            if exc is not None and first_error is None:
+                log.error(
+                    "Failed to update message %s", flag_name, exc_info=exc
+                )
+                if isinstance(exc, Exception):
+                    first_error = exc
+            elif isinstance(result, dict):
+                for item in result.get("updates") or []:
+                    camel_uid = item.get("uid")
+                    list_key = (
+                        list_key_by_uid.get(str(camel_uid)) if camel_uid else None
+                    )
+                    if list_key is None:
+                        continue
+                    updates_by_list_key[list_key] = dict(item.get("flags") or {})
+                if result.get("queued"):
+                    any_queued = True
+                if flag_name == "seen":
+                    unread = result.get("folder_unread")
+                    total = result.get("folder_total")
+                    if unread is not None and total is not None:
+                        folder_count_updates.append(
+                            (
+                                account_uid,
+                                folder_name,
+                                int(unread),
+                                int(total),
+                            )
+                        )
+            pending -= 1
+            if pending > 0:
+                return
+            # Reconcile with server result (counts / queued toast).
+            self._apply_message_flag_updates(
+                updates_by_list_key,
+                flag_name,
+                folder_count_updates=folder_count_updates,
+                queued=any_queued,
+                error=first_error,
+            )
 
         for (account_uid, folder_name), pairs in groups.items():
             message_uids = [message_uid for _list_key, message_uid in pairs]
             list_key_by_uid = {
                 message_uid: list_key for list_key, message_uid in pairs
             }
-            try:
-                if flag_name == "seen":
-                    assert seen is not None
-                    result = self._mail.set_messages_seen(
-                        account_uid, folder_name, message_uids, seen=seen
-                    )
-                else:
-                    assert flagged is not None
-                    result = self._mail.set_messages_flagged(
-                        account_uid, folder_name, message_uids, flagged=flagged
-                    )
-            except Exception as exc:
-                log.exception("Failed to update message %s", flag_name)
-                error = exc
-                break
 
-            for item in result.get("updates") or []:
-                camel_uid = item.get("uid")
-                list_key = list_key_by_uid.get(str(camel_uid)) if camel_uid else None
-                if list_key is None:
-                    continue
-                updates_by_list_key[list_key] = dict(item.get("flags") or {})
-            if result.get("queued"):
-                any_queued = True
+            def _on_done(
+                result: object,
+                exc: BaseException | None,
+                *,
+                _account_uid: str = account_uid,
+                _folder_name: str = folder_name,
+                _list_key_by_uid: dict[str, str] = list_key_by_uid,
+            ) -> None:
+                # run_job_async already invokes on_done on the GTK thread.
+                _finish_group(
+                    result,
+                    exc,
+                    account_uid=_account_uid,
+                    folder_name=_folder_name,
+                    list_key_by_uid=_list_key_by_uid,
+                )
+
             if flag_name == "seen":
-                unread = result.get("folder_unread")
-                total = result.get("folder_total")
-                if unread is not None and total is not None:
-                    folder_count_updates.append(
-                        (account_uid, folder_name, int(unread), int(total))
-                    )
-
-        self._apply_message_flag_updates(
-            updates_by_list_key,
-            flag_name,
-            folder_count_updates=folder_count_updates,
-            queued=any_queued,
-            error=error,
-        )
+                assert seen is not None
+                self._mail.set_messages_seen_async(
+                    account_uid,
+                    folder_name,
+                    message_uids,
+                    seen=seen,
+                    on_done=_on_done,
+                )
+            else:
+                assert flagged is not None
+                self._mail.set_messages_flagged_async(
+                    account_uid,
+                    folder_name,
+                    message_uids,
+                    flagged=flagged,
+                    on_done=_on_done,
+                )
 
     def _apply_message_flag_updates(
         self,
