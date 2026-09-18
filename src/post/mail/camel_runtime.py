@@ -28,15 +28,17 @@ _DEFAULT_JOB_TIMEOUT = 120.0
 def camel_helpers_enabled() -> bool:
     """True when the UI should spawn per-account Camel helpers.
 
-    Disabled inside helper processes. **Default off** in the UI: multiple helper
-    processes sharing ``~/.local/share/evolution`` proved unstable (helper exits
-    mid-read → "Could not read this message" / Loading timeouts). Opt in with
-    ``POST_MAIL_CAMEL_HELPERS=1`` for experiments (#437).
+    Disabled inside helper processes. **Default on** in the UI (#445): each
+    helper uses private Camel data/cache dirs so processes do not share
+    ``~/.local/share/evolution`` (the #439 mid-read failure mode). Opt out with
+    ``POST_MAIL_CAMEL_HELPERS=0``.
     """
     if os.environ.get(_HELPER_PROCESS_ENV) == "1":
         return False
-    raw = (os.environ.get(_HELPERS_ENV) or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    raw = os.environ.get(_HELPERS_ENV)
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class CamelHelperError(RuntimeError):
@@ -83,7 +85,13 @@ class AccountCamelRuntime:
         ]
 
     def _start_unlocked(self) -> None:
-        self._stop_unlocked(kill=True)
+        # Only SIGKILL a still-living child. Reaping an already-dead process
+        # avoids exit_code=-9 storms when retries race (#445).
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            self._stop_unlocked(kill=True)
+        else:
+            self._reap_dead_unlocked()
         env = os.environ.copy()
         env[_HELPER_PROCESS_ENV] = "1"
         env[_HELPERS_ENV] = "0"
@@ -160,18 +168,46 @@ class AccountCamelRuntime:
                 pending["msg"] = msg
                 pending["event"].set()
         except Exception:
-            log.debug(
-                "helper reader exited account=%s", self.account_uid, exc_info=True
+            log.warning(
+                "helper reader exited account=%s",
+                self.account_uid,
+                exc_info=True,
             )
         finally:
             if proc is not None:
-                exit_code = proc.poll()
+                try:
+                    exit_code = proc.wait(timeout=0.5)
+                except Exception:
+                    exit_code = proc.poll()
+                # stdout EOF with poll() still None usually means a short IPC
+                # read desync or a still-writing child — not a clean exit.
+                if exit_code is None:
+                    try:
+                        os.kill(proc.pid, 0)
+                        still_alive = True
+                    except OSError:
+                        still_alive = False
+                    if still_alive:
+                        log.warning(
+                            "camel helper stdout closed while process still "
+                            "alive account=%s pid=%s; killing to resync IPC",
+                            self.account_uid,
+                            proc.pid,
+                        )
+                        try:
+                            proc.kill()
+                            exit_code = proc.wait(timeout=2.0)
+                        except Exception:
+                            exit_code = proc.poll()
             log.warning(
                 "camel helper reader stopped account=%s exit_code=%s",
                 self.account_uid,
                 exit_code,
             )
             with self._lock:
+                # Ignore stale readers after kill/respawn (#445).
+                if self._proc is not proc:
+                    return
                 self._alive = False
                 for pending in self._pending.values():
                     pending["msg"] = {
@@ -292,6 +328,29 @@ class AccountCamelRuntime:
             while proc.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.05)
             self._stop_unlocked(kill=True)
+
+    def _reap_dead_unlocked(self) -> None:
+        """Drop handles for an already-exited helper without SIGKILL (#445)."""
+        proc = self._proc
+        if proc is None:
+            self._alive = False
+            return
+        if proc.poll() is None:
+            # Still running — do not clear ``_alive`` here (would force a
+            # mid-call kill on the next ensure_started).
+            return
+        self._alive = False
+        try:
+            proc.wait(timeout=0.1)
+        except Exception:
+            pass
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+        self._proc = None
 
     def _stop_unlocked(self, *, kill: bool) -> None:
         proc = self._proc

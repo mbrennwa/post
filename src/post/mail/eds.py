@@ -1316,14 +1316,15 @@ class MailService:
                 uid = str(args[2]) if len(args) >= 3 else text
                 folder = str(args[1]) if len(args) >= 2 else None
                 raise MessageNotAvailableError(uid, folder) from exc
-            # One retry after a crashed helper (common under multi-process Camel).
+            # One retry after a crashed helper. Do not kill_account first — the
+            # process is already dead; an extra kill storms SIGKILL (-9) and
+            # races concurrent callers (#445).
             if "camel helper process exited" in text or "not running" in text:
                 log.warning(
                     "Retrying camel helper call after exit account=%s method=%s",
                     account_uid,
                     method,
                 )
-                self._camel_pool.kill_account(account_uid)
                 return self._camel_pool.call(
                     account_uid, method, args, kwargs or {}, timeout=timeout
                 )
@@ -2205,8 +2206,9 @@ class MailService:
             self._session.set_online(self._network_available)
             return self._session
 
-        user_data = os.path.expanduser("~/.local/share/evolution")
-        user_cache = os.path.expanduser("~/.cache/evolution")
+        from post.mail.camel_paths import resolve_camel_dirs
+
+        user_data, user_cache = resolve_camel_dirs()
         if not is_mail_io_thread():
             Camel.init(user_data, False)
 
@@ -8955,6 +8957,15 @@ class MailService:
         message_uid: str,
         attachment_index: int,
     ) -> tuple[str, bytes]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "read_attachment_data",
+                account_uid,
+                [account_uid, folder_name, message_uid, attachment_index],
+            )
+            if isinstance(result, (list, tuple)) and len(result) == 2:
+                return str(result[0]), bytes(result[1])
+            raise CamelHelperError("read_attachment_data: invalid helper result")
         return run_on_mail_thread(
             self._read_attachment_data_unlocked,
             account_uid,
@@ -8980,6 +8991,18 @@ class MailService:
     def toggle_message_seen(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "toggle_message_seen",
+                account_uid,
+                [account_uid, folder_name, message_uid],
+            )
+            if isinstance(result, dict):
+                self._mirror_flag_result_to_folder_caches(
+                    account_uid, folder_name, result, message_uid=message_uid
+                )
+                return result
+            return {}
         return run_on_mail_thread(
             self._toggle_message_seen_unlocked,
             account_uid,
@@ -8990,6 +9013,18 @@ class MailService:
     def toggle_message_flagged(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "toggle_message_flagged",
+                account_uid,
+                [account_uid, folder_name, message_uid],
+            )
+            if isinstance(result, dict):
+                self._mirror_flag_result_to_folder_caches(
+                    account_uid, folder_name, result, message_uid=message_uid
+                )
+                return result
+            return {}
         return run_on_mail_thread(
             self._toggle_message_flagged_unlocked,
             account_uid,
@@ -9005,6 +9040,19 @@ class MailService:
         *,
         seen: bool,
     ) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "set_messages_seen",
+                account_uid,
+                [account_uid, folder_name, message_uids],
+                {"seen": seen},
+            )
+            if isinstance(result, dict):
+                self._mirror_flag_result_to_folder_caches(
+                    account_uid, folder_name, result
+                )
+                return result
+            return {}
         return run_on_mail_thread(
             self._set_messages_seen_unlocked,
             account_uid,
@@ -9021,6 +9069,19 @@ class MailService:
         *,
         flagged: bool,
     ) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "set_messages_flagged",
+                account_uid,
+                [account_uid, folder_name, message_uids],
+                {"flagged": flagged},
+            )
+            if isinstance(result, dict):
+                self._mirror_flag_result_to_folder_caches(
+                    account_uid, folder_name, result
+                )
+                return result
+            return {}
         return run_on_mail_thread(
             self._set_messages_flagged_unlocked,
             account_uid,
@@ -9032,6 +9093,18 @@ class MailService:
     def toggle_messages_seen(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "toggle_messages_seen",
+                account_uid,
+                [account_uid, folder_name, message_uids],
+            )
+            if isinstance(result, dict):
+                self._mirror_flag_result_to_folder_caches(
+                    account_uid, folder_name, result
+                )
+                return result
+            return {}
         return run_on_mail_thread(
             self._toggle_messages_seen_unlocked,
             account_uid,
@@ -9042,6 +9115,18 @@ class MailService:
     def toggle_messages_flagged(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "toggle_messages_flagged",
+                account_uid,
+                [account_uid, folder_name, message_uids],
+            )
+            if isinstance(result, dict):
+                self._mirror_flag_result_to_folder_caches(
+                    account_uid, folder_name, result
+                )
+                return result
+            return {}
         return run_on_mail_thread(
             self._toggle_messages_flagged_unlocked,
             account_uid,
@@ -9052,6 +9137,13 @@ class MailService:
     def move_messages_to_trash(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "move_messages_to_trash",
+                account_uid,
+                [account_uid, folder_name, message_uids],
+            )
+            return result if isinstance(result, dict) else {}
         return run_on_mail_thread(
             self._move_messages_to_trash_unlocked,
             account_uid,
@@ -9062,6 +9154,13 @@ class MailService:
     def archive_messages(
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "archive_messages",
+                account_uid,
+                [account_uid, folder_name, message_uids],
+            )
+            return result if isinstance(result, dict) else {}
         return run_on_mail_thread(
             self._archive_messages_unlocked,
             account_uid,
@@ -9094,6 +9193,15 @@ class MailService:
     def mark_message_read(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> tuple[int, int]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "mark_message_read",
+                account_uid,
+                [account_uid, folder_name, message_uid],
+            )
+            if isinstance(result, (list, tuple)) and len(result) == 2:
+                return int(result[0]), int(result[1])
+            return (-1, -1)
         return run_on_mail_thread(
             self._mark_message_read_unlocked,
             account_uid,
@@ -9759,12 +9867,16 @@ class MailService:
                 op_type="set_seen",
                 seen=new_seen,
             )
-        return {
+        result = {
             "flags": {"seen": new_seen},
             "folder_unread": unread,
             "folder_total": total,
             "queued": queued,
         }
+        self._mirror_flag_result_to_folder_caches(
+            account_uid, folder_name, result, message_uid=message_uid
+        )
+        return result
 
     def _toggle_message_flagged_unlocked(
         self, account_uid: str, folder_name: str, message_uid: str
@@ -9794,7 +9906,11 @@ class MailService:
                 op_type="set_flagged",
                 flagged=new_flagged,
             )
-        return {"flags": {"flagged": new_flagged}, "queued": queued}
+        result = {"flags": {"flagged": new_flagged}, "queued": queued}
+        self._mirror_flag_result_to_folder_caches(
+            account_uid, folder_name, result, message_uid=message_uid
+        )
+        return result
 
     def _set_messages_seen_unlocked(
         self,
@@ -9838,12 +9954,14 @@ class MailService:
         unread = folder_get_unread_count(folder)
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
-        return {
+        result = {
             "updates": updates,
             "folder_unread": unread,
             "folder_total": total,
             "queued": queued,
         }
+        self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
+        return result
 
     def _set_messages_flagged_unlocked(
         self,
@@ -9884,7 +10002,9 @@ class MailService:
                 op_type="set_flagged",
                 flagged=flagged,
             )
-        return {"updates": updates, "queued": queued}
+        result = {"updates": updates, "queued": queued}
+        self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
+        return result
 
     def _toggle_messages_seen_unlocked(
         self, account_uid: str, folder_name: str, message_uids: list[str]
@@ -9940,12 +10060,14 @@ class MailService:
         unread = folder_get_unread_count(folder)
         total = folder.get_message_count()
         self._update_cached_folder_counts(account_uid, folder_name, unread, total)
-        return {
+        result = {
             "updates": updates,
             "folder_unread": unread,
             "folder_total": total,
             "queued": queued,
         }
+        self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
+        return result
 
     def _toggle_messages_flagged_unlocked(
         self, account_uid: str, folder_name: str, message_uids: list[str]
@@ -9998,7 +10120,9 @@ class MailService:
                     if updates
                     else True,
                 )
-        return {"updates": updates, "queued": queued}
+        result = {"updates": updates, "queued": queued}
+        self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
+        return result
 
     def _move_messages_to_trash_unlocked(
         self, account_uid: str, folder_name: str, message_uids: list[str]
@@ -10905,6 +11029,100 @@ class MailService:
                 updated["flags"] = merged
                 index.messages[position] = updated
                 break
+
+    def _mirror_flag_result_to_folder_caches(
+        self,
+        account_uid: str,
+        folder_name: str,
+        result: dict[str, Any],
+        *,
+        message_uid: str | None = None,
+    ) -> None:
+        """Apply flag mutation results to RAM + on-disk folder index (#445).
+
+        Helper processes update Camel and their own ``_folder_indexes``, but the
+        UI paints folder switches from ``folder_index_cache`` first. Without
+        mirroring here, flagged/unread flips look sticky in the current list
+        then vanish when switching inbox and back.
+        """
+        updates = list(result.get("updates") or [])
+        flags_only = result.get("flags")
+        if not updates and message_uid and isinstance(flags_only, dict):
+            updates = [{"uid": message_uid, "flags": flags_only}]
+        if not updates and not (
+            result.get("folder_unread") is not None
+            and result.get("folder_total") is not None
+        ):
+            return
+
+        for item in updates:
+            uid = item.get("uid")
+            flags = item.get("flags") or {}
+            if not uid or not isinstance(flags, dict):
+                continue
+            self._update_cached_message_flags(
+                account_uid,
+                folder_name,
+                str(uid),
+                seen=flags["seen"] if "seen" in flags else None,
+                flagged=flags["flagged"] if "flagged" in flags else None,
+            )
+
+        unread = result.get("folder_unread")
+        total = result.get("folder_total")
+        if unread is not None and total is not None:
+            self._update_cached_folder_counts(
+                account_uid, folder_name, int(unread), int(total)
+            )
+
+        index = self._folder_indexes.get((account_uid, folder_name))
+        if index is not None:
+            if _folder_index_is_cacheable(index) or index.messages:
+                folder_index_cache.save(
+                    account_uid,
+                    folder_name,
+                    index.messages,
+                    index.unread,
+                    index.total,
+                    grow_only=is_heavy_folder_name(folder_name),
+                )
+            return
+
+        # No RAM index in this process (common in the UI when helpers own Camel):
+        # patch the shared disk cache so the next folder open is not stale.
+        cached = folder_index_cache.load(account_uid, folder_name)
+        if cached is None or not updates:
+            return
+        messages, cached_unread, cached_total = cached
+        by_uid = {
+            str(item["uid"]): dict(item.get("flags") or {})
+            for item in updates
+            if item.get("uid")
+        }
+        patched: list[dict] = []
+        changed = False
+        for message in messages:
+            uid = str(message.get("uid") or "")
+            flag_patch = by_uid.get(uid)
+            if flag_patch is None:
+                patched.append(message)
+                continue
+            merged = dict(message.get("flags") or {})
+            merged.update(flag_patch)
+            updated = dict(message)
+            updated["flags"] = merged
+            patched.append(updated)
+            changed = True
+        if not changed and unread is None:
+            return
+        folder_index_cache.save(
+            account_uid,
+            folder_name,
+            patched,
+            int(unread) if unread is not None else cached_unread,
+            int(total) if total is not None else cached_total,
+            grow_only=is_heavy_folder_name(folder_name),
+        )
 
     def _update_cached_folder_counts(
         self, account_uid: str, folder_name: str, unread: int, total: int
