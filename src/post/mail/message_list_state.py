@@ -495,6 +495,24 @@ def prune_stale_folder_index_uids(
     return removed
 
 
+def prune_orphan_folder_index_uids(
+    by_uid: dict[str, dict[str, Any]],
+    camel_uids: set[str],
+) -> list[str]:
+    """Drop every index UID absent from Camel (lone ghosts, not just remaps).
+
+    Stronger than ``prune_stale_folder_index_uids``. Call only when Camel's UID
+    set is authoritative for this folder — e.g. IMAP after a confirmed
+    INVALID_UID miss (#451), not during partial Graph Archive catch-up.
+    """
+    if not by_uid or not camel_uids:
+        return []
+    removed = [uid for uid in list(by_uid) if uid not in camel_uids]
+    for uid in removed:
+        by_uid.pop(uid, None)
+    return removed
+
+
 def dedupe_folder_index_messages(
     messages: list[dict[str, Any]],
     *,

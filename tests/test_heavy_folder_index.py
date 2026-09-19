@@ -459,33 +459,22 @@ class OfflineSyncNoHeavyIndexTests(unittest.TestCase):
         mail.get_account.return_value = mock.Mock(display_label="Test")
         mail.continue_heavy_folder_index = mock.Mock()
         mail.offline_body_sync_is_held.return_value = False
+        mail.offline_downsync_folder = mock.Mock(return_value={"status": "ok"})
         coordinator = OfflineBodySyncCoordinator(mail)
 
-        import gi
-
-        gi.require_version("Camel", "1.2")
-        from gi.repository import Camel
-
-        offline_folder = mock.Mock(spec=Camel.OfflineFolder)
-        offline_folder.get_full_name.return_value = "Archive"
-        offline_folder.can_downsync.return_value = True
         cancellable = mock.Mock()
         cancellable.is_cancelled.return_value = False
 
-        with mock.patch(
-            "post.mail.offline_sync.apply_offline_sync_to_folder"
-        ):
-            with mock.patch.object(coordinator, "_downsync_folder_sync") as downsync:
-                complete = coordinator._run_account_sync(
-                    "acct-1",
-                    "all",
-                    cancellable,
-                    folders=[offline_folder],
-                    folder_index=0,
-                )
+        complete = coordinator._run_account_sync(
+            "acct-1",
+            "all",
+            cancellable,
+            folders=["Archive"],
+            folder_index=0,
+        )
 
         self.assertTrue(complete)
-        downsync.assert_called_once()
+        mail.offline_downsync_folder.assert_called_once()
         mail.continue_heavy_folder_index.assert_called_once_with(
             "acct-1", "Archive", allow_refresh=False
         )

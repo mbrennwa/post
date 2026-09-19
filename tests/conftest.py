@@ -7,5 +7,5 @@ from __future__ import annotations
 
 import os
 
-# Unit tests use in-process Camel mocks; force helpers off (#445 default is on).
-os.environ.setdefault("POST_MAIL_CAMEL_HELPERS", "0")
+# Unit tests use in-process Camel mocks; do not spawn real helper processes.
+os.environ.setdefault("POST_MAIL_TEST_NO_CAMEL_HELPERS", "1")

@@ -19,6 +19,7 @@ from post.mail.message_list_state import (
     message_list_fingerprint,
     normalize_folder_index_by_uid,
     prepended_message_count,
+    prune_orphan_folder_index_uids,
     prune_stale_folder_index_uids,
     touch_lru_cache,
     upsert_folder_index_by_identity,
@@ -540,6 +541,15 @@ class FolderIndexIdentityUpsertTests(unittest.TestCase):
         removed = prune_stale_folder_index_uids(by_uid, {"something-else"})
         self.assertEqual(removed, [])
         self.assertIn("only", by_uid)
+
+    def test_prune_orphans_drops_lone_ghosts(self) -> None:
+        by_uid = {
+            "ghost": {"uid": "ghost", "message_id": "<a@x>"},
+            "live": {"uid": "live", "message_id": "<b@x>"},
+        }
+        removed = prune_orphan_folder_index_uids(by_uid, {"live"})
+        self.assertEqual(removed, ["ghost"])
+        self.assertEqual(set(by_uid), {"live"})
 
     def test_normalize_large_index_is_linear(self) -> None:
         # Regression: O(n²) identity scan froze Archive open (#267).

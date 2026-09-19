@@ -2,16 +2,17 @@
 
 Post keeps the GTK main loop free of blocking Camel / EDS work (#443).
 
-**Default runtime (#445 / Phase 3b):** one Camel **helper process per account**
-(`POST_MAIL_CAMEL_HELPERS` defaults on). Each helper uses **private** Camel
-data/cache under `~/.cache/post/camel-helper/<account>/` so processes do not
-share `~/.local/share/evolution` (that shared-store mode caused mid-read exits;
-see #439). Opt out with `POST_MAIL_CAMEL_HELPERS=0` (one in-process FIFO again).
+**Runtime (#445 / Phase 3b):** one Camel **helper process per account**. Each
+helper uses **private** Camel data/cache under
+`~/.cache/post/camel-helper/<account>/` so processes do not share
+`~/.local/share/evolution` (that shared-store mode caused mid-read exits;
+see #439). There is no supported helpers-off mode in the UI.
 
-**First enable:** helper Camel caches start empty — message bodies re-download
-into the per-account cache (no automatic copy from `~/.cache/evolution`).
+**First launch / new helper cache:** helper Camel caches start empty — message
+bodies re-download into the per-account cache (no automatic copy from
+`~/.cache/evolution`).
 
-**Helpers-on architecture** (default):
+**Architecture:**
 
 ```
 ┌─────────────────────┐  MailService jobs         ┌──────────────────────────┐
@@ -25,25 +26,14 @@ into the per-account cache (no automatic copy from `~/.cache/evolution`).
 └─────────────────────┘                           └──────────────────────────┘
 ```
 
-**Helpers-off** (`POST_MAIL_CAMEL_HELPERS=0`):
-
-```
-┌─────────────────────┐  submit_* / *_async       ┌──────────────────────────┐
-│  GTK main thread    │ ─────────────────────────►│  post-mail-io (one FIFO) │
-│  (UI only)          │  M365 bg STATUS (HTTP)    │  + one MailSession       │
-│                     │ ─────────────────────────►│  post-graph-http         │
-│                     │ ◄── GLib.idle_add ─────── │                         │
-└─────────────────────┘                           └──────────────────────────┘
-```
-
 ## Architecture
 
 - **`post.mail.camel_helper`** — per-account helper process (`python3 -m post.mail.camel_helper --account-uid …` / `post-camel-helper`). Owns **one** `MailSession` and a private mail I/O thread in that process. Sets private Camel dirs via `post.mail.camel_paths` before connect (#445). UI talks length-prefixed JSON on stdin/stdout (`camel_ipc.py`). **`camel_ipc.read_message` loops until the full frame arrives** — raw `Popen` pipes may short-read (~64 KiB); treating that as EOF desynced IPC and surfaced as `camel helper process exited` on larger bodies (#445).
-- **`post.mail.camel_runtime`** — UI supervisor: spawn / call / watchdog timeout → **kill** / respawn; `CamelRuntimePool` keyed by account. **Default on** (#445). Opt out with `POST_MAIL_CAMEL_HELPERS=0`. Helpers set `POST_MAIL_CAMEL_HELPER_PROCESS=1` so they do not nest. Unit tests force helpers off via `tests/conftest.py`.
+- **`post.mail.camel_runtime`** — UI supervisor: spawn / call / watchdog timeout → **kill** / respawn; `CamelRuntimePool` keyed by account. Helpers set `POST_MAIL_CAMEL_HELPER_PROCESS=1` so they do not nest. Unit tests set `POST_MAIL_TEST_NO_CAMEL_HELPERS=1` via `tests/conftest.py`.
 - **`post.mail.camel_paths`** — resolves Camel `user_data` / `user_cache`: helper env overrides → `~/.cache/post/camel-helper/<account>/{data,cache}`; otherwise system `~/.local/share/evolution` + `~/.cache/evolution`.
-- **`post.mail.io_thread`** — still used **inside** each helper (and in the UI when helpers are disabled). The UI process must not pin a shared `post-mail-io` on helper IPC when helpers are on (`submit_*` runs account work off that shared thread).
-- **`MailService`** (`post.mail.eds`) — job facade (#425 / #435 / #437 / #445). Prefer `submit_job` with `account_uid`. Camel-backed methods (`read_message`, `list_folders`, `move_messages`, **flag toggles / set seen**, …) proxy to the account helper when helpers are enabled — do **not** mix helper reads with in-process `run_on_mail_thread` writes (split-brain on private vs system Evolution dirs; #445). After helper flag mutations, **`_mirror_flag_result_to_folder_caches`** updates the UI RAM index and shared `folder_index_cache` so flagged/unread survives folder switches (the UI paints from disk cache first). M365 Graph STATUS stays in-process on `post-graph-http` (#435); OAuth tokens for Graph may be fetched via the helper. Startup uses `connect_async`; quit uses `shutdown_async` (#443).
-- **Epic lanes (#422 / #435)** — `foreground` = folder you’re in, open, send; `background` = maintenance. Same `(account, folder)` stays one-at-a-time (`FolderJobLock`). Per-helper Camel stays serial; **cross-account** isolation is the Phase 3 win when helpers are on (default).
+- **`post.mail.io_thread`** — used **inside** each helper. The UI process must not pin a shared `post-mail-io` on helper IPC (`submit_*` runs account work off that shared thread).
+- **`MailService`** (`post.mail.eds`) — job facade (#425 / #435 / #437 / #445). Prefer `submit_job` with `account_uid`. Camel-backed methods (`read_message`, `list_folders`, `move_messages`, **flag toggles / set seen**, …) proxy to the account helper — do **not** mix helper reads with in-process `run_on_mail_thread` writes (split-brain on private vs system Evolution dirs; #445). After helper flag mutations, **`_mirror_flag_result_to_folder_caches`** updates the UI RAM index and shared `folder_index_cache` so flagged/unread survives folder switches (the UI paints from disk cache first). M365 Graph STATUS stays in-process on `post-graph-http` (#435); OAuth tokens for Graph may be fetched via the helper. Startup uses `connect_async`; quit uses `shutdown_async` (#443).
+- **Epic lanes (#422 / #435)** — `foreground` = folder you’re in, open, send; `background` = maintenance. Same `(account, folder)` stays one-at-a-time (`FolderJobLock`). Per-helper Camel stays serial; **cross-account** isolation is the Phase 3 win.
 - **M365 background STATUS** — Graph folder counts on **`post-graph-http`** (Soup), not a second Camel `*_sync`.
 - **Kill / respawn** — `kill_account_camel_helper` / job watchdog timeout terminates that account’s helper; other accounts keep working. `invalidate_account_connection` stops the helper and clears UI caches. `shutdown_async` / `shutdown_sync` shuts down all helpers.
 - **UI / mail modules** — must not call `get_mail_io_thread()`. Queue work through `MailService`. `app.py` starts the UI mail thread at startup and connects EDS off GTK via `MailService.connect_async` (#443).
@@ -54,8 +44,8 @@ into the per-account cache (no automatic copy from `~/.cache/evolution`).
 2. **Never call `Camel.*_sync` directly from UI or ad-hoc worker threads** — go through `MailService` or `run_on_mail_thread()`.
 3. **One `MailSession` per process** — in a helper, that session is for one account; do not add a second in-process session in the UI process. Do not reintroduce legacy per-thread worker sessions in the UI.
 4. **Password / OAuth prompts** — use `GLib.idle_add` to show dialogs on the GTK thread; mail thread waits on the result. Do **not** call GOA `EnsureCredentials` synchronously from the GTK thread (compose must not preflight on the UI thread; see #156). Nested `GLib.MainLoop` for password/folder dialogs is intentional (modal); do not use that pattern for Camel/EDS I/O.
-5. **Outbound send** — compose persists to outbox first, then delivers via Camel `transport.send_to_sync` on the account helper (or UI mail I/O when helpers are off). No `smtplib` send path. Send and draft save use a **finite** cancellable timeout; draft failures/timeouts fall back to the local draft queue.
-6. **Offline body download** — `OfflineBodySyncCoordinator` runs `downsync_sync` on Camel I/O (helper when enabled). Each folder downsync is bound by a **30s** per-folder `Gio.Cancellable` timeout so one slow folder cannot pin that account’s Camel for minutes (#197); a folder timeout does **not** cancel the rest of the account pass (#208). Folders are ordered ordinary → Archive → Trash → Junk. Interactive work preempts offline sync via `cancel_all()` and between-folder yield. **Arrival prefetch (#372)** is a separate per-UID queue (`synchronize_message_sync`, 15s timeout, 20-UID burst cap). It does **not** use full-account downsync and is **not** paused by the Archive hold; interactive I/O still cancels the in-flight FETCH and keeps queued UIDs. See [offline-body-cache.md](offline-body-cache.md).
+5. **Outbound send** — compose persists to outbox first, then delivers via Camel `transport.send_to_sync` on the account helper. No `smtplib` send path. Send and draft save use a **finite** cancellable timeout; draft failures/timeouts fall back to the local draft queue.
+6. **Offline body download** — `OfflineBodySyncCoordinator` schedules the crawl in the UI; Camel `downsync_sync` / arrival FETCH run through `MailService` APIs on the account helper (#451). Each folder downsync is bound by a **30s** per-folder timeout so one slow folder cannot pin that account’s Camel for minutes (#197); a folder timeout does **not** cancel the rest of the account pass (#208). Folders are ordered ordinary → Archive → Trash → Junk. Interactive work preempts between folders via yield. **Arrival prefetch (#372)** is a separate per-UID queue (15s timeout, 20-UID burst cap). It does **not** use full-account downsync and is **not** paused by the Archive hold. See [offline-body-cache.md](offline-body-cache.md).
 7. **Sync watcher setup** — `MailSyncWatcher` store/folder signal wiring runs as **background** mail-I/O work so folder search can preempt it. Preempt also cancels in-flight sidebar folder lists.
 8. **Search** — interactive mail-I/O work: filter the folder-index (`filter_messages_by_query`). Folder-index rows are **headers only**; `body:` / bare-word terms load cached MIME. Cancellable; preempts offline downsync. See [offline-body-cache.md](offline-body-cache.md).
 9. **Correspondents / autocomplete** — build from cached folder tree + folder indexes only; never connect a store just for compose autocomplete (#156).
@@ -63,7 +53,7 @@ into the per-account cache (no automatic copy from `~/.cache/evolution`).
 11. **Per-account Take offline** — first connect / `set_online_sync` must honor `get_account_user_online`, not only global network availability. From GTK use `submit_front` (never `run_sync`).
 12. **Network monitor reconnect (#400)** — `Gio.NetworkMonitor` callbacks run on GTK. `MailService.set_network_available` / `go_online_sync` must **`submit_front`** (never `run_sync` from GTK). Per-store `set_online_sync` uses a **15s** cancellable; one failed/expired OAuth account must not block the rest. Prefer a single offline→online pass (flag + clear folder indexes + timed sync); do not call `go_online_sync` after `set_network_available` from the window.
 13. **Folder transfer / Archive (#189/#404)** — `transfer_messages_to_sync` uses a finite `Gio.Cancellable` timeout; soft-succeed when source UIDs are already gone. After move (including soft-succeed), prune Camel `FolderSummary` UIDs locally (Evolution-style) and update Post’s folder-index cache with **destination RestIds only**. Do **not** park Inbox RestIds as openable Archive rows. For a small interactive move, a **bounded** dest `refresh_info` (8s) plus per-UID `synchronize_message_sync` learns dest ids; do **not** block UI completion on unbounded Graph `refresh_info_sync` of a 29k Archive. For `microsoft365` / `ews` bulk, skip post-transfer full-folder `synchronize_sync` / `refresh_info_sync` (#189). Account transfer-busy / not-responding badges escalate on timeout; refuse new moves for that account while busy. **Quit** waits for in-flight Archive/move/trash and outbound send via async gates + `shutdown_async` so the GTK loop keeps pumping (#443); do not call `shutdown_sync` from GTK. **If Graph ignores cancel:** terminate that account’s **helper process** (#437); do not add a second in-process Camel session in the UI.
-14. **Folder stats / count refresh (#197 / #435)** — Non-M365: Camel STATUS via the account helper (or UI mail I/O when helpers are off). **M365:** sidebar / STATUS-style counts prefer Graph HTTP on `post-graph-http`. Grow-only `folder-status` cache rules still apply.
+14. **Folder stats / count refresh (#197 / #435)** — Non-M365: Camel STATUS via the account helper. **M365:** sidebar / STATUS-style counts prefer Graph HTTP on `post-graph-http`. Grow-only `folder-status` cache rules still apply.
 15. **Heavy-folder header index (#208)** — Archive / All Mail / Trash / Junk open with disk/memory cache first, then a **chunked** background `continue_heavy_folder_index` (UID batches). Indexes are grow-only on disk (never replace a larger cache with a smaller partial summary). **Do not** call this indexer with server refresh from offline body sync. Opening a heavy folder: (1) index local summary immediately, (2) async `refresh_info` with `pump_until` so interactive mail I/O can run during Graph fetch (**without** sidebar `cancel_folder_refresh` aborting it — heavy index uses a separate cancellable), (3) index any new UIDs. M365 often stalls at a partial local summary; Post calls `prepare_content_refresh` and retries while the folder stays open until headers grow or several no-growth stalls. Folder::changed during that refresh must not invalidate the in-progress index. Cancel/timeout indexes the local summary but **does not** set `refresh_done` — the indexer keeps retrying while the folder stays open (that account’s full-account offline body sync stays held until that indexer finishes, #407/#449; other accounts keep crawling). Interactive work pending before refresh yields with `yield_for_interactive` and leaves `refresh_done=False` (never permanently skips server refresh). Offline body sync may re-index local summary only (`allow_refresh=False`) after downsync. UI initially binds at most 500 rows (`MESSAGE_LIST_UI_BIND_CAP`) and appends more when the user scrolls near the end; status may show `Showing N of M`. Search uses the full in-memory index. **Sidebar STATUS** for heavy folders: M365 prefers Graph `totalItemCount` (#435); otherwise store FolderInfo REFRESH, persisted as a **grow-only** high-water mark (`folder-status` cache). Camel local-summary sizes must never be labeled “on server.”
 16. **EDS registry / calendars (#443)** — `SourceRegistry.new_sync` is blocking D-Bus. Startup connects via `MailService.connect_async`; Add-to-calendar lists writable calendars off GTK (`run_async` / worker thread). Do not call `list_writable_calendars()` or `MailService.connect()` from the GTK thread in new code.
 
@@ -120,15 +110,14 @@ Run after changes to mail threading, send, or shutdown. Check boxes when verifie
 
 | Scenario | Pass |
 |----------|------|
-| Cold start (helpers default on): open Gmail + M365 bodies | ☐ |
+| Cold start: open Gmail + M365 bodies | ☐ |
 | Mark unread → leave folder → return (must stick; no split-brain) | ☐ |
 | Two accounts: open/send on A while B does heavy Camel work | ☐ |
 | Watchdog/kill helper for A; B still open/send; A recovers | ☐ |
 | No `camel helper process exited` / SIGKILL (-9) storm on folder switch | ☐ |
 | M365 STATUS still via Graph HTTP (no Camel FIFO for that poll) | ☐ |
 | Quit with multiple helpers running | ☐ |
-| `POST_MAIL_CAMEL_HELPERS=0` falls back to in-process Camel | ☐ |
-| First enable: empty per-account Camel cache re-downloads bodies | ☐ |
+| First launch: empty per-account Camel cache re-downloads bodies | ☐ |
 
 ### Phase 2 spike (#435)
 

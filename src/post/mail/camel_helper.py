@@ -57,6 +57,9 @@ ALLOWED_METHODS = frozenset(
         "invalidate_account_connection",
         "set_network_available",
         "go_online_sync",
+        "list_offline_downsync_folders",
+        "offline_downsync_folder",
+        "synchronize_folder_message",
     }
 )
 
@@ -71,13 +74,13 @@ def _configure_logging() -> None:
     )
 
 
-def _build_mail_service():
+def _build_mail_service(account_uid: str):
     from post.mail.eds import MailService
     from post.mail.io_thread import get_mail_io_thread
 
     # Ensure Camel.init / mail thread exist in this process before connect.
     get_mail_io_thread()
-    return MailService.connect()
+    return MailService.connect(account_uid=account_uid)
 
 
 def _dispatch(mail: Any, method: str, args: list[Any], kwargs: dict[str, Any]) -> Any:
@@ -104,9 +107,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     account_uid = args.account_uid
 
-    # Mark this process as a helper so nested code can avoid spawning helpers.
+    # Mark this process as a helper so nested code does not spawn helpers.
     os.environ["POST_MAIL_CAMEL_HELPER_PROCESS"] = "1"
-    os.environ["POST_MAIL_CAMEL_HELPERS"] = "0"
 
     from post.mail.camel_paths import configure_helper_camel_dirs
 
@@ -123,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
 
     log.info("starting camel helper account=%s pid=%s", account_uid, os.getpid())
     try:
-        mail = _build_mail_service()
+        mail = _build_mail_service(account_uid)
     except Exception:
         log.exception("failed to connect MailService in helper")
         return 1

@@ -68,7 +68,35 @@ class MessageNotAvailableErrorTests(unittest.TestCase):
             "Archive",
             reason=MessageUnavailableReason.NOT_FETCHABLE_YET,
         )
-        self.assertIn("available yet", exc.user_message().lower())
+        text = exc.user_message().lower()
+        self.assertIn("content", text)
+        self.assertIn("download", text)
+
+
+class ReadMessageFetchRetryTests(unittest.TestCase):
+    def test_not_fetchable_yet_forces_download_then_retries(self) -> None:
+        service = MailService(registry=MagicMock())
+        first = MessageNotAvailableError(
+            "42",
+            "INBOX",
+            reason=MessageUnavailableReason.NOT_FETCHABLE_YET,
+        )
+        recovered = {"uid": "42", "subject": "ok"}
+        with (
+            patch("post.mail.eds.camel_helpers_enabled", return_value=False),
+            patch("post.mail.eds.run_on_mail_thread") as run_mail,
+            patch.object(
+                service,
+                "synchronize_folder_message",
+                return_value={"status": "fetched"},
+            ) as sync,
+        ):
+            run_mail.side_effect = [first, recovered]
+            result = service.read_message("acct", "INBOX", "42", mark_seen=False)
+
+        self.assertEqual(result, recovered)
+        sync.assert_called_once_with("acct", "INBOX", "42", force=True)
+        self.assertEqual(run_mail.call_count, 2)
 
 
 class MissingMessageErrorDetectionTests(unittest.TestCase):
@@ -161,7 +189,8 @@ class ReadMessageUnavailableTests(unittest.TestCase):
         self.assertEqual(
             ctx.exception.reason, MessageUnavailableReason.NOT_FETCHABLE_YET
         )
-        self.assertIn("available yet", ctx.exception.user_message().lower())
+        self.assertIn("download", ctx.exception.user_message().lower())
+        self.assertIn("content", ctx.exception.user_message().lower())
         folder.synchronize_message_sync.assert_called_once_with("53054", None)
 
     def test_online_invalid_uid_recovers_when_only_folder_index_knows_uid(
@@ -192,6 +221,97 @@ class ReadMessageUnavailableTests(unittest.TestCase):
 
         self.assertIs(mime, recovered)
         folder.synchronize_message_sync.assert_called_once_with("53054", None)
+
+    @patch("post.mail.eds.folder_index_cache.save")
+    def test_online_invalid_uid_index_only_sync_miss_is_vanished(
+        self, _save: MagicMock
+    ) -> None:
+        """Ghost folder-index UID: sync confirms missing → vanish, not soft-fail."""
+        from post.mail.eds import _FolderMessageIndex
+
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        service._folder_indexes[("account", "INBOX")] = _FolderMessageIndex(
+            messages=[{"uid": "23326", "subject": "ghost"}],
+            unread=0,
+            total=1,
+        )
+        folder = MagicMock()
+        folder.get_message_sync.side_effect = _invalid_uid_error("23326")
+        folder.get_message_cached.return_value = None
+        folder.get_message_info.return_value = None
+        folder.synchronize_message_sync.side_effect = _invalid_uid_error("23326")
+
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._get_message_mime_sync(
+                folder, "account", "INBOX", "23326"
+            )
+
+        self.assertEqual(ctx.exception.message_uid, "23326")
+        self.assertEqual(
+            ctx.exception.reason, MessageUnavailableReason.VANISHED
+        )
+        self.assertEqual(
+            ctx.exception.user_message(),
+            "This message is no longer available.",
+        )
+        self.assertFalse(
+            any(
+                str(m.get("uid")) == "23326"
+                for m in service._folder_indexes[("account", "INBOX")].messages
+            )
+        )
+        folder.synchronize_message_sync.assert_called_once_with("23326", None)
+
+    @patch("post.mail.eds.folder_index_cache.save")
+    @patch("post.mail.eds.folder_get_uids", return_value=["39480", "100"])
+    def test_online_invalid_uid_imap_reconciles_other_orphans(
+        self, _uids: MagicMock, _save: MagicMock
+    ) -> None:
+        """One confirmed miss triggers IMAP orphan prune for the whole folder."""
+        from post.mail.eds import _FolderMessageIndex
+
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        service._accounts_by_uid["account"] = MagicMock(backend="imapx")
+        service._folder_indexes[("account", "INBOX")] = _FolderMessageIndex(
+            messages=[
+                {"uid": "23326", "subject": "ghost"},
+                {"uid": "999", "subject": "also gone"},
+                {
+                    "uid": "39480",
+                    "subject": "live",
+                    "message_id": "<same@x>",
+                },
+                {
+                    "uid": "old-twin",
+                    "subject": "stale twin",
+                    "message_id": "<same@x>",
+                },
+                {"uid": "100", "subject": "other live"},
+            ],
+            unread=1,
+            total=5,
+        )
+        folder = MagicMock()
+        folder.get_message_sync.side_effect = _invalid_uid_error("23326")
+        folder.get_message_cached.return_value = None
+        folder.get_message_info.return_value = None
+        folder.synchronize_message_sync.side_effect = _invalid_uid_error("23326")
+
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._get_message_mime_sync(
+                folder, "account", "INBOX", "23326"
+            )
+
+        self.assertEqual(
+            ctx.exception.reason, MessageUnavailableReason.VANISHED
+        )
+        remaining = {
+            str(m.get("uid"))
+            for m in service._folder_indexes[("account", "INBOX")].messages
+        }
+        self.assertEqual(remaining, {"39480", "100"})
 
     @patch("post.mail.eds.folder_index_cache.save")
     def test_online_graph_item_not_found_index_row_is_kept(

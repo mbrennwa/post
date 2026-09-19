@@ -16,19 +16,17 @@ import gi
 
 gi.require_version("Camel", "1.2")
 gi.require_version("Gio", "2.0")
-from gi.repository import Camel, Gio, GLib
+from gi.repository import Camel, Gio
 
-from post.mail.camel_util import camel_uid_is_binary, camel_uid_to_api, folder_get_message_info
-from post.mail.folders import folder_can_contain_messages, is_post_outbox_folder
+from post.mail.camel_util import camel_uid_is_binary, folder_get_message_info
+from post.mail.folders import is_post_outbox_folder
 from post.mail.message_list_state import (
     is_heavy_folder_name,
     offline_folder_priority,
 )
 from post.mail.offline_settings import (
     account_is_user_offline,
-    apply_offline_sync_to_folder,
     downsync_expression_for_mode,
-    message_within_offline_age,
 )
 from post.preferences import (
     OFFLINE_BODY_SYNC_OFF,
@@ -42,10 +40,10 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Bound downsync_sync so one folder cannot pin post-mail-io for minutes (#197).
-_OFFLINE_DOWNSYNC_TIMEOUT_SECONDS = 30
+OFFLINE_DOWNSYNC_TIMEOUT_SECONDS = 30
 # Per-UID arrival FETCH (#372). Short so interactive mail I/O is not pinned.
 ARRIVAL_PREFETCH_BURST = 20
-_ARRIVAL_PREFETCH_TIMEOUT_SECONDS = 15
+ARRIVAL_PREFETCH_TIMEOUT_SECONDS = 15
 
 OfflineSyncProgressCallback = Callable[["OfflineSyncProgress"], None]
 
@@ -127,7 +125,7 @@ class OfflineSyncProgress:
 
 
 class OfflineBodySyncCoordinator:
-    """Schedules Camel downsync jobs on the mail I/O thread (one account at a time)."""
+    """Schedules offline body jobs; Camel work via MailService (helper IPC when on)."""
 
     def __init__(self, mail: MailService) -> None:
         self._mail = mail
@@ -328,144 +326,38 @@ class OfflineBodySyncCoordinator:
                     or not network
                 ):
                     continue
+                if (
+                    not item.force
+                    and self._mail.get_account_connect_health(item.account_uid)
+                    == "needs_sign_in"
+                ):
+                    continue
+                if camel_uid_is_binary(item.uid):
+                    continue
                 try:
-                    folder = self._mail._open_folder_unlocked(  # noqa: SLF001
-                        item.account_uid, item.folder_name
+                    result = self._mail.synchronize_folder_message(
+                        item.account_uid,
+                        item.folder_name,
+                        item.uid,
+                        force=item.force,
+                        mode=mode,
                     )
                 except Exception:
                     log.debug(
-                        "Arrival prefetch skipped open for %s/%s",
+                        "Arrival prefetch failed for %s/%s",
                         item.account_uid,
                         item.folder_name,
                         exc_info=True,
                     )
                     continue
-                if folder is None:
-                    continue
-                if not item.force:
-                    apply_offline_sync_to_folder(folder, mode)
-                if camel_uid_is_binary(item.uid):
-                    continue
-                try:
-                    api_uid = camel_uid_to_api(item.uid)
-                except TypeError:
-                    continue
-                if self._arrival_uid_is_cached(folder, api_uid):
-                    self._mail.classify_cached_visible_attachments(
-                        item.account_uid,
-                        item.folder_name,
-                        item.uid,
-                        folder=folder,
-                    )
-                    continue
-                if user_offline or not network:
-                    continue
-                if (
-                    self._mail.get_account_connect_health(item.account_uid)
-                    == "needs_sign_in"
-                ):
-                    continue
-                if not item.force and not self._arrival_uid_in_age_window(
-                    folder, item.uid, mode
-                ):
-                    continue
-                preempted = self._prefetch_one_uid(folder, api_uid)
-                if preempted:
+                status = str(result.get("status") or "")
+                if status == "cancelled" and self._mail.has_interactive_work_pending():
                     self._requeue_arrival_item(item)
                     self._finish_arrival_worker(resubmit=True)
                     return
-                self._mail.classify_cached_visible_attachments(
-                    item.account_uid,
-                    item.folder_name,
-                    item.uid,
-                    folder=folder,
-                )
         except Exception:
             log.debug("Arrival body prefetch worker failed", exc_info=True)
             self._finish_arrival_worker(resubmit=bool(self._arrival_queue))
-
-    def _arrival_uid_is_cached(self, folder: Camel.Folder, api_uid: str) -> bool:
-        try:
-            return self._mail._first_cached_rfc822_path(folder, api_uid) is not None  # noqa: SLF001
-        except Exception:
-            log.debug("Arrival cache probe failed for %s", api_uid, exc_info=True)
-            return False
-
-    @staticmethod
-    def _arrival_uid_in_age_window(
-        folder: Camel.Folder,
-        uid: str,
-        mode: OfflineBodySyncMode,
-    ) -> bool:
-        info = folder_get_message_info(folder, uid)
-        if info is None:
-            return message_within_offline_age(mode, None)
-        getter = getattr(info, "get_date_received", None)
-        sent_getter = getattr(info, "get_date_sent", None)
-        raw = getter() if callable(getter) else None
-        if not isinstance(raw, (int, float)) or raw <= 0:
-            raw = sent_getter() if callable(sent_getter) else None
-        return message_within_offline_age(mode, raw)
-
-    def _prefetch_one_uid(self, folder: Camel.Folder, api_uid: str) -> bool:
-        """Fetch one MIME. Return True when interactive preempt cancelled the FETCH."""
-        fetch_cancellable = Gio.Cancellable()
-        stop_watch = threading.Event()
-        self._arrival_fetch_cancellable = fetch_cancellable
-
-        def _watch_timeout() -> None:
-            deadline = time.monotonic() + _ARRIVAL_PREFETCH_TIMEOUT_SECONDS
-            while not stop_watch.is_set():
-                if fetch_cancellable.is_cancelled():
-                    return
-                if time.monotonic() >= deadline:
-                    fetch_cancellable.cancel()
-                    return
-                stop_watch.wait(0.05)
-
-        watcher = threading.Thread(
-            target=_watch_timeout,
-            name="post-arrival-prefetch-watch",
-            daemon=True,
-        )
-        started = time.monotonic()
-        watcher.start()
-        try:
-            folder.synchronize_message_sync(api_uid, fetch_cancellable)
-        except GLib.Error as exc:
-            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
-                elapsed = time.monotonic() - started
-                if self._mail.has_interactive_work_pending():
-                    log.debug(
-                        "Arrival prefetch preempted for %s after %.1fs",
-                        api_uid,
-                        elapsed,
-                    )
-                    return True
-                if elapsed >= _ARRIVAL_PREFETCH_TIMEOUT_SECONDS * 0.9:
-                    log.debug(
-                        "Arrival prefetch timed out after %.1fs for %s",
-                        elapsed,
-                        api_uid,
-                    )
-                return False
-            log.debug(
-                "Arrival prefetch failed for %s",
-                api_uid,
-                exc_info=True,
-            )
-        except Exception:
-            log.debug(
-                "Arrival prefetch failed for %s",
-                api_uid,
-                exc_info=True,
-            )
-        finally:
-            stop_watch.set()
-            watcher.join(timeout=1.0)
-            if self._arrival_fetch_cancellable is fetch_cancellable:
-                self._arrival_fetch_cancellable = None
-        return False
 
     def _account_sync_worker(
         self,
@@ -473,7 +365,7 @@ class OfflineBodySyncCoordinator:
         mode: OfflineBodySyncMode,
         cancellable: Gio.Cancellable,
         *,
-        folders: list[Camel.Folder] | None = None,
+        folders: list[str] | None = None,
         folder_index: int = 0,
     ) -> None:
         # Respect interactive Archive/folder holds: do not resume body backfill
@@ -506,7 +398,7 @@ class OfflineBodySyncCoordinator:
         mode: OfflineBodySyncMode,
         cancellable: Gio.Cancellable,
         *,
-        folders: list[Camel.Folder] | None = None,
+        folders: list[str] | None = None,
         folder_index: int = 0,
     ) -> bool:
         expression = downsync_expression_for_mode(mode)
@@ -517,8 +409,14 @@ class OfflineBodySyncCoordinator:
         account_label = account.display_label
 
         if folders is None:
-            folders = self._collect_downsync_folders(account_uid, cancellable)
-            if folders is None:
+            try:
+                folders = self._mail.list_offline_downsync_folders(account_uid)
+            except Exception:
+                log.debug(
+                    "Skipping offline body sync for unavailable account %s",
+                    account_uid,
+                    exc_info=True,
+                )
                 return True
             folder_index = 0
 
@@ -539,14 +437,10 @@ class OfflineBodySyncCoordinator:
                 )
                 return False
 
-            folder = folders[folder_index]
+            folder_name = folders[folder_index]
             folder_index += 1
-            if not isinstance(folder, Camel.OfflineFolder):
+            if not folder_name:
                 continue
-            apply_offline_sync_to_folder(folder, mode)
-            if not folder.can_downsync():
-                continue
-            folder_name = folder.get_full_name() or ""
             self._notify_progress(
                 OfflineSyncProgress(
                     account_uid=account_uid,
@@ -558,7 +452,16 @@ class OfflineBodySyncCoordinator:
             # Do not call continue_heavy_folder_index with refresh here: M365
             # refresh_info can pin post-mail-io (#208). Index local summary only
             # after body downsync so the list tracks newly cached headers.
-            self._downsync_folder_sync(folder, expression, cancellable)
+            try:
+                self._mail.offline_downsync_folder(
+                    account_uid, folder_name, expression
+                )
+            except Exception:
+                log.debug(
+                    "Offline downsync failed for folder %r",
+                    folder_name,
+                    exc_info=True,
+                )
             if is_heavy_folder_name(folder_name) and not cancellable.is_cancelled():
                 try:
                     self._mail.continue_heavy_folder_index(
@@ -575,64 +478,11 @@ class OfflineBodySyncCoordinator:
 
         return True
 
-    def _collect_downsync_folders(
-        self,
-        account_uid: str,
-        cancellable: Gio.Cancellable,
-    ) -> list[Camel.Folder] | None:
-        try:
-            store = self._mail._get_store_unlocked(account_uid)  # noqa: SLF001
-        except Exception:
-            log.debug(
-                "Skipping offline body sync for unavailable account %s",
-                account_uid,
-                exc_info=True,
-            )
-            return None
-
-        if not isinstance(store, Camel.OfflineStore):
-            return None
-
-        if not store.requires_downsync():
-            log.debug(
-                "Store %s reports no downsync required; running backfill anyway",
-                account_uid,
-            )
-
-        folders: list[Camel.Folder] = []
-        try:
-            listed = store.dup_downsync_folders()
-            if listed:
-                folders.extend(listed)
-        except Exception:
-            log.debug("dup_downsync_folders failed for %s", account_uid, exc_info=True)
-
-        if not folders:
-            try:
-                for folder_info in self._mail._list_folders_unlocked(account_uid):  # noqa: SLF001
-                    full_name = folder_info.get("full_name")
-                    if not isinstance(full_name, str) or not full_name:
-                        continue
-                    if not folder_can_contain_messages(folder_info):
-                        continue
-                    folder = store.get_folder_sync(full_name, 0, cancellable)
-                    if folder is not None:
-                        folders.append(folder)
-            except Exception:
-                log.debug(
-                    "Could not list folders for offline sync on %s",
-                    account_uid,
-                    exc_info=True,
-                )
-                return None
-
-        return self._sort_folders_by_offline_priority(folders)
-
     @staticmethod
     def _sort_folders_by_offline_priority(
         folders: list[Camel.Folder],
     ) -> list[Camel.Folder]:
-        """Ordinary → Archive → Trash → Junk (#208)."""
+        """Ordinary → Archive → Trash → Junk (#208). Kept for unit tests."""
 
         def sort_key(folder: Camel.Folder) -> tuple[int, str]:
             name = folder.get_full_name() or ""
@@ -650,68 +500,3 @@ class OfflineBodySyncCoordinator:
             return (priority, name.lower())
 
         return sorted(folders, key=sort_key)
-
-    def _downsync_folder_sync(
-        self,
-        folder: Camel.OfflineFolder,
-        expression: str,
-        account_cancellable: Gio.Cancellable,
-    ) -> None:
-        """Downsync one folder; timeout cancels only this folder (#208)."""
-        if account_cancellable.is_cancelled():
-            return
-        folder_name = folder.get_full_name() or ""
-        chunk_cancellable = Gio.Cancellable()
-        stop_watch = threading.Event()
-
-        def _watch_account_and_timeout() -> None:
-            deadline = time.monotonic() + _OFFLINE_DOWNSYNC_TIMEOUT_SECONDS
-            while not stop_watch.is_set():
-                if account_cancellable.is_cancelled():
-                    chunk_cancellable.cancel()
-                    return
-                if time.monotonic() >= deadline:
-                    chunk_cancellable.cancel()
-                    return
-                stop_watch.wait(0.05)
-
-        watcher = threading.Thread(
-            target=_watch_account_and_timeout,
-            name="post-offline-downsync-watch",
-            daemon=True,
-        )
-        started = time.monotonic()
-        watcher.start()
-        try:
-            folder.downsync_sync(expression, chunk_cancellable)
-        except GLib.Error as exc:
-            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
-                elapsed = time.monotonic() - started
-                if account_cancellable.is_cancelled():
-                    log.debug(
-                        "Offline downsync cancelled for folder %r after %.1fs",
-                        folder_name,
-                        elapsed,
-                    )
-                elif elapsed >= _OFFLINE_DOWNSYNC_TIMEOUT_SECONDS * 0.9:
-                    log.warning(
-                        "Offline downsync timed out after %.1fs for folder %r "
-                        "(continuing with next folder)",
-                        elapsed,
-                        folder_name,
-                    )
-                else:
-                    log.debug(
-                        "Offline downsync cancelled for folder %r after %.1fs",
-                        folder_name,
-                        elapsed,
-                    )
-                return
-            log.debug(
-                "Offline downsync failed for folder %r",
-                folder_name,
-                exc_info=True,
-            )
-        finally:
-            stop_watch.set()
-            watcher.join(timeout=1.0)
