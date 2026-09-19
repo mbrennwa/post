@@ -768,7 +768,9 @@ class MailService:
         default=None, init=False, repr=False
     )
     _mail_io_callbacks_registered: bool = field(default=False, init=False, repr=False)
-    _offline_body_sync_held: bool = field(default=False, init=False, repr=False)
+    _offline_body_sync_held_accounts: set[str] = field(
+        default_factory=set, init=False, repr=False
+    )
     _folder_search_cancellable: Gio.Cancellable | None = field(
         default=None, init=False, repr=False
     )
@@ -980,30 +982,34 @@ class MailService:
     def is_network_available(self) -> bool:
         return self._network_available
 
-    def hold_offline_body_sync(self, hold: bool) -> None:
-        """Pause or resume background offline body caching for interactive UI.
+    def hold_offline_body_sync(self, hold: bool, *, account_uid: str) -> None:
+        """Pause or resume full-account offline body caching for one account.
 
-        While held, folder opens / Archive indexing keep the mail I/O thread;
-        other accounts' full-account backfill must not resume until released
-        (#407: hold lasts for heavy-folder indexing, not the whole selection).
+        While held, that account's folder open / Archive indexing owns its Camel
+        I/O; only that account's full-account backfill is paused (#407 timing,
+        #449 account scope — other accounts keep crawling).
         """
-        self._offline_body_sync_held = bool(hold)
         if hold:
-            self.offline_sync.cancel_all()
+            self._offline_body_sync_held_accounts.add(account_uid)
+            self.offline_sync.cancel_account(account_uid)
         else:
-            self.schedule_offline_body_sync()
+            self._offline_body_sync_held_accounts.discard(account_uid)
+            self.schedule_offline_body_sync(account_uid)
 
-    def offline_body_sync_is_held(self) -> bool:
-        """True while folder opens / heavy-folder indexing owns mail I/O (#208)."""
-        return self._offline_body_sync_held
+    def offline_body_sync_is_held(self, account_uid: str) -> bool:
+        """True while this account's heavy-folder work holds its downsync (#449)."""
+        return account_uid in self._offline_body_sync_held_accounts
 
     def schedule_offline_body_sync(self, account_uid: str | None = None) -> None:
-        if self._offline_body_sync_held:
-            return
-        if account_uid is None:
-            self.offline_sync.schedule_all_accounts()
-        else:
+        if account_uid is not None:
+            if account_uid in self._offline_body_sync_held_accounts:
+                return
             self.offline_sync.schedule_account(account_uid)
+            return
+        for account in self.list_accounts():
+            if account.uid in self._offline_body_sync_held_accounts:
+                continue
+            self.offline_sync.schedule_account(account.uid)
 
     def schedule_arrival_body_prefetch(
         self,
@@ -3275,12 +3281,39 @@ class MailService:
 
     def _flush_operation_queue_unlocked(self) -> int:
         flushed = 0
+        skip_accounts: set[str] = set()
         self._flushing_operation_queue = True
         try:
             for queue_id, operation in list_queued_operations():
+                if operation.account_uid in skip_accounts:
+                    continue
+                if self.get_account_connect_health(operation.account_uid) == (
+                    "needs_sign_in"
+                ):
+                    skip_accounts.add(operation.account_uid)
+                    continue
                 try:
                     self._execute_queued_operation_unlocked(operation)
-                except Exception:
+                except Exception as exc:
+                    if is_sign_in_required_error(exc):
+                        self.set_account_connect_health(
+                            operation.account_uid, "needs_sign_in"
+                        )
+                        log.warning(
+                            "Queued operation %s (%s) waiting for sign-in (%s)",
+                            queue_id,
+                            operation.op_type,
+                            operation.account_uid,
+                        )
+                        skip_accounts.add(operation.account_uid)
+                        continue
+                    if is_queueable_network_error(exc):
+                        log.warning(
+                            "Queued operation %s (%s) deferred: network unavailable",
+                            queue_id,
+                            operation.op_type,
+                        )
+                        break
                     log.exception(
                         "Failed to flush queued operation %s (%s)",
                         queue_id,

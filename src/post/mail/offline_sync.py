@@ -478,7 +478,7 @@ class OfflineBodySyncCoordinator:
     ) -> None:
         # Respect interactive Archive/folder holds: do not resume body backfill
         # while the UI has paused offline sync (#208).
-        if self._mail.offline_body_sync_is_held():
+        if self._mail.offline_body_sync_is_held(account_uid):
             self._running.discard(account_uid)
             self._cancellables.pop(account_uid, None)
             if not self._running:
@@ -525,7 +525,7 @@ class OfflineBodySyncCoordinator:
         while folder_index < len(folders):
             if cancellable.is_cancelled():
                 return True
-            if self._mail.offline_body_sync_is_held():
+            if self._mail.offline_body_sync_is_held(account_uid):
                 return True
             if self._mail.has_interactive_work_pending():
                 self._mail.submit_background(
