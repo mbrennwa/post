@@ -12,7 +12,7 @@ from post.mail.eds import MailService
 
 
 class HelperFlagRoutingTests(unittest.TestCase):
-    def test_set_messages_seen_uses_helper_when_enabled(self) -> None:
+    def test_set_messages_seen_uses_helper(self) -> None:
         service = MailService(registry=mock.Mock())
         with (
             mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True),
@@ -35,7 +35,10 @@ class HelperFlagRoutingTests(unittest.TestCase):
         )
         run_mail.assert_not_called()
 
-    def test_set_messages_seen_uses_mail_thread_when_helpers_off(self) -> None:
+    def test_set_messages_seen_uses_mail_thread_when_helpers_disabled_for_tests(
+        self,
+    ) -> None:
+        """In-process path is only for ``POST_MAIL_TEST_NO_CAMEL_HELPERS``."""
         service = MailService(registry=mock.Mock())
         with (
             mock.patch("post.mail.eds.camel_helpers_enabled", return_value=False),
@@ -52,7 +55,7 @@ class HelperFlagRoutingTests(unittest.TestCase):
         helper_call.assert_not_called()
         run_mail.assert_called_once()
 
-    def test_toggle_message_seen_uses_helper_when_enabled(self) -> None:
+    def test_toggle_message_seen_uses_helper(self) -> None:
         service = MailService(registry=mock.Mock())
         with (
             mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True),
@@ -68,7 +71,7 @@ class HelperFlagRoutingTests(unittest.TestCase):
             ["acct", "INBOX", "uid-1"],
         )
 
-    def test_set_messages_flagged_mirrors_disk_cache_when_helpers_on(self) -> None:
+    def test_set_messages_flagged_mirrors_disk_cache(self) -> None:
         """Helper flag writes must update shared folder-index disk cache (#445)."""
         service = MailService(registry=mock.Mock())
         helper_result = {

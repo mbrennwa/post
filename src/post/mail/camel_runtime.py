@@ -29,8 +29,13 @@ _DEFAULT_JOB_TIMEOUT = 120.0
 def camel_helpers_enabled() -> bool:
     """True when the UI should spawn per-account Camel helpers.
 
-    Always on in the UI. Disabled inside helper processes (no nesting). Unit
-    tests may set ``POST_MAIL_TEST_NO_CAMEL_HELPERS=1``.
+    Always ``True`` in the product UI. Returns ``False`` only when:
+
+    - running inside a helper (``POST_MAIL_CAMEL_HELPER_PROCESS=1``, no nesting), or
+    - unit tests set ``POST_MAIL_TEST_NO_CAMEL_HELPERS=1`` (in-process Camel mocks).
+
+    There is no product opt-out. ``MailService`` still has in-process branches for
+    that test escape hatch only.
     """
     if os.environ.get(_HELPER_PROCESS_ENV) == "1":
         return False

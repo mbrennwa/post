@@ -232,12 +232,12 @@ _TRANSFER_TIMEOUT_SECONDS = 45
 # after Camel has already moved messages (M365 Graph can hang here).
 _TRANSFER_POST_TIMEOUT_SECONDS = 30
 # Per-folder refresh_info_sync / store FolderInfo REFRESH for sidebar counts
-# must not pin post-mail-io (#197, #210).
+# must not pin a Camel worker forever (#197, #210).
 _FOLDER_STATS_TIMEOUT_SECONDS = 15
 # Bound get_message_sync so revoked GOA tokens cannot leave the reader hung (#341).
 _MESSAGE_READ_TIMEOUT_SECONDS = 30
 # Network reconnect set_online_sync per store (#400). Same order as GOA
-# EnsureCredentials so one dead OAuth account cannot pin post-mail-io / GTK.
+# EnsureCredentials so one dead OAuth account cannot pin a Camel worker / GTK.
 _NETWORK_RECONNECT_TIMEOUT_SECONDS = 15
 # Stay below Camel IMAPx MAX_UIDSET_ITEMS (100) to avoid spurious uidset warnings
 # in evolution-data-server 3.56 when batching UID MOVE/COPY commands.
@@ -1487,7 +1487,12 @@ class MailService:
             self._leave_mail_op()
 
     def has_interactive_work_pending(self) -> bool:
-        """True when interactive mail jobs are queued on ``post-mail-io``."""
+        """True when interactive mail jobs are queued on the UI mail worker.
+
+        With helpers on (product), Camel work runs in helper processes; this
+        still reflects UI-side ``post-mail-io`` / job threads used for non-Camel
+        or test in-process paths.
+        """
         return get_mail_io_thread().has_interactive_work_pending()
 
     def submit_interactive(
@@ -1496,7 +1501,7 @@ class MailService:
         """Queue named interactive mail work (today's ``submit`` queue)."""
         log.debug("Mail job queue=interactive name=%s", name)
         if camel_helpers_enabled():
-            # Do not pin shared post-mail-io on helper IPC (#437).
+            # Helper IPC must not share one UI Camel FIFO (#437).
             threading.Thread(
                 target=func,
                 args=args,
@@ -1560,9 +1565,8 @@ class MailService:
         for open-folder refresh so it stays on today's background Camel queue.
 
         ``runner="graph_http"`` (or ``auto`` for M365 background count jobs) runs
-        on ``post-graph-http`` so Camel ``post-mail-io`` is free. When Camel
-        helpers are enabled (#437), account-scoped Camel work runs on that
-        account's helper worker (not the shared UI ``post-mail-io``). Gmail
+        on ``post-graph-http`` so the account Camel helper is free. Account-scoped
+        Camel work runs on that account's helper worker (#437 / #445). Gmail
         Camel overlap stays fail-closed (see ``gmail_camel_overlap_enabled``).
         """
         resolved_queue = queue or default_queue_for_lane(
@@ -1589,7 +1593,7 @@ class MailService:
         ):
             log.warning(
                 "Gmail Camel overlap gate is on but same-session dual Camel is "
-                "not enabled (#435 fail-closed); serializing on post-mail-io "
+                "not enabled (#435 fail-closed); keeping serial Camel for "
                 "name=%s",
                 name,
             )
@@ -1750,7 +1754,7 @@ class MailService:
     def get_account_folder_stats_via_graph(
         self, account_uid: str
     ) -> dict[str, tuple[int, int]]:
-        """STATUS-style counts via Graph HTTP (#435). Safe off ``post-mail-io``.
+        """STATUS-style counts via Graph HTTP (#435). Safe off the Camel helper.
 
         Obtains the OAuth token with a short mail-thread call, then performs
         Soup Graph requests on the caller thread (``post-graph-http``).
@@ -11660,7 +11664,7 @@ class MailService:
                 )
             return
 
-        # No RAM index in this process (common in the UI when helpers own Camel):
+        # No RAM index in this process (UI process: helpers own Camel):
         # patch the shared disk cache so the next folder open is not stale.
         cached = folder_index_cache.load(account_uid, folder_name)
         if cached is None or not updates:

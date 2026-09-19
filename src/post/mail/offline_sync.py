@@ -39,7 +39,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Bound downsync_sync so one folder cannot pin post-mail-io for minutes (#197).
+# Bound downsync_sync so one folder cannot pin that account's Camel helper
+# for minutes (#197).
 OFFLINE_DOWNSYNC_TIMEOUT_SECONDS = 30
 # Per-UID arrival FETCH (#372). Short so interactive mail I/O is not pinned.
 ARRIVAL_PREFETCH_BURST = 20
@@ -450,8 +451,9 @@ class OfflineBodySyncCoordinator:
                 )
             )
             # Do not call continue_heavy_folder_index with refresh here: M365
-            # refresh_info can pin post-mail-io (#208). Index local summary only
-            # after body downsync so the list tracks newly cached headers.
+            # refresh_info can pin that account's Camel helper (#208). Index
+            # local summary only after body downsync so the list tracks newly
+            # cached headers.
             try:
                 self._mail.offline_downsync_folder(
                     account_uid, folder_name, expression

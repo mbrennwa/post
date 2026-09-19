@@ -21,7 +21,11 @@ _SAFE_UID = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def default_evolution_dirs() -> tuple[str, str]:
-    """System Evolution locations (single in-process Camel / helpers off)."""
+    """System Evolution Camel locations (non-helper / legacy fallback).
+
+    Product helpers use ``helper_camel_dirs`` instead. These paths remain for
+    ``resolve_camel_dirs`` when not in a helper process (tests, rare fallbacks).
+    """
     return (
         os.path.expanduser("~/.local/share/evolution"),
         os.path.expanduser("~/.cache/evolution"),
