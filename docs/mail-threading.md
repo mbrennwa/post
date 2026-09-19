@@ -49,7 +49,7 @@ overlap inside one Gmail process was deferred — not part of the shipped end st
 ## Rules for contributors
 
 1. **Never call `MailIoThread.run_sync()` / `run_on_mail_thread()` from the GTK thread** — it blocks the UI. From GTK use `MailService.submit_interactive` / `submit_front` / `submit_background` / `submit_job` or `*_async` (not `get_mail_io_thread()`). Fixed examples (#443): sidebar Archive “read and unflagged” count; quit uses `shutdown_async` (not `shutdown_sync` on GTK); Add-to-calendar lists EDS calendars off GTK; startup uses `MailService.connect_async`.
-2. **Never call `Camel.*_sync` directly from UI or ad-hoc worker threads** — go through `MailService` (helper IPC when helpers are on).
+2. **Never call `Camel.*_sync` directly from UI or ad-hoc worker threads** — go through `MailService` (product path is helper IPC).
 3. **One `MailSession` per process** — in a helper, that session is for one account; do not add a second in-process session in the UI process. Do not reintroduce legacy per-thread worker sessions in the UI.
 4. **Password / OAuth prompts** — use `GLib.idle_add` to show dialogs on the GTK thread; mail thread waits on the result. Do **not** call GOA `EnsureCredentials` synchronously from the GTK thread (compose must not preflight on the UI thread; see #156). Nested `GLib.MainLoop` for password/folder dialogs is intentional (modal); do not use that pattern for Camel/EDS I/O.
 5. **Outbound send** — compose persists to outbox first, then delivers via Camel `transport.send_to_sync` on the account helper. No `smtplib` send path. Send and draft save use a **finite** cancellable timeout; draft failures/timeouts fall back to the local draft queue.

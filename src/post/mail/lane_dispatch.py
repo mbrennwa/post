@@ -100,7 +100,7 @@ class FolderJobLock:
 
 
 class GraphHttpWorker:
-    """Serial queue for Graph HTTP that does **not** use ``post-mail-io``."""
+    """Serial queue for Graph HTTP that does **not** use the Camel helper FIFO."""
 
     def __init__(self) -> None:
         self._queue: collections.deque[Callable[[], None]] = collections.deque()

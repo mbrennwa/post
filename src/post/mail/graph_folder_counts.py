@@ -81,7 +81,7 @@ def fetch_mail_folder_counts_by_display_name(
 ) -> dict[str, tuple[int, int]]:
     """Return ``displayName.casefold() → (unread, total)`` for top-level Graph folders.
 
-    Used by Phase 2 (#435) M365 background STATUS so Camel ``post-mail-io`` is
+    Used by Phase 2 (#435) M365 background STATUS so the account Camel helper is
     not held for store FolderInfo REFRESH.
     """
     out: dict[str, tuple[int, int]] = {}
