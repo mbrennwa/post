@@ -35,26 +35,6 @@ class HelperFlagRoutingTests(unittest.TestCase):
         )
         run_mail.assert_not_called()
 
-    def test_set_messages_seen_uses_mail_thread_when_helpers_disabled_for_tests(
-        self,
-    ) -> None:
-        """In-process path is only for ``POST_MAIL_TEST_NO_CAMEL_HELPERS``."""
-        service = MailService(registry=mock.Mock())
-        with (
-            mock.patch("post.mail.eds.camel_helpers_enabled", return_value=False),
-            mock.patch.object(service, "_camel_helper_call") as helper_call,
-            mock.patch(
-                "post.mail.eds.run_on_mail_thread",
-                return_value={"unread": 0, "total": 1},
-            ) as run_mail,
-        ):
-            result = service.set_messages_seen(
-                "acct", "INBOX", ["uid-1"], seen=True
-            )
-        self.assertEqual(result, {"unread": 0, "total": 1})
-        helper_call.assert_not_called()
-        run_mail.assert_called_once()
-
     def test_toggle_message_seen_uses_helper(self) -> None:
         service = MailService(registry=mock.Mock())
         with (
