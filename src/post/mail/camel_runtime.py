@@ -44,6 +44,17 @@ def camel_helpers_enabled() -> bool:
 class CamelHelperError(RuntimeError):
     """Raised when a helper call fails or the process is killed."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+        self.details = details or {}
+
 
 class CamelHelperTimeout(CamelHelperError):
     """Raised when a helper job exceeds the watchdog timeout."""
@@ -281,9 +292,16 @@ class AccountCamelRuntime:
         if not msg.get("ok"):
             err = str(msg.get("error") or "camel helper call failed")
             err_type = str(msg.get("error_type") or "CamelHelperError")
+            details = msg.get("error_details")
+            if not isinstance(details, dict):
+                details = None
             if err_type == "CamelHelperTimeout":
-                raise CamelHelperTimeout(err)
-            raise CamelHelperError(f"{err_type}: {err}")
+                raise CamelHelperTimeout(err, error_type=err_type, details=details)
+            raise CamelHelperError(
+                f"{err_type}: {err}",
+                error_type=err_type,
+                details=details,
+            )
         return msg.get("result")
 
     def submit_worker(self, func: Callable[[], None]) -> None:

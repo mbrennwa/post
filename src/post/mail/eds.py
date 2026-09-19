@@ -1312,10 +1312,25 @@ class MailService:
             )
         except CamelHelperError as exc:
             text = str(exc)
-            if text.startswith("MessageNotAvailableError:"):
-                uid = str(args[2]) if len(args) >= 3 else text
-                folder = str(args[1]) if len(args) >= 2 else None
-                raise MessageNotAvailableError(uid, folder) from exc
+            err_type = getattr(exc, "error_type", None) or ""
+            details = getattr(exc, "details", None) or {}
+            if (
+                err_type == "MessageNotAvailableError"
+                or text.startswith("MessageNotAvailableError:")
+            ):
+                uid = str(
+                    details.get("message_uid")
+                    or (args[2] if len(args) >= 3 else text)
+                )
+                folder = details.get("folder_name")
+                if folder is None and len(args) >= 2:
+                    folder = str(args[1])
+                reason = str(
+                    details.get("reason") or MessageUnavailableReason.VANISHED
+                )
+                raise MessageNotAvailableError(
+                    uid, folder, reason=reason
+                ) from exc
             # One retry after a crashed helper. Do not kill_account first — the
             # process is already dead; an extra kill storms SIGKILL (-9) and
             # races concurrent callers (#445).
@@ -6000,11 +6015,28 @@ class MailService:
         names = [folder_name] if folder_name else []
         if not folder_name or folder_name.lower() == "inbox":
             names.extend(["Inbox", "INBOX"])
-        cache_root = os.path.expanduser("~/.cache/evolution")
-        for store_root in evolution_store_roots(cache_root, store_uid):
-            found = find_nonempty_rfc822(store_root, names, digest)
-            if found is not None:
-                return found
+        # Search helper private cache (when set) and system Evolution cache.
+        # Helpers use ~/.cache/post/camel-helper/<uid>/cache; pre-helper or
+        # UI-era bodies often still live under ~/.cache/evolution (#445 / GOA).
+        from post.mail.camel_paths import default_evolution_dirs, resolve_camel_dirs
+
+        cache_roots: list[str] = []
+        try:
+            _data, helper_or_env_cache = resolve_camel_dirs()
+            cache_roots.append(helper_or_env_cache)
+        except Exception:
+            pass
+        _sys_data, sys_cache = default_evolution_dirs()
+        cache_roots.append(sys_cache)
+        seen_roots: set[str] = set()
+        for cache_root in cache_roots:
+            if not cache_root or cache_root in seen_roots:
+                continue
+            seen_roots.add(cache_root)
+            for store_root in evolution_store_roots(cache_root, store_uid):
+                found = find_nonempty_rfc822(store_root, names, digest)
+                if found is not None:
+                    return found
         return None
 
     def _construct_mime_from_rfc822_path(self, filename: str) -> Any | None:
@@ -6395,6 +6427,16 @@ class MailService:
                 raise err from cause
             raise err
 
+        # Not in Camel summary / folder-index: still prefer sign-in over
+        # "vanished" when GOA/Graph auth is the failure (keeps the list row).
+        if cause is not None and is_sign_in_required_error(cause):
+            cached = self._try_message_cached(folder, api_uid)
+            if cached is not None:
+                self.set_account_connect_health(account_uid, "needs_sign_in")
+                return cached
+            self._raise_uncached_sign_in(
+                account_uid, folder_name, message_uid, cause=cause
+            )
         if cause is not None:
             raise MessageNotAvailableError(message_uid, folder_name) from cause
         raise MessageNotAvailableError(message_uid, folder_name)
