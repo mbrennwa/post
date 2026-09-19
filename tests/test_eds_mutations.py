@@ -60,22 +60,6 @@ class DraftDispatchTests(unittest.TestCase):
         self.assertEqual((folder_name, uid), ("Drafts", "draft-1"))
 
     @mock.patch("post.mail.eds.run_on_mail_thread")
-    def test_read_attachment_data_uses_mail_thread(self, run_on_mail_thread) -> None:
-        run_on_mail_thread.return_value = ("file.txt", b"data")
-        service = MailService(registry=mock.Mock())
-
-        result = service.read_attachment_data("acct-1", "INBOX", "1", 0)
-
-        run_on_mail_thread.assert_called_once_with(
-            service._read_attachment_data_unlocked,
-            "acct-1",
-            "INBOX",
-            "1",
-            0,
-        )
-        self.assertEqual(result, ("file.txt", b"data"))
-
-    @mock.patch("post.mail.eds.run_on_mail_thread")
     def test_read_compose_attachments_uses_mail_thread(
         self, run_on_mail_thread
     ) -> None:
@@ -92,32 +76,53 @@ class DraftDispatchTests(unittest.TestCase):
         )
         self.assertEqual(result, [])
 
-    @mock.patch("post.mail.eds.run_on_mail_thread")
-    def test_toggle_message_seen_uses_mail_thread(self, run_on_mail_thread) -> None:
-        run_on_mail_thread.return_value = {"updates": []}
+    def test_read_attachment_data_uses_camel_helper(self) -> None:
         service = MailService(registry=mock.Mock())
+        with mock.patch.object(
+            service,
+            "_camel_helper_call",
+            return_value=("file.txt", b"data"),
+        ) as helper_call:
+            result = service.read_attachment_data("acct-1", "INBOX", "1", 0)
 
-        service.toggle_message_seen("acct-1", "INBOX", "42")
-
-        run_on_mail_thread.assert_called_once_with(
-            service._toggle_message_seen_unlocked,
+        helper_call.assert_called_once_with(
+            "read_attachment_data",
             "acct-1",
-            "INBOX",
-            "42",
+            ["acct-1", "INBOX", "1", 0],
+        )
+        self.assertEqual(result, ("file.txt", b"data"))
+
+    def test_toggle_message_seen_uses_camel_helper(self) -> None:
+        service = MailService(registry=mock.Mock())
+        with (
+            mock.patch.object(
+                service,
+                "_camel_helper_call",
+                return_value={"updates": []},
+            ) as helper_call,
+            mock.patch.object(service, "_mirror_flag_result_to_folder_caches"),
+        ):
+            service.toggle_message_seen("acct-1", "INBOX", "42")
+
+        helper_call.assert_called_once_with(
+            "toggle_message_seen",
+            "acct-1",
+            ["acct-1", "INBOX", "42"],
         )
 
-    @mock.patch("post.mail.eds.run_on_mail_thread")
-    def test_move_messages_to_trash_uses_mail_thread(self, run_on_mail_thread) -> None:
-        run_on_mail_thread.return_value = {"moved_uids": ["1"]}
+    def test_move_messages_to_trash_uses_camel_helper(self) -> None:
         service = MailService(registry=mock.Mock())
+        with mock.patch.object(
+            service,
+            "_camel_helper_call",
+            return_value={"moved_uids": ["1"]},
+        ) as helper_call:
+            service.move_messages_to_trash("acct-1", "INBOX", ["1"])
 
-        service.move_messages_to_trash("acct-1", "INBOX", ["1"])
-
-        run_on_mail_thread.assert_called_once_with(
-            service._move_messages_to_trash_unlocked,
+        helper_call.assert_called_once_with(
+            "move_messages_to_trash",
             "acct-1",
-            "INBOX",
-            ["1"],
+            ["acct-1", "INBOX", ["1"]],
         )
 
 

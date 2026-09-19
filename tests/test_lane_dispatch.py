@@ -130,11 +130,14 @@ class MailSubmitJobTests(unittest.TestCase):
         submit_bg.assert_not_called()
         self.assertTrue(ran.is_set())
 
-    def test_submit_job_non_m365_background_uses_camel_queue(self) -> None:
+    def test_submit_job_non_m365_background_uses_helper_worker(self) -> None:
         with (
             mock.patch.object(
                 self.service, "_account_backend_is_microsoft365", return_value=False
             ),
+            mock.patch.object(
+                self.service._camel_pool, "submit_worker"
+            ) as submit_helper,
             mock.patch.object(self.service, "submit_background") as submit_bg,
             mock.patch("post.mail.eds.graph_http_worker") as graph_worker,
         ):
@@ -144,11 +147,17 @@ class MailSubmitJobTests(unittest.TestCase):
                 epic_lane="background",
                 account_uid="acct-gmail",
             )
-        submit_bg.assert_called_once()
+        submit_helper.assert_called_once()
+        submit_bg.assert_not_called()
         graph_worker.return_value.submit.assert_not_called()
 
-    def test_open_folder_refresh_is_foreground_but_preemptible(self) -> None:
-        with mock.patch.object(self.service, "submit_background") as submit_bg:
+    def test_open_folder_refresh_uses_helper_worker(self) -> None:
+        with (
+            mock.patch.object(
+                self.service._camel_pool, "submit_worker"
+            ) as submit_helper,
+            mock.patch.object(self.service, "submit_background") as submit_bg,
+        ):
             self.service.submit_job(
                 "folder_message_sync",
                 lambda: None,
@@ -157,4 +166,5 @@ class MailSubmitJobTests(unittest.TestCase):
                 folder="INBOX",
                 preemptible=True,
             )
-        submit_bg.assert_called_once()
+        submit_helper.assert_called_once()
+        submit_bg.assert_not_called()

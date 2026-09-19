@@ -15,7 +15,6 @@ class HelperFlagRoutingTests(unittest.TestCase):
     def test_set_messages_seen_uses_helper(self) -> None:
         service = MailService(registry=mock.Mock())
         with (
-            mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True),
             mock.patch.object(
                 service,
                 "_camel_helper_call",
@@ -37,12 +36,9 @@ class HelperFlagRoutingTests(unittest.TestCase):
 
     def test_toggle_message_seen_uses_helper(self) -> None:
         service = MailService(registry=mock.Mock())
-        with (
-            mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True),
-            mock.patch.object(
-                service, "_camel_helper_call", return_value={"seen": False}
-            ) as helper_call,
-        ):
+        with mock.patch.object(
+            service, "_camel_helper_call", return_value={"seen": False}
+        ) as helper_call:
             result = service.toggle_message_seen("acct", "INBOX", "uid-1")
         self.assertEqual(result, {"seen": False})
         helper_call.assert_called_once_with(
@@ -59,7 +55,6 @@ class HelperFlagRoutingTests(unittest.TestCase):
             "queued": False,
         }
         with (
-            mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True),
             mock.patch.object(
                 service, "_camel_helper_call", return_value=helper_result
             ),

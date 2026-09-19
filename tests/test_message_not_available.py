@@ -83,20 +83,19 @@ class ReadMessageFetchRetryTests(unittest.TestCase):
         )
         recovered = {"uid": "42", "subject": "ok"}
         with (
-            patch("post.mail.eds.camel_helpers_enabled", return_value=False),
-            patch("post.mail.eds.run_on_mail_thread") as run_mail,
+            patch.object(service, "_camel_helper_call") as helper_call,
             patch.object(
                 service,
                 "synchronize_folder_message",
                 return_value={"status": "fetched"},
             ) as sync,
         ):
-            run_mail.side_effect = [first, recovered]
+            helper_call.side_effect = [first, recovered]
             result = service.read_message("acct", "INBOX", "42", mark_seen=False)
 
         self.assertEqual(result, recovered)
         sync.assert_called_once_with("acct", "INBOX", "42", force=True)
-        self.assertEqual(run_mail.call_count, 2)
+        self.assertEqual(helper_call.call_count, 2)
 
 
 class MissingMessageErrorDetectionTests(unittest.TestCase):
