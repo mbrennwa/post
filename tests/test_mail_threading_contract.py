@@ -105,13 +105,15 @@ class MailThreadingContractTests(unittest.TestCase):
         self.assertTrue(doc.is_file(), "docs/mail-threading.md is required")
         text = doc.read_text(encoding="utf-8")
         self.assertIn("post-mail-io", text)
-        self.assertIn("Manual regression matrix", text)
+        self.assertIn("Manual soak", text)
+        self.assertIn("#422", text)
         self.assertIn("submit_interactive", text)
         self.assertIn("job", text.lower())
         self.assertIn("shutdown_async", text)
         self.assertIn("connect_async", text)
         self.assertIn("camel-helper", text)
         self.assertIn("POST_MAIL_CAMEL_HELPER_PROCESS", text)
+        self.assertIn("POST_MAIL_TEST_NO_CAMEL_HELPERS", text)
 
     def test_sidebar_archive_read_unflagged_counts_async(self) -> None:
         """GTK must not block on count before the confirm dialog (#443)."""
