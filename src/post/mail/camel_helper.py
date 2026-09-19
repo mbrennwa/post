@@ -181,17 +181,29 @@ def main(argv: list[str] | None = None) -> int:
                 account_uid,
                 exc_info=True,
             )
-            write_message(
-                stdout,
-                {
-                    "type": "result",
-                    "id": req_id,
-                    "ok": False,
-                    "error": str(exc) or repr(exc),
-                    "error_type": type(exc).__name__,
-                    "traceback": traceback.format_exc(),
-                },
-            )
+            payload: dict[str, Any] = {
+                "type": "result",
+                "id": req_id,
+                "ok": False,
+                "error": str(exc) or repr(exc),
+                "error_type": type(exc).__name__,
+                "traceback": traceback.format_exc(),
+            }
+            # Preserve MessageNotAvailableError.reason across IPC — without it
+            # the UI treats every miss as VANISHED and removes the list row
+            # (wrong for GOA/sign-in cache misses on M365).
+            try:
+                from post.mail.eds import MessageNotAvailableError
+
+                if isinstance(exc, MessageNotAvailableError):
+                    payload["error_details"] = {
+                        "message_uid": exc.message_uid,
+                        "folder_name": exc.folder_name,
+                        "reason": exc.reason,
+                    }
+            except Exception:
+                pass
+            write_message(stdout, payload)
 
 
 if __name__ == "__main__":
