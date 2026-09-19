@@ -10,128 +10,89 @@ from post.mail.eds import MailService
 
 
 class ListMessagesPageDispatchTests(unittest.TestCase):
-    @mock.patch("post.mail.eds.is_mail_io_thread", return_value=False)
-    @mock.patch("post.mail.eds.get_mail_io_thread")
-    def test_dispatches_to_mail_thread(self, get_io_thread, _is_mail_io) -> None:
-        io_thread = mock.Mock()
-        io_thread.run_sync.return_value = ([], 0, 0, False)
-        get_io_thread.return_value = io_thread
-
+    def test_dispatches_via_camel_helper(self) -> None:
         service = MailService(registry=mock.Mock())
-        service.list_messages_page(
-            "acct-1",
-            "INBOX",
-            offset=10,
-            limit=25,
-            sync=True,
-        )
-
-        io_thread.run_sync.assert_called_once_with(
-            service._list_messages_page_unlocked,
-            "acct-1",
-            "INBOX",
-            offset=10,
-            limit=25,
-            sync=True,
-        )
-
-    @mock.patch("post.mail.eds.is_mail_io_thread", return_value=True)
-    def test_runs_inline_on_mail_thread(self, _is_mail_io) -> None:
-        service = MailService(registry=mock.Mock())
-        expected = ([{"uid": "1"}], 1, 1, False)
-
         with mock.patch.object(
             service,
-            "_list_messages_page_unlocked",
-            return_value=expected,
-        ) as unlocked:
-            result = service.list_messages_page("acct-1", "INBOX")
+            "_camel_helper_call",
+            return_value=([{"uid": "1"}], 1, 1, False),
+        ) as helper_call:
+            result = service.list_messages_page(
+                "acct-1",
+                "INBOX",
+                offset=10,
+                limit=25,
+                sync=True,
+            )
 
-        unlocked.assert_called_once_with(
+        helper_call.assert_called_once_with(
+            "list_messages_page",
             "acct-1",
-            "INBOX",
-            offset=0,
-            limit=50,
-            sync=True,
+            ["acct-1", "INBOX"],
+            {"offset": 10, "limit": 25, "sync": True},
         )
-        self.assertEqual(result, expected)
+        self.assertEqual(result, ([{"uid": "1"}], 1, 1, False))
 
 
 class ListFoldersDispatchTests(unittest.TestCase):
-    @mock.patch("post.mail.eds.is_mail_io_thread", return_value=False)
-    @mock.patch("post.mail.eds.run_on_mail_thread")
-    def test_dispatches_to_mail_thread(self, run_on_mail_thread, _is_mail_io) -> None:
-        run_on_mail_thread.return_value = [{"full_name": "INBOX"}]
+    def test_dispatches_via_camel_helper(self) -> None:
         service = MailService(registry=mock.Mock())
+        with mock.patch.object(
+            service,
+            "_camel_helper_call",
+            return_value=[{"full_name": "INBOX"}],
+        ) as helper_call:
+            result = service.list_folders("acct-1")
 
-        result = service.list_folders("acct-1")
-
-        run_on_mail_thread.assert_called_once_with(
-            service._list_folders_unlocked,
-            "acct-1",
-            cancellable=None,
+        helper_call.assert_called_once_with(
+            "list_folders", "acct-1", ["acct-1"], {}
         )
         self.assertEqual(result, [{"full_name": "INBOX"}])
 
-    @mock.patch("post.mail.eds.is_mail_io_thread", return_value=True)
-    def test_runs_inline_on_mail_thread(self, _is_mail_io) -> None:
-        service = MailService(registry=mock.Mock())
-        expected = [{"full_name": "INBOX"}]
-
-        with mock.patch.object(
-            service,
-            "_list_folders_unlocked",
-            return_value=expected,
-        ) as unlocked:
-            result = service.list_folders("acct-1")
-
-        unlocked.assert_called_once_with("acct-1", cancellable=None)
-        self.assertEqual(result, expected)
-
 
 class ReadPathDispatchTests(unittest.TestCase):
-    @mock.patch("post.mail.eds.run_on_mail_thread")
-    def test_read_message_uses_mail_thread(self, run_on_mail_thread) -> None:
-        run_on_mail_thread.return_value = {"uid": "1"}
+    def test_read_message_uses_camel_helper(self) -> None:
         service = MailService(registry=mock.Mock())
+        with mock.patch.object(
+            service, "_camel_helper_call", return_value={"uid": "1"}
+        ) as helper_call:
+            result = service.read_message(
+                "acct-1", "INBOX", "42", mark_seen=False
+            )
 
-        result = service.read_message("acct-1", "INBOX", "42", mark_seen=False)
-
-        run_on_mail_thread.assert_called_once_with(
-            service._read_message_unlocked,
+        helper_call.assert_called_once_with(
+            "read_message",
             "acct-1",
-            "INBOX",
-            "42",
-            mark_seen=False,
+            ["acct-1", "INBOX", "42"],
+            {"mark_seen": False},
         )
         self.assertEqual(result, {"uid": "1"})
 
-    @mock.patch("post.mail.eds.run_on_mail_thread")
-    def test_get_folder_stats_uses_mail_thread(self, run_on_mail_thread) -> None:
-        run_on_mail_thread.return_value = (3, 10)
+    def test_get_folder_stats_uses_camel_helper(self) -> None:
         service = MailService(registry=mock.Mock())
+        with mock.patch.object(
+            service, "_camel_helper_call", return_value=(3, 10)
+        ) as helper_call:
+            result = service.get_folder_stats("acct-1", "INBOX")
 
-        result = service.get_folder_stats("acct-1", "INBOX")
-
-        run_on_mail_thread.assert_called_once_with(
-            service._get_folder_stats_unlocked,
+        helper_call.assert_called_once_with(
+            "get_folder_stats",
             "acct-1",
-            "INBOX",
+            ["acct-1", "INBOX"],
         )
         self.assertEqual(result, (3, 10))
 
-    @mock.patch("post.mail.eds.run_on_mail_thread")
-    def test_get_account_folder_stats_uses_mail_thread(
-        self, run_on_mail_thread
-    ) -> None:
-        run_on_mail_thread.return_value = {"INBOX": (1, 2)}
+    def test_get_account_folder_stats_uses_camel_helper(self) -> None:
         service = MailService(registry=mock.Mock())
+        with mock.patch.object(
+            service,
+            "_camel_helper_call",
+            return_value={"INBOX": (1, 2)},
+        ) as helper_call:
+            result = service.get_account_folder_stats("acct-1")
 
-        result = service.get_account_folder_stats("acct-1")
-
-        run_on_mail_thread.assert_called_once_with(
-            service._get_account_folder_stats_unlocked,
-            "acct-1",
+        helper_call.assert_called_once_with(
+            "get_account_folder_stats", "acct-1", ["acct-1"]
         )
         self.assertEqual(result, {"INBOX": (1, 2)})
 
