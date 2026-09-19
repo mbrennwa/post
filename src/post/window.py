@@ -379,6 +379,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._send_delay_status = ""
         self._send_delay_tick_id: int | None = None
         self._offline_held_for_load_generation: int | None = None
+        self._offline_held_account_uid: str | None = None
         self._heavy_index_in_progress: tuple[str, str] | None = None
         self._heavy_bind_catchup_load_id: int | None = None
         self._heavy_pipeline_id: str | None = None
@@ -1986,8 +1987,8 @@ class MainWindow(Adw.ApplicationWindow):
         def update() -> bool:
             if progress is None or not progress.active:
                 self._offline_download_status = ""
-            elif self._offline_held_for_load_generation is not None:
-                # Interactive folder work holds offline sync; ignore late progress.
+            elif self._mail.offline_body_sync_is_held(progress.account_uid):
+                # That account's folder work holds its downsync; ignore late progress.
                 self._offline_download_status = ""
             else:
                 self._offline_download_status = offline_cache_status_text(
@@ -1999,11 +2000,17 @@ class MainWindow(Adw.ApplicationWindow):
 
         GLib.idle_add(update)
 
-    def _hold_offline_sync_for_folder_work(self, load_id: int) -> None:
-        """Cancel offline backfill so opening Archive/etc. can use mail I/O (#208)."""
+    def _hold_offline_sync_for_folder_work(
+        self, load_id: int, account_uid: str
+    ) -> None:
+        """Cancel that account's offline backfill for Archive/etc. I/O (#208/#449)."""
+        prev_uid = self._offline_held_account_uid
+        if prev_uid is not None and prev_uid != account_uid:
+            self._mail.hold_offline_body_sync(False, account_uid=prev_uid)
         self._offline_held_for_load_generation = load_id
+        self._offline_held_account_uid = account_uid
         self._offline_download_status = ""
-        self._mail.hold_offline_body_sync(True)
+        self._mail.hold_offline_body_sync(True, account_uid=account_uid)
         self._refresh_status_display()
 
     def _heavy_index_blocks_offline_sync(self, load_id: int) -> bool:
@@ -2022,14 +2029,17 @@ class MainWindow(Adw.ApplicationWindow):
         if self._offline_held_for_load_generation != load_id:
             return
         # Keep holding while Archive/etc. Graph catch-up is in progress so
-        # other accounts' downsync cannot steal the background FIFO (#407).
+        # this account's downsync cannot steal its Camel FIFO (#407/#449).
         # Sitting in a caught-up heavy folder must not keep the hold.
         if self._heavy_index_blocks_offline_sync(load_id):
             self._offline_download_status = ""
             self._refresh_status_display()
             return
+        account_uid = self._offline_held_account_uid
         self._offline_held_for_load_generation = None
-        self._mail.hold_offline_body_sync(False)
+        self._offline_held_account_uid = None
+        if account_uid is not None:
+            self._mail.hold_offline_body_sync(False, account_uid=account_uid)
         self._sync_watcher_current_folder()
 
     def _on_offline_body_sync_changed(
@@ -5156,7 +5166,7 @@ class MainWindow(Adw.ApplicationWindow):
                 len(self._current_folder_messages or []),
             )
             self._hold_offline_sync_for_folder_work(
-                self._messages_load_generation
+                self._messages_load_generation, account_uid
             )
             if self._current_folder_messages:
                 self._schedule_bind_unbound_heavy_messages(
@@ -5194,8 +5204,8 @@ class MainWindow(Adw.ApplicationWindow):
                     )
                 self._heavy_index_in_progress = None
         self._sidebar.cancel_folder_count_poll()
-        # Pause Gmail/etc. offline backfill so this folder owns mail I/O + status.
-        self._hold_offline_sync_for_folder_work(load_id)
+        # Pause this account's offline backfill so this folder owns its Camel I/O.
+        self._hold_offline_sync_for_folder_work(load_id, account_uid)
 
         display_folder = (
             "Outbox"

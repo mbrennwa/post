@@ -5,14 +5,32 @@
 
 from __future__ import annotations
 
+import tempfile
 import threading
 import unittest
 from unittest import mock
 
 from post.mail.eds import MailService
+from post.mail.operation_queue import (
+    QueuedOperation,
+    enqueue_operation,
+    list_queued_operations,
+)
 
 
 class ServiceLockReleaseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._ops_tmpdir = tempfile.TemporaryDirectory()
+        self._ops_dir_patch = mock.patch(
+            "post.mail.operation_queue.operations_dir",
+            return_value=self._ops_tmpdir.name,
+        )
+        self._ops_dir_patch.start()
+
+    def tearDown(self) -> None:
+        self._ops_dir_patch.stop()
+        self._ops_tmpdir.cleanup()
+
     def test_call_without_service_lock_releases_nested_lock(self) -> None:
         service = MailService(registry=mock.Mock())
         seen_depth: list[int] = []
@@ -145,18 +163,72 @@ class ServiceLockReleaseTests(unittest.TestCase):
         service.offline_sync.cancel_all.assert_called_once()
         service.offline_sync.cancel_arrival_in_flight.assert_called_once()
 
-    def test_hold_offline_body_sync_blocks_resume_until_released(self) -> None:
+    def test_hold_offline_body_sync_is_account_scoped(self) -> None:
         service = MailService(registry=mock.Mock())
         coordinator = mock.Mock()
         service._offline_sync = coordinator
+        account_a = mock.Mock()
+        account_a.uid = "acct-a"
+        account_b = mock.Mock()
+        account_b.uid = "acct-b"
+        service.list_accounts = mock.Mock(return_value=[account_a, account_b])
 
-        service.hold_offline_body_sync(True)
-        coordinator.cancel_all.assert_called_once()
+        service.hold_offline_body_sync(True, account_uid="acct-a")
+        coordinator.cancel_account.assert_called_once_with("acct-a")
+        coordinator.cancel_all.assert_not_called()
+
         service.schedule_offline_body_sync()
+        coordinator.schedule_account.assert_called_once_with("acct-b")
         coordinator.schedule_all_accounts.assert_not_called()
 
-        service.hold_offline_body_sync(False)
-        coordinator.schedule_all_accounts.assert_called_once()
+        coordinator.schedule_account.reset_mock()
+        service.schedule_offline_body_sync("acct-a")
+        coordinator.schedule_account.assert_not_called()
+
+        service.hold_offline_body_sync(False, account_uid="acct-a")
+        coordinator.schedule_account.assert_called_once_with("acct-a")
+        self.assertFalse(service.offline_body_sync_is_held("acct-a"))
+        self.assertFalse(service.offline_body_sync_is_held("acct-b"))
+
+    def test_flush_operation_queue_leaves_sign_in_ops_queued(self) -> None:
+        """Expired GOA must not ERROR-abort the whole operation flush."""
+        service = MailService(registry=mock.Mock())
+        dead = QueuedOperation(
+            op_type="move_to_trash",
+            account_uid="acct-dead",
+            folder_name="INBOX",
+            message_uids=["1"],
+        )
+        ok = QueuedOperation(
+            op_type="move_to_trash",
+            account_uid="acct-ok",
+            folder_name="INBOX",
+            message_uids=["2"],
+        )
+        dead_id = enqueue_operation(dead)
+        ok_id = enqueue_operation(ok)
+
+        def _execute(operation: QueuedOperation) -> None:
+            if operation.account_uid == "acct-dead":
+                raise RuntimeError(
+                    "Failed to obtain an access token: refresh token expired AADSTS70043"
+                )
+
+        with mock.patch.object(
+            service,
+            "_execute_queued_operation_unlocked",
+            side_effect=_execute,
+        ):
+            flushed = service._flush_operation_queue_unlocked()
+
+        self.assertEqual(flushed, 1)
+        remaining = list_queued_operations()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0][0], dead_id)
+        self.assertEqual(
+            service.get_account_connect_health("acct-dead"), "needs_sign_in"
+        )
+        self.assertNotIn(ok_id, {qid for qid, _ in remaining})
 
     def test_folder_list_register_keeps_sibling_cancellables(self) -> None:
         service = MailService(registry=mock.Mock())

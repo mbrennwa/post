@@ -129,6 +129,7 @@ class HeavyFolderOfflineHoldTests(unittest.TestCase):
         window = mock.Mock()
         window._messages_load_generation = 7
         window._offline_held_for_load_generation = 7
+        window._offline_held_account_uid = "acct-1"
         window._current_account = _account()
         window._current_folder = "Archive"
         window._heavy_index_in_progress = (
@@ -144,24 +145,44 @@ class HeavyFolderOfflineHoldTests(unittest.TestCase):
         return window
 
     def test_keeps_hold_while_heavy_index_in_progress(self) -> None:
-        """Archive indexing must keep the global downsync hold (#407)."""
+        """Archive indexing must keep that account's downsync hold (#407/#449)."""
         window = self._window(indexing=True)
 
         MainWindow._release_offline_sync_for_folder_work(window, 7)
 
         window._mail.hold_offline_body_sync.assert_not_called()
         self.assertEqual(window._offline_held_for_load_generation, 7)
+        self.assertEqual(window._offline_held_account_uid, "acct-1")
         window._sync_watcher_current_folder.assert_not_called()
 
     def test_releases_hold_when_archive_selected_but_index_done(self) -> None:
-        """Caught-up Archive must not keep other accounts' backfill paused (#407)."""
+        """Caught-up Archive must not keep that account's backfill paused (#407/#449)."""
         window = self._window(indexing=False)
 
         MainWindow._release_offline_sync_for_folder_work(window, 7)
 
-        window._mail.hold_offline_body_sync.assert_called_once_with(False)
+        window._mail.hold_offline_body_sync.assert_called_once_with(
+            False, account_uid="acct-1"
+        )
         self.assertIsNone(window._offline_held_for_load_generation)
+        self.assertIsNone(window._offline_held_account_uid)
         window._sync_watcher_current_folder.assert_called_once_with()
+
+    def test_hold_releases_previous_account_when_switching(self) -> None:
+        window = self._window(indexing=False)
+        window._offline_held_account_uid = "acct-old"
+        window._offline_held_for_load_generation = 6
+
+        MainWindow._hold_offline_sync_for_folder_work(window, 8, "acct-1")
+
+        window._mail.hold_offline_body_sync.assert_any_call(
+            False, account_uid="acct-old"
+        )
+        window._mail.hold_offline_body_sync.assert_any_call(
+            True, account_uid="acct-1"
+        )
+        self.assertEqual(window._offline_held_for_load_generation, 8)
+        self.assertEqual(window._offline_held_account_uid, "acct-1")
 
 
 if __name__ == "__main__":
