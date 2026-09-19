@@ -1,13 +1,18 @@
 # Offline body cache and search
 
-Post downloads message **bodies** into Camel's local cache (`~/.cache/evolution/`) so mail can be read and searched offline. Header metadata alone is not enough for body text or attachments.
+Post downloads message **bodies** into each account’s Camel cache under
+`~/.cache/post/camel-helper/<account>/cache/` so mail can be read and searched
+offline. Header metadata alone is not enough for body text or attachments.
 
-Epic: [#99](https://github.com/mbrennwa/post/issues/99)
+Epic: [#99](https://github.com/mbrennwa/post/issues/99). Runtime: per-account
+Camel helpers ([#445](https://github.com/mbrennwa/post/issues/445),
+[#451](https://github.com/mbrennwa/post/issues/451)); see
+[mail-threading.md](mail-threading.md).
 
 ## Settings
 
-**Settings → Offline** configures per-account **body** download into Camel
-(`~/.cache/evolution/`). It does **not** store bodies in the folder-index
+**Settings → Offline** configures per-account **body** download into that
+account’s helper Camel cache. It does **not** store bodies in the folder-index
 (`~/.cache/post/folder-index/`). Header search (`from:`, `subject:`, …) uses
 the folder-index. `body:` and bare-word search need cached MIME
 ([#137](https://github.com/mbrennwa/post/issues/137),
@@ -57,7 +62,9 @@ Limits: per-folder only; attachment content not searched; offline body matches r
 
 ## Threading
 
-Offline downsync and Camel search run on **`post-mail-io`** only. UI updates via `GLib.idle_add`. See [mail-threading.md](mail-threading.md).
+The UI process schedules the crawl (`OfflineBodySyncCoordinator`). Camel
+`downsync_sync` / arrival FETCH run on the **account helper** via `MailService`
+(#451). UI updates via `GLib.idle_add`. See [mail-threading.md](mail-threading.md).
 
 ## Manual regression matrix
 
@@ -73,7 +80,12 @@ Offline downsync and Camel search run on **`post-mail-io`** only. UI updates via
 | Search older Archive subject after index catch-up | ☐ |
 | Trash/Junk accidentally moved mail findable after backfill | ☐ |
 | Offline caching order: ordinary before Archive before Trash before Junk | ☐ |
+| Bodies land under `~/.cache/post/camel-helper/<account>/cache/` (not system Evolution) | ☐ |
 
-## Shared cache with Evolution
+## Camel cache location
 
-Post configures the same EDS/Camel store as Evolution. Offline settings affect Evolution's local cache for that account.
+Product Post uses **per-account helper** Camel dirs
+(`~/.cache/post/camel-helper/<account>/{data,cache}`). Those caches are **not**
+shared with Evolution’s `~/.cache/evolution/`. First helper enable starts empty;
+bodies re-download. EDS account sources still come from the shared source
+registry (Online Accounts / Evolution Data Server).

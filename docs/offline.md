@@ -1,6 +1,8 @@
 # Offline mail in Post
 
-Post keeps mail usable when the network is down by relying on Camel/EDS local storage (`~/.cache/evolution/`) plus Post-side caches and queues.
+Post keeps mail usable when the network is down by relying on each account’s
+helper Camel cache (`~/.cache/post/camel-helper/<account>/`) plus Post-side
+caches and queues (see [offline-body-cache.md](offline-body-cache.md)).
 
 Related: [#6](https://github.com/mbrennwa/post/issues/6), [offline body cache](offline-body-cache.md).
 
