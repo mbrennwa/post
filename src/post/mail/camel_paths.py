@@ -5,8 +5,8 @@
 
 Helper processes must not share ``~/.local/share/evolution`` — multi-process
 Camel on one store caused mid-read exits (#439). Each helper gets private dirs
-under the Post cache tree; the UI/in-process path keeps the system Evolution
-locations when helpers are off.
+under the Post cache tree. System Evolution locations remain for non-helper
+tools and legacy path resolution.
 """
 
 from __future__ import annotations

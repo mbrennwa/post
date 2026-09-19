@@ -20,25 +20,23 @@ from .camel_ipc import read_message, write_message
 
 log = logging.getLogger(__name__)
 
-_HELPERS_ENV = "POST_MAIL_CAMEL_HELPERS"
 _HELPER_PROCESS_ENV = "POST_MAIL_CAMEL_HELPER_PROCESS"
+# Unit-test only: keep in-process Camel mocks without spawning helpers.
+_TEST_NO_HELPERS_ENV = "POST_MAIL_TEST_NO_CAMEL_HELPERS"
 _DEFAULT_JOB_TIMEOUT = 120.0
 
 
 def camel_helpers_enabled() -> bool:
     """True when the UI should spawn per-account Camel helpers.
 
-    Disabled inside helper processes. **Default on** in the UI (#445): each
-    helper uses private Camel data/cache dirs so processes do not share
-    ``~/.local/share/evolution`` (the #439 mid-read failure mode). Opt out with
-    ``POST_MAIL_CAMEL_HELPERS=0``.
+    Always on in the UI. Disabled inside helper processes (no nesting). Unit
+    tests may set ``POST_MAIL_TEST_NO_CAMEL_HELPERS=1``.
     """
     if os.environ.get(_HELPER_PROCESS_ENV) == "1":
         return False
-    raw = os.environ.get(_HELPERS_ENV)
-    if raw is None or not str(raw).strip():
-        return True
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    if os.environ.get(_TEST_NO_HELPERS_ENV) == "1":
+        return False
+    return True
 
 
 class CamelHelperError(RuntimeError):
@@ -105,7 +103,6 @@ class AccountCamelRuntime:
             self._reap_dead_unlocked()
         env = os.environ.copy()
         env[_HELPER_PROCESS_ENV] = "1"
-        env[_HELPERS_ENV] = "0"
         # Ensure src layout works the same as ``python3 -m post.main``.
         cmd = self._helper_command()
         log.info(

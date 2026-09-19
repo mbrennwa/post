@@ -190,6 +190,22 @@ class ServiceLockReleaseTests(unittest.TestCase):
         self.assertFalse(service.offline_body_sync_is_held("acct-a"))
         self.assertFalse(service.offline_body_sync_is_held("acct-b"))
 
+    def test_helper_bound_account_refuses_other_store(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._helper_bound_account_uid = "acct-a"
+        with self.assertRaises(ValueError):
+            service._get_store_unlocked("acct-b")
+
+    def test_offline_helper_methods_are_allowed(self) -> None:
+        from post.mail.camel_helper import ALLOWED_METHODS
+
+        for name in (
+            "list_offline_downsync_folders",
+            "offline_downsync_folder",
+            "synchronize_folder_message",
+        ):
+            self.assertIn(name, ALLOWED_METHODS)
+
     def test_flush_operation_queue_leaves_sign_in_ops_queued(self) -> None:
         """Expired GOA must not ERROR-abort the whole operation flush."""
         service = MailService(registry=mock.Mock())

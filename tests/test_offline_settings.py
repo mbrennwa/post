@@ -163,7 +163,7 @@ class OfflineSyncYieldTests(unittest.TestCase):
         mail.offline_body_sync_is_held.return_value = False
         coordinator = OfflineBodySyncCoordinator(mail)
 
-        folder = mock.Mock()
+        folder = "INBOX"
         cancellable = mock.Mock()
         cancellable.is_cancelled.return_value = False
 
@@ -183,18 +183,17 @@ class OfflineDownsyncTimeoutTests(unittest.TestCase):
     def test_downsync_folder_sync_cancels_on_timeout(self) -> None:
         import gi
 
+        gi.require_version("Camel", "1.2")
         gi.require_version("Gio", "2.0")
         gi.require_version("GLib", "2.0")
-        from gi.repository import Gio, GLib
+        from gi.repository import Camel, Gio, GLib
 
         from post.mail import offline_sync
-        from post.mail.offline_sync import OfflineBodySyncCoordinator
+        from post.mail.eds import MailService
 
-        mail = mock.Mock()
-        coordinator = OfflineBodySyncCoordinator(mail)
-        account_cancellable = Gio.Cancellable()
-        folder = mock.Mock()
-        folder.get_full_name.return_value = "INBOX"
+        mail = MailService(registry=mock.Mock())
+        folder = mock.Mock(spec=Camel.OfflineFolder)
+        folder.can_downsync.return_value = True
         saw_chunk_cancel = {"value": False}
 
         def blocking_downsync(_expression: str, cancel: Gio.Cancellable) -> None:
@@ -212,15 +211,27 @@ class OfflineDownsyncTimeoutTests(unittest.TestCase):
 
         folder.downsync_sync.side_effect = blocking_downsync
 
-        with mock.patch.object(offline_sync, "_OFFLINE_DOWNSYNC_TIMEOUT_SECONDS", 0.1):
-            started = time.monotonic()
-            coordinator._downsync_folder_sync(
-                folder, "(match-all #t)", account_cancellable
-            )
-            elapsed = time.monotonic() - started
+        with mock.patch.object(offline_sync, "OFFLINE_DOWNSYNC_TIMEOUT_SECONDS", 0.1):
+            with mock.patch(
+                "post.mail.eds.OFFLINE_DOWNSYNC_TIMEOUT_SECONDS", 0.1
+            ):
+                with mock.patch.object(
+                    mail, "_open_folder_unlocked", return_value=folder
+                ):
+                    with mock.patch(
+                        "post.mail.eds.apply_offline_sync_to_folder"
+                    ):
+                        with mock.patch(
+                            "post.preferences.effective_offline_body_sync",
+                            return_value="all",
+                        ):
+                            started = time.monotonic()
+                            result = mail._offline_downsync_folder_unlocked(
+                                "acct-1", "INBOX", "(match-all #t)"
+                            )
+                            elapsed = time.monotonic() - started
 
-        # Per-folder timeout must not cancel the whole account pass (#208).
-        self.assertFalse(account_cancellable.is_cancelled())
+        self.assertEqual(result.get("status"), "timeout")
         self.assertTrue(saw_chunk_cancel["value"])
         self.assertLess(elapsed, 1.0)
 

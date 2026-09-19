@@ -111,7 +111,7 @@ class MailThreadingContractTests(unittest.TestCase):
         self.assertIn("shutdown_async", text)
         self.assertIn("connect_async", text)
         self.assertIn("camel-helper", text)
-        self.assertIn("POST_MAIL_CAMEL_HELPERS", text)
+        self.assertIn("POST_MAIL_CAMEL_HELPER_PROCESS", text)
 
     def test_sidebar_archive_read_unflagged_counts_async(self) -> None:
         """GTK must not block on count before the confirm dialog (#443)."""

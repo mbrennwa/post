@@ -191,6 +191,8 @@ from .message_list_state import (
     is_moved_provisional,
     is_trash_or_junk_folder_name,
     merge_folder_index_envelope,
+    offline_folder_priority,
+    prune_orphan_folder_index_uids,
     prune_stale_folder_index_uids,
     union_folder_index_messages,
     upsert_folder_index_by_identity,
@@ -200,6 +202,8 @@ from .offline_sync import (
     OfflineBodySyncCoordinator,
     OfflineSyncProgress,
     sort_dates_for_uids,
+    OFFLINE_DOWNSYNC_TIMEOUT_SECONDS,
+    ARRIVAL_PREFETCH_TIMEOUT_SECONDS,
 )
 from .search import (
     MessageSearchQuery,
@@ -293,8 +297,8 @@ class MessageNotAvailableError(LookupError):
             return MESSAGE_NOT_CACHED_SIGN_IN
         if self.reason == MessageUnavailableReason.NOT_FETCHABLE_YET:
             return (
-                "This message isn't available yet. "
-                "Try again in a moment."
+                "This message's content hasn't finished downloading. "
+                "Try opening it again in a moment."
             )
         return "This message is no longer available."
 
@@ -813,6 +817,10 @@ class MailService:
     _camel_pool: CamelRuntimePool = field(
         default_factory=CamelRuntimePool, init=False, repr=False
     )
+    # When set (Camel helper process), only this account may be listed/opened (#451).
+    _helper_bound_account_uid: str | None = field(
+        default=None, init=False, repr=False
+    )
 
     @property
     def offline_sync(self) -> OfflineBodySyncCoordinator:
@@ -1135,6 +1143,330 @@ class MailService:
             return
         apply_offline_settings_to_store(store, account_uid)
         self.schedule_offline_body_sync(account_uid)
+
+    def list_offline_downsync_folders(self, account_uid: str) -> list[str]:
+        """Return folder full_names for offline body crawl (#451)."""
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "list_offline_downsync_folders",
+                account_uid,
+                [account_uid],
+            )
+            if not isinstance(result, list):
+                return []
+            return [str(name) for name in result if isinstance(name, str) and name]
+        return run_on_mail_thread(
+            self._list_offline_downsync_folders_unlocked, account_uid
+        )
+
+    def offline_downsync_folder(
+        self, account_uid: str, folder_name: str, expression: str
+    ) -> dict[str, Any]:
+        """Downsync one folder's bodies (30s bound). JSON-safe for helpers (#451)."""
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "offline_downsync_folder",
+                account_uid,
+                [account_uid, folder_name, expression],
+                timeout=OFFLINE_DOWNSYNC_TIMEOUT_SECONDS + 15.0,
+            )
+            return result if isinstance(result, dict) else {"status": "failed"}
+        return run_on_mail_thread(
+            self._offline_downsync_folder_unlocked,
+            account_uid,
+            folder_name,
+            expression,
+        )
+
+    def synchronize_folder_message(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        force: bool = False,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch one message MIME for arrival prefetch (#372 / #451)."""
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "synchronize_folder_message",
+                account_uid,
+                [account_uid, folder_name, message_uid],
+                {"force": force, "mode": mode},
+                timeout=ARRIVAL_PREFETCH_TIMEOUT_SECONDS + 10.0,
+            )
+            if not isinstance(result, dict):
+                return {"status": "failed"}
+            attachments = result.get("has_visible_attachments")
+            if isinstance(attachments, bool):
+                self._update_cached_message_flags(
+                    account_uid,
+                    folder_name,
+                    message_uid,
+                    attachments=attachments,
+                )
+                self._notify_visible_attachments_changed(
+                    account_uid, folder_name, message_uid, attachments
+                )
+            return result
+        return run_on_mail_thread(
+            self._synchronize_folder_message_unlocked,
+            account_uid,
+            folder_name,
+            message_uid,
+            force=force,
+            mode=mode,
+        )
+
+    def _list_offline_downsync_folders_unlocked(
+        self, account_uid: str
+    ) -> list[str]:
+        try:
+            store = self._get_store_unlocked(account_uid)
+        except Exception:
+            log.debug(
+                "Skipping offline body sync for unavailable account %s",
+                account_uid,
+                exc_info=True,
+            )
+            return []
+
+        if not isinstance(store, Camel.OfflineStore):
+            return []
+
+        folders: list[Camel.Folder] = []
+        try:
+            listed = store.dup_downsync_folders()
+            if listed:
+                folders.extend(listed)
+        except Exception:
+            log.debug("dup_downsync_folders failed for %s", account_uid, exc_info=True)
+
+        if not folders:
+            try:
+                for folder_info in self._list_folders_unlocked(account_uid):
+                    full_name = folder_info.get("full_name")
+                    if not isinstance(full_name, str) or not full_name:
+                        continue
+                    if not folder_can_contain_messages(folder_info):
+                        continue
+                    folder = store.get_folder_sync(full_name, 0, None)
+                    if folder is not None:
+                        folders.append(folder)
+            except Exception:
+                log.debug(
+                    "Could not list folders for offline sync on %s",
+                    account_uid,
+                    exc_info=True,
+                )
+                return []
+
+        names: list[str] = []
+        for folder in folders:
+            name = folder.get_full_name() or ""
+            if not name:
+                continue
+            names.append(name)
+
+        def sort_key(name: str) -> tuple[int, str]:
+            return (offline_folder_priority(name), name.lower())
+
+        return sorted(names, key=sort_key)
+
+    def _offline_downsync_folder_unlocked(
+        self, account_uid: str, folder_name: str, expression: str
+    ) -> dict[str, Any]:
+        from post.preferences import effective_offline_body_sync
+
+        try:
+            folder = self._open_folder_unlocked(account_uid, folder_name)
+        except Exception:
+            log.debug(
+                "Offline downsync open failed for %s/%s",
+                account_uid,
+                folder_name,
+                exc_info=True,
+            )
+            return {"status": "failed"}
+        if folder is None or not isinstance(folder, Camel.OfflineFolder):
+            return {"status": "skipped"}
+        mode = effective_offline_body_sync(account_uid)
+        apply_offline_sync_to_folder(folder, mode)
+        if not folder.can_downsync():
+            return {"status": "skipped"}
+
+        chunk_cancellable = Gio.Cancellable()
+        stop_watch = threading.Event()
+
+        def _watch_timeout() -> None:
+            deadline = time.monotonic() + OFFLINE_DOWNSYNC_TIMEOUT_SECONDS
+            while not stop_watch.is_set():
+                if time.monotonic() >= deadline:
+                    chunk_cancellable.cancel()
+                    return
+                stop_watch.wait(0.05)
+
+        watcher = threading.Thread(
+            target=_watch_timeout,
+            name="post-offline-downsync-watch",
+            daemon=True,
+        )
+        started = time.monotonic()
+        watcher.start()
+        try:
+            folder.downsync_sync(expression, chunk_cancellable)
+        except GLib.Error as exc:
+            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                elapsed = time.monotonic() - started
+                if elapsed >= OFFLINE_DOWNSYNC_TIMEOUT_SECONDS * 0.9:
+                    log.warning(
+                        "Offline downsync timed out after %.1fs for folder %r "
+                        "(continuing with next folder)",
+                        elapsed,
+                        folder_name,
+                    )
+                    return {"status": "timeout"}
+                log.debug(
+                    "Offline downsync cancelled for folder %r after %.1fs",
+                    folder_name,
+                    elapsed,
+                )
+                return {"status": "cancelled"}
+            log.debug(
+                "Offline downsync failed for folder %r",
+                folder_name,
+                exc_info=True,
+            )
+            return {"status": "failed"}
+        except Exception:
+            log.debug(
+                "Offline downsync failed for folder %r",
+                folder_name,
+                exc_info=True,
+            )
+            return {"status": "failed"}
+        finally:
+            stop_watch.set()
+            watcher.join(timeout=1.0)
+        return {"status": "ok"}
+
+    def _synchronize_folder_message_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        force: bool = False,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        from post.preferences import (
+            OFFLINE_BODY_SYNC_OFF,
+            OfflineBodySyncMode,
+            effective_offline_body_sync,
+        )
+        from post.mail.offline_settings import message_within_offline_age
+
+        if camel_uid_is_binary(message_uid):
+            return {"status": "skipped"}
+        try:
+            api_uid = camel_uid_to_api(message_uid)
+        except TypeError:
+            return {"status": "skipped"}
+
+        try:
+            folder = self._open_folder_unlocked(account_uid, folder_name)
+        except Exception:
+            log.debug(
+                "Arrival prefetch skipped open for %s/%s",
+                account_uid,
+                folder_name,
+                exc_info=True,
+            )
+            return {"status": "failed"}
+        if folder is None:
+            return {"status": "failed"}
+
+        sync_mode: OfflineBodySyncMode
+        if mode is None:
+            sync_mode = effective_offline_body_sync(account_uid)
+        else:
+            sync_mode = mode  # type: ignore[assignment]
+
+        if not force:
+            if sync_mode == OFFLINE_BODY_SYNC_OFF:
+                return {"status": "skipped"}
+            apply_offline_sync_to_folder(folder, sync_mode)
+
+        try:
+            cached = self._first_cached_rfc822_path(folder, api_uid) is not None
+        except Exception:
+            cached = False
+        if cached:
+            visible = self.classify_cached_visible_attachments(
+                account_uid, folder_name, message_uid, folder=folder
+            )
+            return {
+                "status": "already_cached",
+                "has_visible_attachments": visible,
+            }
+
+        if not force:
+            info = folder_get_message_info(folder, message_uid)
+            raw = None
+            if info is not None:
+                getter = getattr(info, "get_date_received", None)
+                sent_getter = getattr(info, "get_date_sent", None)
+                raw = getter() if callable(getter) else None
+                if not isinstance(raw, (int, float)) or raw <= 0:
+                    raw = sent_getter() if callable(sent_getter) else None
+            if not message_within_offline_age(sync_mode, raw):
+                return {"status": "skipped"}
+
+        fetch_cancellable = Gio.Cancellable()
+        stop_watch = threading.Event()
+
+        def _watch_timeout() -> None:
+            deadline = time.monotonic() + ARRIVAL_PREFETCH_TIMEOUT_SECONDS
+            while not stop_watch.is_set():
+                if time.monotonic() >= deadline:
+                    fetch_cancellable.cancel()
+                    return
+                stop_watch.wait(0.05)
+
+        watcher = threading.Thread(
+            target=_watch_timeout,
+            name="post-arrival-prefetch-watch",
+            daemon=True,
+        )
+        started = time.monotonic()
+        watcher.start()
+        try:
+            folder.synchronize_message_sync(api_uid, fetch_cancellable)
+        except GLib.Error as exc:
+            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                elapsed = time.monotonic() - started
+                if elapsed >= ARRIVAL_PREFETCH_TIMEOUT_SECONDS * 0.9:
+                    log.debug(
+                        "Arrival prefetch timed out after %.1fs for %s",
+                        elapsed,
+                        api_uid,
+                    )
+                    return {"status": "timeout"}
+                return {"status": "cancelled"}
+            log.debug("Arrival prefetch failed for %s", api_uid, exc_info=True)
+            return {"status": "failed"}
+        except Exception:
+            log.debug("Arrival prefetch failed for %s", api_uid, exc_info=True)
+            return {"status": "failed"}
+        finally:
+            stop_watch.set()
+            watcher.join(timeout=1.0)
+
+        visible = self.classify_cached_visible_attachments(
+            account_uid, folder_name, message_uid, folder=folder
+        )
+        return {"status": "fetched", "has_visible_attachments": visible}
 
     def _enter_mail_op(self) -> None:
         with self._pending_mail_ops_cond:
@@ -1758,7 +2090,7 @@ class MailService:
                     log.exception("Failed to flush mail store on shutdown")
 
     @classmethod
-    def connect(cls) -> MailService:
+    def connect(cls, account_uid: str | None = None) -> MailService:
         registry = source_registry_new_sync(
             failure_message=EDS_REGISTRY_CONNECT_ERROR
         )
@@ -1767,6 +2099,8 @@ class MailService:
             failure_message=EDS_REGISTRY_RECONNECT_AFTER_LOCAL_ERROR
         )
         service = cls(registry=registry)
+        if account_uid:
+            service._helper_bound_account_uid = account_uid
         service._ensure_mail_io_callbacks()
         service._drop_orphan_account_caches()
         if camel_helpers_enabled():
@@ -2131,8 +2465,11 @@ class MailService:
         accounts: list[MailAccount] = []
         evolution_local_pref = get_show_evolution_local()
         hide_empty_builtin_local = is_builtin_local_store_empty(self.registry)
+        bound = self._helper_bound_account_uid
         for source in self.registry.list_enabled("Mail Account"):
             uid = source.get_uid()
+            if bound is not None and uid != bound:
+                continue
             if uid == BUILTIN_LOCAL_UID:
                 if evolution_local_pref is False:
                     continue
@@ -2610,6 +2947,11 @@ class MailService:
         cancellable: Gio.Cancellable | None = None,
         allow_online: bool = True,
     ) -> Camel.Store:
+        bound = self._helper_bound_account_uid
+        if bound is not None and account_uid != bound:
+            raise ValueError(
+                f"Camel helper bound to {bound}; refused store for {account_uid}"
+            )
         if account_uid in self._stores:
             store = self._stores[account_uid]
             if not allow_online:
@@ -6219,7 +6561,7 @@ class MailService:
         folder_name: str,
         message_uid: str,
     ) -> None:
-        """Remove a Graph-confirmed-dead RestId from the folder-index (#294)."""
+        """Remove a confirmed-dead UID from the folder-index (#294/#451)."""
         messages = self._folder_index_messages(account_uid, folder_name)
         row = next(
             (
@@ -6246,6 +6588,108 @@ class MailService:
         self._remove_messages_from_cache(
             account_uid, folder_name, [message_uid], unread, total
         )
+
+    def _reconcile_folder_index_after_confirmed_miss(
+        self,
+        folder: Camel.Folder,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+    ) -> list[str]:
+        """After INVALID_UID, drop the miss and investigate other ghosts (#451).
+
+        Graph/EWS summaries are often partial — only remove the confirmed UID.
+        IMAP: Camel's current UID set is treated as authoritative; also drop
+        identity remaps and orphan index rows Camel no longer knows.
+        """
+        backend = (self._backend_for_account(account_uid) or "").lower()
+        if backend not in {"imap", "imapx"}:
+            if self._folder_index_has_uid(account_uid, folder_name, message_uid):
+                self._drop_stale_folder_index_uid(
+                    account_uid, folder_name, message_uid
+                )
+                return [message_uid]
+            return []
+
+        camel_uids = {str(uid) for uid in folder_get_uids(folder) if uid}
+        if not camel_uids:
+            if self._folder_index_has_uid(account_uid, folder_name, message_uid):
+                self._drop_stale_folder_index_uid(
+                    account_uid, folder_name, message_uid
+                )
+                return [message_uid]
+            return []
+
+        messages = self._folder_index_messages(account_uid, folder_name)
+        if not messages:
+            return []
+        by_uid: dict[str, dict] = {}
+        for message in messages:
+            uid = str(message.get("uid") or "")
+            if not uid:
+                continue
+            by_uid[uid] = dict(message)
+
+        remapped = prune_stale_folder_index_uids(by_uid, camel_uids)
+        orphans = prune_orphan_folder_index_uids(by_uid, camel_uids)
+        # Always ensure the confirmed miss is gone even if Camel UIDs raced.
+        if message_uid in by_uid and message_uid not in camel_uids:
+            by_uid.pop(message_uid, None)
+            if message_uid not in remapped and message_uid not in orphans:
+                orphans.append(message_uid)
+
+        removed = remapped + orphans
+        if not removed:
+            return []
+
+        sorted_messages = self._sorted_folder_messages(by_uid)
+        key = (account_uid, folder_name)
+        existing = self._folder_indexes.get(key)
+        unread = existing.unread if existing is not None else 0
+        total = existing.total if existing is not None else len(messages)
+        if unread >= 0:
+            for uid in removed:
+                row = next(
+                    (m for m in messages if str(m.get("uid") or "") == uid),
+                    None,
+                )
+                if row is not None and not (row.get("flags") or {}).get(
+                    "seen", False
+                ):
+                    unread = max(0, unread - 1)
+        if total >= 0:
+            total = max(0, total - len(removed))
+        else:
+            total = len(sorted_messages)
+
+        self._store_folder_index(
+            account_uid,
+            folder_name,
+            _FolderMessageIndex(
+                messages=sorted_messages,
+                unread=unread,
+                total=total,
+            ),
+        )
+        folder_index_cache.save(
+            account_uid,
+            folder_name,
+            sorted_messages,
+            unread,
+            total,
+            grow_only=False,
+        )
+        log.info(
+            "Reconciled folder-index for IMAP %s/%s after confirmed miss %s "
+            "(remapped=%d orphans=%d remaining=%d)",
+            account_uid,
+            folder_name,
+            message_uid,
+            len(remapped),
+            len(orphans),
+            len(sorted_messages),
+        )
+        return removed
 
     def _recover_stale_graph_restid(
         self,
@@ -6336,6 +6780,10 @@ class MailService:
         though the body is cached or the UID is still in Camel (#265). Listed
         messages soft-fail so the row stays; only truly unknown UIDs are vanished.
 
+        If Camel does not know the UID and ``synchronize_message_sync`` also
+        reports INVALID_UID, the folder-index row is a ghost — drop it and
+        vanish (#451). Do not soft-fail as "still downloading".
+
         Graph ``ErrorItemNotFound`` means that RestId is not in this folder
         (#294/#404). Remap to a same-identity live UID. If the row is still
         listed and dest is unresolved, keep it — do not call the message gone.
@@ -6387,6 +6835,26 @@ class MailService:
                     self._raise_uncached_sign_in(
                         account_uid, folder_name, message_uid, cause=sync_exc
                     )
+                elif (
+                    isinstance(sync_exc, GLib.Error)
+                    and self._is_missing_message_error(sync_exc)
+                    and not camel_known
+                ):
+                    log.info(
+                        "UID %s in %r confirmed missing after sync "
+                        "(stale folder-index row; treating as vanished)",
+                        message_uid,
+                        folder_name,
+                    )
+                    if index_known:
+                        self._reconcile_folder_index_after_confirmed_miss(
+                            folder, account_uid, folder_name, message_uid
+                        )
+                    raise MessageNotAvailableError(
+                        message_uid,
+                        folder_name,
+                        reason=MessageUnavailableReason.VANISHED,
+                    ) from sync_exc
                 else:
                     log_mail_error(
                         log,
@@ -9010,20 +9478,49 @@ class MailService:
         *,
         mark_seen: bool = True,
     ) -> dict:
-        if camel_helpers_enabled():
-            return self._camel_helper_call(
-                "read_message",
+        def _once() -> dict:
+            if camel_helpers_enabled():
+                return self._camel_helper_call(
+                    "read_message",
+                    account_uid,
+                    [account_uid, folder_name, message_uid],
+                    {"mark_seen": mark_seen},
+                )
+            return run_on_mail_thread(
+                self._read_message_unlocked,
                 account_uid,
-                [account_uid, folder_name, message_uid],
-                {"mark_seen": mark_seen},
+                folder_name,
+                message_uid,
+                mark_seen=mark_seen,
             )
-        return run_on_mail_thread(
-            self._read_message_unlocked,
-            account_uid,
-            folder_name,
-            message_uid,
-            mark_seen=mark_seen,
-        )
+
+        try:
+            return _once()
+        except MessageNotAvailableError as exc:
+            if exc.reason != MessageUnavailableReason.NOT_FETCHABLE_YET:
+                raise
+            # Listed header without MIME yet — force-fetch this UID and retry once
+            # so the reader is not stuck on a soft error (#451).
+            log.info(
+                "Message body not ready for %s in %r; downloading then retrying",
+                message_uid,
+                folder_name,
+            )
+            try:
+                self.synchronize_folder_message(
+                    account_uid,
+                    folder_name,
+                    message_uid,
+                    force=True,
+                )
+            except Exception:
+                log.debug(
+                    "Forced body fetch failed for %s in %r",
+                    message_uid,
+                    folder_name,
+                    exc_info=True,
+                )
+            return _once()
 
     def read_attachment_data(
         self,
