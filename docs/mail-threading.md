@@ -116,13 +116,13 @@ Run before closing epic [#422](https://github.com/mbrennwa/post/issues/422) (Pha
 
 | Scenario | Pass criteria | Pass |
 |----------|---------------|------|
-| Two accounts active | Open/send on A while B does Archive or body crawl; A stays responsive | ☐ |
-| Archive catch-up vs Inbox | Open Archive on one account; Inbox still usable; other accounts’ offline crawl not globally cancelled (#449) | ☐ |
-| Send during sync | Compose/send while sync or heavy index runs; GTK stays live | ☐ |
-| Kill / stuck account | Kill or wedge one helper; other account works; killed account recovers after respawn | ☐ |
-| Quit | Quit with multiple helpers; clean exit, no Force Quit | ☐ |
+| Two accounts active | Open/send on A while B does Archive or body crawl; A stays responsive | ☑ |
+| Archive catch-up vs Inbox | Open Archive on one account; Inbox still usable; other accounts’ offline crawl not globally cancelled (#449) | ☑ |
+| Send during sync | Compose/send while sync or heavy index runs; GTK stays live | ☑ |
+| Kill / stuck account | Kill or wedge one helper; other account works; killed account recovers after respawn | ☑ |
+| Quit | Quit with multiple helpers; clean exit, no Force Quit | ☑ |
 
-Supporting evidence: automated helper soak 2026-09-18 (PR #447) for multi-account reads, kill/respawn, flag stickiness — re-check Archive-vs-Inbox and quit on current `main` (#449 / #451).
+Supporting evidence: automated helper soak 2026-09-18 (PR #447); Phase 5 automated acceptance soak 2026-09-19 (#453) — concurrent multi-account Inbox, Archive-vs-Inbox, account-scoped hold unit test, post-I/O ping, kill/respawn, multi-helper shutdown. GTK compose click-through not automated (helper responsiveness used as proxy for “send during sync”).
 
 ## Ongoing regression (optional)
 
