@@ -6,8 +6,9 @@ Post keeps the GTK main loop free of blocking Camel / EDS work (#443).
 always on in the product. Each helper uses **private** Camel data/cache under
 `~/.cache/post/camel-helper/<account>/` so processes do not share
 `~/.local/share/evolution` (shared-store mode caused mid-read exits; #439 / #445).
-There is no supported helpers-off mode in the UI. Unit tests may set
-`POST_MAIL_TEST_NO_CAMEL_HELPERS=1`.
+There is no supported helpers-off mode in the UI. Unit tests set
+`POST_MAIL_TEST_NO_CAMEL_HELPERS=1` via `scripts/check.sh` (and
+`tests/conftest.py` for pytest).
 
 **First launch / new helper cache:** helper Camel caches start empty — message
 bodies re-download into the per-account cache (no automatic copy from
@@ -36,7 +37,8 @@ overlap inside one Gmail process was deferred — not part of the shipped end st
 ## Architecture
 
 - **`post.mail.camel_helper`** — per-account helper process (`python3 -m post.mail.camel_helper --account-uid …` / `post-camel-helper`). Owns **one** `MailSession` and a private mail I/O thread in that process. Sets private Camel dirs via `post.mail.camel_paths` before connect (#445). Bound to a single `--account-uid` on connect (#451). UI talks length-prefixed JSON on stdin/stdout (`camel_ipc.py`). **`camel_ipc.read_message` loops until the full frame arrives** — raw `Popen` pipes may short-read (~64 KiB); treating that as EOF desynced IPC and surfaced as `camel helper process exited` on larger bodies (#445).
-- **`post.mail.camel_runtime`** — UI supervisor: spawn / call / watchdog timeout → **kill** / respawn; `CamelRuntimePool` keyed by account. Helpers set `POST_MAIL_CAMEL_HELPER_PROCESS=1` so they do not nest. Unit tests set `POST_MAIL_TEST_NO_CAMEL_HELPERS=1` via `tests/conftest.py`.
+- **`post.mail.camel_runtime`** — UI supervisor: spawn / call / watchdog timeout → **kill** / respawn; `CamelRuntimePool` keyed by account. Helpers set `POST_MAIL_CAMEL_HELPER_PROCESS=1` so they do not nest. Unit tests set `POST_MAIL_TEST_NO_CAMEL_HELPERS=1` via `scripts/check.sh`
+(and `tests/conftest.py` for pytest).
 - **`post.mail.camel_paths`** — resolves Camel `user_data` / `user_cache`: helper env overrides → `~/.cache/post/camel-helper/<account>/{data,cache}`; otherwise system `~/.local/share/evolution` + `~/.cache/evolution` (non-helper / legacy).
 - **`post.mail.io_thread`** — used **inside** each helper. The UI must not treat a shared `post-mail-io` as the place for Camel `*_sync`; account Camel work goes through helper IPC.
 - **`MailService`** (`post.mail.eds`) — job facade (#425 / #435 / #437 / #445). Prefer `submit_job` with `account_uid`. Camel-backed methods (`read_message`, `list_folders`, `move_messages`, **flag toggles / set seen**, offline downsync / arrival prefetch, …) proxy to the account helper — do **not** mix helper reads with in-process `run_on_mail_thread` writes (split-brain on private vs system Evolution dirs; #445). After helper flag mutations, **`_mirror_flag_result_to_folder_caches`** updates the UI RAM index and shared `folder_index_cache` so flagged/unread survives folder switches (the UI paints from disk cache first). M365 Graph STATUS stays in-process on `post-graph-http` (#435); OAuth tokens for Graph may be fetched via the helper. Startup uses `connect_async`; quit uses `shutdown_async` (#443).
