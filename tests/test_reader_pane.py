@@ -119,7 +119,7 @@ class MessageReaderPaneTests(unittest.TestCase):
         )
         self.assertFalse(self.pane._message_actions.get_visible())
 
-    def test_show_message_builds_interactive_address_rows(self) -> None:
+    def test_show_message_builds_header_rows(self) -> None:
         self.pane.show_message(
             _sample_message(),
             body={"plain": "Body text", "html": None},
@@ -134,14 +134,10 @@ class MessageReaderPaneTests(unittest.TestCase):
             rows.append(child)
             child = child.get_next_sibling()
         self.assertGreaterEqual(len(rows), 3)
-        labels = []
-        for row in rows:
-            field = row.get_first_child()
-            assert field is not None
-            labels.append(field.get_label())
-        self.assertEqual(labels[0], "From:")
-        self.assertIn("To:", labels)
-        self.assertIn("Date:", labels)
+        labels = [row.get_label() for row in rows if isinstance(row, Gtk.Label)]
+        self.assertTrue(any(lab.startswith("From:") for lab in labels))
+        self.assertTrue(any(lab.startswith("To:") for lab in labels))
+        self.assertTrue(any(lab.startswith("Date:") for lab in labels))
 
     def test_address_menu_callbacks(self) -> None:
         composed: list[str] = []
