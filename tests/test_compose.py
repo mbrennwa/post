@@ -1650,6 +1650,34 @@ class HtmlForwardReplyTests(unittest.TestCase):
         self.assertIn("color:#000000;background:#ffffff", quoted)
         self.assertIn("color:red", quoted)
 
+    def test_quote_html_reply_strips_body_style_blocks(self) -> None:
+        """Document-level sender CSS must not survive into the compose quote (#411)."""
+        original = {
+            "from": "Alice <alice@example.com>",
+            "date_received": "2026-09-11",
+        }
+        source = (
+            "<style>html, body, #editor { background: #ffffff; color: #000000; }</style>"
+            "<p>Quoted text</p>"
+        )
+        quoted = quote_html_reply(original, source)
+        self.assertIn("Quoted text", quoted)
+        self.assertNotIn("<style", quoted.lower())
+        self.assertNotIn("background: #ffffff", quoted)
+        self.assertIn('class="post_quote"', quoted)
+
+    def test_quote_html_forward_strips_body_script_blocks(self) -> None:
+        original = {
+            "from": "Alice <alice@example.com>",
+            "to": "Bob <bob@example.com>",
+            "date_received": "2026-09-11",
+        }
+        source = "<script>document.body.style.background='#fff'</script><p>Newsletter</p>"
+        quoted = quote_html_forward(original, source)
+        self.assertIn("Newsletter", quoted)
+        self.assertNotIn("<script", quoted.lower())
+        self.assertIn('class="post_quote"', quoted)
+
     def test_quote_html_reply_adapt_shell_dissolves_white_card(self) -> None:
         original = {
             "from": "Alice <alice@example.com>",

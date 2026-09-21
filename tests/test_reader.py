@@ -12,7 +12,11 @@ from post.preferences import (
     MESSAGE_APPEARANCE_ADAPT_TEXT,
 )
 from post.reader import build_reader_document
-from post.reader.html import resolve_cid_images, strip_theme_locked_text_colors
+from post.reader.html import (
+    resolve_cid_images,
+    strip_sender_style_blocks,
+    strip_theme_locked_text_colors,
+)
 
 
 class BuildReaderDocumentTests(unittest.TestCase):
@@ -1392,6 +1396,19 @@ class StripThemeLockedTextColorsTests(unittest.TestCase):
         self.assertNotIn("rgb(0, 0, 0)", out)
         self.assertRegex(out, r"direction:\s*ltr")
         self.assertRegex(out, r"font-size:\s*12pt")
+
+
+class StripSenderStyleBlocksTests(unittest.TestCase):
+    def test_strips_style_and_script_keeps_markup(self) -> None:
+        html = (
+            "<style>body{color:red}</style>"
+            "<script>alert(1)</script>"
+            "<p>Hello</p>"
+        )
+        out = strip_sender_style_blocks(html)
+        self.assertEqual(out, "<p>Hello</p>")
+        self.assertNotIn("<style", out.lower())
+        self.assertNotIn("<script", out.lower())
 
 
 if __name__ == "__main__":
