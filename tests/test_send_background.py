@@ -224,6 +224,35 @@ class RunOutboundSendTests(unittest.TestCase):
         show_error_toast.assert_called_once()
         self.mail.deliver_outbound_queue_item.assert_not_called()
 
+    @mock.patch("post.compose_window.get_send_delay_seconds", return_value=30)
+    @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
+    @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
+    @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
+    def test_delayed_send_clears_status_hint(
+        self, _idle_add, persist, _queue_id, _delay
+    ) -> None:
+        outbox_changed = mock.Mock()
+        on_delayed_send = mock.Mock()
+
+        run_outbound_send(
+            mail=self.mail,
+            parent=None,
+            set_status=self.set_status,
+            on_outbox_changed=outbox_changed,
+            on_draft_saved=None,
+            on_delayed_send=on_delayed_send,
+            request=self.request,
+        )
+
+        self.mail.deliver_outbound_queue_item.assert_not_called()
+        persist.assert_called_once()
+        self.assertIsNotNone(persist.call_args.kwargs.get("send_after"))
+        on_delayed_send.assert_called_once()
+        self.assertEqual(on_delayed_send.call_args.args[0], "queue-1")
+        outbox_changed.assert_called()
+        # Empty hint so live countdown owns the status bar (#429).
+        self.assertEqual(self.status_messages, [""])
+
 
 class FinishOutboundSendTests(unittest.TestCase):
     @mock.patch("post.compose_window.show_error_toast")
@@ -297,6 +326,62 @@ class FinishOutboundSendTests(unittest.TestCase):
             "“Hello”: Subject must not contain line breaks. It is still in Outbox.",
         )
         park.assert_called_once_with("queue-1", "Subject must not contain line breaks.")
+
+    def test_finish_success_none_defaults_to_message_sent(self) -> None:
+        set_status = mock.Mock()
+        request = OutboundSendRequest(
+            account_uid="acct-1",
+            to=["user@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hello",
+            body="Body",
+            in_reply_to=None,
+            references=None,
+            attachments=None,
+            queue_id="queue-1",
+        )
+
+        _finish_outbound_send(
+            None,
+            set_status,
+            None,
+            mock.Mock(),
+            mock.Mock(),
+            request,
+            None,
+            None,
+        )
+
+        set_status.assert_called_once_with("Message sent")
+
+    def test_finish_success_empty_status_clears_hint(self) -> None:
+        set_status = mock.Mock()
+        request = OutboundSendRequest(
+            account_uid="acct-1",
+            to=["user@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hello",
+            body="Body",
+            in_reply_to=None,
+            references=None,
+            attachments=None,
+            queue_id="queue-1",
+        )
+
+        _finish_outbound_send(
+            None,
+            set_status,
+            None,
+            mock.Mock(),
+            mock.Mock(),
+            request,
+            None,
+            "",
+        )
+
+        set_status.assert_called_once_with("")
 
 
 if __name__ == "__main__":

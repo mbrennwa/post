@@ -97,7 +97,6 @@ from post.mail.send_queue import (
     persist_outbound_send,
 )
 from post.preferences import (
-    format_send_delay_status,
     get_account_signature,
     get_account_signatures,
     get_message_appearance,
@@ -293,7 +292,7 @@ def _run_outbound_send_worker(
                 mail,
                 request_with_id,
                 None,
-                format_send_delay_status(delay_seconds),
+                "",  # clear hint; live _send_delay_status owns the countdown
             )
             return
 
@@ -457,7 +456,10 @@ def _complete_outbound_send_success(
         )
     if on_outbox_changed is not None:
         on_outbox_changed()
-    set_status(success_status or "Message sent")
+    if success_status is not None:
+        set_status(success_status)
+    else:
+        set_status("Message sent")
     return False
 
 
