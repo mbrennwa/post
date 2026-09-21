@@ -4742,9 +4742,61 @@ class MailService:
         with self._lock:
             return self._empty_folder_unlocked(account_uid, folder_name)
 
+    def _helper_folder_messages_for_bulk(
+        self, account_uid: str, folder_name: str
+    ) -> tuple[list[dict], int, int]:
+        """Helper Camel summary for bulk Archive selection (#461).
+
+        Never select from UI-only folder-index cache alone — that can invent
+        UIDs and over-archive. Drop pending local removals so we do not
+        re-queue UIDs already on the local-first path.
+        """
+        messages, unread, total, _source = self.get_folder_messages(
+            account_uid, folder_name, sync=False
+        )
+        filtered = self._filter_pending_local_removals(
+            account_uid, folder_name, list(messages or [])
+        )
+        return filtered, int(unread), int(total)
+
+    def _bulk_archive_via_local_first(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        source_folder_unread: int,
+        source_folder_total: int,
+    ) -> dict[str, Any]:
+        if not message_uids:
+            return {
+                "archived_count": 0,
+                "source_folder_unread": source_folder_unread,
+                "source_folder_total": source_folder_total,
+            }
+        result = self.archive_messages(account_uid, folder_name, message_uids)
+        result["archived_count"] = len(result.get("moved_uids") or [])
+        return result
+
     def archive_read_messages(
         self, account_uid: str, folder_name: str
     ) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            messages, unread, total = self._helper_folder_messages_for_bulk(
+                account_uid, folder_name
+            )
+            read_uids = [
+                message["uid"]
+                for message in messages
+                if message.get("uid") and not message_is_unread(message)
+            ]
+            return self._bulk_archive_via_local_first(
+                account_uid,
+                folder_name,
+                read_uids,
+                source_folder_unread=unread,
+                source_folder_total=total,
+            )
         return run_on_mail_thread(
             self._archive_read_messages_unlocked, account_uid, folder_name
         )
@@ -4752,6 +4804,15 @@ class MailService:
     def count_read_unflagged_messages(
         self, account_uid: str, folder_name: str
     ) -> int:
+        if camel_helpers_enabled():
+            messages, _unread, _total = self._helper_folder_messages_for_bulk(
+                account_uid, folder_name
+            )
+            return sum(
+                1
+                for message in messages
+                if message.get("uid") and message_is_read_unflagged(message)
+            )
         return run_on_mail_thread(
             self._count_read_unflagged_messages_unlocked,
             account_uid,
@@ -4761,6 +4822,22 @@ class MailService:
     def archive_read_unflagged_messages(
         self, account_uid: str, folder_name: str
     ) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            messages, unread, total = self._helper_folder_messages_for_bulk(
+                account_uid, folder_name
+            )
+            uids = [
+                message["uid"]
+                for message in messages
+                if message.get("uid") and message_is_read_unflagged(message)
+            ]
+            return self._bulk_archive_via_local_first(
+                account_uid,
+                folder_name,
+                uids,
+                source_folder_unread=unread,
+                source_folder_total=total,
+            )
         return run_on_mail_thread(
             self._archive_read_unflagged_messages_unlocked,
             account_uid,
@@ -4770,6 +4847,20 @@ class MailService:
     def archive_all_messages(
         self, account_uid: str, folder_name: str
     ) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            messages, unread, total = self._helper_folder_messages_for_bulk(
+                account_uid, folder_name
+            )
+            all_uids = [
+                message["uid"] for message in messages if message.get("uid")
+            ]
+            return self._bulk_archive_via_local_first(
+                account_uid,
+                folder_name,
+                all_uids,
+                source_folder_unread=unread,
+                source_folder_total=total,
+            )
         return run_on_mail_thread(
             self._archive_all_messages_unlocked, account_uid, folder_name
         )

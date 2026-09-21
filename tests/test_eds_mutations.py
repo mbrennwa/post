@@ -1097,3 +1097,132 @@ class ArchiveCountTests(unittest.TestCase):
         service._build_folder_index_unlocked.assert_called_once_with(
             "acct-1", "INBOX", sync=False
         )
+
+
+class BulkArchiveHelperRoutingTests(unittest.TestCase):
+    """Bulk Archive selects via helper folder list + local-first (#461)."""
+
+    def _messages(self) -> list[dict]:
+        return [
+            {"uid": "r1", "flags": {"seen": True, "flagged": False}},
+            {"uid": "r2", "flags": {"seen": True, "flagged": True}},
+            {"uid": "u1", "flags": {"seen": False, "flagged": False}},
+        ]
+
+    def test_archive_read_uses_helper_list_and_archive_messages(self) -> None:
+        service = MailService(registry=mock.Mock())
+        with (
+            mock.patch.object(
+                service,
+                "get_folder_messages",
+                return_value=(self._messages(), 1, 3, "local"),
+            ) as get_folder,
+            mock.patch.object(
+                service,
+                "archive_messages",
+                return_value={"moved_uids": ["r1", "r2"]},
+            ) as archive,
+            mock.patch("post.mail.eds.run_on_mail_thread") as run_mail,
+        ):
+            result = service.archive_read_messages("acct-1", "INBOX")
+
+        get_folder.assert_called_once_with("acct-1", "INBOX", sync=False)
+        archive.assert_called_once_with("acct-1", "INBOX", ["r1", "r2"])
+        run_mail.assert_not_called()
+        self.assertEqual(result["archived_count"], 2)
+
+    def test_archive_read_unflagged_uses_helper_list(self) -> None:
+        service = MailService(registry=mock.Mock())
+        with (
+            mock.patch.object(
+                service,
+                "get_folder_messages",
+                return_value=(self._messages(), 1, 3, "local"),
+            ),
+            mock.patch.object(
+                service,
+                "archive_messages",
+                return_value={"moved_uids": ["r1"]},
+            ) as archive,
+            mock.patch("post.mail.eds.run_on_mail_thread") as run_mail,
+        ):
+            result = service.archive_read_unflagged_messages("acct-1", "INBOX")
+
+        archive.assert_called_once_with("acct-1", "INBOX", ["r1"])
+        run_mail.assert_not_called()
+        self.assertEqual(result["archived_count"], 1)
+
+    def test_archive_all_uses_helper_list(self) -> None:
+        service = MailService(registry=mock.Mock())
+        with (
+            mock.patch.object(
+                service,
+                "get_folder_messages",
+                return_value=(self._messages(), 1, 3, "local"),
+            ),
+            mock.patch.object(
+                service,
+                "archive_messages",
+                return_value={"moved_uids": ["r1", "r2", "u1"]},
+            ) as archive,
+            mock.patch("post.mail.eds.run_on_mail_thread") as run_mail,
+        ):
+            result = service.archive_all_messages("acct-1", "INBOX")
+
+        archive.assert_called_once_with("acct-1", "INBOX", ["r1", "r2", "u1"])
+        run_mail.assert_not_called()
+        self.assertEqual(result["archived_count"], 3)
+
+    def test_archive_all_empty_selection_skips_archive_messages(self) -> None:
+        service = MailService(registry=mock.Mock())
+        with (
+            mock.patch.object(
+                service,
+                "get_folder_messages",
+                return_value=([], 0, 0, "local"),
+            ),
+            mock.patch.object(service, "archive_messages") as archive,
+            mock.patch("post.mail.eds.run_on_mail_thread") as run_mail,
+        ):
+            result = service.archive_all_messages("acct-1", "INBOX")
+
+        archive.assert_not_called()
+        run_mail.assert_not_called()
+        self.assertEqual(result["archived_count"], 0)
+        self.assertEqual(result["source_folder_unread"], 0)
+        self.assertEqual(result["source_folder_total"], 0)
+
+    def test_count_read_unflagged_uses_helper_list(self) -> None:
+        service = MailService(registry=mock.Mock())
+        with (
+            mock.patch.object(
+                service,
+                "get_folder_messages",
+                return_value=(self._messages(), 1, 3, "local"),
+            ),
+            mock.patch("post.mail.eds.run_on_mail_thread") as run_mail,
+        ):
+            count = service.count_read_unflagged_messages("acct-1", "INBOX")
+
+        self.assertEqual(count, 1)
+        run_mail.assert_not_called()
+
+    def test_bulk_archive_skips_pending_local_removals(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._note_pending_local_removals("acct-1", "INBOX", ["r1"])
+        with (
+            mock.patch.object(
+                service,
+                "get_folder_messages",
+                return_value=(self._messages(), 1, 3, "local"),
+            ),
+            mock.patch.object(
+                service,
+                "archive_messages",
+                return_value={"moved_uids": ["r2"]},
+            ) as archive,
+        ):
+            result = service.archive_read_messages("acct-1", "INBOX")
+
+        archive.assert_called_once_with("acct-1", "INBOX", ["r2"])
+        self.assertEqual(result["archived_count"], 1)
