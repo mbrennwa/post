@@ -95,3 +95,50 @@ class OperationQueueTests(unittest.TestCase):
             payload = json.load(handle)
         self.assertEqual(payload["op_type"], "archive")
         self.assertEqual(payload["message_uids"], ["9"])
+
+    def test_coalesce_merges_same_key_uids(self) -> None:
+        from post.mail.operation_queue import coalesce_or_enqueue_operation
+
+        first = coalesce_or_enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["1"],
+            )
+        )
+        second = coalesce_or_enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["2", "1"],
+            )
+        )
+        self.assertEqual(first, second)
+        items = list_queued_operations()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0][1].message_uids, ["1", "2"])
+
+    def test_coalesce_skips_in_flight_ids(self) -> None:
+        from post.mail.operation_queue import coalesce_or_enqueue_operation
+
+        first = coalesce_or_enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["1"],
+            )
+        )
+        second = coalesce_or_enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["2"],
+            ),
+            skip_ids={first},
+        )
+        self.assertNotEqual(first, second)
+        self.assertEqual(count_queued_operations(), 2)

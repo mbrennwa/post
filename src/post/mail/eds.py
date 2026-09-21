@@ -121,8 +121,8 @@ from .draft_queue import (
 from .operation_queue import (
     OperationType,
     QueuedOperation,
+    coalesce_or_enqueue_operation,
     count_queued_operations,
-    enqueue_operation,
     list_queued_operations,
     remove_queued_operation,
 )
@@ -767,6 +767,15 @@ class MailService:
     )
     _active_outbound_deliveries: set[str] = field(default_factory=set, init=False)
     _flushing_operation_queue: bool = field(default=False, init=False)
+    _flushing_queue_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _operation_flush_scheduled: bool = field(default=False, init=False)
+    _operation_flush_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    # UIDs removed locally while waiting for helper/server flush (#462).
+    _pending_local_removals: dict[tuple[str, str], set[str]] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _flushing_draft_queue: bool = field(default=False, init=False)
     _offline_sync: OfflineBodySyncCoordinator | None = field(
         default=None, init=False, repr=False
@@ -2028,6 +2037,8 @@ class MailService:
         self.wait_for_outbound_sends()
         # Finish in-flight Archive/move/trash before tearing down Camel (#189).
         self.wait_for_folder_transfers()
+        # Brief wait only — remaining QueuedOperations stay on disk (#462/#443).
+        self.wait_for_operation_queue(timeout=3.0)
         self.cancel_folder_search()
         offline_sync_active = self.offline_sync.is_active()
         self.offline_sync.cancel_all()
@@ -2108,9 +2119,11 @@ class MailService:
         service._ensure_mail_io_callbacks()
         service._drop_orphan_account_caches()
         if camel_helpers_enabled():
-            service._camel_pool.set_account_died_callback(
-                lambda uid: service.set_account_connect_health(uid, "not_responding")
-            )
+            def _on_helper_died(uid: str) -> None:
+                service.set_account_connect_health(uid, "not_responding")
+                service.schedule_operation_queue_flush(uid)
+
+            service._camel_pool.set_account_died_callback(_on_helper_died)
         return service
 
     def set_password_prompt(self, callback: PasswordPromptCallback | None) -> None:
@@ -3183,11 +3196,93 @@ class MailService:
             self._flush_send_queue_unlocked, force=force
         )
 
-    def flush_operation_queue(self) -> int:
-        """Apply queued mail mutations after reconnect. Returns count flushed."""
+    def flush_operation_queue(self, *, helper_timeout: float = 180.0) -> int:
+        """Flush durable message mutations to the server (#462).
+
+        With per-account helpers, execution runs in the helper Camel tree — never
+        against the UI process Evolution dirs.
+        """
+        if camel_helpers_enabled():
+            accounts = sorted(
+                {
+                    operation.account_uid
+                    for _queue_id, operation in list_queued_operations()
+                }
+            )
+            flushed = 0
+            for account_uid in accounts:
+                try:
+                    result = self._camel_helper_call(
+                        "flush_account_operation_queue",
+                        account_uid,
+                        [account_uid],
+                        timeout=helper_timeout,
+                    )
+                    flushed += int(result or 0)
+                except Exception:
+                    log.exception(
+                        "Failed to flush operation queue via helper for %s",
+                        account_uid,
+                    )
+            return flushed
         if is_mail_io_thread():
             return self._flush_operation_queue_unlocked()
         return get_mail_io_thread().run_sync(self._flush_operation_queue_unlocked)
+
+    def flush_account_operation_queue(self, account_uid: str) -> int:
+        """Flush queued mutations for one account (helper entry point, #462)."""
+        if is_mail_io_thread():
+            return self._flush_operation_queue_unlocked(account_uid=account_uid)
+        return get_mail_io_thread().run_sync(
+            self._flush_operation_queue_unlocked, account_uid=account_uid
+        )
+
+    def schedule_operation_queue_flush(
+        self, account_uid: str | None = None
+    ) -> None:
+        """Kick a background flush without blocking the caller (#462)."""
+        del account_uid  # reserved for future per-account prioritization
+        with self._operation_flush_lock:
+            if self._operation_flush_scheduled:
+                return
+            self._operation_flush_scheduled = True
+
+        def worker() -> None:
+            try:
+                self.flush_operation_queue()
+            except Exception:
+                log.exception("Background operation-queue flush failed")
+            finally:
+                with self._operation_flush_lock:
+                    self._operation_flush_scheduled = False
+                if count_queued_operations() > 0:
+                    self.schedule_operation_queue_flush()
+
+        self.submit_background("flush_operation_queue", worker)
+
+    def wait_for_operation_queue(self, timeout: float = 3.0) -> bool:
+        """Wait briefly for an in-flight flush; leave remaining ops on disk (#462).
+
+        Must not start a new long helper MOVE during quit — that pinned the
+        shutdown path and left the window open/unresponsive (#443).
+        """
+        deadline = time.monotonic() + timeout
+        while count_queued_operations() > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.warning(
+                    "Timed out waiting for %d queued operation(s); "
+                    "leaving on disk for next launch",
+                    count_queued_operations(),
+                )
+                return False
+            with self._operation_flush_lock:
+                in_flight = self._operation_flush_scheduled
+            if not in_flight:
+                # Nothing flushing; do not kick a 180s MOVE from quit.
+                return count_queued_operations() <= 0
+            time.sleep(min(0.1, max(0.05, remaining)))
+        return True
 
     def count_queued_operations(self) -> int:
         return count_queued_operations()
@@ -3625,12 +3720,16 @@ class MailService:
             sign_in_required=sign_in_required,
         )
 
-    def _flush_operation_queue_unlocked(self) -> int:
+    def _flush_operation_queue_unlocked(
+        self, account_uid: str | None = None
+    ) -> int:
         flushed = 0
         skip_accounts: set[str] = set()
         self._flushing_operation_queue = True
         try:
             for queue_id, operation in list_queued_operations():
+                if account_uid is not None and operation.account_uid != account_uid:
+                    continue
                 if operation.account_uid in skip_accounts:
                     continue
                 if self.get_account_connect_health(operation.account_uid) == (
@@ -3638,6 +3737,7 @@ class MailService:
                 ):
                     skip_accounts.add(operation.account_uid)
                     continue
+                self._flushing_queue_ids.add(queue_id)
                 try:
                     self._execute_queued_operation_unlocked(operation)
                 except Exception as exc:
@@ -3668,7 +3768,19 @@ class MailService:
                     break
                 else:
                     remove_queued_operation(queue_id)
+                    if operation.op_type in {
+                        "archive",
+                        "move_to_trash",
+                        "move_to_folder",
+                    }:
+                        self._clear_pending_local_removals(
+                            operation.account_uid,
+                            operation.folder_name,
+                            operation.message_uids,
+                        )
                     flushed += 1
+                finally:
+                    self._flushing_queue_ids.discard(queue_id)
         finally:
             self._flushing_operation_queue = False
         return flushed
@@ -5139,7 +5251,10 @@ class MailService:
             )
             if isinstance(result, (list, tuple)) and len(result) == 4:
                 messages, unread, total, has_more = result
-                return list(messages or []), int(unread), int(total), bool(has_more)
+                filtered = self._filter_pending_local_removals(
+                    account_uid, folder_name, list(messages or [])
+                )
+                return filtered, int(unread), int(total), bool(has_more)
             return [], -1, -1, False
         if is_mail_io_thread():
             return self._list_messages_page_unlocked(
@@ -5955,7 +6070,10 @@ class MailService:
             index, _source = self._get_folder_index_unlocked(
                 account_uid, folder_name, sync=sync
             )
-            page, has_more = paginate_messages(index.messages, offset, limit)
+            filtered = self._filter_pending_local_removals(
+                account_uid, folder_name, list(index.messages)
+            )
+            page, has_more = paginate_messages(filtered, offset, limit)
             return page, index.unread, index.total, has_more
 
     def _prefer_nonempty_folder_index(
@@ -9584,17 +9702,9 @@ class MailService:
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
         if camel_helpers_enabled():
-            result = self._camel_helper_call(
-                "toggle_message_seen",
-                account_uid,
-                [account_uid, folder_name, message_uid],
+            return self._local_first_toggle_flag(
+                account_uid, folder_name, message_uid, flag_name="seen"
             )
-            if isinstance(result, dict):
-                self._mirror_flag_result_to_folder_caches(
-                    account_uid, folder_name, result, message_uid=message_uid
-                )
-                return result
-            return {}
         return run_on_mail_thread(
             self._toggle_message_seen_unlocked,
             account_uid,
@@ -9606,17 +9716,9 @@ class MailService:
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> dict[str, Any]:
         if camel_helpers_enabled():
-            result = self._camel_helper_call(
-                "toggle_message_flagged",
-                account_uid,
-                [account_uid, folder_name, message_uid],
+            return self._local_first_toggle_flag(
+                account_uid, folder_name, message_uid, flag_name="flagged"
             )
-            if isinstance(result, dict):
-                self._mirror_flag_result_to_folder_caches(
-                    account_uid, folder_name, result, message_uid=message_uid
-                )
-                return result
-            return {}
         return run_on_mail_thread(
             self._toggle_message_flagged_unlocked,
             account_uid,
@@ -9633,18 +9735,13 @@ class MailService:
         seen: bool,
     ) -> dict[str, Any]:
         if camel_helpers_enabled():
-            result = self._camel_helper_call(
-                "set_messages_seen",
+            return self._local_first_set_flags(
                 account_uid,
-                [account_uid, folder_name, message_uids],
-                {"seen": seen},
+                folder_name,
+                message_uids,
+                op_type="set_seen",
+                seen=seen,
             )
-            if isinstance(result, dict):
-                self._mirror_flag_result_to_folder_caches(
-                    account_uid, folder_name, result
-                )
-                return result
-            return {}
         return run_on_mail_thread(
             self._set_messages_seen_unlocked,
             account_uid,
@@ -9662,18 +9759,13 @@ class MailService:
         flagged: bool,
     ) -> dict[str, Any]:
         if camel_helpers_enabled():
-            result = self._camel_helper_call(
-                "set_messages_flagged",
+            return self._local_first_set_flags(
                 account_uid,
-                [account_uid, folder_name, message_uids],
-                {"flagged": flagged},
+                folder_name,
+                message_uids,
+                op_type="set_flagged",
+                flagged=flagged,
             )
-            if isinstance(result, dict):
-                self._mirror_flag_result_to_folder_caches(
-                    account_uid, folder_name, result
-                )
-                return result
-            return {}
         return run_on_mail_thread(
             self._set_messages_flagged_unlocked,
             account_uid,
@@ -9686,17 +9778,9 @@ class MailService:
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
         if camel_helpers_enabled():
-            result = self._camel_helper_call(
-                "toggle_messages_seen",
-                account_uid,
-                [account_uid, folder_name, message_uids],
+            return self._local_first_toggle_flags(
+                account_uid, folder_name, message_uids, flag_name="seen"
             )
-            if isinstance(result, dict):
-                self._mirror_flag_result_to_folder_caches(
-                    account_uid, folder_name, result
-                )
-                return result
-            return {}
         return run_on_mail_thread(
             self._toggle_messages_seen_unlocked,
             account_uid,
@@ -9708,17 +9792,9 @@ class MailService:
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
         if camel_helpers_enabled():
-            result = self._camel_helper_call(
-                "toggle_messages_flagged",
-                account_uid,
-                [account_uid, folder_name, message_uids],
+            return self._local_first_toggle_flags(
+                account_uid, folder_name, message_uids, flag_name="flagged"
             )
-            if isinstance(result, dict):
-                self._mirror_flag_result_to_folder_caches(
-                    account_uid, folder_name, result
-                )
-                return result
-            return {}
         return run_on_mail_thread(
             self._toggle_messages_flagged_unlocked,
             account_uid,
@@ -9730,12 +9806,13 @@ class MailService:
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
         if camel_helpers_enabled():
-            result = self._camel_helper_call(
-                "move_messages_to_trash",
+            return self._local_first_transfer(
                 account_uid,
-                [account_uid, folder_name, message_uids],
+                folder_name,
+                message_uids,
+                op_type="move_to_trash",
+                destination_folder=None,
             )
-            return result if isinstance(result, dict) else {}
         return run_on_mail_thread(
             self._move_messages_to_trash_unlocked,
             account_uid,
@@ -9747,12 +9824,13 @@ class MailService:
         self, account_uid: str, folder_name: str, message_uids: list[str]
     ) -> dict[str, Any]:
         if camel_helpers_enabled():
-            result = self._camel_helper_call(
-                "archive_messages",
+            return self._local_first_transfer(
                 account_uid,
-                [account_uid, folder_name, message_uids],
+                folder_name,
+                message_uids,
+                op_type="archive",
+                destination_folder=None,
             )
-            return result if isinstance(result, dict) else {}
         return run_on_mail_thread(
             self._archive_messages_unlocked,
             account_uid,
@@ -9768,12 +9846,13 @@ class MailService:
         message_uids: list[str],
     ) -> dict[str, Any]:
         if camel_helpers_enabled():
-            result = self._camel_helper_call(
-                "move_messages",
+            return self._local_first_transfer(
                 account_uid,
-                [account_uid, source_folder, destination_folder, message_uids],
+                source_folder,
+                message_uids,
+                op_type="move_to_folder",
+                destination_folder=destination_folder,
             )
-            return result if isinstance(result, dict) else {}
         return run_on_mail_thread(
             self._move_messages_unlocked,
             account_uid,
@@ -10552,6 +10631,20 @@ class MailService:
             "folder_total": total,
             "queued": queued,
         }
+        # Local-first may have already applied flags; still STORE on flush (#462).
+        if (
+            self._flushing_operation_queue
+            and message_uids
+            and not changed_uids
+        ):
+            self._persist_message_flag_changes_unlocked(
+                account_uid,
+                folder,
+                list(message_uids),
+                op_type="set_seen",
+                seen=seen,
+            )
+            result["queued"] = False
         self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
         return result
 
@@ -10595,6 +10688,19 @@ class MailService:
                 flagged=flagged,
             )
         result = {"updates": updates, "queued": queued}
+        if (
+            self._flushing_operation_queue
+            and message_uids
+            and not changed_uids
+        ):
+            self._persist_message_flag_changes_unlocked(
+                account_uid,
+                folder,
+                list(message_uids),
+                op_type="set_flagged",
+                flagged=flagged,
+            )
+            result["queued"] = False
         self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
         return result
 
@@ -10826,7 +10932,36 @@ class MailService:
     ) -> tuple[int, int]:
         index = self._folder_indexes.get((account_uid, folder_name))
         if index is None:
-            return -1, -1
+            # No RAM index in this process — still patch shared disk cache so a
+            # later folder open does not resurrect locally-archived rows (#462).
+            cached = folder_index_cache.load(account_uid, folder_name)
+            if cached is None:
+                return -1, -1
+            messages, unread, total = cached
+            uid_set = set(message_uids)
+            removed_unread = sum(
+                1
+                for message in messages
+                if message.get("uid") in uid_set
+                and not (message.get("flags") or {}).get("seen", False)
+            )
+            kept = [
+                message
+                for message in messages
+                if message.get("uid") not in uid_set
+            ]
+            new_unread = max(0, unread - removed_unread) if unread >= 0 else unread
+            new_total = (
+                max(0, total - len(message_uids)) if total >= 0 else len(kept)
+            )
+            folder_index_cache.save(
+                account_uid,
+                folder_name,
+                kept,
+                new_unread,
+                new_total,
+            )
+            return new_unread, new_total
         uid_set = set(message_uids)
         removed_unread = sum(
             1
@@ -10854,6 +10989,487 @@ class MailService:
         )
         return index.unread, index.total
 
+    def _note_pending_local_removals(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+    ) -> None:
+        key = (account_uid, folder_name)
+        bucket = self._pending_local_removals.setdefault(key, set())
+        for uid in message_uids:
+            text = str(uid)
+            if text:
+                bucket.add(text)
+
+    def _clear_pending_local_removals(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+    ) -> None:
+        key = (account_uid, folder_name)
+        bucket = self._pending_local_removals.get(key)
+        if not bucket:
+            return
+        for uid in message_uids:
+            bucket.discard(str(uid))
+        if not bucket:
+            self._pending_local_removals.pop(key, None)
+
+    def _filter_pending_local_removals(
+        self,
+        account_uid: str,
+        folder_name: str,
+        messages: list[dict],
+    ) -> list[dict]:
+        pending = self._pending_local_removals.get((account_uid, folder_name))
+        if not pending:
+            return messages
+        return [
+            message
+            for message in messages
+            if str(message.get("uid") or "") not in pending
+        ]
+
+    def apply_local_mutation(
+        self,
+        account_uid: str,
+        op_type: str,
+        folder_name: str,
+        message_uids: list[str],
+        destination_folder: str | None = None,
+        seen: bool | None = None,
+        flagged: bool | None = None,
+    ) -> dict[str, Any]:
+        """Apply a mutation locally in Camel without server I/O (#462)."""
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "apply_local_mutation",
+                account_uid,
+                [account_uid, op_type, folder_name, message_uids],
+                {
+                    "destination_folder": destination_folder,
+                    "seen": seen,
+                    "flagged": flagged,
+                },
+                timeout=30.0,
+            )
+            return result if isinstance(result, dict) else {}
+        return run_on_mail_thread(
+            self._apply_local_mutation_unlocked,
+            account_uid,
+            op_type,
+            folder_name,
+            message_uids,
+            destination_folder=destination_folder,
+            seen=seen,
+            flagged=flagged,
+        )
+
+    def _apply_local_mutation_unlocked(
+        self,
+        account_uid: str,
+        op_type: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        destination_folder: str | None = None,
+        seen: bool | None = None,
+        flagged: bool | None = None,
+    ) -> dict[str, Any]:
+        uids = [str(uid) for uid in message_uids if uid]
+        if op_type in {"archive", "move_to_trash", "move_to_folder"}:
+            self._note_pending_local_removals(account_uid, folder_name, uids)
+            source_unread, source_total = (
+                self._optimistic_remove_messages_from_cache_unlocked(
+                    account_uid, folder_name, uids
+                )
+            )
+            # Keep FolderSummary intact until flush MOVE so Camel can still
+            # transfer; pending-removal filter hides UIDs from list/index (#462).
+            return {
+                "moved_uids": list(uids),
+                "destination_uids": [],
+                "source_folder": folder_name,
+                "source_folder_unread": source_unread,
+                "source_folder_total": source_total,
+                "destination_folder": destination_folder,
+                "destination_folder_unread": -1,
+                "destination_folder_total": -1,
+                "queued": True,
+            }
+        if op_type == "set_seen":
+            if seen is None:
+                raise ValueError("apply_local_mutation set_seen requires seen=")
+            return self._apply_local_seen_unlocked(
+                account_uid, folder_name, uids, seen=seen
+            )
+        if op_type == "set_flagged":
+            if flagged is None:
+                raise ValueError(
+                    "apply_local_mutation set_flagged requires flagged="
+                )
+            return self._apply_local_flagged_unlocked(
+                account_uid, folder_name, uids, flagged=flagged
+            )
+        if op_type == "toggle_seen":
+            return self._apply_local_toggle_seen_unlocked(
+                account_uid, folder_name, uids
+            )
+        if op_type == "toggle_flagged":
+            return self._apply_local_toggle_flagged_unlocked(
+                account_uid, folder_name, uids
+            )
+        raise ValueError(f"Unknown local mutation: {op_type}")
+
+    def _apply_local_seen_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        seen: bool,
+    ) -> dict[str, Any]:
+        folder = self._require_folder_unlocked(account_uid, folder_name)
+        updates: list[dict[str, Any]] = []
+        for message_uid in message_uids:
+            info = folder_get_message_info(folder, message_uid)
+            if info is None:
+                updates.append({"uid": message_uid, "flags": {"seen": seen}})
+                continue
+            currently_seen = bool(info.get_flags() & Camel.MessageFlags.SEEN)
+            if currently_seen != seen:
+                flag_value = Camel.MessageFlags.SEEN if seen else 0
+                self._apply_message_flags_unlocked(
+                    folder,
+                    account_uid,
+                    folder_name,
+                    message_uid,
+                    Camel.MessageFlags.SEEN,
+                    flag_value,
+                )
+            updates.append({"uid": message_uid, "flags": {"seen": seen}})
+        unread = folder_get_unread_count(folder)
+        total = folder.get_message_count()
+        self._update_cached_folder_counts(account_uid, folder_name, unread, total)
+        result = {
+            "updates": updates,
+            "folder_unread": unread,
+            "folder_total": total,
+            "queued": True,
+        }
+        self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
+        return result
+
+    def _apply_local_flagged_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        flagged: bool,
+    ) -> dict[str, Any]:
+        folder = self._require_folder_unlocked(account_uid, folder_name)
+        backend = self._backend_for_account(account_uid)
+        updates: list[dict[str, Any]] = []
+        for message_uid in message_uids:
+            info = folder_get_message_info(folder, message_uid)
+            if info is None:
+                updates.append({"uid": message_uid, "flags": {"flagged": flagged}})
+                continue
+            currently_flagged = _message_info_is_flagged(info, backend=backend)
+            if currently_flagged != flagged:
+                self._apply_message_flagged_unlocked(
+                    folder,
+                    account_uid,
+                    folder_name,
+                    message_uid,
+                    flagged,
+                    backend=backend,
+                )
+            updates.append({"uid": message_uid, "flags": {"flagged": flagged}})
+        result = {"updates": updates, "queued": True}
+        self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
+        return result
+
+    def _apply_local_toggle_seen_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+    ) -> dict[str, Any]:
+        folder = self._require_folder_unlocked(account_uid, folder_name)
+        updates: list[dict[str, Any]] = []
+        for message_uid in message_uids:
+            info = folder_get_message_info(folder, message_uid)
+            if info is None:
+                continue
+            currently_seen = bool(info.get_flags() & Camel.MessageFlags.SEEN)
+            new_seen = not currently_seen
+            flag_value = Camel.MessageFlags.SEEN if new_seen else 0
+            self._apply_message_flags_unlocked(
+                folder,
+                account_uid,
+                folder_name,
+                message_uid,
+                Camel.MessageFlags.SEEN,
+                flag_value,
+            )
+            updates.append({"uid": message_uid, "flags": {"seen": new_seen}})
+        unread = folder_get_unread_count(folder)
+        total = folder.get_message_count()
+        self._update_cached_folder_counts(account_uid, folder_name, unread, total)
+        result = {
+            "updates": updates,
+            "folder_unread": unread,
+            "folder_total": total,
+            "queued": True,
+        }
+        self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
+        return result
+
+    def _apply_local_toggle_flagged_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+    ) -> dict[str, Any]:
+        folder = self._require_folder_unlocked(account_uid, folder_name)
+        backend = self._backend_for_account(account_uid)
+        updates: list[dict[str, Any]] = []
+        for message_uid in message_uids:
+            info = folder_get_message_info(folder, message_uid)
+            if info is None:
+                continue
+            currently_flagged = _message_info_is_flagged(info, backend=backend)
+            new_flagged = not currently_flagged
+            self._apply_message_flagged_unlocked(
+                folder,
+                account_uid,
+                folder_name,
+                message_uid,
+                new_flagged,
+                backend=backend,
+            )
+            updates.append({"uid": message_uid, "flags": {"flagged": new_flagged}})
+        result = {"updates": updates, "queued": True}
+        self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
+        return result
+
+    def _kick_local_apply_and_flush(
+        self,
+        account_uid: str,
+        op_type: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        destination_folder: str | None = None,
+        seen: bool | None = None,
+        flagged: bool | None = None,
+    ) -> None:
+        """Apply helper-local state then flush without blocking the caller (#462).
+
+        Must not wait on helper ``_serial`` — a background MOVE flush can hold
+        that lock for tens of seconds and would freeze interactive Archive/quit.
+        """
+
+        def worker() -> None:
+            try:
+                self.apply_local_mutation(
+                    account_uid,
+                    op_type,
+                    folder_name,
+                    message_uids,
+                    destination_folder=destination_folder,
+                    seen=seen,
+                    flagged=flagged,
+                )
+            except Exception:
+                log.exception(
+                    "Local apply failed for %s on %s; queued for flush anyway",
+                    op_type,
+                    account_uid,
+                )
+            self.schedule_operation_queue_flush(account_uid)
+
+        self.submit_background(f"local_apply_{op_type}", worker)
+
+    def _local_first_transfer(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        op_type: OperationType,
+        destination_folder: str | None,
+    ) -> dict[str, Any]:
+        uids = [str(uid) for uid in message_uids if uid]
+        if not uids:
+            return {"moved_uids": [], "queued": True}
+        self._note_pending_local_removals(account_uid, folder_name, uids)
+        source_unread, source_total = (
+            self._optimistic_remove_messages_from_cache_unlocked(
+                account_uid, folder_name, uids
+            )
+        )
+        coalesce_or_enqueue_operation(
+            QueuedOperation(
+                op_type=op_type,
+                account_uid=account_uid,
+                folder_name=folder_name,
+                message_uids=list(uids),
+                destination_folder=destination_folder,
+            ),
+            skip_ids=set(self._flushing_queue_ids),
+        )
+        self._kick_local_apply_and_flush(
+            account_uid,
+            op_type,
+            folder_name,
+            uids,
+            destination_folder=destination_folder,
+        )
+        return {
+            "moved_uids": list(uids),
+            "destination_uids": [],
+            "source_folder": folder_name,
+            "source_folder_unread": source_unread,
+            "source_folder_total": source_total,
+            "destination_folder": destination_folder,
+            "destination_folder_unread": -1,
+            "destination_folder_total": -1,
+            "queued": True,
+        }
+
+    def _local_first_set_flags(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        op_type: OperationType,
+        seen: bool | None = None,
+        flagged: bool | None = None,
+    ) -> dict[str, Any]:
+        uids = [str(uid) for uid in message_uids if uid]
+        if not uids:
+            return {"updates": [], "queued": True}
+        coalesce_or_enqueue_operation(
+            QueuedOperation(
+                op_type=op_type,
+                account_uid=account_uid,
+                folder_name=folder_name,
+                message_uids=list(uids),
+                seen=seen,
+                flagged=flagged,
+            ),
+            skip_ids=set(self._flushing_queue_ids),
+        )
+        updates: list[dict[str, Any]] = []
+        for uid in uids:
+            flags: dict[str, Any] = {}
+            if seen is not None:
+                flags["seen"] = seen
+            if flagged is not None:
+                flags["flagged"] = flagged
+            updates.append({"uid": uid, "flags": flags})
+        result: dict[str, Any] = {"updates": updates, "queued": True}
+        self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
+        self._kick_local_apply_and_flush(
+            account_uid,
+            op_type,
+            folder_name,
+            uids,
+            seen=seen,
+            flagged=flagged,
+        )
+        return result
+
+    def _flag_from_folder_index(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        flag_name: str,
+    ) -> bool | None:
+        index = self._folder_indexes.get((account_uid, folder_name))
+        messages = index.messages if index is not None else None
+        if messages is None:
+            cached = folder_index_cache.load(account_uid, folder_name)
+            if cached is None:
+                return None
+            messages = cached[0]
+        for message in messages:
+            if str(message.get("uid") or "") != str(message_uid):
+                continue
+            flags = message.get("flags") or {}
+            if flag_name not in flags:
+                return None
+            return bool(flags[flag_name])
+        return None
+
+    def _local_first_toggle_flag(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        flag_name: str,
+    ) -> dict[str, Any]:
+        return self._local_first_toggle_flags(
+            account_uid, folder_name, [message_uid], flag_name=flag_name
+        )
+
+    def _local_first_toggle_flags(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+        *,
+        flag_name: str,
+    ) -> dict[str, Any]:
+        # Flip from folder-index when possible so toggle never waits on helper
+        # ``_serial`` held by a background MOVE flush (#462).
+        updates: list[dict[str, Any]] = []
+        for uid in message_uids:
+            current = self._flag_from_folder_index(
+                account_uid, folder_name, str(uid), flag_name
+            )
+            if current is None:
+                # Unknown — assume unread/unflagged → mark seen/flagged.
+                current = False
+            new_value = not current
+            flags = {flag_name: new_value}
+            updates.append({"uid": str(uid), "flags": flags})
+            if flag_name == "seen":
+                coalesce_or_enqueue_operation(
+                    QueuedOperation(
+                        op_type="set_seen",
+                        account_uid=account_uid,
+                        folder_name=folder_name,
+                        message_uids=[str(uid)],
+                        seen=new_value,
+                    ),
+                    skip_ids=set(self._flushing_queue_ids),
+                )
+            else:
+                coalesce_or_enqueue_operation(
+                    QueuedOperation(
+                        op_type="set_flagged",
+                        account_uid=account_uid,
+                        folder_name=folder_name,
+                        message_uids=[str(uid)],
+                        flagged=new_value,
+                    ),
+                    skip_ids=set(self._flushing_queue_ids),
+                )
+        result: dict[str, Any] = {"updates": updates, "queued": True}
+        self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
+        # Folder-index already updated; helper Camel flags catch up on flush.
+        self.schedule_operation_queue_flush(account_uid)
+        return result
+
     def _queue_transfer_operation_unlocked(
         self,
         account_uid: str,
@@ -10866,14 +11482,18 @@ class MailService:
         source_unread, source_total = self._optimistic_remove_messages_from_cache_unlocked(
             account_uid, source_folder_name, message_uids
         )
-        enqueue_operation(
+        self._note_pending_local_removals(
+            account_uid, source_folder_name, message_uids
+        )
+        coalesce_or_enqueue_operation(
             QueuedOperation(
                 op_type=op_type,
                 account_uid=account_uid,
                 folder_name=source_folder_name,
                 message_uids=list(message_uids),
                 destination_folder=destination_folder,
-            )
+            ),
+            skip_ids=set(self._flushing_queue_ids),
         )
         return {
             "moved_uids": list(message_uids),
@@ -10897,7 +11517,7 @@ class MailService:
         seen: bool | None = None,
         flagged: bool | None = None,
     ) -> None:
-        enqueue_operation(
+        coalesce_or_enqueue_operation(
             QueuedOperation(
                 op_type=op_type,
                 account_uid=account_uid,
@@ -10905,7 +11525,8 @@ class MailService:
                 message_uids=list(message_uids),
                 seen=seen,
                 flagged=flagged,
-            )
+            ),
+            skip_ids=set(self._flushing_queue_ids),
         )
 
     def _transfer_messages_unlocked(

@@ -92,37 +92,52 @@ class DraftDispatchTests(unittest.TestCase):
         )
         self.assertEqual(result, ("file.txt", b"data"))
 
-    def test_toggle_message_seen_uses_camel_helper(self) -> None:
-        service = MailService(registry=mock.Mock())
-        with (
-            mock.patch.object(
-                service,
-                "_camel_helper_call",
-                return_value={"updates": []},
-            ) as helper_call,
-            mock.patch.object(service, "_mirror_flag_result_to_folder_caches"),
-        ):
-            service.toggle_message_seen("acct-1", "INBOX", "42")
-
-        helper_call.assert_called_once_with(
-            "toggle_message_seen",
-            "acct-1",
-            ["acct-1", "INBOX", "42"],
-        )
-
-    def test_move_messages_to_trash_uses_camel_helper(self) -> None:
+    def test_toggle_message_seen_uses_local_first(self) -> None:
         service = MailService(registry=mock.Mock())
         with mock.patch.object(
             service,
-            "_camel_helper_call",
-            return_value={"moved_uids": ["1"]},
-        ) as helper_call:
-            service.move_messages_to_trash("acct-1", "INBOX", ["1"])
+            "_local_first_toggle_flag",
+            return_value={"updates": [], "queued": True},
+        ) as local_first:
+            service.toggle_message_seen("acct-1", "INBOX", "42")
 
-        helper_call.assert_called_once_with(
-            "move_messages_to_trash",
+        local_first.assert_called_once_with(
+            "acct-1", "INBOX", "42", flag_name="seen"
+        )
+
+    def test_move_messages_to_trash_uses_local_first(self) -> None:
+        service = MailService(registry=mock.Mock())
+        with mock.patch.object(
+            service,
+            "_local_first_transfer",
+            return_value={"moved_uids": ["1"], "queued": True},
+        ) as local_first:
+            result = service.move_messages_to_trash("acct-1", "INBOX", ["1"])
+
+        local_first.assert_called_once_with(
             "acct-1",
-            ["acct-1", "INBOX", ["1"]],
+            "INBOX",
+            ["1"],
+            op_type="move_to_trash",
+            destination_folder=None,
+        )
+        self.assertEqual(result["queued"], True)
+
+    def test_archive_messages_uses_local_first(self) -> None:
+        service = MailService(registry=mock.Mock())
+        with mock.patch.object(
+            service,
+            "_local_first_transfer",
+            return_value={"moved_uids": ["1"], "queued": True},
+        ) as local_first:
+            service.archive_messages("acct-1", "INBOX", ["1"])
+
+        local_first.assert_called_once_with(
+            "acct-1",
+            "INBOX",
+            ["1"],
+            op_type="archive",
+            destination_folder=None,
         )
 
 

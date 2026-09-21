@@ -12,59 +12,63 @@ from post.mail.eds import MailService
 
 
 class HelperFlagRoutingTests(unittest.TestCase):
-    def test_set_messages_seen_uses_helper(self) -> None:
+    def test_set_messages_seen_uses_local_first(self) -> None:
         service = MailService(registry=mock.Mock())
         with (
             mock.patch.object(
                 service,
-                "_camel_helper_call",
-                return_value={"unread": 1, "total": 2},
-            ) as helper_call,
+                "_local_first_set_flags",
+                return_value={"updates": [], "queued": True},
+            ) as local_first,
             mock.patch("post.mail.eds.run_on_mail_thread") as run_mail,
         ):
             result = service.set_messages_seen(
                 "acct", "INBOX", ["uid-1"], seen=False
             )
-        self.assertEqual(result, {"unread": 1, "total": 2})
-        helper_call.assert_called_once_with(
-            "set_messages_seen",
+        self.assertEqual(result, {"updates": [], "queued": True})
+        local_first.assert_called_once_with(
             "acct",
-            ["acct", "INBOX", ["uid-1"]],
-            {"seen": False},
+            "INBOX",
+            ["uid-1"],
+            op_type="set_seen",
+            seen=False,
         )
         run_mail.assert_not_called()
 
-    def test_toggle_message_seen_uses_helper(self) -> None:
+    def test_toggle_message_seen_uses_local_first(self) -> None:
         service = MailService(registry=mock.Mock())
         with mock.patch.object(
-            service, "_camel_helper_call", return_value={"seen": False}
-        ) as helper_call:
+            service,
+            "_local_first_toggle_flag",
+            return_value={"flags": {"seen": False}, "queued": True},
+        ) as local_first:
             result = service.toggle_message_seen("acct", "INBOX", "uid-1")
-        self.assertEqual(result, {"seen": False})
-        helper_call.assert_called_once_with(
-            "toggle_message_seen",
-            "acct",
-            ["acct", "INBOX", "uid-1"],
+        self.assertEqual(result["queued"], True)
+        local_first.assert_called_once_with(
+            "acct", "INBOX", "uid-1", flag_name="seen"
         )
 
-    def test_set_messages_flagged_mirrors_disk_cache(self) -> None:
-        """Helper flag writes must update shared folder-index disk cache (#445)."""
+    def test_set_messages_flagged_mirrors_via_local_first(self) -> None:
+        """Local-first flag writes still update shared folder-index disk cache."""
         service = MailService(registry=mock.Mock())
         helper_result = {
             "updates": [{"uid": "uid-1", "flags": {"flagged": True}}],
-            "queued": False,
+            "queued": True,
         }
-        with (
-            mock.patch.object(
-                service, "_camel_helper_call", return_value=helper_result
-            ),
-            mock.patch.object(service, "_mirror_flag_result_to_folder_caches") as mirror,
-        ):
+        with mock.patch.object(
+            service, "_local_first_set_flags", return_value=helper_result
+        ) as local_first:
             result = service.set_messages_flagged(
                 "acct", "INBOX", ["uid-1"], flagged=True
             )
         self.assertEqual(result, helper_result)
-        mirror.assert_called_once_with("acct", "INBOX", helper_result)
+        local_first.assert_called_once_with(
+            "acct",
+            "INBOX",
+            ["uid-1"],
+            op_type="set_flagged",
+            flagged=True,
+        )
 
 
 if __name__ == "__main__":

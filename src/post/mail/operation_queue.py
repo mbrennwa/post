@@ -84,6 +84,49 @@ def enqueue_operation(operation: QueuedOperation, *, queue_id: str | None = None
     return queue_id
 
 
+def _operations_match_for_coalesce(
+    existing: QueuedOperation, operation: QueuedOperation
+) -> bool:
+    return (
+        existing.account_uid == operation.account_uid
+        and existing.op_type == operation.op_type
+        and existing.folder_name == operation.folder_name
+        and existing.destination_folder == operation.destination_folder
+        and existing.seen == operation.seen
+        and existing.flagged == operation.flagged
+    )
+
+
+def coalesce_or_enqueue_operation(
+    operation: QueuedOperation,
+    *,
+    skip_ids: set[str] | frozenset[str] | None = None,
+) -> str:
+    """Merge into a pending same-key op, or enqueue a new one (#462).
+
+    ``skip_ids`` are operations currently executing (do not merge into them).
+    """
+    skip = skip_ids or frozenset()
+    for queue_id, existing in list_queued_operations():
+        if queue_id in skip:
+            continue
+        if not _operations_match_for_coalesce(existing, operation):
+            continue
+        merged_uids: list[str] = []
+        seen_uids: set[str] = set()
+        for uid in list(existing.message_uids) + list(operation.message_uids):
+            text = str(uid)
+            if not text or text in seen_uids:
+                continue
+            seen_uids.add(text)
+            merged_uids.append(text)
+        existing.message_uids = merged_uids
+        # Rewrite in place so flush order / queue_id stay stable.
+        enqueue_operation(existing, queue_id=queue_id)
+        return queue_id
+    return enqueue_operation(operation)
+
+
 def list_queued_operations() -> list[tuple[str, QueuedOperation]]:
     directory = operations_dir()
     if not os.path.isdir(directory):
