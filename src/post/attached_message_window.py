@@ -21,7 +21,6 @@ gi.require_version("GLib", "2.0")
 from gi.repository import Adw, Gio, GLib, Gtk
 
 from post.attachment_menu import (
-    make_attachment_popover,
     popup_attachment_menu,
     register_attachment_actions,
 )
@@ -216,7 +215,7 @@ class AttachedMessageWindow(Adw.ApplicationWindow):
             on_save=self._on_attachment_menu_save,
             on_open_with=self._on_attachment_menu_open_with,
         )
-        self._attachment_popover = make_attachment_popover()
+        self._attachment_popover: Gtk.PopoverMenu | None = None
 
     def _on_attachment_context_menu(
         self,
@@ -230,7 +229,7 @@ class AttachedMessageWindow(Adw.ApplicationWindow):
         self._context_attachment_index = index
         self._context_attachment_mime = mime_type
         self._context_attachment_name = name
-        popup_attachment_menu(
+        self._attachment_popover = popup_attachment_menu(
             self._attachment_popover,
             widget,
             x,

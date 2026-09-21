@@ -21,7 +21,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from post.attachment_menu import (
-    make_attachment_popover,
+    dismiss_popover,
     popup_attachment_menu,
     register_attachment_actions,
 )
@@ -2876,7 +2876,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_open_with=self._on_attachment_menu_open_with,
             on_add_to_calendar=self._on_attachment_menu_add_to_calendar,
         )
-        self._attachment_popover = make_attachment_popover()
+        self._attachment_popover: Gtk.PopoverMenu | None = None
 
     def _setup_message_menu(self) -> None:
         mark_read_action = Gio.SimpleAction.new("message-mark-read", None)
@@ -2945,8 +2945,7 @@ class MainWindow(Adw.ApplicationWindow):
         )
         self.add_action(self._outbox_send_now_action)
 
-        self._message_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
-        self._message_popover.set_parent(self._message_scroll)
+        self._message_popover: Gtk.PopoverMenu | None = None
 
     def _setup_message_shortcuts(self) -> None:
         controller = Gtk.ShortcutController()
@@ -2979,7 +2978,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._sync_watcher.set_current_folder(None, None)
         if not self._try_eager_restore_active_folder():
             self._clear_reader()
-            self._message_popover.popdown()
+            dismiss_popover(self._message_popover)
             self._message_list_view.clear()
             self._current_account = None
             self._current_folder = None
@@ -3140,7 +3139,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _reload_sidebar(self) -> bool:
         self._sync_watcher.set_current_folder(None, None)
         self._clear_reader()
-        self._message_popover.popdown()
+        dismiss_popover(self._message_popover)
         self._message_list_view.clear()
         self._current_account = None
         self._current_folder = None
@@ -3553,7 +3552,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._messages_load_generation += 1
             load_id = self._messages_load_generation
             self._messages_load_expects_search = False
-            self._message_popover.popdown()
+            dismiss_popover(self._message_popover)
             self._clear_reader()
             self._on_messages_loaded(
                 load_id,
@@ -3746,7 +3745,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._context_attachment_index = index
         self._context_attachment_mime = mime_type
         self._context_attachment_name = name
-        popup_attachment_menu(
+        self._attachment_popover = popup_attachment_menu(
             self._attachment_popover,
             widget,
             x,
@@ -5310,7 +5309,7 @@ class MainWindow(Adw.ApplicationWindow):
         ):
             self._pending_restore_message_uid = self._current_message_uid
             self._restore_message_folder = (account_uid, folder_name)
-        self._message_popover.popdown()
+        dismiss_popover(self._message_popover)
         self._message_list_view.clear()
         if seed_matches:
             seed_matches = sort_messages_newest_first(seed_matches)
@@ -6319,9 +6318,12 @@ class MainWindow(Adw.ApplicationWindow):
             menu.append(
                 self._count_menu_label("Move to Trash", count), "win.message-move-trash"
             )
-        self._message_popover.set_menu_model(menu)
+        dismiss_popover(self._message_popover)
+        popover = Gtk.PopoverMenu.new_from_model(menu)
+        popover.set_parent(self._message_scroll)
+        self._message_popover = popover
 
-        parent = self._message_popover.get_parent()
+        parent = popover.get_parent()
         coords: tuple[float, float] | None = None
         if popup_widget is not None and parent is not None:
             coords = popup_widget.translate_coordinates(parent, x, y)
@@ -6336,8 +6338,8 @@ class MainWindow(Adw.ApplicationWindow):
         rect.y = int(menu_y)
         rect.width = 1
         rect.height = 1
-        self._message_popover.set_pointing_to(rect)
-        self._message_popover.popup()
+        popover.set_pointing_to(rect)
+        popover.popup()
 
     def _on_message_list_item_pressed(self, uid: str) -> None:
         self._user_message_click_pending = True
@@ -6638,7 +6640,7 @@ class MainWindow(Adw.ApplicationWindow):
         if not groups:
             return
 
-        self._message_popover.popdown()
+        dismiss_popover(self._message_popover)
         self._clear_move_undo()
 
         label = "Trash" if destination == "trash" else "Archive"
