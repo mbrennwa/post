@@ -6661,14 +6661,6 @@ class MainWindow(Adw.ApplicationWindow):
                 self._delete_queued_messages(message_uids)
                 continue
 
-            if self._mail.get_account_transfer_state(group_account) != "idle":
-                show_error_toast(
-                    self,
-                    "A previous move is still in progress or the server is not "
-                    "responding; try again in a moment",
-                )
-                continue
-
             self._suppress_sync_list_reload = (group_account, group_folder)
 
             # Optimistic UI: remove rows immediately so Archive doesn't look
@@ -6737,14 +6729,6 @@ class MainWindow(Adw.ApplicationWindow):
         uids: list[str],
     ) -> None:
         if not uids or source_folder == dest_folder:
-            return
-
-        if self._mail.get_account_transfer_state(account_uid) != "idle":
-            show_error_toast(
-                self,
-                "A previous move is still in progress or the server is not "
-                "responding; try again in a moment",
-            )
             return
 
         uids = list(uids)

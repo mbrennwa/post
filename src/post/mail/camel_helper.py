@@ -42,6 +42,8 @@ ALLOWED_METHODS = frozenset(
         "move_messages",
         "archive_messages",
         "move_messages_to_trash",
+        "apply_local_mutation",
+        "flush_account_operation_queue",
         "toggle_message_seen",
         "toggle_message_flagged",
         "toggle_messages_seen",

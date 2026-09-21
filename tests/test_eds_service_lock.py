@@ -13,6 +13,7 @@ from unittest import mock
 from post.mail.eds import MailService
 from post.mail.operation_queue import (
     QueuedOperation,
+    count_queued_operations,
     enqueue_operation,
     list_queued_operations,
 )
@@ -203,8 +204,73 @@ class ServiceLockReleaseTests(unittest.TestCase):
             "list_offline_downsync_folders",
             "offline_downsync_folder",
             "synchronize_folder_message",
+            "apply_local_mutation",
+            "flush_account_operation_queue",
         ):
             self.assertIn(name, ALLOWED_METHODS)
+
+    def test_flush_operation_queue_routes_through_helper(self) -> None:
+        service = MailService(registry=mock.Mock())
+        enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["1"],
+            )
+        )
+        with mock.patch.object(
+            service, "_camel_helper_call", return_value=1
+        ) as helper_call:
+            flushed = service.flush_operation_queue()
+        self.assertEqual(flushed, 1)
+        helper_call.assert_called_once_with(
+            "flush_account_operation_queue",
+            "acct-1",
+            ["acct-1"],
+            timeout=180.0,
+        )
+
+    def test_local_first_transfer_enqueues_and_schedules_flush(self) -> None:
+        service = MailService(registry=mock.Mock())
+        with (
+            mock.patch.object(
+                service,
+                "_optimistic_remove_messages_from_cache_unlocked",
+                return_value=(0, 0),
+            ),
+            mock.patch.object(service, "_kick_local_apply_and_flush") as kick,
+        ):
+            result = service._local_first_transfer(
+                "acct-1",
+                "INBOX",
+                ["a", "b"],
+                op_type="archive",
+                destination_folder=None,
+            )
+        self.assertTrue(result.get("queued"))
+        self.assertEqual(result.get("moved_uids"), ["a", "b"])
+        items = list_queued_operations()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0][1].message_uids, ["a", "b"])
+        kick.assert_called_once()
+
+    def test_wait_for_operation_queue_does_not_start_flush(self) -> None:
+        """Quit must not kick a long helper MOVE (#462/#443)."""
+        service = MailService(registry=mock.Mock())
+        enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["1"],
+            )
+        )
+        with mock.patch.object(service, "flush_operation_queue") as flush:
+            ok = service.wait_for_operation_queue(timeout=0.2)
+        self.assertFalse(ok)
+        flush.assert_not_called()
+        self.assertEqual(count_queued_operations(), 1)
 
     def test_flush_operation_queue_leaves_sign_in_ops_queued(self) -> None:
         """Expired GOA must not ERROR-abort the whole operation flush."""
