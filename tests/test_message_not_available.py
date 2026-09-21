@@ -751,6 +751,10 @@ class GoaDeadCacheReadTests(unittest.TestCase):
         from post.mail.eds import _FolderMessageIndex
 
         service = MailService(registry=MagicMock())
+        # Non-IMAP: uncovered keep must still prefer the richer disk index (#267).
+        service._accounts_by_uid = {
+            "acct-1": MagicMock(backend="microsoft365"),
+        }
         camel_index = _FolderMessageIndex(
             messages=[{"uid": "old-1", "subject": "old"}],
             unread=11,
