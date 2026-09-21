@@ -2116,7 +2116,7 @@ class MainWindow(Adw.ApplicationWindow):
         return True
 
     def _start_open_folder_poll(self) -> None:
-        """Poll the open folder on Graph backends that lack live push (#270)."""
+        """Poll open folder when live push is unavailable (#270 Graph; #351 IMAP)."""
         if self._open_folder_poll_timer_id is not None:
             return
         self._open_folder_poll_timer_id = GLib.timeout_add_seconds(
@@ -2129,6 +2129,12 @@ class MainWindow(Adw.ApplicationWindow):
             GLib.source_remove(timer_id)
             self._open_folder_poll_timer_id = None
 
+    @staticmethod
+    def _backend_uses_open_folder_poll(backend: str | None) -> bool:
+        """True for backends without reliable UI-visible live push (#270 / #351)."""
+        name = (backend or "").lower()
+        return name in FOLLOW_UP_FLAG_BACKENDS or name in {"imap", "imapx"}
+
     def _on_open_folder_poll_tick(self) -> bool:
         if not self._sync_watcher.running:
             self._open_folder_poll_timer_id = None
@@ -2137,7 +2143,7 @@ class MainWindow(Adw.ApplicationWindow):
         folder_name = self._current_folder
         if account is None or folder_name is None:
             return True
-        if (account.backend or "").lower() not in FOLLOW_UP_FLAG_BACKENDS:
+        if not MainWindow._backend_uses_open_folder_poll(account.backend):
             return True
         if (
             not self._network_available
@@ -2173,6 +2179,8 @@ class MainWindow(Adw.ApplicationWindow):
             and self._is_viewing_folder(account_uid, folder_name)
         ):
             self._sidebar.refresh_folder_row(account_uid, folder_name)
+            # Do not drop the list refresh — retry when the in-flight sync ends (#351).
+            self._pending_sync_folder_refresh = (account_uid, folder_name)
             return
         self._mail.invalidate_folder_index(account_uid, folder_name)
         self._refresh_folder_view(account_uid, folder_name)
@@ -5653,6 +5661,8 @@ class MainWindow(Adw.ApplicationWindow):
         # Indexer clears ``_heavy_index_in_progress`` on catch-up; release then
         # lifts the offline hold even if Archive is still selected (#407).
         self._release_offline_sync_for_folder_work(load_id)
+        # Run any Folder::changed refresh deferred while sync was in progress (#351).
+        self._maybe_run_pending_sync_folder_refresh()
         if changed:
             return False
         if account is not None and folder is not None:
@@ -5933,6 +5943,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         if error is not None:
             self._message_sync_in_progress = False
+            self._maybe_run_pending_sync_folder_refresh()
             if account := self._current_account:
                 if self._is_viewing_folder(account.uid, folder_name):
                     self._update_message_status(account, folder_name)
@@ -5987,6 +5998,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_list_view.clear()
             self._message_stack.set_visible_child_name("empty")
             self._update_message_status(account, folder_name)
+            self._maybe_run_pending_sync_folder_refresh()
             return False
 
         self._message_stack.set_visible_child_name("list")
@@ -5999,6 +6011,7 @@ class MainWindow(Adw.ApplicationWindow):
             )
             if self._search_query is None:
                 self._try_restore_selected_message(account.uid, folder_name)
+            self._maybe_run_pending_sync_folder_refresh()
             return False
 
         def after_refresh_list() -> None:
