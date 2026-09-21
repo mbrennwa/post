@@ -250,6 +250,7 @@ ADAPT_TEXT_CSS = """
 """
 
 _STYLE_BLOCK = re.compile(r"<style\b[^>]*>(.*?)</style>", re.IGNORECASE | re.DOTALL)
+_SCRIPT_BLOCK = re.compile(r"<script\b[^>]*>(.*?)</script>", re.IGNORECASE | re.DOTALL)
 _INLINE_STYLE = re.compile(
     r"""style\s*=\s*(["'])(.*?)\1""",
     re.IGNORECASE | re.DOTALL,
@@ -1491,9 +1492,15 @@ class _AdaptationClassMarker(HTMLParser):
         self._parts.append(f"<?{data}>")
 
 
-def _strip_sender_style_blocks(body_html: str) -> str:
-    """Remove sender ``<style>`` blocks after styles are consumed for adaptation."""
-    return _STYLE_BLOCK.sub("", body_html)
+def strip_sender_style_blocks(body_html: str) -> str:
+    """Remove sender ``<style>`` and ``<script>`` blocks from HTML.
+
+    Used after Adapt text consumes stylesheets, and on default compose quotes
+    so document-level CSS cannot restyle the editor shell (#411).
+    """
+    if not body_html:
+        return body_html
+    return _SCRIPT_BLOCK.sub("", _STYLE_BLOCK.sub("", body_html))
 
 
 _COMPOSE_SHELL_DARK = "#1e1e1e"
@@ -1637,7 +1644,7 @@ def mark_adaptation_classes(
         marker.close()
     except Exception:
         return body_html
-    return _strip_sender_style_blocks(marker.get_result())
+    return strip_sender_style_blocks(marker.get_result())
 
 
 def adapt_html_for_shell(

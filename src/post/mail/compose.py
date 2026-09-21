@@ -19,7 +19,11 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Gio
 
 from post.preferences import MESSAGE_APPEARANCE_ADAPT_TEXT, MessageAppearance
-from post.reader.html import adapt_html_for_shell, strip_theme_locked_text_colors
+from post.reader.html import (
+    adapt_html_for_shell,
+    strip_sender_style_blocks,
+    strip_theme_locked_text_colors,
+)
 
 from .subject_prefixes import strip_subject_prefixes as _strip_subject_prefixes
 
@@ -293,7 +297,7 @@ def _quoted_html_content(
     """Inner quote HTML: strip theme-locked colors, optionally Adapt text for display."""
     if not adapt_shell:
         return strip_theme_locked_text_colors(
-            _strip_html_document_wrappers(body_html)
+            strip_sender_style_blocks(_strip_html_document_wrappers(body_html))
         )
     shell = "#1e1e1e" if shell_dark else "#ffffff"
     return adapt_html_for_shell(body_html, shell_background=shell)
