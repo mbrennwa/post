@@ -65,25 +65,19 @@ def build_attachment_menu(*, include_calendar: bool = False) -> Gio.Menu:
     return menu
 
 
-def make_attachment_popover() -> Gtk.PopoverMenu:
-    """Create a popover seeded with the base Save / Open With menu."""
-    return Gtk.PopoverMenu.new_from_model(build_attachment_menu())
-
-
-def ensure_popover_parent(popover: Gtk.PopoverMenu, widget: Gtk.Widget) -> None:
-    """Reparent a popover onto *widget*, unparenting any previous parent."""
-    current = popover.get_parent()
-    if current is widget:
+def dismiss_popover(popover: Gtk.Popover | None) -> None:
+    """Popdown and unparent *popover* if it still has a parent (sidebar-style)."""
+    if popover is None:
         return
-    if current is not None:
+    if popover.get_visible():
         popover.popdown()
-        if popover.get_parent() is current:
-            popover.unparent()
-    popover.set_parent(widget)
+    parent = popover.get_parent()
+    if parent is not None:
+        popover.unparent()
 
 
 def popup_attachment_menu(
-    popover: Gtk.PopoverMenu,
+    popover: Gtk.PopoverMenu | None,
     widget: Gtk.Widget,
     x: float,
     y: float,
@@ -91,17 +85,25 @@ def popup_attachment_menu(
     mime_type: str | None = None,
     name: str = "",
     support_calendar: bool = False,
-) -> None:
-    """Show the attachment menu at (*x*, *y*) relative to *widget*."""
+) -> Gtk.PopoverMenu:
+    """Show a fresh attachment menu at (*x*, *y*) relative to *widget*.
+
+    Dismisses any previous *popover* and returns the new instance so callers
+    can keep a reference without calling ``set_menu_model`` on a live popover.
+    """
+    dismiss_popover(popover)
     include_calendar = False
     if support_calendar:
         include_calendar = looks_like_calendar_attachment(mime_type, name)
-    popover.set_menu_model(build_attachment_menu(include_calendar=include_calendar))
-    ensure_popover_parent(popover, widget)
+    new_popover = Gtk.PopoverMenu.new_from_model(
+        build_attachment_menu(include_calendar=include_calendar)
+    )
+    new_popover.set_parent(widget)
     rect = Gdk.Rectangle()
     rect.x = int(x)
     rect.y = int(y)
     rect.width = 1
     rect.height = 1
-    popover.set_pointing_to(rect)
-    popover.popup()
+    new_popover.set_pointing_to(rect)
+    new_popover.popup()
+    return new_popover

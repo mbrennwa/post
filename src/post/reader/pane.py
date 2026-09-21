@@ -19,7 +19,7 @@ gi.require_version("Graphene", "1.0")
 
 from gi.repository import Gdk, Gio, GLib, Graphene, Gtk, WebKit
 
-from post.attachment_menu import ensure_popover_parent
+from post.attachment_menu import dismiss_popover
 from post.attachment_open import open_attachment
 from post.mail.helpers import (
     ReaderHeaderRow,
@@ -539,11 +539,10 @@ class MessageReaderPane(Gtk.Box):
         self._image_copy_address_action = copy_image_address_action
         self._image_open_link_action = open_link_action
         self._image_copy_link_action = copy_link_action
-        self._address_popover = Gtk.PopoverMenu.new_from_model(Gio.Menu())
+        self._address_popover: Gtk.PopoverMenu | None = None
         self._invite_clipboard_text = ""
         # Popovers are not always in the action widget tree; expose the group
         # so Copy (and address actions) activate reliably.
-        self._address_popover.insert_action_group("reader", group)
         self._invite_popover.insert_action_group("reader", group)
 
     @property
@@ -851,18 +850,19 @@ class MessageReaderPane(Gtk.Box):
         outer.append(field)
 
         if row.addresses:
-            wrap_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            wrap_box.set_hexpand(True)
-            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-            line.set_hexpand(True)
-            for index, display in enumerate(row.addresses):
-                if index > 0:
-                    comma = Gtk.Label(label=",", xalign=0)
-                    comma.add_css_class("dim-label")
-                    line.append(comma)
-                line.append(self._make_address_label(display))
-            wrap_box.append(line)
-            outer.append(wrap_box)
+            flow = Gtk.FlowBox()
+            flow.set_selection_mode(Gtk.SelectionMode.NONE)
+            flow.set_homogeneous(False)
+            flow.set_hexpand(True)
+            flow.set_halign(Gtk.Align.FILL)
+            flow.set_valign(Gtk.Align.START)
+            flow.set_min_children_per_line(1)
+            flow.set_max_children_per_line(20)
+            flow.set_row_spacing(2)
+            flow.set_column_spacing(6)
+            for display in row.addresses:
+                flow.append(self._make_address_label(display))
+            outer.append(flow)
         else:
             value = Gtk.Label(label=row.plain or "", xalign=0, wrap=True)
             set_label_wrap_mode(value, Gtk.WrapMode.WORD_CHAR)
@@ -878,6 +878,9 @@ class MessageReaderPane(Gtk.Box):
         label = Gtk.Label(label=display, xalign=0)
         label.add_css_class("dim-label")
         label.set_selectable(False)
+        # Cap natural width so one huge display name cannot inflate the row.
+        label.set_ellipsize(3)  # Pango.EllipsizeMode.END
+        label.set_max_width_chars(40)
         if not email:
             return label
 
@@ -913,19 +916,23 @@ class MessageReaderPane(Gtk.Box):
     ) -> None:
         self._context_address = email
         self._sync_address_search_action()
+        dismiss_popover(self._address_popover)
         menu = Gio.Menu()
-        menu.append(f"New Message to {email}…", "reader.address-new-message")
-        menu.append(f"Search Messages from {email}", "reader.address-search-from")
+        menu.append("New Message…", "reader.address-new-message")
+        menu.append("Search Messages from…", "reader.address-search-from")
         menu.append("Copy address", "reader.address-copy")
-        self._address_popover.set_menu_model(menu)
-        ensure_popover_parent(self._address_popover, widget)
+        popover = Gtk.PopoverMenu.new_from_model(menu)
+        # Popovers are not always in the action widget tree.
+        popover.insert_action_group("reader", self._reader_action_group)
+        popover.set_parent(widget)
         rect = Gdk.Rectangle()
         rect.x = int(x)
         rect.y = int(y)
         rect.width = 1
         rect.height = 1
-        self._address_popover.set_pointing_to(rect)
-        self._address_popover.popup()
+        popover.set_pointing_to(rect)
+        self._address_popover = popover
+        popover.popup()
 
     def _on_address_new_message_activate(self, *_args) -> None:
         email = self._context_address
