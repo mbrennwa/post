@@ -940,6 +940,105 @@ class ImapGhostFolderIndexTests(unittest.TestCase):
         index_cache.invalidate.assert_not_called()
         status_cache.clear.assert_not_called()
 
+    @mock.patch("post.mail.eds.folder_status_cache")
+    @mock.patch("post.mail.eds.folder_index_cache")
+    def test_imap_uncovered_camel_accepts_camel_over_ghost_disk(
+        self,
+        index_cache: mock.Mock,
+        status_cache: mock.Mock,
+    ) -> None:
+        """IMAP Inbox: ghosts on disk must not veto Camel's newer UID set (#463)."""
+        from post.mail.eds import MailService, _FolderMessageIndex
+
+        index_cache.load.return_value = (
+            [
+                {"uid": "23327", "subject": "ghost-a"},
+                {"uid": "23328", "subject": "ghost-b"},
+            ],
+            0,
+            2,
+        )
+        mail = MailService.__new__(MailService)
+        # Helpers often never call list_accounts(); backend must resolve via EDS.
+        mail._accounts_by_uid = {}
+        mail._folder_indexes = {}
+        source = mock.Mock()
+        source.has_extension.return_value = True
+        ext = mock.Mock()
+        ext.get_backend_name.return_value = "imapx"
+        source.get_extension.return_value = ext
+        mail.registry = mock.Mock()
+        mail.registry.ref_source.return_value = source
+        camel = _FolderMessageIndex(
+            messages=[
+                {"uid": "23370", "subject": "kept"},
+                {"uid": "23373", "subject": "new"},
+            ],
+            unread=1,
+            total=2,
+        )
+        kept, source_name = mail._prefer_nonempty_folder_index(
+            "acct", "INBOX", camel
+        )
+        self.assertIsNone(source_name)
+        self.assertEqual(
+            [m["uid"] for m in kept.messages],
+            ["23370", "23373"],
+        )
+        index_cache.invalidate.assert_not_called()
+        status_cache.clear.assert_not_called()
+
+    def test_backend_for_account_falls_back_to_registry(self) -> None:
+        from post.mail.eds import MailService
+
+        mail = MailService.__new__(MailService)
+        mail._accounts_by_uid = {}
+        source = mock.Mock()
+        source.has_extension.return_value = True
+        ext = mock.Mock()
+        ext.get_backend_name.return_value = "imapx"
+        source.get_extension.return_value = ext
+        mail.registry = mock.Mock()
+        mail.registry.ref_source.return_value = source
+        self.assertEqual(mail._backend_for_account("acct"), "imapx")
+
+    @mock.patch("post.mail.eds.folder_status_cache")
+    @mock.patch("post.mail.eds.folder_index_cache")
+    def test_microsoft365_uncovered_camel_still_keeps_disk_index(
+        self,
+        index_cache: mock.Mock,
+        status_cache: mock.Mock,
+    ) -> None:
+        from post.mail.eds import MailService, _FolderMessageIndex
+
+        disk_msgs = [
+            {"uid": "old-restid", "subject": "A", "message_id": "<a@x>"},
+            {"uid": "other", "subject": "B", "message_id": "<b@x>"},
+        ]
+        index_cache.load.return_value = (disk_msgs, 0, 2)
+        mail = MailService.__new__(MailService)
+        mail._accounts_by_uid = {"acct": mock.Mock(backend="microsoft365")}
+        mail._folder_indexes = {}
+        # Partial Camel summary covers neither disk identity fully as a set.
+        camel = _FolderMessageIndex(
+            messages=[
+                {
+                    "uid": "new-restid",
+                    "subject": "A",
+                    "message_id": "<a@x>",
+                }
+            ],
+            unread=0,
+            total=1,
+        )
+        kept, source = mail._prefer_nonempty_folder_index(
+            "acct", "Archive", camel
+        )
+        self.assertEqual(source, "disk_cache")
+        self.assertEqual([m["uid"] for m in kept.messages], ["old-restid", "other"])
+        index_cache.invalidate.assert_not_called()
+        status_cache.clear.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

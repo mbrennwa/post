@@ -5966,14 +5966,17 @@ class MailService:
     ) -> tuple[_FolderMessageIndex, FolderIndexSource | None]:
         """Keep RAM/disk when Camel's summary is empty or a stale other-folder set.
 
-        For IMAP, an empty Camel summary after sync is authoritative — keeping a
-        ghost folder-index lists UIDs that cannot be opened (#441).
+        For IMAP, Camel's summary after sync is authoritative: an empty summary
+        drops ghost folder-index rows (#441); a non-empty summary that does not
+        cover every RAM/disk identity still wins so new UIDs appear and ghosts
+        drop (#463). Graph/M365 keep uncovered RAM/disk for partial summaries.
         """
         key = (account_uid, folder_name)
         ram = self._folder_indexes.get(key)
         cached = folder_index_cache.load(account_uid, folder_name)
         backend = (self._backend_for_account(account_uid) or "").lower()
-        imap_empty_is_authoritative = backend in {"imap", "imapx"} and (
+        imap_authoritative = backend in {"imap", "imapx"}
+        imap_empty_is_authoritative = imap_authoritative and (
             not index.messages
         )
 
@@ -6029,6 +6032,19 @@ class MailService:
                 continue
             if folder_index_covers_identities(index.messages, other.messages):
                 continue
+            if imap_authoritative:
+                # Ghosts in RAM/disk make Camel look uncovered; keep Camel so
+                # new UIDs are not discarded (#463).
+                log.info(
+                    "Accepting Camel folder index for IMAP %s/%s over uncovered "
+                    "%s index (camel=%d, discarded=%d) (#463)",
+                    account_uid,
+                    folder_name,
+                    source,
+                    len(index.messages),
+                    len(other.messages),
+                )
+                return index, None
             log.warning(
                 "Keeping %s folder index for %s/%s after uncovered Camel summary "
                 "(camel=%d, kept=%d)",
@@ -11519,10 +11535,28 @@ class MailService:
         return found
 
     def _backend_for_account(self, account_uid: str) -> str | None:
+        """Return Camel/EDS backend name for ``account_uid``.
+
+        Helpers often never call ``list_accounts()``, so ``_accounts_by_uid``
+        can be empty while folder sync still runs — fall back to the Mail
+        Account source on the registry (#463).
+        """
         account = self._accounts_by_uid.get(account_uid)
-        if account is None:
+        if account is not None:
+            return account.backend
+        registry = getattr(self, "registry", None)
+        if registry is None:
             return None
-        return account.backend
+        try:
+            source = registry.ref_source(account_uid)
+        except Exception:
+            return None
+        if source is None or not source.has_extension("Mail Account"):
+            return None
+        try:
+            return source.get_extension("Mail Account").get_backend_name()
+        except Exception:
+            return None
 
     def _apply_message_flagged_unlocked(
         self,
