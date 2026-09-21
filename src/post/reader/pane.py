@@ -19,11 +19,9 @@ gi.require_version("Graphene", "1.0")
 
 from gi.repository import Gdk, Gio, GLib, Graphene, Gtk, WebKit
 
-from post.attachment_menu import dismiss_popover
 from post.attachment_open import open_attachment
 from post.mail.helpers import (
     ReaderHeaderRow,
-    bare_email_from_address,
     format_attachment_size,
     mailto_primary_email,
     reader_header_rows,
@@ -539,7 +537,6 @@ class MessageReaderPane(Gtk.Box):
         self._image_copy_address_action = copy_image_address_action
         self._image_open_link_action = open_link_action
         self._image_copy_link_action = copy_link_action
-        self._address_popover: Gtk.PopoverMenu | None = None
         self._invite_clipboard_text = ""
         # Popovers are not always in the action widget tree; expose the group
         # so Copy (and address actions) activate reliably.
@@ -840,99 +837,23 @@ class MessageReaderPane(Gtk.Box):
             self._reader_meta_box.append(self._build_header_row(row))
 
     def _build_header_row(self, row: ReaderHeaderRow) -> Gtk.Widget:
-        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        outer.set_hexpand(True)
-        outer.set_halign(Gtk.Align.FILL)
-
-        field = Gtk.Label(label=f"{row.label}:", xalign=0)
-        field.add_css_class("dim-label")
-        field.set_valign(Gtk.Align.START)
-        outer.append(field)
-
+        # Same construction for From / To / Date / Cc / …: one Label so the
+        # field name and value share a single Pango baseline (#469).
         if row.addresses:
-            flow = Gtk.FlowBox()
-            flow.set_selection_mode(Gtk.SelectionMode.NONE)
-            flow.set_homogeneous(False)
-            flow.set_hexpand(True)
-            flow.set_halign(Gtk.Align.FILL)
-            flow.set_valign(Gtk.Align.START)
-            flow.set_min_children_per_line(1)
-            flow.set_max_children_per_line(20)
-            flow.set_row_spacing(2)
-            flow.set_column_spacing(6)
-            for display in row.addresses:
-                flow.append(self._make_address_label(display))
-            outer.append(flow)
+            body = ", ".join(row.addresses)
         else:
-            value = Gtk.Label(label=row.plain or "", xalign=0, wrap=True)
-            set_label_wrap_mode(value, Gtk.WrapMode.WORD_CHAR)
-            value.add_css_class("dim-label")
-            value.set_width_chars(1)
-            value.set_hexpand(True)
-            value.set_halign(Gtk.Align.FILL)
-            outer.append(value)
-        return outer
-
-    def _make_address_label(self, display: str) -> Gtk.Widget:
-        email = bare_email_from_address(display)
-        label = Gtk.Label(label=display, xalign=0)
-        label.add_css_class("dim-label")
-        label.set_selectable(False)
-        # Cap natural width so one huge display name cannot inflate the row.
-        label.set_ellipsize(3)  # Pango.EllipsizeMode.END
-        label.set_max_width_chars(40)
-        if not email:
-            return label
-
-        # Event box so right-click has a stable widget target.
-        click_target = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        click_target.append(label)
-        click_target.set_tooltip_text(email)
-
-        menu_gesture = Gtk.GestureClick()
-        menu_gesture.set_button(Gdk.BUTTON_SECONDARY)
-        menu_gesture.connect("pressed", self._on_address_menu_pressed, email)
-        click_target.add_controller(menu_gesture)
-        return click_target
-
-    def _on_address_menu_pressed(
-        self,
-        gesture: Gtk.GestureClick,
-        _n_press: int,
-        x: float,
-        y: float,
-        email: str,
-    ) -> None:
-        widget = gesture.get_widget()
-        if widget is None:
-            return
-        self._popup_address_menu(widget, x, y, email)
+            body = row.plain or ""
+        text = f"{row.label}: {body}".rstrip()
+        value = Gtk.Label(label=text, xalign=0, wrap=True)
+        set_label_wrap_mode(value, Gtk.WrapMode.WORD_CHAR)
+        value.add_css_class("dim-label")
+        value.set_width_chars(1)
+        value.set_hexpand(True)
+        value.set_halign(Gtk.Align.FILL)
+        return value
 
     def _sync_address_search_action(self) -> None:
         self._address_search_action.set_enabled(bool(self._can_search_messages()))
-
-    def _popup_address_menu(
-        self, widget: Gtk.Widget, x: float, y: float, email: str
-    ) -> None:
-        self._context_address = email
-        self._sync_address_search_action()
-        dismiss_popover(self._address_popover)
-        menu = Gio.Menu()
-        menu.append("New Message…", "reader.address-new-message")
-        menu.append("Search Messages from…", "reader.address-search-from")
-        menu.append("Copy address", "reader.address-copy")
-        popover = Gtk.PopoverMenu.new_from_model(menu)
-        # Popovers are not always in the action widget tree.
-        popover.insert_action_group("reader", self._reader_action_group)
-        popover.set_parent(widget)
-        rect = Gdk.Rectangle()
-        rect.x = int(x)
-        rect.y = int(y)
-        rect.width = 1
-        rect.height = 1
-        popover.set_pointing_to(rect)
-        self._address_popover = popover
-        popover.popup()
 
     def _on_address_new_message_activate(self, *_args) -> None:
         email = self._context_address
