@@ -104,6 +104,13 @@ __ADAPT_TEXT_CSS__
 (function () {
   const editor = document.getElementById("editor");
   let savedRange = null;
+  let undoStack = [];
+  let redoStack = [];
+  let applyingHistory = false;
+  let historyMuted = false;
+  let lastInputType = "";
+  let lastPushAt = 0;
+  let committed = null;
   function currentMode() {
     return editor.getAttribute("contenteditable") === "plaintext-only"
       ? "plain"
@@ -139,8 +146,16 @@ __ADAPT_TEXT_CSS__
   function demoteToPlainIfAllowed() {
     if (hasMeaningfulFormatting()) return;
     const text = editor.innerText;
-    editor.setAttribute("contenteditable", "plaintext-only");
-    editor.innerText = text;
+    const apply = function () {
+      editor.setAttribute("contenteditable", "plaintext-only");
+      editor.innerText = text;
+    };
+    if (historyMuted) apply();
+    else {
+      historyMuted = true;
+      try { apply(); }
+      finally { historyMuted = false; }
+    }
     notify();
   }
   function stampLinks() {
@@ -161,6 +176,125 @@ __ADAPT_TEXT_CSS__
         mode: currentMode()
       });
     } catch (e) {}
+  }
+  function caretOffset() {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount || !editor.contains(sel.anchorNode)) {
+      return (editor.innerText || "").length;
+    }
+    const range = sel.getRangeAt(0);
+    const pre = range.cloneRange();
+    pre.selectNodeContents(editor);
+    pre.setEnd(range.endContainer, range.endOffset);
+    return pre.toString().length;
+  }
+  function setCaretOffset(offset) {
+    const sel = window.getSelection();
+    const range = document.createRange();
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null);
+    let remaining = offset;
+    let node = walker.nextNode();
+    while (node) {
+      const len = node.textContent.length;
+      if (remaining <= len) {
+        range.setStart(node, Math.max(0, remaining));
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return;
+      }
+      remaining -= len;
+      node = walker.nextNode();
+    }
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  function historySnapshot() {
+    return {
+      html: editor.innerHTML,
+      text: editor.innerText,
+      mode: editor.getAttribute("contenteditable"),
+      caret: caretOffset()
+    };
+  }
+  committed = historySnapshot();
+  function snapshotsMatch(a, b) {
+    return a.html === b.html && a.text === b.text && a.mode === b.mode;
+  }
+  function pushUndo() {
+    if (applyingHistory || historyMuted) return;
+    if (pushSnapshot(historySnapshot())) redoStack = [];
+  }
+  function resetHistory() {
+    undoStack = [];
+    redoStack = [];
+    lastInputType = "";
+    lastPushAt = 0;
+    committed = historySnapshot();
+  }
+  function baseline() {
+    if (!committed) committed = historySnapshot();
+    return committed;
+  }
+  function pushSnapshot(snap) {
+    if (!snap) return false;
+    const top = undoStack[undoStack.length - 1];
+    if (top && snapshotsMatch(top, snap)) return false;
+    undoStack.push(snap);
+    if (undoStack.length > 100) undoStack.shift();
+    return true;
+  }
+  function applySnapshot(snap) {
+    editor.setAttribute("contenteditable", snap.mode);
+    if (snap.mode === "plaintext-only") editor.innerText = snap.text;
+    else editor.innerHTML = snap.html;
+    setCaretOffset(snap.caret);
+  }
+  function undoEdit() {
+    if (!undoStack.length) return;
+    applyingHistory = true;
+    try {
+      redoStack.push(baseline());
+      applySnapshot(undoStack.pop());
+      committed = historySnapshot();
+    } finally {
+      queueMicrotask(function () { applyingHistory = false; });
+    }
+    lastInputType = "";
+    notify();
+  }
+  function redoEdit() {
+    if (!redoStack.length) return;
+    applyingHistory = true;
+    try {
+      pushSnapshot(baseline());
+      applySnapshot(redoStack.pop());
+      committed = historySnapshot();
+    } finally {
+      queueMicrotask(function () { applyingHistory = false; });
+    }
+    lastInputType = "";
+    notify();
+  }
+  function noteUserInput(inputType) {
+    if (applyingHistory || historyMuted) return;
+    if (!sameBurst(inputType)) {
+      if (pushSnapshot(baseline())) redoStack = [];
+    }
+    lastPushAt = Date.now();
+    lastInputType = inputType;
+    committed = historySnapshot();
+  }
+  function sameBurst(inputType) {
+    if ((Date.now() - lastPushAt) >= 800) return false;
+    if (inputType === "insertText" && lastInputType === "insertText") return true;
+    const deleting = inputType === "deleteContentBackward"
+      || inputType === "deleteContentForward";
+    const wasDeleting = lastInputType === "deleteContentBackward"
+      || lastInputType === "deleteContentForward";
+    return deleting && wasDeleting;
   }
   function saveSelection() {
     const sel = window.getSelection();
@@ -213,6 +347,9 @@ __ADAPT_TEXT_CSS__
     } catch (e) {}
   }
   function increaseQuote() {
+    pushUndo();
+    historyMuted = true;
+    try {
     promoteToRich();
     const sel = window.getSelection();
     if (!sel.rangeCount) return;
@@ -236,8 +373,15 @@ __ADAPT_TEXT_CSS__
       range.insertNode(bq);
     }
     notify();
+    } finally {
+      historyMuted = false;
+      lastInputType = "";
+    }
   }
   function decreaseQuote() {
+    pushUndo();
+    historyMuted = true;
+    try {
     const sel = window.getSelection();
     if (!sel.rangeCount) return;
     let node = sel.anchorNode;
@@ -253,14 +397,25 @@ __ADAPT_TEXT_CSS__
     }
     notify();
     demoteToPlainIfAllowed();
+    } finally {
+      historyMuted = false;
+      lastInputType = "";
+    }
   }
   function exec(command) {
-    if (command !== "removeFormat") {
-      promoteToRich();
+    pushUndo();
+    historyMuted = true;
+    try {
+      if (command !== "removeFormat") {
+        promoteToRich();
+      }
+      document.execCommand(command, false, null);
+      notify();
+      demoteToPlainIfAllowed();
+    } finally {
+      historyMuted = false;
+      lastInputType = "";
     }
-    document.execCommand(command, false, null);
-    notify();
-    demoteToPlainIfAllowed();
   }
   editor.addEventListener("paste", function (e) {
     if (editor.getAttribute("contenteditable") !== "plaintext-only") return;
@@ -269,18 +424,38 @@ __ADAPT_TEXT_CSS__
     const pastedHtml = (clip.getData("text/html") || "").trim();
     if (!pastedHtml) return;
     e.preventDefault();
-    promoteToRich();
-    document.execCommand("insertHTML", false, pastedHtml);
+    pushUndo();
+    historyMuted = true;
+    try {
+      promoteToRich();
+      document.execCommand("insertHTML", false, pastedHtml);
+      notify();
+    } finally {
+      historyMuted = false;
+      lastInputType = "";
+    }
+  });
+  editor.addEventListener("input", function (e) {
+    noteUserInput((e && e.inputType) || "");
     notify();
   });
-  editor.addEventListener("input", notify);
   editor.addEventListener("keyup", notify);
   editor.addEventListener("mouseup", saveSelection);
   editor.addEventListener("keyup", saveSelection);
   editor.addEventListener("keydown", function (e) {
     const mod = e.ctrlKey || e.metaKey;
-    if (!mod) return;
-    if (e.code === "KeyB") { e.preventDefault(); exec("bold"); }
+    if (!mod || e.altKey) return;
+    // WebKitGTK does not undo contenteditable. Keep our own stack (#473).
+    if (e.code === "KeyZ") {
+      e.preventDefault();
+      if (e.shiftKey) redoEdit();
+      else undoEdit();
+    }
+    else if (e.code === "KeyY" && !e.shiftKey) {
+      e.preventDefault();
+      redoEdit();
+    }
+    else if (e.code === "KeyB") { e.preventDefault(); exec("bold"); }
     else if (e.code === "KeyI") { e.preventDefault(); exec("italic"); }
     else if (e.code === "KeyX" && e.shiftKey) { e.preventDefault(); exec("strikeThrough"); }
     else if (e.code === "KeyK") { e.preventDefault(); requestLink(); }
@@ -319,13 +494,21 @@ __ADAPT_TEXT_CSS__
     getPlain: function () { return editor.innerText; },
     getHtml: function () { return editor.innerHTML; },
     setPlain: function (text) {
+      historyMuted = true;
       editor.innerText = text;
+      historyMuted = false;
+      resetHistory();
       notify();
     },
     setHtml: function (fragment) {
+      historyMuted = true;
       editor.innerHTML = fragment;
+      historyMuted = false;
+      resetHistory();
       notify();
     },
+    undoEdit: function () { undoEdit(); },
+    redoEdit: function () { redoEdit(); },
     exec: function (command) { restoreSelection(); exec(command); },
     increaseQuote: function () { restoreSelection(); increaseQuote(); },
     decreaseQuote: function () { restoreSelection(); decreaseQuote(); },
@@ -336,6 +519,9 @@ __ADAPT_TEXT_CSS__
     },
     createLink: function (url) {
       restoreSelection();
+      pushUndo();
+      historyMuted = true;
+      try {
       promoteToRich();
       const sel = window.getSelection();
       if (!sel || !sel.rangeCount) return;
@@ -366,12 +552,23 @@ __ADAPT_TEXT_CSS__
         }
       }
       notify();
+      } finally {
+        historyMuted = false;
+        lastInputType = "";
+      }
     },
     removeLink: function () {
       restoreSelection();
-      document.execCommand("unlink", false, null);
-      notify();
-      demoteToPlainIfAllowed();
+      pushUndo();
+      historyMuted = true;
+      try {
+        document.execCommand("unlink", false, null);
+        notify();
+        demoteToPlainIfAllowed();
+      } finally {
+        historyMuted = false;
+        lastInputType = "";
+      }
     },
     placeCursorAtStart: function () {
       editor.focus();
@@ -672,6 +869,12 @@ class ComposeBodyEditor(Gtk.Box):
         self._suppress_changed = True
         self._cached_html = fragment
         self._load_document(body_html=fragment, edit_mode="true")
+
+    def undo(self) -> None:
+        self._run_js("if (window.__postCompose) window.__postCompose.undoEdit();")
+
+    def redo(self) -> None:
+        self._run_js("if (window.__postCompose) window.__postCompose.redoEdit();")
 
     def grab_focus(self) -> bool:  # type: ignore[override]
         return self._web_view.grab_focus()

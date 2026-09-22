@@ -689,6 +689,7 @@ class ComposeWindow(Adw.Window):
         body_focus = Gtk.EventControllerFocus()
         body_focus.connect("enter", self._on_body_focus_in)
         self._body_view.web_view.add_controller(body_focus)
+        self._setup_body_undo_shortcut()
         # Keep the name used by focus/scroll helpers and tests (#149 / #167).
         self._body_scrolled = self._body_view
         content.append(self._body_view)
@@ -1685,6 +1686,56 @@ class ComposeWindow(Adw.Window):
     def _on_subject_focus_leave(self, *_args) -> None:
         if self._mode == "new":
             self._focus_body_at_start_on_enter = True
+
+    def _setup_body_undo_shortcut(self) -> None:
+        # Capture on the composer window, before WebKit. WebKitGTK never
+        # delivers Ctrl+Z to the contenteditable page (#473).
+        controller = Gtk.EventControllerKey()
+        controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        controller.connect("key-pressed", self._on_body_undo_key_pressed)
+        self.add_controller(controller)
+
+    def _body_has_focus(self) -> bool:
+        widget = self.get_focus()
+        while widget is not None:
+            if widget is self._body_view or widget is self._body_view.web_view:
+                return True
+            widget = widget.get_parent()
+        return False
+
+    def _on_body_undo_key_pressed(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        state: Gdk.ModifierType,
+    ) -> bool:
+        if keyval not in (Gdk.KEY_z, Gdk.KEY_Z, Gdk.KEY_y, Gdk.KEY_Y):
+            return False
+        if not state & Gdk.ModifierType.CONTROL_MASK:
+            return False
+        if state & (
+            Gdk.ModifierType.ALT_MASK
+            | Gdk.ModifierType.SUPER_MASK
+            | Gdk.ModifierType.META_MASK
+        ):
+            return False
+        focus = self.get_focus()
+        if isinstance(focus, Gtk.Editable):
+            return False
+        if not self._body_has_focus():
+            return False
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        if keyval in (Gdk.KEY_y, Gdk.KEY_Y):
+            if shift:
+                return False
+            self._body_view.redo()
+            return True
+        if shift:
+            self._body_view.redo()
+        else:
+            self._body_view.undo()
+        return True
 
     def _on_body_focus_in(self, *_args) -> None:
         if not self._focus_body_at_start_on_enter:
