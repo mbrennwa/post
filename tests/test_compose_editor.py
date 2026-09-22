@@ -59,6 +59,22 @@ class BuildEditorDocumentTests(unittest.TestCase):
         self.assertIn("hasMeaningfulFormatting", doc)
         self.assertIn('addEventListener("paste"', doc)
 
+    def test_body_undo_uses_page_stack(self) -> None:
+        doc = build_editor_document()
+        self.assertIn('e.code === "KeyZ"', doc)
+        self.assertIn('e.code === "KeyY"', doc)
+        self.assertIn("function undoEdit()", doc)
+        self.assertIn("function redoEdit()", doc)
+        self.assertIn("function noteUserInput(", doc)
+        self.assertIn("undoEdit: function () { undoEdit(); }", doc)
+        self.assertIn("redoEdit: function () { redoEdit(); }", doc)
+        self.assertIn("undoEdit();", doc)
+        self.assertIn("redoEdit();", doc)
+        self.assertNotIn('execCommand("undo"', doc)
+        self.assertNotIn('execCommand("redo"', doc)
+        self.assertNotIn('exec("undo")', doc)
+        self.assertNotIn('exec("redo")', doc)
+
     def test_quoted_html_uses_normal_whitespace(self) -> None:
         doc = build_editor_document()
         self.assertIn("blockquote.post_quote", doc)

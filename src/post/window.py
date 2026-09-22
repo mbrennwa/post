@@ -737,6 +737,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._setup_attachment_menu()
         self._setup_message_menu()
         self._setup_undo_action()
+        self._setup_undo_shortcut()
         self._setup_compose_action()
         self._setup_delete_shortcut()
         self._setup_search_shortcuts()
@@ -2870,9 +2871,37 @@ class MainWindow(Adw.ApplicationWindow):
         self._undo_move_action.connect("activate", self._on_undo_move_action)
         self.add_action(self._undo_move_action)
 
-        application = self.get_application()
-        if application is not None:
-            application.set_accels_for_action("win.undo-move", ["<Control>z"])
+    def _setup_undo_shortcut(self) -> None:
+        # Window-local, not an application accelerator. An application
+        # <Control>z binding runs before the focused widget on every window
+        # and steals text undo while a move is pending (#473).
+        controller = Gtk.EventControllerKey()
+        controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        controller.connect("key-pressed", self._on_undo_key_pressed)
+        self.add_controller(controller)
+
+    def _on_undo_key_pressed(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        state: Gdk.ModifierType,
+    ) -> bool:
+        if keyval not in (Gdk.KEY_z, Gdk.KEY_Z):
+            return False
+        if state & (
+            Gdk.ModifierType.SHIFT_MASK
+            | Gdk.ModifierType.ALT_MASK
+            | Gdk.ModifierType.SUPER_MASK
+            | Gdk.ModifierType.META_MASK
+        ):
+            return False
+        if not state & Gdk.ModifierType.CONTROL_MASK:
+            return False
+        focus = self.get_focus()
+        if isinstance(focus, Gtk.Editable):
+            return False
+        return self._trigger_move_undo()
 
     def _on_undo_move_action(self, *_args) -> None:
         self._trigger_move_undo()
