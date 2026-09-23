@@ -88,7 +88,11 @@ from post.mail.send_errors import (
     is_permanent_send_error,
     user_send_error_message,
 )
-from post.mail.draft_queue import is_queued_draft_id
+from post.mail.draft_queue import (
+    is_queued_draft_id,
+    load_queued_draft,
+    load_queued_draft_attachments,
+)
 from post.mail.send_queue import (
     load_queued_attachments,
     load_queued_outbound_message,
@@ -717,7 +721,9 @@ class ComposeWindow(Adw.Window):
         self.connect("close-request", self._on_close_request)
         self.connect("destroy", self._teardown_address_completions)
         GLib.idle_add(self._set_initial_focus)
-        if self._mode in ("draft", "send-again"):
+        if self._mode in ("draft", "send-again") and not (
+            self._mode == "draft" and is_queued_draft_id(self._draft_message_uid)
+        ):
             GLib.idle_add(self._begin_load_draft_attachments)
         elif self._mode == "forward":
             GLib.idle_add(self._begin_load_forward_attachments)
@@ -1612,6 +1618,13 @@ class ComposeWindow(Adw.Window):
             self._draft_body_plain_snapshot = plain_body
             self._quoted_html_source = None
             self._quoted_plain_expected = ""
+            if is_queued_draft_id(self._draft_message_uid):
+                assert self._draft_message_uid is not None
+                queued = load_queued_draft(self._draft_message_uid)
+                self._attachments = load_queued_draft_attachments(
+                    self._draft_message_uid, queued
+                )
+                self._refresh_attachments_ui()
         elif self._mode == "send-again" and self._draft_message is not None:
             msg = self._draft_message
             if msg.get("to"):

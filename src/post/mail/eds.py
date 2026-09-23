@@ -4397,13 +4397,20 @@ class MailService:
                     isinstance(cause, BaseException)
                     and is_network_unavailable_error(cause)
                 )
+                needs_sign_in = is_sign_in_required_error(exc) or (
+                    isinstance(cause, BaseException)
+                    and is_sign_in_required_error(cause)
+                )
                 cancelled = cancellable.is_cancelled()
                 if (
                     offline
+                    or needs_sign_in
                     or cancelled
                     or "working online" in str(exc).lower()
                     or "timed out" in str(exc).lower()
                 ):
+                    if needs_sign_in:
+                        self.set_account_connect_health(account_uid, "needs_sign_in")
                     return self._queue_draft_unlocked(
                         account_uid,
                         folder_name,
@@ -4444,7 +4451,13 @@ class MailService:
         except GLib.Error as exc:
             if self._flushing_draft_queue:
                 raise
-            if cancellable.is_cancelled() or is_network_unavailable_error(exc):
+            if (
+                cancellable.is_cancelled()
+                or is_network_unavailable_error(exc)
+                or is_sign_in_required_error(exc)
+            ):
+                if is_sign_in_required_error(exc):
+                    self.set_account_connect_health(account_uid, "needs_sign_in")
                 return _queue_local()
             raise
         finally:
