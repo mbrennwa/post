@@ -360,5 +360,170 @@ class FlushSendQueueResultTests(unittest.TestCase):
         self.assertEqual(seen, ["acct-1", "acct-1"])
 
 
+class GoaEnsureConnectHealthTests(unittest.TestCase):
+    """EnsureCredentials outcome drives sidebar connect health (#478)."""
+
+    def _goa_service(self, *, goa_on_mail_account: bool = False) -> MailService:
+        """Build a service whose GOA extension matches real EDS layout.
+
+        Mail Account sources do not carry the GOA extension; it lives on the
+        collection parent. ``goa_on_mail_account=True`` covers the rare case.
+        """
+        registry = mock.Mock()
+        mail = mock.Mock()
+        mail.has_extension.side_effect = lambda name: (
+            name == "GNOME Online Accounts" and goa_on_mail_account
+        )
+        mail.get_uid.return_value = "acct-1"
+        mail.get_parent.return_value = "collection-1"
+        mail.get_display_name.return_value = "M365"
+
+        parent = mock.Mock()
+        parent.has_extension.side_effect = lambda name: name == "GNOME Online Accounts"
+        parent.get_uid.return_value = "collection-1"
+        parent.get_parent.return_value = ""
+        parent.get_display_name.return_value = "M365"
+        goa = mock.Mock()
+        goa.get_account_id.return_value = "goa-1"
+        parent.get_extension.return_value = goa
+        if goa_on_mail_account:
+            mail.get_extension.return_value = goa
+
+        def ref_source(uid: str):
+            if uid == "acct-1":
+                return mail
+            if uid == "collection-1":
+                return parent
+            return None
+
+        registry.ref_source.side_effect = ref_source
+        registry.list_sources.return_value = [mail, parent]
+        return MailService(registry=registry)
+
+    def test_apply_failed_sets_needs_sign_in(self) -> None:
+        service = self._goa_service()
+        service._apply_goa_ensure_outcome("acct-1", "failed")
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+    def test_apply_ok_clears_needs_sign_in(self) -> None:
+        service = self._goa_service()
+        service.set_account_connect_health("acct-1", "needs_sign_in")
+        service._apply_goa_ensure_outcome("acct-1", "ok")
+        self.assertEqual(service.get_account_connect_health("acct-1"), "ok")
+
+    def test_apply_cancelled_leaves_health_unchanged(self) -> None:
+        service = self._goa_service()
+        service.set_account_connect_health("acct-1", "ok")
+        service._apply_goa_ensure_outcome("acct-1", "cancelled")
+        self.assertEqual(service.get_account_connect_health("acct-1"), "ok")
+        service.set_account_connect_health("acct-1", "needs_sign_in")
+        service._apply_goa_ensure_outcome("acct-1", "cancelled")
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+    def test_prepare_failure_sets_needs_sign_in(self) -> None:
+        service = self._goa_service()
+        with mock.patch(
+            "post.mail.eds.ensure_goa_credentials", return_value="failed"
+        ):
+            service._prepare_account_credentials_unlocked("acct-1")
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+    def test_prepare_skips_when_goa_only_missing(self) -> None:
+        registry = mock.Mock()
+        mail = mock.Mock()
+        mail.has_extension.return_value = False
+        mail.get_uid.return_value = "acct-1"
+        mail.get_parent.return_value = ""
+        mail.get_display_name.return_value = "IMAP"
+        registry.ref_source.return_value = mail
+        registry.list_sources.return_value = [mail]
+        service = MailService(registry=registry)
+        with mock.patch(
+            "post.mail.eds.ensure_goa_credentials", return_value="failed"
+        ) as ensure:
+            service._prepare_account_credentials_unlocked("acct-1")
+        ensure.assert_not_called()
+        self.assertEqual(service.get_account_connect_health("acct-1"), "ok")
+
+    def test_folder_list_probes_goa_via_parent_collection(self) -> None:
+        service = self._goa_service()
+        service._network_available = True
+        store = mock.Mock()
+        root = mock.Mock()
+        store.get_folder_info_sync.return_value = root
+        with (
+            mock.patch(
+                "post.mail.eds.ensure_goa_credentials", return_value="failed"
+            ) as ensure,
+            mock.patch.object(service, "_get_store_unlocked", return_value=store),
+            mock.patch("post.mail.eds.walk_folder_info") as walk,
+        ):
+            walk.side_effect = lambda _root, folders: folders.append(
+                {"full_name": "INBOX", "display_name": "Inbox"}
+            )
+            result = service._list_folders_unlocked("acct-1")
+        ensure.assert_called_once()
+        self.assertEqual(result[0]["full_name"], "INBOX")
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+    def test_folder_list_cancelled_ensure_leaves_ok(self) -> None:
+        service = self._goa_service()
+        service._network_available = True
+        store = mock.Mock()
+        root = mock.Mock()
+        store.get_folder_info_sync.return_value = root
+        with (
+            mock.patch(
+                "post.mail.eds.ensure_goa_credentials", return_value="cancelled"
+            ),
+            mock.patch.object(service, "_get_store_unlocked", return_value=store),
+            mock.patch("post.mail.eds.walk_folder_info") as walk,
+        ):
+            walk.side_effect = lambda _root, folders: folders.append(
+                {"full_name": "INBOX", "display_name": "Inbox"}
+            )
+            service._list_folders_unlocked("acct-1")
+        self.assertEqual(service.get_account_connect_health("acct-1"), "ok")
+
+    def test_graph_token_miss_probes_goa(self) -> None:
+        service = self._goa_service()
+        with (
+            mock.patch.object(
+                service, "get_oauth2_access_token_for_account", return_value=None
+            ),
+            mock.patch(
+                "post.mail.eds.run_on_mail_thread",
+                side_effect=lambda fn, *a, **k: fn(*a, **k),
+            ),
+            mock.patch.object(
+                service, "_probe_goa_connect_health_unlocked", return_value="failed"
+            ) as probe,
+            mock.patch.object(
+                service, "_get_account_folder_stats_unlocked", return_value={}
+            ),
+        ):
+            service.get_account_folder_stats_via_graph("acct-1")
+        probe.assert_called_once_with("acct-1")
+
+    def test_read_gate_cancelled_does_not_set_needs_sign_in(self) -> None:
+        service = self._goa_service()
+        with mock.patch(
+            "post.mail.eds.ensure_goa_credentials", return_value="cancelled"
+        ):
+            ready = service._goa_credentials_ready_for_read_unlocked("acct-1")
+        self.assertFalse(ready)
+        self.assertEqual(service.get_account_connect_health("acct-1"), "ok")
+
+    def test_read_gate_uses_parent_goa(self) -> None:
+        service = self._goa_service()
+        with mock.patch(
+            "post.mail.eds.ensure_goa_credentials", return_value="failed"
+        ) as ensure:
+            ready = service._goa_credentials_ready_for_read_unlocked("acct-1")
+        ensure.assert_called_once()
+        self.assertFalse(ready)
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+
 if __name__ == "__main__":
     unittest.main()
