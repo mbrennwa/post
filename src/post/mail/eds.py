@@ -147,6 +147,7 @@ from .send_queue import (
 from post.preferences import get_show_evolution_local
 from .account_status import AccountConnectHealth, AccountTransferState
 from .auth import (
+    GoaEnsureOutcome,
     PasswordPromptCallback,
     authenticate_service_sync,
     authentication_failed_error,
@@ -1850,9 +1851,12 @@ class MailService:
         """
         token = self.get_oauth2_access_token_for_account(account_uid)
         if not token:
-            return run_on_mail_thread(
-                self._get_account_folder_stats_unlocked, account_uid
-            )
+            # Dead GOA auth: badge via EnsureCredentials, then Camel fallback (#478).
+            def _fallback() -> dict[str, tuple[int, int]]:
+                self._probe_goa_connect_health_unlocked(account_uid)
+                return self._get_account_folder_stats_unlocked(account_uid)
+
+            return run_on_mail_thread(_fallback)
         by_display = graph_folder_counts.fetch_mail_folder_counts_by_display_name(
             token
         )
@@ -1925,6 +1929,11 @@ class MailService:
                         account_uid, folder_name, unread, total
                     )
                 return unread, total
+        else:
+            # Dead GOA auth: badge via EnsureCredentials, then Camel fallback (#478).
+            run_on_mail_thread(
+                self._probe_goa_connect_health_unlocked, account_uid
+            )
         return self.get_folder_stats(account_uid, folder_name)
 
     def run_job_async(
@@ -3023,8 +3032,11 @@ class MailService:
         source = self.registry.ref_source(account_uid)
         if source is None:
             return
-        if source.has_extension("GNOME Online Accounts"):
-            ensure_goa_credentials(self.registry, source, None)
+        # GOA extension is on the collection parent, not the Mail Account (#478).
+        if not source_uses_goa(self.registry, source):
+            return
+        outcome = ensure_goa_credentials(self.registry, source, None)
+        self._apply_goa_ensure_outcome(account_uid, outcome)
 
     def _prepare_account_credentials_unlocked(
         self,
@@ -3034,8 +3046,40 @@ class MailService:
         source = self.registry.ref_source(account_uid)
         if source is None:
             return
-        if source.has_extension("GNOME Online Accounts"):
-            ensure_goa_credentials(self.registry, source, cancellable)
+        if not source_uses_goa(self.registry, source):
+            return
+        outcome = ensure_goa_credentials(self.registry, source, cancellable)
+        self._apply_goa_ensure_outcome(account_uid, outcome)
+
+    def _apply_goa_ensure_outcome(
+        self, account_uid: str, outcome: GoaEnsureOutcome
+    ) -> None:
+        """Map EnsureCredentials result to connect health (#478).
+
+        ``cancelled`` must not change health (folder-list preempt, #168).
+        """
+        if outcome == "failed":
+            self.set_account_connect_health(account_uid, "needs_sign_in")
+        elif outcome == "ok":
+            self.set_account_connect_health(account_uid, "ok")
+
+    def _probe_goa_connect_health_unlocked(
+        self,
+        account_uid: str,
+        *,
+        cancellable: Gio.Cancellable | None = None,
+    ) -> GoaEnsureOutcome | None:
+        """EnsureCredentials for GOA accounts; update health. None if not GOA."""
+        source = self.registry.ref_source(account_uid)
+        if source is None:
+            return None
+        # Walk parent/siblings: Mail Account sources do not carry the GOA
+        # extension themselves (#478).
+        if not source_uses_goa(self.registry, source):
+            return None
+        outcome = ensure_goa_credentials(self.registry, source, cancellable)
+        self._apply_goa_ensure_outcome(account_uid, outcome)
+        return outcome
 
     def _get_store_unlocked(
         self,
@@ -4678,6 +4722,11 @@ class MailService:
                 with self._lock:
                     self._folder_tree_cache[account_uid] = _merge_heavy_folder_status_into_tree(account_uid, result)
             return result
+
+        # Probe GOA even when Camel returns a warm local summary (#478).
+        self._probe_goa_connect_health_unlocked(
+            account_uid, cancellable=cancellable
+        )
 
         try:
             with self._lock:
@@ -10411,12 +10460,17 @@ class MailService:
         source = self.registry.ref_source(account_uid)
         if source is None:
             return True
-        has_goa = source.has_extension("GNOME Online Accounts")
-        if has_goa is not True:
+        # GOA extension is on the collection parent, not the Mail Account (#478).
+        if not source_uses_goa(self.registry, source):
             return True
-        if ensure_goa_credentials(self.registry, source, None):
+        outcome = ensure_goa_credentials(self.registry, source, None)
+        if outcome == "ok":
+            self._apply_goa_ensure_outcome(account_uid, outcome)
             return True
-        self.set_account_connect_health(account_uid, "needs_sign_in")
+        if outcome == "failed":
+            self._apply_goa_ensure_outcome(account_uid, outcome)
+            return False
+        # cancelled: do not treat as auth-dead (#168 / #478)
         return False
 
     def _allow_network_unlocked(self, account_uid: str) -> bool:

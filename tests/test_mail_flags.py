@@ -354,9 +354,30 @@ class ReadMessageSignInTests(unittest.TestCase):
 
 class ReadMessageGoaUnavailableTests(unittest.TestCase):
     def _goa_account(self, service: object) -> None:
-        source = MagicMock()
-        source.has_extension.return_value = True
-        service.registry.ref_source.return_value = source
+        # Real EDS: GOA extension is on the collection parent, not Mail Account.
+        mail = MagicMock()
+        mail.has_extension.side_effect = lambda name: name != "GNOME Online Accounts"
+        mail.get_uid.return_value = "acct-1"
+        mail.get_parent.return_value = "collection-1"
+        mail.get_display_name.return_value = "M365"
+        parent = MagicMock()
+        parent.has_extension.side_effect = lambda name: name == "GNOME Online Accounts"
+        parent.get_uid.return_value = "collection-1"
+        parent.get_parent.return_value = ""
+        parent.get_display_name.return_value = "M365"
+        goa = MagicMock()
+        goa.get_account_id.return_value = "goa-1"
+        parent.get_extension.return_value = goa
+
+        def ref_source(uid: str):
+            if uid == "acct-1":
+                return mail
+            if uid == "collection-1":
+                return parent
+            return None
+
+        service.registry.ref_source.side_effect = ref_source
+        service.registry.list_sources.return_value = [mail, parent]
 
     def _read_with_mocked_mime(
         self,
@@ -395,7 +416,7 @@ class ReadMessageGoaUnavailableTests(unittest.TestCase):
                             mark_seen=mark_seen,
                         )
 
-    @patch("post.mail.eds.ensure_goa_credentials", return_value=False)
+    @patch("post.mail.eds.ensure_goa_credentials", return_value="failed")
     @patch("post.mail.eds.MailService._mark_message_seen_unlocked")
     @patch("post.mail.eds.MailService._get_message_mime_sync")
     @patch("post.mail.eds.MailService._get_store_unlocked")
@@ -427,7 +448,7 @@ class ReadMessageGoaUnavailableTests(unittest.TestCase):
         mark_seen_mock.assert_called_once()
         self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
 
-    @patch("post.mail.eds.ensure_goa_credentials", return_value=False)
+    @patch("post.mail.eds.ensure_goa_credentials", return_value="failed")
     @patch("post.mail.eds.MailService._mark_message_seen_unlocked")
     @patch("post.mail.eds.MailService._get_message_mime_sync")
     @patch("post.mail.eds.MailService._get_store_unlocked")

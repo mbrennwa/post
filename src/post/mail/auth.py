@@ -82,7 +82,18 @@ def _related_credential_sources(
     if parent_uid:
         _append_unique(sources, seen, registry.ref_source(parent_uid))
 
-    for candidate in registry.list_sources():
+    try:
+        listed = registry.list_sources()
+    except TypeError:
+        listed = ()
+    if not listed:
+        return sources
+    try:
+        candidates = list(listed)
+    except TypeError:
+        return sources
+
+    for candidate in candidates:
         if candidate.get_uid() in seen:
             continue
         same_name = bool(name) and candidate.get_display_name() == name
@@ -115,7 +126,12 @@ def _goa_account_ids(
             continue
         goa = candidate.get_extension("GNOME Online Accounts")
         account_id = goa.get_account_id()
-        if account_id and account_id not in ids:
+        # Require a real string so unit-test MagicMocks do not call D-Bus (#478).
+        if (
+            isinstance(account_id, str)
+            and account_id
+            and account_id not in ids
+        ):
             ids.append(account_id)
     return ids
 
@@ -148,25 +164,34 @@ def open_gnome_online_accounts() -> bool:
         return False
 
 
+GoaEnsureOutcome = Literal["ok", "failed", "cancelled"]
+
+
 def ensure_goa_credentials(
     registry: EDataServer.SourceRegistry,
     source: EDataServer.Source,
     cancellable: Gio.Cancellable | None = None,
-) -> bool:
+) -> GoaEnsureOutcome:
     """Refresh GOA credentials so EDS can read them from the keyring.
 
-    Returns True when every GOA account responded successfully (or none apply).
+    Returns ``ok`` when every GOA account responded successfully (or none apply),
+    ``failed`` on a real EnsureCredentials / bus error, and ``cancelled`` when
+    the call was preempted (#168). Callers must not treat ``cancelled`` as
+    auth-dead (#478).
     """
     account_ids = _goa_account_ids(registry, source)
     if not account_ids:
-        return True
+        return "ok"
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, cancellable)
-    except GLib.Error:
+    except GLib.Error as exc:
+        if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+            log.debug("GOA session bus get cancelled")
+            return "cancelled"
         log.exception("Could not connect to session D-Bus for GOA")
-        return False
+        return "failed"
 
-    ok = True
+    outcome: GoaEnsureOutcome = "ok"
     for account_id in account_ids:
         path = f"/org/gnome/OnlineAccounts/Accounts/{account_id}"
         try:
@@ -187,15 +212,14 @@ def ensure_goa_credentials(
                     "GOA EnsureCredentials cancelled for %s",
                     account_id,
                 )
-                ok = False
-            else:
-                log.warning(
-                    "GOA EnsureCredentials failed for %s: %s",
-                    account_id,
-                    exc.message,
-                )
-                ok = False
-    return ok
+                return "cancelled"
+            log.warning(
+                "GOA EnsureCredentials failed for %s: %s",
+                account_id,
+                exc.message,
+            )
+            outcome = "failed"
+    return outcome
 
 
 def lookup_stored_password(
@@ -278,9 +302,16 @@ def authenticate_service_sync(
         _raise_if_cancelled(cancellable)
         password: str | None = None
         if not reprompt:
-            ensure_goa_credentials(registry, source, cancellable)
+            goa_outcome = ensure_goa_credentials(registry, source, cancellable)
             # Folder-list preempt cancels EnsureCredentials; do not fall through to a
             # password dialog for a cancelled background load (#168).
+            if goa_outcome == "cancelled":
+                _raise_if_cancelled(cancellable)
+                raise GLib.Error.new_literal(
+                    Gio.io_error_quark(),
+                    "Operation was cancelled",
+                    Gio.IOErrorEnum.CANCELLED,
+                )
             _raise_if_cancelled(cancellable)
             password = lookup_stored_password(registry, source, cancellable)
             _raise_if_cancelled(cancellable)

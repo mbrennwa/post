@@ -1,7 +1,7 @@
 # Copyright (C) 2026 mbrennwa
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""GOA credential refresh must not wait forever (#156)."""
+"""GOA credential refresh must not wait forever (#156); tri-state (#478)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from post.mail import auth
 
 
 class EnsureGoaCredentialsTests(unittest.TestCase):
-    def test_ensure_credentials_uses_finite_timeout(self) -> None:
+    def _goa_source(self) -> tuple[mock.Mock, mock.Mock]:
         registry = mock.Mock()
         source = mock.Mock()
         source.get_display_name.return_value = "M365"
@@ -24,10 +24,16 @@ class EnsureGoaCredentialsTests(unittest.TestCase):
         source.get_extension.return_value = goa
         registry.list_sources.return_value = [source]
         registry.ref_source.return_value = None
+        return registry, source
+
+    def test_ensure_credentials_uses_finite_timeout(self) -> None:
+        registry, source = self._goa_source()
 
         bus = mock.Mock()
         with mock.patch("post.mail.auth.Gio.bus_get_sync", return_value=bus):
-            self.assertTrue(auth.ensure_goa_credentials(registry, source, None))
+            self.assertEqual(
+                auth.ensure_goa_credentials(registry, source, None), "ok"
+            )
 
         bus.call_sync.assert_called_once()
         timeout_ms = bus.call_sync.call_args.args[7]
@@ -35,18 +41,9 @@ class EnsureGoaCredentialsTests(unittest.TestCase):
         self.assertGreater(timeout_ms, 0)
         self.assertNotEqual(timeout_ms, -1)
 
-    def test_ensure_credentials_failure_returns_false(self) -> None:
-        registry = mock.Mock()
-        source = mock.Mock()
+    def test_ensure_credentials_failure_returns_failed(self) -> None:
+        registry, source = self._goa_source()
         source.get_display_name.return_value = "Gmail"
-        source.get_uid.return_value = "acct-1"
-        source.get_parent.return_value = ""
-        source.has_extension.return_value = True
-        goa = mock.Mock()
-        goa.get_account_id.return_value = "goa-1"
-        source.get_extension.return_value = goa
-        registry.list_sources.return_value = [source]
-        registry.ref_source.return_value = None
 
         bus = mock.Mock()
         bus.call_sync.side_effect = auth.GLib.Error.new_literal(
@@ -55,20 +52,26 @@ class EnsureGoaCredentialsTests(unittest.TestCase):
             auth.Gio.IOErrorEnum.FAILED,
         )
         with mock.patch("post.mail.auth.Gio.bus_get_sync", return_value=bus):
-            self.assertFalse(auth.ensure_goa_credentials(registry, source, None))
+            self.assertEqual(
+                auth.ensure_goa_credentials(registry, source, None), "failed"
+            )
+
+    def test_ensure_credentials_cancel_returns_cancelled(self) -> None:
+        registry, source = self._goa_source()
+
+        bus = mock.Mock()
+        bus.call_sync.side_effect = auth.GLib.Error.new_literal(
+            auth.Gio.io_error_quark(),
+            "Operation was cancelled",
+            auth.Gio.IOErrorEnum.CANCELLED,
+        )
+        with mock.patch("post.mail.auth.Gio.bus_get_sync", return_value=bus):
+            self.assertEqual(
+                auth.ensure_goa_credentials(registry, source, None), "cancelled"
+            )
 
     def test_source_uses_goa(self) -> None:
-        registry = mock.Mock()
-        source = mock.Mock()
-        source.get_display_name.return_value = "M365"
-        source.get_uid.return_value = "acct-1"
-        source.get_parent.return_value = ""
-        source.has_extension.return_value = True
-        goa = mock.Mock()
-        goa.get_account_id.return_value = "goa-1"
-        source.get_extension.return_value = goa
-        registry.list_sources.return_value = [source]
-        registry.ref_source.return_value = None
+        registry, source = self._goa_source()
         self.assertTrue(auth.source_uses_goa(registry, source))
 
     def test_open_gnome_online_accounts_falls_back_to_control_center(self) -> None:
