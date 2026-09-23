@@ -79,10 +79,10 @@ from post.mail.correspondents import (
 from post.mail.eds import MailAccount
 from post.mail.network_errors import (
     format_attachment_error,
-    is_sign_in_required_error,
     log_mail_error,
 )
 from post.mail.send_errors import (
+    SendError,
     SendQueued,
     format_outbox_failure_toast,
     is_permanent_send_error,
@@ -99,6 +99,7 @@ from post.mail.send_queue import (
     new_outbound_queue_id,
     park_outbound_message,
     persist_outbound_send,
+    set_outbound_send_after,
 )
 from post.preferences import (
     get_account_signature,
@@ -244,9 +245,8 @@ def _run_outbound_send_worker(
             delay_seconds = (
                 0 if request.send_immediately else get_send_delay_seconds()
             )
-            send_after = (
-                time.time() + delay_seconds if delay_seconds > 0 else None
-            )
+            # Persist without send_after until preflight succeeds so the
+            # countdown cannot start during a slow GOA check (#488).
             persist_outbound_send(
                 account_uid=request.account_uid,
                 to=request.to,
@@ -259,7 +259,7 @@ def _run_outbound_send_worker(
                 references=request.references,
                 attachments=request.attachments,
                 queue_id=queue_id,
-                send_after=send_after,
+                send_after=None,
             )
         except ValueError as exc:
             log.warning("Outbound compose validation failed: %s", exc)
@@ -284,7 +284,29 @@ def _run_outbound_send_worker(
         if on_outbox_changed is not None:
             GLib.idle_add(_notify_outbox_changed, on_outbox_changed)
 
-        if delay_seconds > 0 and send_after is not None:
+        try:
+            mail.ensure_account_ready_to_send(request.account_uid)
+        except SendError as exc:
+            log.warning(
+                "Send preflight failed: %s",
+                user_send_error_message(exc),
+            )
+            GLib.idle_add(
+                _finish_outbound_send,
+                parent,
+                set_status,
+                on_draft_saved,
+                on_outbox_changed,
+                mail,
+                request_with_id,
+                exc,
+                None,
+            )
+            return
+
+        if delay_seconds > 0:
+            send_after = time.time() + delay_seconds
+            set_outbound_send_after(queue_id, send_after)
             if on_delayed_send is not None:
                 GLib.idle_add(_schedule_delayed_send, on_delayed_send, queue_id, send_after)
             GLib.idle_add(
@@ -387,13 +409,10 @@ def _finish_outbound_send(
                     park_outbound_message(request.queue_id, message)
                 except FileNotFoundError:
                     pass
-                message = format_outbox_failure_toast(
-                    message, subject=request.subject, to=request.to
-                )
-            elif not is_sign_in_required_error(error):
-                message = format_outbox_failure_toast(
-                    message, subject=request.subject, to=request.to
-                )
+            # Name the item and Outbox for all send failures, including sign-in (#488).
+            message = format_outbox_failure_toast(
+                message, subject=request.subject, to=request.to
+            )
         if parent is not None:
             show_error_toast(parent, message)
         else:

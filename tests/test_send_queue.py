@@ -505,6 +505,26 @@ class OutboxAccountFilterTests(unittest.TestCase):
                 self.assertEqual(list_pending_delayed_outbound_messages(), [])
                 self.assertFalse(clear_outbound_send_delay(queue_id))
 
+    def test_set_outbound_send_after(self) -> None:
+        from post.mail.send_queue import set_outbound_send_after
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                queue_id = persist_outbound_send(
+                    account_uid="account-1",
+                    to=["user@example.com"],
+                    cc=None,
+                    bcc=None,
+                    subject="Delayed",
+                    body="Body",
+                    send_after=None,
+                )
+                send_after = time.time() + 120
+                set_outbound_send_after(queue_id, send_after)
+                loaded = load_queued_outbound_message(queue_id)
+                self.assertEqual(loaded.send_after, send_after)
+                self.assertTrue(has_pending_send_delay(loaded))
+
     def test_queued_to_list_dict_includes_send_after(self) -> None:
         send_after = time.time() + 60
         message = QueuedOutboundMessage(
@@ -713,6 +733,6 @@ class ParkOutboundMessageTests(unittest.TestCase):
         self.assertIn("Coauthors draft", toast)
         self.assertIn("still in Outbox", toast)
         self.assertIn(
-            "2 messages are still in Outbox",
+            "They are still in Outbox",
             format_parked_startup_toast(2, "This message is too large to send."),
         )

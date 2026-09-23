@@ -121,7 +121,7 @@ class RunOutboundSendTests(unittest.TestCase):
 
         show_error_toast.assert_called_once_with(
             parent,
-            "“Hello”: SMTP failed It is still in Outbox.",
+            "“Hello” could not be sent. The message is still in Outbox. SMTP failed",
         )
         self.assertEqual(self.status_messages, [])
         outbox_changed.assert_called()
@@ -224,12 +224,13 @@ class RunOutboundSendTests(unittest.TestCase):
         show_error_toast.assert_called_once()
         self.mail.deliver_outbound_queue_item.assert_not_called()
 
+    @mock.patch("post.compose_window.set_outbound_send_after")
     @mock.patch("post.compose_window.get_send_delay_seconds", return_value=30)
     @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
     @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
     @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
     def test_delayed_send_clears_status_hint(
-        self, _idle_add, persist, _queue_id, _delay
+        self, _idle_add, persist, _queue_id, _delay, set_send_after
     ) -> None:
         outbox_changed = mock.Mock()
         on_delayed_send = mock.Mock()
@@ -246,12 +247,61 @@ class RunOutboundSendTests(unittest.TestCase):
 
         self.mail.deliver_outbound_queue_item.assert_not_called()
         persist.assert_called_once()
-        self.assertIsNotNone(persist.call_args.kwargs.get("send_after"))
+        self.assertIsNone(persist.call_args.kwargs.get("send_after"))
+        set_send_after.assert_called_once()
+        self.assertEqual(set_send_after.call_args.args[0], "queue-1")
         on_delayed_send.assert_called_once()
         self.assertEqual(on_delayed_send.call_args.args[0], "queue-1")
         outbox_changed.assert_called()
         # Empty hint so live countdown owns the status bar (#429).
         self.assertEqual(self.status_messages, [""])
+
+    @mock.patch("post.compose_window.set_outbound_send_after")
+    @mock.patch("post.compose_window.show_error_toast")
+    @mock.patch("post.compose_window.get_send_delay_seconds", return_value=30)
+    @mock.patch("post.compose_window.new_outbound_queue_id", return_value="queue-1")
+    @mock.patch("post.compose_window.persist_outbound_send", return_value="queue-1")
+    @mock.patch("post.compose_window.GLib.idle_add", side_effect=_run_idle_add)
+    def test_delayed_send_preflight_failure_toasts_without_scheduling(
+        self,
+        _idle_add,
+        persist,
+        _queue_id,
+        _delay,
+        show_error_toast,
+        set_send_after,
+    ) -> None:
+        """Dead GOA must surface immediately — before the send delay (#488)."""
+        from post.mail.network_errors import TOKEN_EXPIRED_FOLDER_MESSAGE
+
+        self.mail.ensure_account_ready_to_send.side_effect = SendError(
+            TOKEN_EXPIRED_FOLDER_MESSAGE
+        )
+        parent = mock.Mock()
+        on_delayed_send = mock.Mock()
+        outbox_changed = mock.Mock()
+
+        run_outbound_send(
+            mail=self.mail,
+            parent=parent,
+            set_status=self.set_status,
+            on_outbox_changed=outbox_changed,
+            on_draft_saved=None,
+            on_delayed_send=on_delayed_send,
+            request=self.request,
+        )
+
+        persist.assert_called_once()
+        self.assertIsNone(persist.call_args.kwargs.get("send_after"))
+        set_send_after.assert_not_called()
+        on_delayed_send.assert_not_called()
+        self.mail.deliver_outbound_queue_item.assert_not_called()
+        show_error_toast.assert_called_once()
+        toast = show_error_toast.call_args.args[1]
+        self.assertIn("Sign-in expired", toast)
+        self.assertIn("Hello", toast)
+        self.assertIn("still in Outbox", toast)
+        outbox_changed.assert_called()
 
 
 class FinishOutboundSendTests(unittest.TestCase):
@@ -286,10 +336,44 @@ class FinishOutboundSendTests(unittest.TestCase):
 
         show_error_toast.assert_called_once_with(
             parent,
-            "“Hello”: Could not send It is still in Outbox.",
+            "“Hello” could not be sent. The message is still in Outbox. Could not send",
         )
         set_status.assert_not_called()
         outbox_changed.assert_called_once()
+
+    @mock.patch("post.compose_window.show_error_toast")
+    def test_finish_sign_in_error_names_message(self, show_error_toast) -> None:
+        from post.mail.network_errors import TOKEN_EXPIRED_FOLDER_MESSAGE
+
+        parent = mock.Mock()
+        request = OutboundSendRequest(
+            account_uid="acct-1",
+            to=["user@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hello",
+            body="Body",
+            in_reply_to=None,
+            references=None,
+            attachments=None,
+            queue_id="queue-1",
+        )
+
+        _finish_outbound_send(
+            parent,
+            mock.Mock(),
+            None,
+            mock.Mock(),
+            mock.Mock(),
+            request,
+            SendError(TOKEN_EXPIRED_FOLDER_MESSAGE),
+            None,
+        )
+
+        toast = show_error_toast.call_args.args[1]
+        self.assertIn("Hello", toast)
+        self.assertIn("Sign-in expired", toast)
+        self.assertIn("still in Outbox", toast)
 
     @mock.patch("post.compose_window.park_outbound_message")
     @mock.patch("post.compose_window.show_error_toast")
@@ -323,7 +407,8 @@ class FinishOutboundSendTests(unittest.TestCase):
 
         show_error_toast.assert_called_once_with(
             parent,
-            "“Hello”: Subject must not contain line breaks. It is still in Outbox.",
+            "“Hello” could not be sent. The message is still in Outbox. "
+            "Subject must not contain line breaks.",
         )
         park.assert_called_once_with("queue-1", "Subject must not contain line breaks.")
 
