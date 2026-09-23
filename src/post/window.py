@@ -4938,16 +4938,32 @@ class MainWindow(Adw.ApplicationWindow):
             self._update_search_scope_ui()
             self._message_stack.set_visible_child_name("list")
 
-        annotated_batch = [
-            annotate_search_match(
-                message,
-                account_uid=account.uid,
-                folder_name=folder_name,
+        # Multi-folder hits must already carry the scanned folder (#477).
+        # Sidebar ``_current_folder`` fallback is only for folder-scoped
+        # cached header search, where the scanned folder is the sidebar one.
+        multi_folder = self._is_multi_folder_scope()
+        annotated_batch: list[dict] = []
+        for message in batch:
+            if message.get("_search_row_key"):
+                annotated_batch.append(message)
+                continue
+            if multi_folder:
+                list_reader_trace(
+                    "search_hit_missing_key",
+                    sidebar_folder=folder_name or "",
+                    uid=str(message.get("uid") or ""),
+                    subject=str(message.get("subject") or "")[:80],
+                )
+                continue
+            annotated_batch.append(
+                annotate_search_match(
+                    message,
+                    account_uid=account.uid,
+                    folder_name=folder_name,
+                )
             )
-            if not message.get("_search_row_key")
-            else message
-            for message in batch
-        ]
+        if not annotated_batch:
+            return False
         for message in annotated_batch:
             list_reader_trace(
                 "search_hit",

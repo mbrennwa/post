@@ -745,6 +745,7 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
             ),
             _update_search_scope_ui=mock.Mock(),
             _load_message_body_for_uid=mock.Mock(),
+            _is_multi_folder_scope=lambda: True,
         )
         window._message_list_key = lambda msg: MainWindow._message_list_key(
             window, msg
@@ -768,6 +769,12 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
 
         window._load_message_body_for_uid.assert_called_once_with(
             list_key, mark_seen=False
+        )
+        inserted = window._message_list_view.insert_messages_newest_first.call_args
+        self.assertEqual(inserted.args[0][0]["_search_folder"], "Archive")
+        self.assertEqual(
+            MainWindow._message_location_for_list_key(window, list_key),
+            ("acct-1", "Archive", "100"),
         )
 
     def test_location_parses_search_row_key_before_sidebar_fallback(self) -> None:
@@ -1192,6 +1199,7 @@ class MarkSeenClickIntentTests(unittest.TestCase):
             ),
             _update_search_scope_ui=mock.Mock(),
             _load_message_body_for_uid=mock.Mock(),
+            _is_multi_folder_scope=lambda: True,
             _sidebar=SimpleNamespace(
                 folder_is_drafts=lambda *_args: False,
             ),
@@ -1215,6 +1223,77 @@ class MarkSeenClickIntentTests(unittest.TestCase):
         MainWindow._apply_search_matches(window, 1, [hit])
 
         window._load_message_body_for_uid.assert_not_called()
+
+    def test_apply_search_matches_drops_unannotated_multi_folder_hits(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        raw = {"uid": "548", "subject": "Vesper", "sort_date": 300}
+        account = SimpleNamespace(uid="acct-1")
+        window = SimpleNamespace(
+            _is_closing=False,
+            _messages_load_generation=1,
+            _search_query=object(),
+            _current_account=account,
+            _current_folder="INBOX",
+            _search_results_streamed=False,
+            _current_folder_messages=[],
+            _message_stack=mock.Mock(
+                set_visible_child_name=mock.Mock(),
+            ),
+            _message_list_view=mock.Mock(
+                insert_messages_newest_first=mock.Mock(),
+            ),
+            _update_search_scope_ui=mock.Mock(),
+            _ensure_reader_matches_selection=mock.Mock(),
+            _is_multi_folder_scope=lambda: True,
+        )
+
+        MainWindow._apply_search_matches(window, 1, [raw])
+
+        window._message_list_view.insert_messages_newest_first.assert_not_called()
+        self.assertEqual(window._current_folder_messages, [])
+
+    def test_apply_search_matches_folder_scope_annotates_with_sidebar(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.mail.search import make_search_row_key
+        from post.window import MainWindow
+
+        raw = {"uid": "42", "subject": "Inbox hit", "sort_date": 100}
+        account = SimpleNamespace(uid="acct-1")
+        window = SimpleNamespace(
+            _is_closing=False,
+            _messages_load_generation=1,
+            _search_query=object(),
+            _current_account=account,
+            _current_folder="INBOX",
+            _search_results_streamed=False,
+            _current_folder_messages=[],
+            _message_stack=mock.Mock(
+                set_visible_child_name=mock.Mock(),
+            ),
+            _message_list_view=mock.Mock(
+                insert_messages_newest_first=mock.Mock(),
+            ),
+            _update_search_scope_ui=mock.Mock(),
+            _ensure_reader_matches_selection=mock.Mock(),
+            _is_multi_folder_scope=lambda: False,
+        )
+
+        MainWindow._apply_search_matches(window, 1, [raw])
+
+        inserted = window._message_list_view.insert_messages_newest_first.call_args
+        annotated = inserted.args[0][0]
+        self.assertEqual(annotated["_search_folder"], "INBOX")
+        self.assertEqual(
+            annotated["_search_row_key"],
+            make_search_row_key("acct-1", "INBOX", "42"),
+        )
+        self.assertEqual(window._current_folder_messages[0]["_search_folder"], "INBOX")
 
     def test_selection_without_click_still_loads_mark_seen_false(self) -> None:
         from unittest import mock
