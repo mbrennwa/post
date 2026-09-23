@@ -385,6 +385,16 @@ class MailSidebar:
             folder_name,
         )
 
+    def drafts_folder_name(self, account_uid: str) -> str | None:
+        """Return the Drafts folder full_name for an account, if known."""
+        for folder in self._account_folders.get(account_uid, []):
+            name = str(folder.get("full_name") or "")
+            if name and is_drafts_folder_name(
+                self._account_folders.get(account_uid, []), name
+            ):
+                return name
+        return None
+
     def folder_is_sent(self, account_uid: str, folder_name: str) -> bool:
         return is_sent_folder_name(
             self._account_folders.get(account_uid, []),

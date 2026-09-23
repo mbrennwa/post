@@ -51,6 +51,68 @@ class DraftQueueTests(unittest.TestCase):
         remove_queued_draft(queue_id)
         self.assertFalse(is_queued_draft_id(queue_id))
 
+    def test_list_queued_draft_messages_for_folder(self) -> None:
+        from post.mail.draft_queue import (
+            list_queued_draft_messages,
+            merge_queued_drafts_into_messages,
+        )
+
+        enqueue_draft(
+            QueuedDraft(
+                account_uid="acct-1",
+                drafts_folder_name="Drafts",
+                to=["bob@example.com"],
+                cc=None,
+                bcc=None,
+                subject="Keep",
+                body="Body",
+                queued_at=100.0,
+            )
+        )
+        enqueue_draft(
+            QueuedDraft(
+                account_uid="acct-1",
+                drafts_folder_name="Other",
+                to=None,
+                cc=None,
+                bcc=None,
+                subject="Skip folder",
+                body="Body",
+                queued_at=200.0,
+            )
+        )
+        enqueue_draft(
+            QueuedDraft(
+                account_uid="acct-2",
+                drafts_folder_name="Drafts",
+                to=None,
+                cc=None,
+                bcc=None,
+                subject="Skip account",
+                body="Body",
+                queued_at=300.0,
+            )
+        )
+        messages, unread, total = list_queued_draft_messages(
+            "acct-1",
+            "Drafts",
+            from_label="Me",
+        )
+        self.assertEqual(unread, 0)
+        self.assertEqual(total, 1)
+        self.assertEqual(messages[0]["subject"], "Keep")
+        self.assertTrue(messages[0]["flags"].get("queued"))
+
+        merged, added = merge_queued_drafts_into_messages(
+            [{"uid": "camel-1", "subject": "Server"}],
+            "acct-1",
+            "Drafts",
+            from_label="Me",
+        )
+        self.assertEqual(added, 1)
+        self.assertEqual(merged[0]["subject"], "Keep")
+        self.assertEqual(merged[1]["uid"], "camel-1")
+
     def test_offline_status_includes_drafts(self) -> None:
         self.assertIn(
             "1 draft queued",
@@ -102,11 +164,6 @@ class SaveDraftOfflineQueueTests(unittest.TestCase):
         self.assertEqual((folder_name, uid), ("Drafts", "draft-queue-id"))
 
     def test_append_failure_queues_draft(self) -> None:
-        import gi
-
-        gi.require_version("GLib", "2.0")
-        from gi.repository import GLib
-
         service = MailService(registry=mock.Mock())
         service._network_available = True
         account = mock.Mock()
@@ -148,6 +205,53 @@ class SaveDraftOfflineQueueTests(unittest.TestCase):
 
         queue_draft.assert_called_once()
         self.assertEqual(uid, "draft-queue-id")
+
+    def test_sign_in_append_failure_queues_draft(self) -> None:
+        service = MailService(registry=mock.Mock())
+        service._network_available = True
+        account = mock.Mock()
+        account.from_address = "user@example.com"
+        account.from_name = "User"
+        account.email = "user@example.com"
+        service.get_account = mock.Mock(return_value=account)
+        service._drafts_folder_name_unlocked = mock.Mock(return_value="Drafts")
+        service.set_account_connect_health = mock.Mock()
+        service._append_draft_unlocked = mock.Mock(
+            side_effect=RuntimeError(
+                "Could not save draft: AADSTS70043: refresh token has expired"
+            )
+        )
+
+        with (
+            mock.patch(
+                "post.mail.eds.build_draft_mime_message",
+                return_value=mock.Mock(),
+            ),
+            mock.patch.object(
+                service,
+                "_queue_draft_unlocked",
+                return_value=("Drafts", "draft-queue-id"),
+            ) as queue_draft,
+        ):
+            folder_name, uid = service._save_draft_unlocked(
+                "acct-1",
+                to=["bob@example.com"],
+                cc=None,
+                bcc=None,
+                subject="Hi",
+                body="Body",
+                body_html=None,
+                in_reply_to=None,
+                references=None,
+                existing_uid=None,
+                drafts_folder_name="Drafts",
+            )
+
+        queue_draft.assert_called_once()
+        self.assertEqual((folder_name, uid), ("Drafts", "draft-queue-id"))
+        service.set_account_connect_health.assert_called_once_with(
+            "acct-1", "needs_sign_in"
+        )
 
     def test_cancelled_append_queues_draft(self) -> None:
         import gi

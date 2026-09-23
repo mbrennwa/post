@@ -90,6 +90,12 @@ from post.mail.search import (
 )
 from post.mail.search_debug import list_reader_trace, search_trace, search_trace_timer
 from post.mail.operation_queue import offline_queue_status_text
+from post.mail.draft_queue import (
+    is_queued_draft_id,
+    merge_queued_drafts_into_messages,
+    read_queued_draft,
+    remove_queued_draft,
+)
 from post.mail.send_delay import OutboundSendDelayScheduler
 from post.mail.network_errors import (
     format_attachment_error,
@@ -928,6 +934,72 @@ class MainWindow(Adw.ApplicationWindow):
             and is_post_outbox_folder(self._current_folder)
         ):
             self._load_messages(self._current_account.uid, POST_OUTBOX_FOLDER)
+
+    def _with_queued_drafts(
+        self,
+        account_uid: str,
+        folder_name: str,
+        messages: list[dict],
+        total: int,
+    ) -> tuple[list[dict], int]:
+        """Prepend local draft-queue rows when viewing a Drafts folder (#485)."""
+        if not self._sidebar.folder_is_drafts(account_uid, folder_name):
+            return messages, total
+        try:
+            account = self._mail.get_account(account_uid)
+            from_label = account.from_label or account.email or account.display_label
+        except ValueError:
+            from_label = ""
+        merged, added = merge_queued_drafts_into_messages(
+            messages,
+            account_uid,
+            folder_name,
+            from_label=from_label or "",
+        )
+        if added <= 0:
+            return messages, total
+        if total < 0:
+            return merged, len(merged)
+        return merged, total + added
+
+    def _drafts_folder_name_for_account(self, account_uid: str) -> str | None:
+        return self._sidebar.drafts_folder_name(account_uid)
+
+    def _refresh_drafts_after_queue_change(
+        self, account_uid: str, drafts_folder_name: str | None = None
+    ) -> None:
+        folder_name = drafts_folder_name or self._drafts_folder_name_for_account(
+            account_uid
+        )
+        if folder_name:
+            self._sidebar.refresh_folder_counts(account_uid, folder_name)
+        if (
+            self._current_account is not None
+            and self._current_account.uid == account_uid
+            and self._current_folder
+            and self._sidebar.folder_is_drafts(account_uid, self._current_folder)
+        ):
+            self._load_messages(account_uid, self._current_folder)
+        self._refresh_status_display()
+
+    def _queued_draft_moved_status(
+        self, account_uid: str, *, count: int = 1
+    ) -> str:
+        needs_sign_in = (
+            self._mail.get_account_connect_health(account_uid) == "needs_sign_in"
+        )
+        if needs_sign_in:
+            if count == 1:
+                return (
+                    "Draft saved locally — will sync to Drafts after you sign in"
+                )
+            return (
+                f"{count} drafts saved locally — will sync to Drafts after you "
+                "sign in"
+            )
+        if count == 1:
+            return "Draft saved — will sync to Drafts when online"
+        return f"{count} drafts saved — will sync to Drafts when online"
 
     def _on_delayed_send_error(self, message: str) -> None:
         if not message:
@@ -2228,6 +2300,9 @@ class MainWindow(Adw.ApplicationWindow):
                 folder_name,
                 sync=sync_flag,
             )
+            messages, total = self._with_queued_drafts(
+                account_uid, folder_name, messages, total
+            )
             return messages, unread, total, source
 
         self._message_sync_in_progress = True
@@ -3072,10 +3147,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._refresh_status_display()
 
     def _refresh_status_display(self) -> None:
+        draft_queued = self._mail.count_queued_drafts()
         if not self._network_available:
             send_queued = len(list_queued_outbound_messages())
             operation_queued = self._mail.count_queued_operations()
-            draft_queued = self._mail.count_queued_drafts()
             parts = [
                 offline_queue_status_text(
                     send_queued_count=send_queued,
@@ -3101,6 +3176,16 @@ class MainWindow(Adw.ApplicationWindow):
             return
         if self._offline_download_status:
             self._status.set_label(self._offline_download_status)
+            return
+        if draft_queued > 0 and not self._status_hint:
+            # Dead-auth / "online" queue: still surface pending local drafts (#485).
+            self._status.set_label(
+                offline_queue_status_text(
+                    send_queued_count=0,
+                    operation_queued_count=0,
+                    draft_queued_count=draft_queued,
+                )
+            )
             return
         self._status.set_label(self._status_hint)
 
@@ -5322,6 +5407,9 @@ class MainWindow(Adw.ApplicationWindow):
                 folder_name,
                 sync=sync_flag,
             )
+            messages, total = self._with_queued_drafts(
+                account_uid, folder_name, messages, total
+            )
             return messages, unread, total, source
 
         self._message_total = -1
@@ -5529,6 +5617,20 @@ class MainWindow(Adw.ApplicationWindow):
                 else:
                     log_mail_error(log, "Failed to list messages", exc)
                     error = exc
+                if (
+                    messages is None
+                    and self._sidebar.folder_is_drafts(account_uid, folder_name)
+                ):
+                    # Dead auth / folder list failure must not hide local draft-queue (#485).
+                    queued_only, queued_total = self._with_queued_drafts(
+                        account_uid, folder_name, [], 0
+                    )
+                    if queued_only:
+                        messages = queued_only
+                        unread = 0
+                        total = queued_total
+                        source = "draft_queue"
+                        error = None
             search_trace(
                 "search_worker_idle_add",
                 load_id=load_id,
@@ -5816,6 +5918,13 @@ class MainWindow(Adw.ApplicationWindow):
                                 folder_name,
                                 sync=False,
                             )
+                            if cached_messages is not None:
+                                cached_messages, cached_total = self._with_queued_drafts(
+                                    account_uid,
+                                    folder_name,
+                                    cached_messages,
+                                    cached_total,
+                                )
                         except Exception:
                             cached_messages = None
                         GLib.idle_add(
@@ -6529,10 +6638,14 @@ class MainWindow(Adw.ApplicationWindow):
 
         def worker() -> None:
             error: Exception | None = None
+            account_uid = ""
+            drafts_folder: str | None = None
+            draft_uid: str | None = None
             try:
                 queued = load_queued_outbound_message(queue_id)
+                account_uid = queued.account_uid
                 attachments = load_queued_attachments(queue_id, queued)
-                self._mail.save_draft(
+                drafts_folder, draft_uid = self._mail.save_draft(
                     queued.account_uid,
                     to=queued.to,
                     cc=queued.cc,
@@ -6548,16 +6661,36 @@ class MainWindow(Adw.ApplicationWindow):
             except Exception as exc:
                 log.exception("Failed to move outbox message to drafts")
                 error = exc
-            GLib.idle_add(self._on_outbox_moved_to_drafts, error)
+            GLib.idle_add(
+                self._on_outbox_moved_to_drafts,
+                error,
+                account_uid,
+                drafts_folder,
+                draft_uid,
+            )
 
         self._mail.submit_interactive("outbox_to_drafts", worker)
 
-    def _on_outbox_moved_to_drafts(self, error: Exception | None) -> bool:
+    def _on_outbox_moved_to_drafts(
+        self,
+        error: Exception | None,
+        account_uid: str,
+        drafts_folder: str | None,
+        draft_uid: str | None,
+    ) -> bool:
         if error is not None:
             show_error_toast(self, f"Could not move to Drafts: {error}")
             return False
         self._on_outbox_changed()
-        self._set_status("Moved queued message to Drafts")
+        if draft_uid and is_queued_draft_id(draft_uid) and account_uid:
+            status = self._queued_draft_moved_status(account_uid)
+            self._set_status(status)
+            show_toast(self, status)
+            self._refresh_drafts_after_queue_change(account_uid, drafts_folder)
+        else:
+            self._set_status("Moved queued message to Drafts")
+            if account_uid:
+                self._refresh_drafts_after_queue_change(account_uid, drafts_folder)
         return False
 
     def _on_status_send_now_clicked(self, *_args) -> None:
@@ -6596,7 +6729,9 @@ class MainWindow(Adw.ApplicationWindow):
 
         def worker() -> None:
             moved: dict[str, int] = {}
+            queued_moved: dict[str, int] = {}
             failed: dict[str, int] = {}
+            drafts_folders: dict[str, str] = {}
             for queue_id in queue_ids:
                 account_uid = ""
                 try:
@@ -6606,7 +6741,7 @@ class MainWindow(Adw.ApplicationWindow):
                         continue
                     account_uid = queued.account_uid
                     attachments = load_queued_attachments(queue_id, queued)
-                    self._mail.save_draft(
+                    drafts_folder, draft_uid = self._mail.save_draft(
                         queued.account_uid,
                         to=queued.to,
                         cc=queued.cc,
@@ -6619,7 +6754,12 @@ class MainWindow(Adw.ApplicationWindow):
                         attachments=attachments or None,
                     )
                     remove_queued_outbound_message(queue_id)
-                    moved[account_uid] = moved.get(account_uid, 0) + 1
+                    if is_queued_draft_id(draft_uid):
+                        queued_moved[account_uid] = queued_moved.get(account_uid, 0) + 1
+                    else:
+                        moved[account_uid] = moved.get(account_uid, 0) + 1
+                    if drafts_folder:
+                        drafts_folders[account_uid] = drafts_folder
                 except Exception:
                     log.exception(
                         "Failed to move delayed outbox message %s to drafts",
@@ -6627,14 +6767,22 @@ class MainWindow(Adw.ApplicationWindow):
                     )
                     key = account_uid or queue_id
                     failed[key] = failed.get(key, 0) + 1
-            GLib.idle_add(self._on_stop_sending_finished, moved, failed)
+            GLib.idle_add(
+                self._on_stop_sending_finished,
+                moved,
+                queued_moved,
+                failed,
+                drafts_folders,
+            )
 
         self._mail.submit_interactive("stop_sending", worker)
 
     def _on_stop_sending_finished(
         self,
         moved: dict[str, int],
+        queued_moved: dict[str, int],
         failed: dict[str, int],
+        drafts_folders: dict[str, str],
     ) -> bool:
         self._stop_sending_in_flight = False
         self._on_outbox_changed()
@@ -6644,6 +6792,15 @@ class MainWindow(Adw.ApplicationWindow):
                 for account_uid, count in moved.items()
             ]
             show_toast(self, format_stop_sending_toast(moved_labels))
+        if queued_moved:
+            for account_uid, count in queued_moved.items():
+                status = self._queued_draft_moved_status(account_uid, count=count)
+                show_toast(self, status)
+                self._set_status(status)
+        for account_uid in set(moved) | set(queued_moved):
+            self._refresh_drafts_after_queue_change(
+                account_uid, drafts_folders.get(account_uid)
+            )
         if failed:
             failed_labels = [
                 (self._sidebar.account_display_label(account_uid), count)
@@ -6673,6 +6830,28 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             self._set_status(f"Removed {count} queued messages")
         self._on_outbox_changed()
+
+    def _delete_queued_drafts(
+        self,
+        queue_ids: list[str],
+        *,
+        account_uid: str,
+        folder_name: str,
+        list_keys: list[str] | None = None,
+    ) -> None:
+        keys = list_keys if list_keys is not None else list(queue_ids)
+        for queue_id in queue_ids:
+            remove_queued_draft(queue_id)
+        self._message_list_view.remove_uids(keys)
+        if self._current_message_uid in keys:
+            self._clear_reader()
+            set_active_message_uid(None)
+        count = len(queue_ids)
+        if count == 1:
+            self._set_status("Removed 1 queued draft")
+        else:
+            self._set_status(f"Removed {count} queued drafts")
+        self._refresh_drafts_after_queue_change(account_uid, folder_name)
 
     def _move_messages(
         self,
@@ -6720,6 +6899,32 @@ class MainWindow(Adw.ApplicationWindow):
             if is_post_outbox_folder(group_folder) and destination == "trash":
                 self._delete_queued_messages(message_uids)
                 continue
+
+            if (
+                destination == "trash"
+                and self._sidebar.folder_is_drafts(group_account, group_folder)
+            ):
+                queued_pairs = [
+                    (list_key, message_uid)
+                    for list_key, message_uid in pairs
+                    if is_queued_draft_id(message_uid)
+                ]
+                if queued_pairs:
+                    self._delete_queued_drafts(
+                        [message_uid for _list_key, message_uid in queued_pairs],
+                        account_uid=group_account,
+                        folder_name=group_folder,
+                        list_keys=[list_key for list_key, _uid in queued_pairs],
+                    )
+                pairs = [
+                    (list_key, message_uid)
+                    for list_key, message_uid in pairs
+                    if not is_queued_draft_id(message_uid)
+                ]
+                if not pairs:
+                    continue
+                list_keys = [list_key for list_key, _message_uid in pairs]
+                message_uids = [message_uid for _list_key, message_uid in pairs]
 
             self._suppress_sync_list_reload = (group_account, group_folder)
 
@@ -7638,6 +7843,27 @@ class MainWindow(Adw.ApplicationWindow):
             if not self._current_folder:
                 return
             folder_name = self._current_folder
+
+        if is_queued_draft_id(uid):
+            try:
+                from_label = account.from_label or account.email or account.display_label
+                msg = read_queued_draft(
+                    uid,
+                    account_uid=account.uid,
+                    from_label=from_label or "",
+                )
+            except Exception as exc:
+                log.exception("Failed to open queued draft %s", uid)
+                show_error_toast(self, f"Could not open draft: {exc}")
+                return
+            self._present_compose_window(
+                account,
+                mode="draft",
+                draft_folder_name=folder_name,
+                draft_message_uid=uid,
+                draft_message=msg,
+            )
+            return
 
         def worker() -> None:
             error: Exception | None = None
