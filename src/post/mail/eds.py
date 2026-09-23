@@ -6178,7 +6178,9 @@ class MailService:
         For IMAP, Camel's summary after sync is authoritative: an empty summary
         drops ghost folder-index rows (#441); a non-empty summary that does not
         cover every RAM/disk identity still wins so new UIDs appear and ghosts
-        drop (#463). Graph/M365 keep uncovered RAM/disk for partial summaries.
+        drop (#463). Heavy Graph/M365 folders keep uncovered RAM/disk so a
+        partial summary cannot wipe Archive (#208). Other folders union Camel
+        into that saved list so new Inbox/Sent/Drafts messages appear (#479).
         """
         key = (account_uid, folder_name)
         ram = self._folder_indexes.get(key)
@@ -6236,6 +6238,7 @@ class MailService:
             return index, None
 
         disk = _from_cache()
+        uncovered: list[tuple[str, _FolderMessageIndex]] = []
         for source, other in (("memory", ram), ("disk_cache", disk)):
             if other is None or not other.messages:
                 continue
@@ -6254,17 +6257,48 @@ class MailService:
                     len(other.messages),
                 )
                 return index, None
-            log.warning(
-                "Keeping %s folder index for %s/%s after uncovered Camel summary "
-                "(camel=%d, kept=%d)",
-                source,
+            uncovered.append((source, other))
+        if not uncovered:
+            return index, None
+        if not is_heavy_folder_name(folder_name):
+            # Camel is primary so a matching Message-ID keeps the live UID.
+            # Saved rows Camel did not return stay (#479).
+            merged_messages = list(index.messages)
+            saved_count = 0
+            for _source, other in uncovered:
+                saved_count = max(saved_count, len(other.messages))
+                merged_messages = union_folder_index_messages(
+                    merged_messages, other.messages
+                )
+            merged_messages = sort_messages_newest_first(merged_messages)
+            log.info(
+                "Merging Camel folder index for %s/%s after uncovered summary "
+                "(camel=%d, saved=%d, merged=%d) (#479)",
                 account_uid,
                 folder_name,
                 len(index.messages),
-                len(other.messages),
+                saved_count,
+                len(merged_messages),
             )
-            return other, source
-        return index, None
+            return (
+                _FolderMessageIndex(
+                    messages=merged_messages,
+                    unread=index.unread,
+                    total=max(index.total, len(merged_messages)),
+                ),
+                "server",
+            )
+        source, other = uncovered[0]
+        log.warning(
+            "Keeping %s folder index for %s/%s after uncovered Camel summary "
+            "(camel=%d, kept=%d)",
+            source,
+            account_uid,
+            folder_name,
+            len(index.messages),
+            len(other.messages),
+        )
+        return other, source
 
     def _clear_ghost_folder_index_after_empty_camel(
         self,
@@ -6357,22 +6391,30 @@ class MailService:
             kept, kept_source = self._prefer_nonempty_folder_index(
                 account_uid, folder_name, index
             )
-            if kept_source is not None:
+            if kept_source in ("memory", "disk_cache"):
                 self._store_folder_index(account_uid, folder_name, kept)
                 return kept, kept_source
-            self._store_folder_index(account_uid, folder_name, index)
-            if _folder_index_is_cacheable(index) and (
-                index.messages or folder_index_cache.load(account_uid, folder_name) is None
-            ):
+            # "server" is a non-heavy union of Camel plus saved rows (#479).
+            # Persist it; returning before save left the next open on the old list.
+            to_save = kept if kept_source == "server" else index
+            self._store_folder_index(account_uid, folder_name, to_save)
+            should_save = kept_source == "server" or (
+                _folder_index_is_cacheable(to_save)
+                and (
+                    to_save.messages
+                    or folder_index_cache.load(account_uid, folder_name) is None
+                )
+            )
+            if should_save:
                 folder_index_cache.save(
                     account_uid,
                     folder_name,
-                    index.messages,
-                    index.unread,
-                    index.total,
+                    to_save.messages,
+                    to_save.unread,
+                    to_save.total,
                     grow_only=heavy,
                 )
-            return index, "server"
+            return to_save, "server"
 
         index = self._folder_indexes.get(key)
         if index is not None:
