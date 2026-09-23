@@ -58,6 +58,43 @@ class DelayedSendErrorTests(unittest.TestCase):
         self.assertIn("still in Outbox", errors[0])
         self.assertIn("Hello", errors[0])
 
+    def test_sign_in_error_toasts_without_parking(self) -> None:
+        mail = mock.Mock()
+        mail.deliver_outbound_queue_item.side_effect = SendError(
+            "Sign-in expired — open Settings → Online Accounts to reconnect."
+        )
+        errors: list[str] = []
+        scheduler = OutboundSendDelayScheduler(
+            mail,
+            on_send_error=errors.append,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp),
+                mock.patch("post.mail.send_delay.GLib.idle_add", side_effect=_run_idle_add),
+            ):
+                queue_id = enqueue_outbound_message(
+                    QueuedOutboundMessage(
+                        account_uid="acct-1",
+                        to=["user@example.com"],
+                        cc=None,
+                        bcc=None,
+                        subject="Hello",
+                        body="Body",
+                    )
+                )
+                scheduler._deliver_worker(queue_id)
+                loaded = load_queued_outbound_message(queue_id)
+
+        self.assertFalse(is_outbound_parked(loaded))
+        mail.set_account_connect_health.assert_called_once_with(
+            "acct-1", "needs_sign_in"
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Sign-in expired", errors[0])
+        self.assertIn("still in Outbox", errors[0])
+        self.assertIn("Hello", errors[0])
+
     def test_send_now_retries_parked_item(self) -> None:
         mail = mock.Mock()
         scheduler = OutboundSendDelayScheduler(mail)

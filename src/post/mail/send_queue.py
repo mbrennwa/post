@@ -343,6 +343,13 @@ def clear_outbound_send_delay(queue_id: str) -> bool:
     return True
 
 
+def set_outbound_send_after(queue_id: str, send_after: float) -> None:
+    """Record send delay only after send preflight has succeeded (#488)."""
+    message = load_queued_outbound_message(queue_id)
+    message.send_after = send_after
+    _rewrite_queued_outbound_message(queue_id, message)
+
+
 def park_outbound_message(queue_id: str, error: str) -> None:
     """Record a permanent send failure so auto-flush skips this item."""
     message = load_queued_outbound_message(queue_id)
@@ -442,19 +449,20 @@ def format_parked_close_body(
     to: Sequence[str] | None = None,
 ) -> str:
     """Quit-dialog body: name the failure and warn that quitting forgets it."""
-    from .send_errors import name_outbound_in_reason
+    from .send_errors import format_outbox_failure_toast
 
-    detail = (reason or "").strip() or "A message could not be sent."
-    if subject is not None or to:
-        detail = name_outbound_in_reason(detail, subject, to)
+    detail = format_outbox_failure_toast(
+        reason or "",
+        count=count,
+        subject=subject,
+        to=to,
+    )
     if count <= 1:
         return (
-            f"{detail} It is still in Outbox. "
-            "Review it before quitting, or it may never be sent."
+            f"{detail} Review it before quitting, or it may never be sent."
         )
     return (
-        f"{detail} {count} messages are still in Outbox. "
-        "Review them before quitting, or they may never be sent."
+        f"{detail} Review them before quitting, or they may never be sent."
     )
 
 

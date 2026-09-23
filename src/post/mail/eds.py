@@ -128,6 +128,7 @@ from .operation_queue import (
 )
 from .network_errors import (
     MESSAGE_NOT_CACHED_SIGN_IN,
+    TOKEN_EXPIRED_FOLDER_MESSAGE,
     is_network_unavailable_error,
     is_queueable_network_error,
     is_sign_in_required_error,
@@ -3037,6 +3038,28 @@ class MailService:
             return
         outcome = ensure_goa_credentials(self.registry, source, None)
         self._apply_goa_ensure_outcome(account_uid, outcome)
+
+    def ensure_account_ready_to_send(self, account_uid: str) -> None:
+        """Refuse send when the account needs sign-in or GOA auth is dead (#488).
+
+        Raises ``SendError`` so compose can toast immediately — including before
+        a send-delay timer starts. Non-GOA accounts only check connect health.
+        """
+        if is_mail_io_thread():
+            self._ensure_account_ready_to_send_unlocked(account_uid)
+            return
+        get_mail_io_thread().run_sync(
+            self._ensure_account_ready_to_send_unlocked, account_uid
+        )
+
+    def _ensure_account_ready_to_send_unlocked(self, account_uid: str) -> None:
+        if self.get_account_connect_health(account_uid) == "needs_sign_in":
+            raise SendError(TOKEN_EXPIRED_FOLDER_MESSAGE)
+        outcome = self._probe_goa_connect_health_unlocked(account_uid)
+        if outcome == "failed" or (
+            self.get_account_connect_health(account_uid) == "needs_sign_in"
+        ):
+            raise SendError(TOKEN_EXPIRED_FOLDER_MESSAGE)
 
     def _prepare_account_credentials_unlocked(
         self,

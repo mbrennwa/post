@@ -150,25 +150,29 @@ class SendErrorMessageTests(unittest.TestCase):
     def test_outbox_failure_toast(self) -> None:
         self.assertEqual(
             format_outbox_failure_toast("This message is too large to send."),
-            "This message is too large to send. It is still in Outbox.",
+            "Message could not be sent. The message is still in Outbox. "
+            "It is too large to send.",
         )
         self.assertEqual(
             format_outbox_failure_toast(
                 "This message is too large to send.",
                 subject="Coauthors draft",
             ),
-            "“Coauthors draft” is too large to send. It is still in Outbox.",
+            "“Coauthors draft” could not be sent. The message is still in Outbox. "
+            "It is too large to send.",
         )
         self.assertEqual(
             format_outbox_failure_toast(
                 "This message is too large to send.",
                 to=["alice@example.com"],
             ),
-            "The message to alice@example.com is too large to send. It is still in Outbox.",
+            "The message to alice@example.com could not be sent. "
+            "The message is still in Outbox. It is too large to send.",
         )
         self.assertEqual(
             format_outbox_failure_toast("This message is too large to send.", count=3),
-            "This message is too large to send. 3 messages are still in Outbox.",
+            "3 messages could not be sent. They are still in Outbox. "
+            "It is too large to send.",
         )
         self.assertEqual(
             format_outbox_failure_toast(
@@ -176,5 +180,16 @@ class SendErrorMessageTests(unittest.TestCase):
                 count=3,
                 subject="Coauthors draft",
             ),
-            "“Coauthors draft” is too large to send. 3 messages are still in Outbox.",
+            "3 messages could not be sent. They are still in Outbox. "
+            "It is too large to send.",
+        )
+        from post.mail.network_errors import TOKEN_EXPIRED_FOLDER_MESSAGE
+
+        self.assertEqual(
+            format_outbox_failure_toast(
+                TOKEN_EXPIRED_FOLDER_MESSAGE,
+                subject="test",
+            ),
+            "“test” could not be sent. The message is still in Outbox. "
+            f"{TOKEN_EXPIRED_FOLDER_MESSAGE}",
         )

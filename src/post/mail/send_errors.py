@@ -58,8 +58,6 @@ _GENERIC_SEND_FAILED = (
 
 _MESSAGE_TOO_LARGE = "This message is too large to send."
 
-_OUTBOX_STILL_THERE_SUFFIX = " It is still in Outbox."
-
 _TOAST_SUBJECT_MAX = 48
 
 MESSAGE_QUEUED = (
@@ -143,6 +141,29 @@ def name_outbound_in_reason(
     return f"{label}: {text}"
 
 
+def _outbox_failure_action(reason: str) -> str:
+    """Actionable detail for an Outbox failure toast (why / what to do next)."""
+    text = (reason or "").strip() or _GENERIC_SEND_FAILED
+    if text == _GENERIC_SEND_FAILED:
+        return "Check your account settings and try again."
+    for prefix in (
+        "The message could not be sent. ",
+        "This message could not be sent. ",
+        "This message ",
+        "The message ",
+    ):
+        if text.startswith(prefix):
+            rest = text[len(prefix) :].strip()
+            if not rest:
+                break
+            if rest.startswith("is "):
+                return f"It {rest}"
+            if rest[0].islower():
+                return rest[0].upper() + rest[1:]
+            return rest
+    return text
+
+
 def format_outbox_failure_toast(
     reason: str,
     *,
@@ -150,15 +171,23 @@ def format_outbox_failure_toast(
     subject: str | None = None,
     to: Sequence[str] | None = None,
 ) -> str:
-    """User-facing send failure that names Outbox as where the mail remains."""
+    """Outbox send-failure toast: could not send, still in Outbox, then what to do.
+
+    Order is fixed (#488): (1) named failure, (2) still in Outbox, (3) action/reason.
+    """
     text = (reason or "").strip() or _GENERIC_SEND_FAILED
-    if subject is not None or to:
-        text = name_outbound_in_reason(text, subject, to)
-    if count > 1:
-        return f"{text} {count} messages are still in Outbox."
-    if "still in Outbox" in text:
+    if "could not be sent" in text.lower() and "still in Outbox" in text:
         return text
-    return f"{text}{_OUTBOX_STILL_THERE_SUFFIX}"
+
+    action = _outbox_failure_action(text)
+    if count > 1:
+        lead = f"{count} messages could not be sent. They are still in Outbox."
+    elif subject is not None or to:
+        label = format_outbound_item_label(subject, to)
+        lead = f"{label} could not be sent. The message is still in Outbox."
+    else:
+        lead = "Message could not be sent. The message is still in Outbox."
+    return f"{lead} {action}"
 
 
 def _truncate_outbound_label(text: str) -> str:

@@ -525,5 +525,78 @@ class GoaEnsureConnectHealthTests(unittest.TestCase):
         self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
 
 
+class EnsureAccountReadyToSendTests(unittest.TestCase):
+    """Send preflight refuses dead GOA / needs_sign_in (#488)."""
+
+    def _goa_service(self) -> MailService:
+        registry = mock.Mock()
+        mail = mock.Mock()
+        mail.has_extension.side_effect = lambda name: False
+        mail.get_uid.return_value = "acct-1"
+        mail.get_parent.return_value = "collection-1"
+        mail.get_display_name.return_value = "M365"
+
+        parent = mock.Mock()
+        parent.has_extension.side_effect = lambda name: name == "GNOME Online Accounts"
+        parent.get_uid.return_value = "collection-1"
+        parent.get_parent.return_value = ""
+        parent.get_display_name.return_value = "M365"
+        goa = mock.Mock()
+        goa.get_account_id.return_value = "goa-1"
+        parent.get_extension.return_value = goa
+
+        def ref_source(uid: str):
+            if uid == "acct-1":
+                return mail
+            if uid == "collection-1":
+                return parent
+            return None
+
+        registry.ref_source.side_effect = ref_source
+        registry.list_sources.return_value = [mail, parent]
+        return MailService(registry=registry)
+
+    def test_needs_sign_in_raises(self) -> None:
+        service = self._goa_service()
+        service.set_account_connect_health("acct-1", "needs_sign_in")
+        with self.assertRaises(SendError) as ctx:
+            service._ensure_account_ready_to_send_unlocked("acct-1")
+        self.assertEqual(str(ctx.exception), TOKEN_EXPIRED_FOLDER_MESSAGE)
+
+    def test_goa_failed_raises_and_sets_health(self) -> None:
+        service = self._goa_service()
+        with mock.patch(
+            "post.mail.eds.ensure_goa_credentials", return_value="failed"
+        ):
+            with self.assertRaises(SendError) as ctx:
+                service._ensure_account_ready_to_send_unlocked("acct-1")
+        self.assertEqual(str(ctx.exception), TOKEN_EXPIRED_FOLDER_MESSAGE)
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+    def test_goa_ok_does_not_raise(self) -> None:
+        service = self._goa_service()
+        with mock.patch(
+            "post.mail.eds.ensure_goa_credentials", return_value="ok"
+        ):
+            service._ensure_account_ready_to_send_unlocked("acct-1")
+        self.assertEqual(service.get_account_connect_health("acct-1"), "ok")
+
+    def test_non_goa_only_checks_health(self) -> None:
+        registry = mock.Mock()
+        mail = mock.Mock()
+        mail.has_extension.return_value = False
+        mail.get_uid.return_value = "acct-1"
+        mail.get_parent.return_value = ""
+        mail.get_display_name.return_value = "IMAP"
+        registry.ref_source.return_value = mail
+        registry.list_sources.return_value = [mail]
+        service = MailService(registry=registry)
+        with mock.patch(
+            "post.mail.eds.ensure_goa_credentials", return_value="failed"
+        ) as ensure:
+            service._ensure_account_ready_to_send_unlocked("acct-1")
+        ensure.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

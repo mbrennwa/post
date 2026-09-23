@@ -142,6 +142,13 @@ class OutboundSendDelayScheduler:
                     self._mail.set_account_connect_health(
                         queued.account_uid, "needs_sign_in"
                     )
+                    self._notify_send_error_idle(
+                        format_outbox_failure_toast(
+                            user_send_error_message(exc),
+                            subject=queued.subject,
+                            to=queued.to,
+                        )
+                    )
             elif is_permanent_send_error(exc):
                 reason = user_send_error_message(exc)
                 try:
