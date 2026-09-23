@@ -236,6 +236,8 @@ _TRANSFER_POST_TIMEOUT_SECONDS = 30
 _FOLDER_STATS_TIMEOUT_SECONDS = 15
 # Bound get_message_sync so revoked GOA tokens cannot leave the reader hung (#341).
 _MESSAGE_READ_TIMEOUT_SECONDS = 30
+# Helper RPCs that must preempt offline downsync and count as interactive (#482).
+_INTERACTIVE_HELPER_METHODS = frozenset({"read_message", "read_attachment_data"})
 # Network reconnect set_online_sync per store (#400). Same order as GOA
 # EnsureCredentials so one dead OAuth account cannot pin a Camel worker / GTK.
 _NETWORK_RECONNECT_TIMEOUT_SECONDS = 15
@@ -830,6 +832,18 @@ class MailService:
     _helper_bound_account_uid: str | None = field(
         default=None, init=False, repr=False
     )
+    # In-flight Camel op cancellable (offline downsync) for cancel_helper_op (#482).
+    _helper_op_cancellable: Gio.Cancellable | None = field(
+        default=None, init=False, repr=False
+    )
+    _helper_op_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    # UI-side count of interactive helper RPCs waiting on or holding _serial (#482).
+    _helper_interactive_pending: int = field(default=0, init=False, repr=False)
+    _helper_interactive_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
 
     @property
     def offline_sync(self) -> OfflineBodySyncCoordinator:
@@ -1306,6 +1320,7 @@ class MailService:
             return {"status": "skipped"}
 
         chunk_cancellable = Gio.Cancellable()
+        self._register_helper_op_cancellable(chunk_cancellable)
         stop_watch = threading.Event()
 
         def _watch_timeout() -> None:
@@ -1358,6 +1373,7 @@ class MailService:
         finally:
             stop_watch.set()
             watcher.join(timeout=1.0)
+            self._clear_helper_op_cancellable(chunk_cancellable)
         return {"status": "ok"}
 
     def _synchronize_folder_message_unlocked(
@@ -1500,9 +1516,52 @@ class MailService:
 
         With helpers on (product), Camel work runs in helper processes; this
         still reflects UI-side ``post-mail-io`` / job threads used for non-Camel
-        or test in-process paths.
+        or test in-process paths. Also true while an interactive helper RPC
+        (read) is waiting on or holding account ``_serial`` (#482).
         """
+        with self._helper_interactive_lock:
+            if self._helper_interactive_pending > 0:
+                return True
         return get_mail_io_thread().has_interactive_work_pending()
+
+    def _enter_helper_interactive(self) -> None:
+        with self._helper_interactive_lock:
+            self._helper_interactive_pending += 1
+
+    def _leave_helper_interactive(self) -> None:
+        with self._helper_interactive_lock:
+            self._helper_interactive_pending = max(
+                0, self._helper_interactive_pending - 1
+            )
+
+    def _register_helper_op_cancellable(self, cancellable: Gio.Cancellable) -> None:
+        with self._helper_op_lock:
+            self._helper_op_cancellable = cancellable
+
+    def _clear_helper_op_cancellable(
+        self, cancellable: Gio.Cancellable | None = None
+    ) -> None:
+        with self._helper_op_lock:
+            if cancellable is None or self._helper_op_cancellable is cancellable:
+                self._helper_op_cancellable = None
+
+    def cancel_helper_op(self) -> None:
+        """Cancel the in-flight Camel op registered for this process (#482)."""
+        with self._helper_op_lock:
+            cancellable = self._helper_op_cancellable
+        if cancellable is not None:
+            cancellable.cancel()
+
+    def preempt_account_helper_op(self, account_uid: str) -> None:
+        """Cancel in-flight offline downsync for ``account_uid`` (#482).
+
+        With helpers, sends a cancel IPC message without waiting on ``_serial``.
+        In-process, cancels the registered chunk cancellable directly.
+        """
+        if camel_helpers_enabled():
+            self._camel_pool.request_cancel(account_uid)
+            return
+        self.cancel_helper_op()
 
     def submit_interactive(
         self, name: str, func: Callable[..., Any], /, *args: Any, **kwargs: Any
@@ -1657,6 +1716,27 @@ class MailService:
         timeout: float | None = 120.0,
     ) -> Any:
         """Invoke ``method`` in the per-account Camel helper (#437)."""
+        interactive = method in _INTERACTIVE_HELPER_METHODS
+        if interactive:
+            self._enter_helper_interactive()
+            self.preempt_account_helper_op(account_uid)
+        try:
+            return self._camel_helper_call_once(
+                method, account_uid, args, kwargs, timeout=timeout
+            )
+        finally:
+            if interactive:
+                self._leave_helper_interactive()
+
+    def _camel_helper_call_once(
+        self,
+        method: str,
+        account_uid: str,
+        args: list[Any],
+        kwargs: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = 120.0,
+    ) -> Any:
         try:
             return self._camel_pool.call(
                 account_uid, method, args, kwargs or {}, timeout=timeout
@@ -7323,6 +7403,10 @@ class MailService:
                 api_uid,
                 offline=offline,
             )
+        # Nonempty on-disk MIME wins for first paint; do not wait on Graph (#482).
+        cached = self._try_message_cached(folder, api_uid)
+        if cached is not None:
+            return cached
         try:
             mime = self._get_message_sync_with_timeout(folder, api_uid)
         except TimeoutError:

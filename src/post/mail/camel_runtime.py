@@ -243,6 +243,25 @@ class AccountCamelRuntime:
                 method, args or [], kwargs or {}, timeout=timeout
             )
 
+    def request_cancel(self) -> None:
+        """Ask the helper to cancel its in-flight Camel op without taking ``_serial`` (#482).
+
+        Safe to call while another thread holds ``call()`` / ``_serial`` waiting
+        for a long ``offline_downsync_folder``. The helper must keep reading
+        stdin while that call runs.
+        """
+        with self._lock:
+            if self._proc is None or self._proc.stdin is None or not self._alive:
+                return
+            try:
+                write_message(self._proc.stdin, {"type": "cancel"})
+            except Exception:
+                log.debug(
+                    "helper cancel write failed account=%s",
+                    self.account_uid,
+                    exc_info=True,
+                )
+
     def _call_unlocked(
         self,
         method: str,
@@ -432,6 +451,13 @@ class CamelRuntimePool:
         return self.get(account_uid).call(
             method, args, kwargs, timeout=timeout
         )
+
+    def request_cancel(self, account_uid: str) -> None:
+        """Cancel in-flight helper Camel work for ``account_uid`` (#482)."""
+        with self._lock:
+            runtime = self._runtimes.get(account_uid)
+        if runtime is not None:
+            runtime.request_cancel()
 
     def submit_worker(self, account_uid: str, func: Callable[[], None]) -> None:
         self.get(account_uid).submit_worker(func)

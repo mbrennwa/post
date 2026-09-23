@@ -23,15 +23,31 @@ from post.mail.camel_runtime import (
 
 _FAKE_HELPER = textwrap.dedent(
     """
-    import os, sys, time
+    import os, sys, time, threading, queue
     from post.mail.camel_ipc import read_message, write_message
 
     account = sys.argv[1] if len(sys.argv) > 1 else "acct"
     stdout = sys.stdout.buffer
     stdin = sys.stdin.buffer
     write_message(stdout, {"type": "ready", "account_uid": account, "pid": os.getpid()})
+    incoming = queue.Queue()
+    cancel_event = threading.Event()
+
+    def reader():
+        while True:
+            msg = read_message(stdin)
+            if msg is None:
+                incoming.put(None)
+                return
+            # Apply cancel immediately so a long call can observe it (#482).
+            if msg.get("type") == "cancel":
+                cancel_event.set()
+                continue
+            incoming.put(msg)
+
+    threading.Thread(target=reader, daemon=True).start()
     while True:
-        msg = read_message(stdin)
+        msg = incoming.get()
         if msg is None:
             break
         if msg.get("type") == "shutdown":
@@ -52,14 +68,22 @@ _FAKE_HELPER = textwrap.dedent(
                 },
             )
         elif method == "sleep_for_test":
-            time.sleep(float(args[0]) if args else 0)
+            seconds = float(args[0]) if args else 0
+            deadline = time.monotonic() + seconds
+            cancelled = False
+            while time.monotonic() < deadline:
+                if cancel_event.is_set():
+                    cancelled = True
+                    break
+                time.sleep(0.05)
+            cancel_event.clear()
             write_message(
                 stdout,
                 {
                     "type": "result",
                     "id": msg.get("id"),
                     "ok": True,
-                    "result": {"slept": args[0] if args else 0},
+                    "result": {"slept": args[0] if args else 0, "cancelled": cancelled},
                 },
             )
         else:
@@ -219,5 +243,34 @@ class FakeHelperRuntimeTests(unittest.TestCase):
             second_pid = runtime._proc.pid if runtime._proc else None
             self.assertIsNotNone(second_pid)
             self.assertNotEqual(first_pid, second_pid)
+        finally:
+            runtime.kill()
+
+    def test_request_cancel_unblocks_sleep_without_serial(self) -> None:
+        """Cancel must free a long call so a following call can run (#482)."""
+        import threading
+        import time
+
+        runtime = self._patch_runtime(AccountCamelRuntime(account_uid="acct-a"))
+        try:
+            results: dict[str, object] = {}
+
+            def long_call() -> None:
+                results["sleep"] = runtime.call(
+                    "sleep_for_test", [5.0], timeout=10.0
+                )
+
+            worker = threading.Thread(target=long_call, daemon=True)
+            worker.start()
+            time.sleep(0.2)
+            runtime.request_cancel()
+            worker.join(timeout=3.0)
+            self.assertFalse(worker.is_alive())
+            sleep_result = results.get("sleep")
+            self.assertIsInstance(sleep_result, dict)
+            assert isinstance(sleep_result, dict)
+            self.assertTrue(sleep_result.get("cancelled"))
+            # Serial is free for another call.
+            self.assertTrue(runtime.call("ping", ["acct-a"], timeout=10.0)["ok"])
         finally:
             runtime.kill()

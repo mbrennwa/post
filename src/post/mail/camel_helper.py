@@ -17,7 +17,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import queue
 import sys
+import threading
 import traceback
 from typing import Any
 
@@ -85,21 +87,74 @@ def _build_mail_service(account_uid: str):
     return MailService.connect(account_uid=account_uid)
 
 
+def _sleep_for_test(mail: Any, seconds: float) -> dict[str, Any]:
+    """Interruptible sleep so ``cancel`` can free helper ``_serial`` in tests (#482)."""
+    import time
+
+    import gi
+
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio
+
+    cancellable = Gio.Cancellable()
+    register = getattr(mail, "_register_helper_op_cancellable", None)
+    clear = getattr(mail, "_clear_helper_op_cancellable", None)
+    if callable(register):
+        register(cancellable)
+    try:
+        deadline = time.monotonic() + max(0.0, seconds)
+        while time.monotonic() < deadline:
+            if cancellable.is_cancelled():
+                return {"slept": seconds, "cancelled": True}
+            time.sleep(0.05)
+        return {"slept": seconds}
+    finally:
+        if callable(clear):
+            clear(cancellable)
+
+
 def _dispatch(mail: Any, method: str, args: list[Any], kwargs: dict[str, Any]) -> Any:
     if method == "ping":
         return {"ok": True, "pid": os.getpid(), "account_uid": args[0] if args else None}
     if method == "sleep_for_test":
-        import time
-
         seconds = float(args[0]) if args else 0.0
-        time.sleep(max(0.0, seconds))
-        return {"slept": seconds}
+        return _sleep_for_test(mail, seconds)
     if method not in ALLOWED_METHODS:
         raise PermissionError(f"method not allowed in camel helper: {method}")
     func = getattr(mail, method, None)
     if func is None or not callable(func):
         raise AttributeError(f"MailService has no method {method!r}")
     return func(*args, **kwargs)
+
+
+def _result_payload(req_id: Any, result: Any) -> dict[str, Any]:
+    return {"type": "result", "id": req_id, "ok": True, "result": result}
+
+
+def _error_payload(req_id: Any, exc: BaseException) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": "result",
+        "id": req_id,
+        "ok": False,
+        "error": str(exc) or repr(exc),
+        "error_type": type(exc).__name__,
+        "traceback": traceback.format_exc(),
+    }
+    # Preserve MessageNotAvailableError.reason across IPC — without it
+    # the UI treats every miss as VANISHED and removes the list row
+    # (wrong for GOA/sign-in cache misses on M365).
+    try:
+        from post.mail.eds import MessageNotAvailableError
+
+        if isinstance(exc, MessageNotAvailableError):
+            payload["error_details"] = {
+                "message_uid": exc.message_uid,
+                "folder_name": exc.folder_name,
+                "reason": exc.reason,
+            }
+    except Exception:
+        pass
+    return payload
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -139,19 +194,50 @@ def main(argv: list[str] | None = None) -> int:
         {"type": "ready", "account_uid": account_uid, "pid": os.getpid()},
     )
 
-    while True:
+    # Stdin reader stays alive while a call runs so ``cancel`` can preempt
+    # offline downsync without waiting for the call to finish (#482).
+    incoming: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+    def _stdin_reader() -> None:
         try:
-            msg = read_message(stdin)
+            while True:
+                try:
+                    msg = read_message(stdin)
+                except Exception:
+                    log.exception("IPC read failed")
+                    incoming.put(None)
+                    return
+                if msg is None:
+                    incoming.put(None)
+                    return
+                incoming.put(msg)
         except Exception:
-            log.exception("IPC read failed")
-            return 1
+            log.exception("stdin reader crashed")
+            incoming.put(None)
+
+    threading.Thread(
+        target=_stdin_reader,
+        name="camel-helper-stdin",
+        daemon=True,
+    ).start()
+
+    while True:
+        msg = incoming.get()
         if msg is None:
             log.info("helper stdin closed account=%s", account_uid)
             return 0
         msg_type = msg.get("type")
         if msg_type == "shutdown":
+            cancel_op = getattr(mail, "cancel_helper_op", None)
+            if callable(cancel_op):
+                cancel_op()
             write_message(stdout, {"type": "bye", "id": msg.get("id")})
             return 0
+        if msg_type == "cancel":
+            cancel_op = getattr(mail, "cancel_helper_op", None)
+            if callable(cancel_op):
+                cancel_op()
+            continue
         if msg_type != "call":
             write_message(
                 stdout,
@@ -172,42 +258,77 @@ def main(argv: list[str] | None = None) -> int:
             call_args = []
         if not isinstance(call_kwargs, dict):
             call_kwargs = {}
-        try:
-            result = _dispatch(mail, method, call_args, call_kwargs)
+
+        done = threading.Event()
+        box: dict[str, Any] = {}
+
+        def _run_call(
+            mid: str = method,
+            cargs: list[Any] = call_args,
+            ckwargs: dict[str, Any] = call_kwargs,
+        ) -> None:
+            try:
+                box["result"] = _dispatch(mail, mid, cargs, ckwargs)
+                box["ok"] = True
+            except BaseException as exc:
+                box["exc"] = exc
+                box["ok"] = False
+                log.debug(
+                    "helper call failed method=%s account=%s",
+                    mid,
+                    account_uid,
+                    exc_info=True,
+                )
+            finally:
+                done.set()
+
+        worker = threading.Thread(
+            target=_run_call,
+            name=f"camel-helper-call-{method[:24]}",
+            daemon=True,
+        )
+        worker.start()
+
+        # Drain cancel/shutdown while the call runs; UI still serializes calls.
+        shutdown_requested = False
+        while not done.wait(timeout=0.05):
+            try:
+                extra = incoming.get_nowait()
+            except queue.Empty:
+                continue
+            if extra is None:
+                cancel_op = getattr(mail, "cancel_helper_op", None)
+                if callable(cancel_op):
+                    cancel_op()
+                done.wait(timeout=30.0)
+                return 0
+            extra_type = extra.get("type")
+            if extra_type == "cancel":
+                cancel_op = getattr(mail, "cancel_helper_op", None)
+                if callable(cancel_op):
+                    cancel_op()
+            elif extra_type == "shutdown":
+                cancel_op = getattr(mail, "cancel_helper_op", None)
+                if callable(cancel_op):
+                    cancel_op()
+                shutdown_requested = True
+                done.wait(timeout=30.0)
+                write_message(stdout, {"type": "bye", "id": extra.get("id")})
+                return 0
+            elif extra_type == "call":
+                # Should not happen while UI holds _serial; re-queue after.
+                incoming.put(extra)
+
+        worker.join(timeout=1.0)
+        if shutdown_requested:
+            return 0
+        if box.get("ok"):
+            write_message(stdout, _result_payload(req_id, box.get("result")))
+        else:
             write_message(
                 stdout,
-                {"type": "result", "id": req_id, "ok": True, "result": result},
+                _error_payload(req_id, box.get("exc") or RuntimeError("helper call failed")),
             )
-        except BaseException as exc:
-            log.debug(
-                "helper call failed method=%s account=%s",
-                method,
-                account_uid,
-                exc_info=True,
-            )
-            payload: dict[str, Any] = {
-                "type": "result",
-                "id": req_id,
-                "ok": False,
-                "error": str(exc) or repr(exc),
-                "error_type": type(exc).__name__,
-                "traceback": traceback.format_exc(),
-            }
-            # Preserve MessageNotAvailableError.reason across IPC — without it
-            # the UI treats every miss as VANISHED and removes the list row
-            # (wrong for GOA/sign-in cache misses on M365).
-            try:
-                from post.mail.eds import MessageNotAvailableError
-
-                if isinstance(exc, MessageNotAvailableError):
-                    payload["error_details"] = {
-                        "message_uid": exc.message_uid,
-                        "folder_name": exc.folder_name,
-                        "reason": exc.reason,
-                    }
-            except Exception:
-                pass
-            write_message(stdout, payload)
 
 
 if __name__ == "__main__":

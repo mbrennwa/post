@@ -164,6 +164,19 @@ class ServiceLockReleaseTests(unittest.TestCase):
         service.offline_sync.cancel_all.assert_called_once()
         service.offline_sync.cancel_arrival_in_flight.assert_called_once()
 
+    def test_helper_interactive_pending_counts_as_interactive(self) -> None:
+        """Read waiting on helper serial must look interactive to offline sync (#482)."""
+        service = MailService(registry=mock.Mock())
+        with mock.patch("post.mail.eds.get_mail_io_thread") as get_io:
+            io_thread = mock.Mock()
+            io_thread.has_interactive_work_pending.return_value = False
+            get_io.return_value = io_thread
+            self.assertFalse(service.has_interactive_work_pending())
+            service._enter_helper_interactive()
+            self.assertTrue(service.has_interactive_work_pending())
+            service._leave_helper_interactive()
+            self.assertFalse(service.has_interactive_work_pending())
+
     def test_hold_offline_body_sync_is_account_scoped(self) -> None:
         service = MailService(registry=mock.Mock())
         coordinator = mock.Mock()

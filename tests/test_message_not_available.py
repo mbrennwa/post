@@ -127,6 +127,7 @@ class ReadMessageUnavailableTests(unittest.TestCase):
         )
 
         self.assertIs(mime, cached)
+        folder.get_message_sync.assert_not_called()
         folder.synchronize_message_sync.assert_not_called()
 
     def test_online_invalid_uid_synchronizes_and_retries(self) -> None:
@@ -587,6 +588,38 @@ class GoaDeadCacheReadTests(unittest.TestCase):
         folder.synchronize_message_sync.assert_not_called()
         self.assertEqual(service.get_account_connect_health("account"), "needs_sign_in")
 
+    def test_online_prefers_cache_before_graph(self) -> None:
+        """Nonempty cache must paint without calling get_message_sync (#482)."""
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        folder = MagicMock()
+        cached = MagicMock(name="cached_mime")
+        folder.get_message_cached.return_value = cached
+        folder.get_message_sync.side_effect = AssertionError(
+            "get_message_sync must not run on cache hit"
+        )
+
+        mime = service._get_message_mime_sync(folder, "account", "INBOX", "42")
+
+        self.assertIs(mime, cached)
+        folder.get_message_sync.assert_not_called()
+        self.assertNotEqual(
+            service.get_account_connect_health("account"), "needs_sign_in"
+        )
+
+    def test_online_cache_miss_still_uses_graph(self) -> None:
+        service = MailService(registry=MagicMock())
+        service._network_available = True
+        folder = MagicMock()
+        fetched = MagicMock(name="fetched_mime")
+        folder.get_message_cached.return_value = None
+        folder.get_message_sync.return_value = fetched
+
+        mime = service._get_message_mime_sync(folder, "account", "INBOX", "42")
+
+        self.assertIs(mime, fetched)
+        folder.get_message_sync.assert_called_once()
+
     def test_online_auth_error_without_cache_is_sign_in(self) -> None:
         service = MailService(registry=MagicMock())
         service._network_available = True
@@ -606,23 +639,6 @@ class GoaDeadCacheReadTests(unittest.TestCase):
             MessageUnavailableReason.NOT_CACHED_SIGN_IN,
         )
         folder.get_message_cached.assert_called()
-        self.assertEqual(service.get_account_connect_health("account"), "needs_sign_in")
-
-    def test_online_auth_error_recovers_from_cache(self) -> None:
-        service = MailService(registry=MagicMock())
-        service._network_available = True
-        folder = MagicMock()
-        cached = MagicMock(name="cached_mime")
-        folder.get_message_sync.side_effect = GLib.Error.new_literal(
-            Gio.io_error_quark(),
-            "Failed to refresh access token (goa-error-quark, 4): AADSTS70043",
-            int(Gio.IOErrorEnum.FAILED),
-        )
-        folder.get_message_cached.return_value = cached
-
-        mime = service._get_message_mime_sync(folder, "account", "INBOX", "42")
-
-        self.assertIs(mime, cached)
         self.assertEqual(service.get_account_connect_health("account"), "needs_sign_in")
 
     def test_airplane_cache_miss_is_offline_not_sign_in(self) -> None:
