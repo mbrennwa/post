@@ -747,21 +747,21 @@ class GoaDeadCacheReadTests(unittest.TestCase):
         folder = service._get_named_folder_unlocked(store, "Inbox")
         self.assertIs(folder, live)
 
-    def test_prefer_nonempty_keeps_disk_when_camel_is_other_set(self) -> None:
+    def test_prefer_nonempty_merges_inbox_when_camel_is_other_set(self) -> None:
         from post.mail.eds import _FolderMessageIndex
 
         service = MailService(registry=MagicMock())
-        # Non-IMAP: uncovered keep must still prefer the richer disk index (#267).
+        # Non-heavy M365: keep the saved row and the Camel-only row (#479).
         service._accounts_by_uid = {
             "acct-1": MagicMock(backend="microsoft365"),
         }
         camel_index = _FolderMessageIndex(
-            messages=[{"uid": "old-1", "subject": "old"}],
+            messages=[{"uid": "old-1", "subject": "old", "message_id": "<old@x>"}],
             unread=11,
             total=56,
         )
         disk = (
-            [{"uid": "new-1", "subject": "SA fieldwork"}],
+            [{"uid": "new-1", "subject": "SA fieldwork", "message_id": "<new@x>"}],
             7,
             8,
         )
@@ -769,8 +769,11 @@ class GoaDeadCacheReadTests(unittest.TestCase):
             kept, source = service._prefer_nonempty_folder_index(
                 "acct-1", "Inbox", camel_index
             )
-        self.assertEqual(source, "disk_cache")
-        self.assertEqual(kept.messages[0]["uid"], "new-1")
+        self.assertEqual(source, "server")
+        self.assertEqual(
+            {message["uid"] for message in kept.messages},
+            {"old-1", "new-1"},
+        )
 
     @patch("post.mail.helpers.get_attachment_data", return_value=("file.pdf", b"%PDF"))
     @patch("post.mail.eds.MailService._get_message_mime_sync")

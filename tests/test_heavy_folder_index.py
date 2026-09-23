@@ -1039,6 +1039,89 @@ class ImapGhostFolderIndexTests(unittest.TestCase):
         index_cache.invalidate.assert_not_called()
         status_cache.clear.assert_not_called()
 
+    @mock.patch("post.mail.eds.folder_status_cache")
+    @mock.patch("post.mail.eds.folder_index_cache")
+    def test_microsoft365_inbox_merges_uncovered_camel_summary(
+        self,
+        index_cache: mock.Mock,
+        status_cache: mock.Mock,
+    ) -> None:
+        from post.mail.eds import MailService, _FolderMessageIndex
+
+        disk_msgs = [
+            {"uid": "saved-1", "subject": "Saved", "message_id": "<saved@x>"},
+            {"uid": "saved-only", "subject": "Only on disk", "message_id": "<disk@x>"},
+        ]
+        index_cache.load.return_value = (disk_msgs, 1, 2)
+        mail = MailService.__new__(MailService)
+        mail._accounts_by_uid = {"acct": mock.Mock(backend="microsoft365")}
+        mail._folder_indexes = {}
+        camel = _FolderMessageIndex(
+            messages=[
+                {"uid": "saved-1", "subject": "Saved", "message_id": "<saved@x>"},
+                {"uid": "camel-new", "subject": "From server", "message_id": "<new@x>"},
+            ],
+            unread=3,
+            total=4,
+        )
+        kept, source = mail._prefer_nonempty_folder_index("acct", "Inbox", camel)
+        self.assertEqual(source, "server")
+        self.assertEqual(
+            {message["uid"] for message in kept.messages},
+            {"saved-1", "saved-only", "camel-new"},
+        )
+        self.assertEqual(kept.unread, 3)
+        self.assertGreaterEqual(kept.total, 3)
+        index_cache.invalidate.assert_not_called()
+        status_cache.clear.assert_not_called()
+
+    @mock.patch("post.mail.eds.folder_index_cache")
+    def test_inbox_sync_persists_merged_folder_index(
+        self,
+        index_cache: mock.Mock,
+    ) -> None:
+        from post.mail.eds import MailService, _FolderMessageIndex
+
+        disk_msgs = [
+            {"uid": "saved-only", "subject": "Only on disk", "message_id": "<disk@x>"},
+        ]
+        index_cache.load.return_value = (disk_msgs, 0, 1)
+        mail = MailService.__new__(MailService)
+
+        class _Lock:
+            def __enter__(self) -> "_Lock":
+                return self
+
+            def __exit__(self, *_args: object) -> bool:
+                return False
+
+        mail._lock = _Lock()
+        mail._accounts_by_uid = {"acct": mock.Mock(backend="microsoft365")}
+        mail._folder_indexes = {}
+        mail._merge_correspondents_from_folder = mock.Mock()
+        camel = _FolderMessageIndex(
+            messages=[
+                {"uid": "camel-new", "subject": "From server", "message_id": "<new@x>"},
+            ],
+            unread=1,
+            total=1,
+        )
+        mail._build_folder_index_unlocked = mock.Mock(return_value=camel)
+        kept, source = mail._get_folder_index_unlocked(
+            "acct", "Inbox", sync=True
+        )
+        self.assertEqual(source, "server")
+        self.assertEqual(
+            {message["uid"] for message in kept.messages},
+            {"saved-only", "camel-new"},
+        )
+        index_cache.save.assert_called_once()
+        saved_messages = index_cache.save.call_args.args[2]
+        self.assertEqual(
+            {message["uid"] for message in saved_messages},
+            {"saved-only", "camel-new"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
