@@ -83,6 +83,8 @@ POST_LOG_LEVEL=DEBUG ./run.sh
 
 Mail I/O tasks that run longer than **10s** also emit **WARNING** lines (`still running` / `slow finish`) with `func=` and elapsed time — useful for soft hangs where the UI sits on “Loading …” behind a Camel call (#197).
 
+A helper RPC that waits more than **1s** behind another call on the same account logs `camel helper call blocked` (account, waiting `method`, in-flight `behind`, `busy_for`, `waited`), then repeats every **10s** until it runs. `camel helper call unblocked` records how long the wait lasted.
+
 For folder search diagnostics (#120), also set `POST_DEBUG_SEARCH=1` (or use `POST_LOG_LEVEL=DEBUG`):
 
 ```bash
