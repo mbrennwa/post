@@ -67,6 +67,8 @@ from post.mail.message_list_state import (
     is_heavy_folder_name,
     merge_folder_index_envelope,
     message_flag_patches,
+    overlay_pending_flags,
+    PendingFlagChange,
     message_list_fingerprint,
     message_lists_equivalent_for_ui,
     prepended_message_count,
@@ -368,6 +370,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._user_message_click_pending = False
         # Click requested mark-seen for this list key; protect in-flight loads (#388).
         self._mark_seen_intent_list_key: str | None = None
+        # (account, folder, uid, flag) → local edit newer than the last server value (#492).
+        self._pending_flag_changes: dict[
+            tuple[str, str, str, str], PendingFlagChange
+        ] = {}
         self._search_query: MessageSearchQuery | None = None
         self._search_scope = get_search_scope()
         self._search_scope_items: list[SearchScope] = []
@@ -5958,6 +5964,10 @@ class MainWindow(Adw.ApplicationWindow):
             self._release_offline_sync_for_folder_work(load_id)
             return False
 
+        messages, unread = self._apply_pending_flag_overlay(
+            account_uid, folder_name, messages, unread
+        )
+
         if not self._search_query:
             if is_post_outbox_folder(folder_name):
                 self._sidebar.refresh_outbox_row(account_uid)
@@ -6109,6 +6119,10 @@ class MainWindow(Adw.ApplicationWindow):
             return False
         if not self._is_viewing_folder(account_uid, folder_name):
             return False
+
+        messages, unread = self._apply_pending_flag_overlay(
+            account_uid, folder_name, messages, unread
+        )
 
         if not self._search_query:
             if is_post_outbox_folder(folder_name):
@@ -6364,7 +6378,106 @@ class MainWindow(Adw.ApplicationWindow):
                 self._current_folder_messages[position] = updated
                 break
 
+    def _note_pending_flag(self, list_key: str, flag: str, local: bool) -> None:
+        """Remember a local seen/flagged edit and the server value it replaced (#492)."""
+        location = self._message_location_for_list_key(list_key)
+        if location is None:
+            return
+        account_uid, folder_name, message_uid = location
+        current = self._message_flags_for_uid(list_key)
+        default = True if flag == "seen" else False
+        baseline = bool(current.get(flag, default))
+        if baseline == local:
+            return
+        self._pending_flag_changes[(account_uid, folder_name, message_uid, flag)] = (
+            PendingFlagChange(baseline=baseline, local=local)
+        )
+
+    def _apply_pending_flag_overlay(
+        self,
+        account_uid: str,
+        folder_name: str,
+        messages: list[dict],
+        unread: int,
+    ) -> tuple[list[dict], int]:
+        """Keep newer local flags on a folder snapshot and push them (#492)."""
+        folder_pending: dict[tuple[str, str], PendingFlagChange] = {}
+        for key, record in self._pending_flag_changes.items():
+            if key[0] == account_uid and key[1] == folder_name:
+                folder_pending[(key[2], key[3])] = record
+        if not folder_pending:
+            return messages, unread
+        rewritten, pushes, unread_delta = overlay_pending_flags(
+            messages, folder_pending
+        )
+        for key in list(self._pending_flag_changes):
+            if key[0] == account_uid and key[1] == folder_name:
+                if (key[2], key[3]) not in folder_pending:
+                    self._pending_flag_changes.pop(key, None)
+        if pushes:
+            self._mirror_kept_pending_flags(account_uid, folder_name, pushes)
+            self._repush_pending_flags(account_uid, folder_name, pushes)
+        if unread >= 0:
+            unread = max(0, unread + unread_delta)
+        return rewritten, unread
+
+    def _mirror_kept_pending_flags(
+        self,
+        account_uid: str,
+        folder_name: str,
+        pushes: list[tuple[str, str, bool]],
+    ) -> None:
+        by_uid: dict[str, dict] = {}
+        for uid, flag, value in pushes:
+            by_uid.setdefault(uid, {})[flag] = value
+        self._mail._mirror_flag_result_to_folder_caches(
+            account_uid,
+            folder_name,
+            {"updates": [{"uid": uid, "flags": flags} for uid, flags in by_uid.items()]},
+        )
+
+    def _repush_pending_flags(
+        self,
+        account_uid: str,
+        folder_name: str,
+        pushes: list[tuple[str, str, bool]],
+    ) -> None:
+        grouped: dict[tuple[str, bool], list[str]] = {}
+        for uid, flag, value in pushes:
+            grouped.setdefault((flag, value), []).append(uid)
+
+        def _on_done(_result: object, _exc: BaseException | None, *, flag: str, uids: list[str]) -> None:
+            for uid in uids:
+                record = self._pending_flag_changes.get(
+                    (account_uid, folder_name, uid, flag)
+                )
+                if record is not None:
+                    record.push_in_flight = False
+
+        for (flag, value), uids in grouped.items():
+            if flag == "seen":
+                self._mail.set_messages_seen_async(
+                    account_uid,
+                    folder_name,
+                    uids,
+                    seen=value,
+                    on_done=lambda result, exc, flag=flag, uids=uids: _on_done(
+                        result, exc, flag=flag, uids=uids
+                    ),
+                )
+            else:
+                self._mail.set_messages_flagged_async(
+                    account_uid,
+                    folder_name,
+                    uids,
+                    flagged=value,
+                    on_done=lambda result, exc, flag=flag, uids=uids: _on_done(
+                        result, exc, flag=flag, uids=uids
+                    ),
+                )
+
     def _mark_message_read(self, uid: str) -> None:
+        self._note_pending_flag(uid, "seen", True)
         flags = self._message_flags_for_uid(uid)
         flags["seen"] = True
         self._message_list_view.update_message_flags(uid, flags)
@@ -7414,6 +7527,14 @@ class MainWindow(Adw.ApplicationWindow):
         )
         if not groups:
             return
+
+        for list_key in list_keys:
+            if flag_name == "seen":
+                assert seen is not None
+                self._note_pending_flag(list_key, "seen", seen)
+            else:
+                assert flagged is not None
+                self._note_pending_flag(list_key, "flagged", flagged)
 
         # Optimistic UI first — sync set_messages_* blocks GTK on the mail I/O
         # thread while Archive/heavy background work runs (#441 freeze).

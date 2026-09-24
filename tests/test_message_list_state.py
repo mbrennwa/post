@@ -299,6 +299,57 @@ class MessageBatchRangesTests(unittest.TestCase):
             [("1", {"seen": True, "flagged": True})],
         )
 
+    def test_pending_flag_baseline_keeps_local_and_requests_push(self) -> None:
+        from post.mail.message_list_state import (
+            PendingFlagChange,
+            overlay_pending_flags,
+            resolve_pending_flag,
+        )
+
+        pending = PendingFlagChange(baseline=False, local=True)
+        self.assertEqual(resolve_pending_flag(pending, False), "keep_local")
+        messages = [{"uid": "1", "subject": "A", "flags": {"seen": False}}]
+        store = {("1", "seen"): pending}
+        rewritten, pushes, unread_delta = overlay_pending_flags(messages, store)
+        self.assertEqual(rewritten[0]["flags"]["seen"], True)
+        self.assertEqual(pushes, [("1", "seen", True)])
+        self.assertEqual(unread_delta, -1)
+        self.assertTrue(pending.push_in_flight)
+        stale = [{"uid": "1", "subject": "A", "flags": {"seen": False}}]
+        again, pushes_again, _delta = overlay_pending_flags(stale, store)
+        self.assertEqual(again[0]["flags"]["seen"], True)
+        self.assertEqual(pushes_again, [])
+
+    def test_pending_flag_echo_clears_record(self) -> None:
+        from post.mail.message_list_state import (
+            PendingFlagChange,
+            overlay_pending_flags,
+            resolve_pending_flag,
+        )
+
+        pending = PendingFlagChange(baseline=False, local=True)
+        self.assertEqual(resolve_pending_flag(pending, True), "converged")
+        store = {("1", "seen"): pending}
+        messages = [{"uid": "1", "flags": {"seen": True}}]
+        rewritten, pushes, unread_delta = overlay_pending_flags(messages, store)
+        self.assertEqual(rewritten[0]["flags"]["seen"], True)
+        self.assertEqual(pushes, [])
+        self.assertEqual(unread_delta, 0)
+        self.assertEqual(store, {})
+
+    def test_pending_flag_absent_adopts_server(self) -> None:
+        from post.mail.message_list_state import (
+            overlay_pending_flags,
+            resolve_pending_flag,
+        )
+
+        self.assertEqual(resolve_pending_flag(None, False), "adopt_server")
+        messages = [{"uid": "1", "flags": {"seen": False, "flagged": True}}]
+        rewritten, pushes, unread_delta = overlay_pending_flags(messages, {})
+        self.assertEqual(rewritten[0]["flags"]["seen"], False)
+        self.assertEqual(pushes, [])
+        self.assertEqual(unread_delta, 0)
+
 
     def test_empty(self) -> None:
         self.assertEqual(message_batch_ranges(0), [])
