@@ -22,6 +22,10 @@ log = logging.getLogger(__name__)
 
 _HELPER_PROCESS_ENV = "POST_MAIL_CAMEL_HELPER_PROCESS"
 _DEFAULT_JOB_TIMEOUT = 120.0
+# First WARNING once a call has been queued behind another helper RPC this long.
+# Repeat while it is still waiting so a stall shows up in the log (#422).
+_BLOCKED_LOG_AFTER = 1.0
+_BLOCKED_LOG_REPEAT = 10.0
 
 
 def camel_helpers_enabled() -> bool:
@@ -70,6 +74,11 @@ class AccountCamelRuntime:
     )
     _alive: bool = field(default=False, init=False)
     _on_died: Callable[[str], None] | None = field(default=None, init=False, repr=False)
+    _busy_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    _busy_method: str | None = field(default=None, init=False, repr=False)
+    _busy_started: float | None = field(default=None, init=False, repr=False)
 
     def set_died_callback(self, callback: Callable[[str], None] | None) -> None:
         self._on_died = callback
@@ -229,6 +238,25 @@ class AccountCamelRuntime:
                 except Exception:
                     log.debug("on_died callback failed", exc_info=True)
 
+    def _busy_snapshot(self) -> tuple[str | None, float]:
+        """Return the in-flight helper method and how long it has been running."""
+        with self._busy_lock:
+            method = self._busy_method
+            started = self._busy_started
+        if started is None:
+            return method, 0.0
+        return method, max(0.0, time.monotonic() - started)
+
+    def _set_busy(self, method: str) -> None:
+        with self._busy_lock:
+            self._busy_method = method
+            self._busy_started = time.monotonic()
+
+    def _clear_busy(self) -> None:
+        with self._busy_lock:
+            self._busy_method = None
+            self._busy_started = None
+
     def call(
         self,
         method: str,
@@ -238,9 +266,53 @@ class AccountCamelRuntime:
         timeout: float | None = _DEFAULT_JOB_TIMEOUT,
     ) -> Any:
         """Run ``method`` in the helper; raise on failure / timeout / kill."""
-        with self._serial:
-            return self._call_unlocked(
-                method, args or [], kwargs or {}, timeout=timeout
+        self._acquire_serial_for(method)
+        try:
+            self._set_busy(method)
+            try:
+                return self._call_unlocked(
+                    method, args or [], kwargs or {}, timeout=timeout
+                )
+            finally:
+                self._clear_busy()
+        finally:
+            self._serial.release()
+
+    def _acquire_serial_for(self, method: str) -> None:
+        """Take ``_serial``, logging when this call waits on a busy helper."""
+        if self._serial.acquire(blocking=False):
+            return
+        wait_started = time.monotonic()
+        next_log = wait_started + _BLOCKED_LOG_AFTER
+        logged = False
+        while True:
+            now = time.monotonic()
+            if now >= next_log:
+                busy_method, busy_for = self._busy_snapshot()
+                waited = now - wait_started
+                log.warning(
+                    "camel helper call blocked account=%s method=%s behind=%s "
+                    "busy_for=%.1fs waited=%.1fs thread=%s",
+                    self.account_uid,
+                    method,
+                    busy_method or "unknown",
+                    busy_for,
+                    waited,
+                    threading.current_thread().name,
+                )
+                logged = True
+                next_log = now + _BLOCKED_LOG_REPEAT
+            remaining = next_log - time.monotonic()
+            if self._serial.acquire(timeout=max(0.05, min(0.25, remaining))):
+                break
+        if logged:
+            log.warning(
+                "camel helper call unblocked account=%s method=%s waited=%.1fs "
+                "thread=%s",
+                self.account_uid,
+                method,
+                time.monotonic() - wait_started,
+                threading.current_thread().name,
             )
 
     def request_cancel(self) -> None:

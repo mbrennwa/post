@@ -136,6 +136,62 @@ class CamelIpcTests(unittest.TestCase):
         self.assertEqual(len(msg["result"]["body"]), 100_000)
 
 
+class CamelHelperBlockedLogTests(unittest.TestCase):
+    def test_waiting_call_logs_the_inflight_method(self) -> None:
+        import logging
+        import threading
+        import time
+
+        from post.mail import camel_runtime
+
+        runtime = AccountCamelRuntime(account_uid="acct-a")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow(
+            method: str,
+            args: list,
+            kwargs: dict,
+            *,
+            timeout: float | None,
+        ) -> dict:
+            del method, args, kwargs, timeout
+            entered.set()
+            release.wait(timeout=5.0)
+            return {"ok": True}
+
+        runtime._call_unlocked = slow  # type: ignore[method-assign]
+        holder = threading.Thread(
+            target=lambda: runtime.call("offline_downsync_folder", timeout=10.0),
+            name="holder",
+            daemon=True,
+        )
+        holder.start()
+        self.assertTrue(entered.wait(timeout=2.0))
+        waiter_done = threading.Event()
+
+        def waiter() -> None:
+            runtime.call("read_message", timeout=10.0)
+            waiter_done.set()
+
+        with (
+            mock.patch.object(camel_runtime, "_BLOCKED_LOG_AFTER", 0.05),
+            mock.patch.object(camel_runtime, "_BLOCKED_LOG_REPEAT", 10.0),
+            self.assertLogs("post.mail.camel_runtime", level=logging.WARNING) as logs,
+        ):
+            threading.Thread(target=waiter, name="waiter", daemon=True).start()
+            time.sleep(0.3)
+            release.set()
+            self.assertTrue(waiter_done.wait(timeout=3.0))
+        holder.join(timeout=2.0)
+        text = "\n".join(logs.output)
+        self.assertIn("camel helper call blocked", text)
+        self.assertIn("method=read_message", text)
+        self.assertIn("behind=offline_downsync_folder", text)
+        self.assertIn("account=acct-a", text)
+        self.assertIn("camel helper call unblocked", text)
+
+
 class CamelHelpersEnabledTests(unittest.TestCase):
     def test_disabled_in_helper_process(self) -> None:
         with mock.patch.dict(
