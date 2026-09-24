@@ -179,6 +179,100 @@ def message_lists_equivalent_for_ui(
     ) == message_list_fingerprint(refreshed[-sample:])
 
 
+@dataclass
+class PendingFlagChange:
+    """Local flag edit that a later folder snapshot must not clobber (#492).
+
+    ``baseline`` is the server value just before the edit. ``local`` is the
+    value the user set. ``push_in_flight`` avoids a second server write while
+    one is already running.
+    """
+
+    baseline: bool
+    local: bool
+    push_in_flight: bool = False
+
+
+def resolve_pending_flag(
+    pending: PendingFlagChange | None,
+    snapshot: bool | None,
+) -> str:
+    """Return ``keep_local``, ``converged``, or ``adopt_server``.
+
+    A snapshot that still equals ``baseline`` is older than the local edit.
+    A snapshot that equals ``local`` means the server echoed it. With no
+    pending record, the snapshot is the newer server value.
+    """
+    if pending is None:
+        return "adopt_server"
+    if snapshot is None:
+        return "keep_local"
+    if bool(snapshot) == bool(pending.local):
+        return "converged"
+    if bool(snapshot) == bool(pending.baseline):
+        return "keep_local"
+    return "adopt_server"
+
+
+def overlay_pending_flags(
+    messages: list[dict[str, Any]],
+    pending: dict[tuple[str, str], PendingFlagChange],
+) -> tuple[list[dict[str, Any]], list[tuple[str, str, bool]], int]:
+    """Apply pending seen/flagged edits onto *messages*.
+
+    *pending* is keyed by ``(uid, flag)`` and is updated in place: echoes are
+    dropped, and a kept local value marks ``push_in_flight``.
+
+    Returns the rewritten list, ``(uid, flag, local_value)`` pushes that are
+    not already in flight, and the unread-count delta from seen flips
+    (negative when a stale unread row is kept read).
+    """
+    if not pending or not messages:
+        return messages, [], 0
+
+    rewritten: list[dict[str, Any]] = []
+    pushes: list[tuple[str, str, bool]] = []
+    unread_delta = 0
+    for message in messages:
+        uid = str(message.get("uid") or "")
+        if not uid:
+            rewritten.append(message)
+            continue
+        flags = dict(message.get("flags") or {})
+        changed = False
+        for flag in ("seen", "flagged"):
+            record = pending.get((uid, flag))
+            if record is None:
+                continue
+            snapshot = flags.get(flag)
+            if snapshot is None and flag == "seen":
+                snapshot = True
+            outcome = resolve_pending_flag(
+                record,
+                None if snapshot is None else bool(snapshot),
+            )
+            if outcome == "converged":
+                pending.pop((uid, flag), None)
+                continue
+            if outcome != "keep_local":
+                pending.pop((uid, flag), None)
+                continue
+            if flag == "seen" and bool(snapshot) != bool(record.local):
+                unread_delta += -1 if record.local else 1
+            flags[flag] = record.local
+            changed = True
+            if not record.push_in_flight:
+                record.push_in_flight = True
+                pushes.append((uid, flag, record.local))
+        if changed:
+            updated = dict(message)
+            updated["flags"] = flags
+            rewritten.append(updated)
+        else:
+            rewritten.append(message)
+    return rewritten, pushes, unread_delta
+
+
 def message_flag_patches(
     current: list[dict[str, Any]],
     refreshed: list[dict[str, Any]],
