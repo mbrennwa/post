@@ -131,6 +131,25 @@ def _result_payload(req_id: Any, result: Any) -> dict[str, Any]:
     return {"type": "result", "id": req_id, "ok": True, "result": result}
 
 
+def attach_ipc_goa_ensure(payload: dict[str, Any], mail: Any) -> dict[str, Any]:
+    """Add the call's EnsureCredentials outcome so the UI can badge the account.
+
+    The probe updates connect health inside this process. Without this field
+    the UI keeps the default ``ok`` and the sidebar looks online (#478).
+    """
+    take = getattr(mail, "take_helper_ipc_goa_outcome", None)
+    if not callable(take):
+        return payload
+    try:
+        outcome = take()
+    except Exception:
+        log.debug("could not read helper GOA outcome", exc_info=True)
+        return payload
+    if outcome in ("ok", "failed"):
+        payload["goa_ensure"] = outcome
+    return payload
+
+
 def _error_payload(req_id: Any, exc: BaseException) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": "result",
@@ -267,6 +286,12 @@ def main(argv: list[str] | None = None) -> int:
             cargs: list[Any] = call_args,
             ckwargs: dict[str, Any] = call_kwargs,
         ) -> None:
+            reset = getattr(mail, "reset_helper_ipc_goa_outcome", None)
+            if callable(reset):
+                try:
+                    reset()
+                except Exception:
+                    log.debug("could not reset helper GOA outcome", exc_info=True)
             try:
                 box["result"] = _dispatch(mail, mid, cargs, ckwargs)
                 box["ok"] = True
@@ -323,12 +348,12 @@ def main(argv: list[str] | None = None) -> int:
         if shutdown_requested:
             return 0
         if box.get("ok"):
-            write_message(stdout, _result_payload(req_id, box.get("result")))
+            payload = _result_payload(req_id, box.get("result"))
         else:
-            write_message(
-                stdout,
-                _error_payload(req_id, box.get("exc") or RuntimeError("helper call failed")),
+            payload = _error_payload(
+                req_id, box.get("exc") or RuntimeError("helper call failed")
             )
+        write_message(stdout, attach_ipc_goa_ensure(payload, mail))
 
 
 if __name__ == "__main__":

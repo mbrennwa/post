@@ -746,6 +746,12 @@ class MailService:
     _account_connect_health: dict[str, AccountConnectHealth] = field(
         default_factory=dict, init=False, repr=False
     )
+    # Worst EnsureCredentials outcome during one helper IPC call (#478).
+    # The helper process owns the probe; the UI adopts this value so the
+    # sidebar badge is not stuck on the helper's private health.
+    _helper_ipc_goa_outcome: GoaEnsureOutcome | None = field(
+        default=None, init=False, repr=False
+    )
     # In-flight / timed-out move state for sidebar badge + fail-fast (#189).
     _account_transfer_state: dict[str, AccountTransferState] = field(
         default_factory=dict, init=False, repr=False
@@ -1739,44 +1745,59 @@ class MailService:
         *,
         timeout: float | None = 120.0,
     ) -> Any:
+        goa_out: list[str] = []
         try:
-            return self._camel_pool.call(
-                account_uid, method, args, kwargs or {}, timeout=timeout
-            )
-        except CamelHelperError as exc:
-            text = str(exc)
-            err_type = getattr(exc, "error_type", None) or ""
-            details = getattr(exc, "details", None) or {}
-            if (
-                err_type == "MessageNotAvailableError"
-                or text.startswith("MessageNotAvailableError:")
-            ):
-                uid = str(
-                    details.get("message_uid")
-                    or (args[2] if len(args) >= 3 else text)
-                )
-                folder = details.get("folder_name")
-                if folder is None and len(args) >= 2:
-                    folder = str(args[1])
-                reason = str(
-                    details.get("reason") or MessageUnavailableReason.VANISHED
-                )
-                raise MessageNotAvailableError(
-                    uid, folder, reason=reason
-                ) from exc
-            # One retry after a crashed helper. Do not kill_account first — the
-            # process is already dead; an extra kill storms SIGKILL (-9) and
-            # races concurrent callers (#445).
-            if "camel helper process exited" in text or "not running" in text:
-                log.warning(
-                    "Retrying camel helper call after exit account=%s method=%s",
+            try:
+                return self._camel_pool.call(
                     account_uid,
                     method,
+                    args,
+                    kwargs or {},
+                    timeout=timeout,
+                    goa_ensure_out=goa_out,
                 )
-                return self._camel_pool.call(
-                    account_uid, method, args, kwargs or {}, timeout=timeout
-                )
-            raise
+            except CamelHelperError as exc:
+                text = str(exc)
+                err_type = getattr(exc, "error_type", None) or ""
+                details = getattr(exc, "details", None) or {}
+                if (
+                    err_type == "MessageNotAvailableError"
+                    or text.startswith("MessageNotAvailableError:")
+                ):
+                    uid = str(
+                        details.get("message_uid")
+                        or (args[2] if len(args) >= 3 else text)
+                    )
+                    folder = details.get("folder_name")
+                    if folder is None and len(args) >= 2:
+                        folder = str(args[1])
+                    reason = str(
+                        details.get("reason") or MessageUnavailableReason.VANISHED
+                    )
+                    raise MessageNotAvailableError(
+                        uid, folder, reason=reason
+                    ) from exc
+                # One retry after a crashed helper. Do not kill_account first — the
+                # process is already dead; an extra kill storms SIGKILL (-9) and
+                # races concurrent callers (#445).
+                if "camel helper process exited" in text or "not running" in text:
+                    log.warning(
+                        "Retrying camel helper call after exit account=%s method=%s",
+                        account_uid,
+                        method,
+                    )
+                    goa_out.clear()
+                    return self._camel_pool.call(
+                        account_uid,
+                        method,
+                        args,
+                        kwargs or {},
+                        timeout=timeout,
+                        goa_ensure_out=goa_out,
+                    )
+                raise
+        finally:
+            self._adopt_helper_goa_ensure(account_uid, goa_out)
 
     def kill_account_camel_helper(self, account_uid: str) -> None:
         """Hard-kill the Camel helper for ``account_uid`` (wedged account)."""
@@ -3074,13 +3095,48 @@ class MailService:
         outcome = ensure_goa_credentials(self.registry, source, cancellable)
         self._apply_goa_ensure_outcome(account_uid, outcome)
 
+    def reset_helper_ipc_goa_outcome(self) -> None:
+        """Drop any EnsureCredentials result from the previous helper call."""
+        self._helper_ipc_goa_outcome = None
+
+    def take_helper_ipc_goa_outcome(self) -> GoaEnsureOutcome | None:
+        """Return and clear the worst EnsureCredentials result for this call."""
+        outcome = self._helper_ipc_goa_outcome
+        self._helper_ipc_goa_outcome = None
+        return outcome
+
+    def _note_helper_ipc_goa_outcome(self, outcome: GoaEnsureOutcome) -> None:
+        """Remember a probe result so the helper can send it to the UI.
+
+        ``failed`` wins over ``ok``. ``cancelled`` is ignored (#168).
+        """
+        if outcome == "cancelled":
+            return
+        if self._helper_ipc_goa_outcome == "failed":
+            return
+        self._helper_ipc_goa_outcome = outcome
+
+    def _adopt_helper_goa_ensure(
+        self, account_uid: str, goa_out: list[str]
+    ) -> None:
+        """Apply a helper EnsureCredentials result to UI connect health."""
+        if not goa_out:
+            return
+        outcome = goa_out[-1]
+        if outcome not in ("ok", "failed"):
+            return
+        self._apply_goa_ensure_outcome(account_uid, outcome)
+
     def _apply_goa_ensure_outcome(
         self, account_uid: str, outcome: GoaEnsureOutcome
     ) -> None:
         """Map EnsureCredentials result to connect health (#478).
 
         ``cancelled`` must not change health (folder-list preempt, #168).
+        The same outcome is recorded for helper IPC so the UI process, which
+        owns the sidebar badge, sees a probe that ran in the Camel helper.
         """
+        self._note_helper_ipc_goa_outcome(outcome)
         if outcome == "failed":
             self.set_account_connect_health(account_uid, "needs_sign_in")
         elif outcome == "ok":

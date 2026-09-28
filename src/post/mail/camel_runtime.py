@@ -58,6 +58,29 @@ class CamelHelperTimeout(CamelHelperError):
     """Raised when a helper job exceeds the watchdog timeout."""
 
 
+def ipc_goa_ensure(msg: dict[str, Any] | None) -> str | None:
+    """Return a helper EnsureCredentials outcome suitable for UI health.
+
+    ``cancelled`` and missing values are omitted so a preempted folder list
+    does not clear or set Needs sign-in (#168, #478).
+    """
+    if not isinstance(msg, dict):
+        return None
+    outcome = msg.get("goa_ensure")
+    if outcome in ("ok", "failed"):
+        return str(outcome)
+    return None
+
+
+def remember_ipc_goa_ensure(dest: list[str], msg: dict[str, Any] | None) -> None:
+    """Store ``ipc_goa_ensure(msg)`` in ``dest``, replacing any previous value."""
+    outcome = ipc_goa_ensure(msg)
+    if outcome is None:
+        return
+    dest.clear()
+    dest.append(outcome)
+
+
 @dataclass
 class AccountCamelRuntime:
     """One helper child for a single ``account_uid``."""
@@ -264,14 +287,23 @@ class AccountCamelRuntime:
         kwargs: dict[str, Any] | None = None,
         *,
         timeout: float | None = _DEFAULT_JOB_TIMEOUT,
+        goa_ensure_out: list[str] | None = None,
     ) -> Any:
-        """Run ``method`` in the helper; raise on failure / timeout / kill."""
+        """Run ``method`` in the helper; raise on failure / timeout / kill.
+
+        When the helper reports an EnsureCredentials result, it is appended to
+        ``goa_ensure_out`` before this method returns or raises.
+        """
         self._acquire_serial_for(method)
         try:
             self._set_busy(method)
             try:
                 return self._call_unlocked(
-                    method, args or [], kwargs or {}, timeout=timeout
+                    method,
+                    args or [],
+                    kwargs or {},
+                    timeout=timeout,
+                    goa_ensure_out=goa_ensure_out,
                 )
             finally:
                 self._clear_busy()
@@ -341,6 +373,7 @@ class AccountCamelRuntime:
         kwargs: dict[str, Any],
         *,
         timeout: float | None,
+        goa_ensure_out: list[str] | None = None,
     ) -> Any:
         self.ensure_started()
         req_id = uuid.uuid4().hex
@@ -373,6 +406,8 @@ class AccountCamelRuntime:
                 f"camel helper timed out for {self.account_uid} method={method}"
             )
         msg = pending.get("msg") or {}
+        if goa_ensure_out is not None:
+            remember_ipc_goa_ensure(goa_ensure_out, msg)
         if not msg.get("ok"):
             err = str(msg.get("error") or "camel helper call failed")
             err_type = str(msg.get("error_type") or "CamelHelperError")
@@ -519,9 +554,14 @@ class CamelRuntimePool:
         kwargs: dict[str, Any] | None = None,
         *,
         timeout: float | None = _DEFAULT_JOB_TIMEOUT,
+        goa_ensure_out: list[str] | None = None,
     ) -> Any:
         return self.get(account_uid).call(
-            method, args, kwargs, timeout=timeout
+            method,
+            args,
+            kwargs,
+            timeout=timeout,
+            goa_ensure_out=goa_ensure_out,
         )
 
     def request_cancel(self, account_uid: str) -> None:
