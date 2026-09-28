@@ -19,6 +19,7 @@ from post.mail.account_status import (
     TOOLTIP_TRANSFER_NOT_RESPONDING,
     account_not_online_badge,
 )
+from post.mail.camel_runtime import CamelHelperError
 from post.mail.eds import FlushSendQueueResult, MailService
 from post.mail.send_errors import SendError, SendQueued
 from post.mail.network_errors import (
@@ -522,6 +523,58 @@ class GoaEnsureConnectHealthTests(unittest.TestCase):
             ready = service._goa_credentials_ready_for_read_unlocked("acct-1")
         ensure.assert_called_once()
         self.assertFalse(ready)
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+    def test_ipc_outcome_failed_wins_and_cancelled_is_ignored(self) -> None:
+        service = self._goa_service()
+        service.reset_helper_ipc_goa_outcome()
+        service._apply_goa_ensure_outcome("acct-1", "ok")
+        service._apply_goa_ensure_outcome("acct-1", "cancelled")
+        service._apply_goa_ensure_outcome("acct-1", "failed")
+        service._apply_goa_ensure_outcome("acct-1", "ok")
+        self.assertEqual(service.take_helper_ipc_goa_outcome(), "failed")
+        self.assertIsNone(service.take_helper_ipc_goa_outcome())
+
+    def test_helper_success_applies_failed_goa_to_ui_health(self) -> None:
+        """Cached folder list must still badge Needs sign-in (#478)."""
+        service = self._goa_service()
+        service._camel_pool = mock.Mock()
+
+        def fake_call(*_args, **kwargs):
+            kwargs["goa_ensure_out"].append("failed")
+            return [{"full_name": "Inbox"}]
+
+        service._camel_pool.call.side_effect = fake_call
+        result = service._camel_helper_call_once(
+            "list_folders", "acct-1", ["acct-1"]
+        )
+        self.assertEqual(result[0]["full_name"], "Inbox")
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+    def test_helper_error_still_applies_failed_goa(self) -> None:
+        service = self._goa_service()
+        service._camel_pool = mock.Mock()
+
+        def fake_call(*_args, **kwargs):
+            kwargs["goa_ensure_out"].append("failed")
+            raise CamelHelperError(
+                "GLib.Error: NotAuthorized refresh token",
+                error_type="GLib.Error",
+            )
+
+        service._camel_pool.call.side_effect = fake_call
+        with self.assertRaises(CamelHelperError):
+            service._camel_helper_call_once(
+                "get_oauth2_access_token_for_account", "acct-1", ["acct-1"]
+            )
+        self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
+
+    def test_helper_call_without_goa_outcome_leaves_health(self) -> None:
+        service = self._goa_service()
+        service.set_account_connect_health("acct-1", "needs_sign_in")
+        service._camel_pool = mock.Mock()
+        service._camel_pool.call.return_value = []
+        service._camel_helper_call_once("list_folders", "acct-1", ["acct-1"])
         self.assertEqual(service.get_account_connect_health("acct-1"), "needs_sign_in")
 
 

@@ -14,11 +14,14 @@ from pathlib import Path
 from unittest import mock
 
 from post.mail.camel_ipc import read_message, write_message
+from post.mail.camel_helper import attach_ipc_goa_ensure
 from post.mail.camel_runtime import (
     AccountCamelRuntime,
     CamelHelperTimeout,
     CamelRuntimePool,
     camel_helpers_enabled,
+    ipc_goa_ensure,
+    remember_ipc_goa_ensure,
 )
 
 _FAKE_HELPER = textwrap.dedent(
@@ -135,6 +138,30 @@ class CamelIpcTests(unittest.TestCase):
         self.assertTrue(msg["ok"])
         self.assertEqual(len(msg["result"]["body"]), 100_000)
 
+    def test_ipc_goa_ensure_keeps_failed_and_ok_only(self) -> None:
+        self.assertEqual(ipc_goa_ensure({"goa_ensure": "failed"}), "failed")
+        self.assertEqual(ipc_goa_ensure({"goa_ensure": "ok"}), "ok")
+        self.assertIsNone(ipc_goa_ensure({"goa_ensure": "cancelled"}))
+        self.assertIsNone(ipc_goa_ensure({}))
+        dest: list[str] = ["ok"]
+        remember_ipc_goa_ensure(dest, {"goa_ensure": "failed"})
+        self.assertEqual(dest, ["failed"])
+        remember_ipc_goa_ensure(dest, {"goa_ensure": "cancelled"})
+        self.assertEqual(dest, ["failed"])
+
+    def test_attach_ipc_goa_ensure_on_success_and_error(self) -> None:
+        mail = mock.Mock()
+        mail.take_helper_ipc_goa_outcome.return_value = "failed"
+        payload = attach_ipc_goa_ensure(
+            {"type": "result", "ok": True, "result": []}, mail
+        )
+        self.assertEqual(payload["goa_ensure"], "failed")
+        mail.take_helper_ipc_goa_outcome.return_value = "cancelled"
+        payload = attach_ipc_goa_ensure(
+            {"type": "result", "ok": False, "error": "cancelled"}, mail
+        )
+        self.assertNotIn("goa_ensure", payload)
+
 
 class CamelHelperBlockedLogTests(unittest.TestCase):
     def test_waiting_call_logs_the_inflight_method(self) -> None:
@@ -154,8 +181,9 @@ class CamelHelperBlockedLogTests(unittest.TestCase):
             kwargs: dict,
             *,
             timeout: float | None,
+            goa_ensure_out: list[str] | None = None,
         ) -> dict:
-            del method, args, kwargs, timeout
+            del method, args, kwargs, timeout, goa_ensure_out
             entered.set()
             release.wait(timeout=5.0)
             return {"ok": True}
