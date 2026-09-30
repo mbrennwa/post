@@ -9462,6 +9462,25 @@ class MailService:
                     folder_name,
                     len(by_uid),
                 )
+        if not uids and local_only:
+            # allow_refresh=False still indexes headers Camel already has.
+            # Offline downsync calls this once and drops the cursor (#500).
+            pending = [
+                uid
+                for uid in folder_get_uids(folder)
+                if uid and str(uid) not in by_uid
+            ]
+            if pending:
+                uids = pending
+                uid_offset = 0
+                log.info(
+                    "Heavy-folder local summary queued %d UIDs for "
+                    "%s/%s (indexed=%d)",
+                    len(pending),
+                    account_uid,
+                    folder_name,
+                    len(by_uid),
+                )
         if not uids:
             # No pending UIDs to materialize — persist and decide whether to
             # refresh again.

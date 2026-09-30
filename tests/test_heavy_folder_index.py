@@ -574,6 +574,57 @@ class HeavyFolderListUnionDiskTests(unittest.TestCase):
         self.assertEqual(uids, {"1", "2"})
         self.assertTrue(progress.done)
 
+    @mock.patch("post.mail.eds.message_info_to_dict")
+    @mock.patch("post.mail.eds.folder_get_message_info")
+    @mock.patch("post.mail.eds.folder_index_cache")
+    @mock.patch("post.mail.eds.get_mail_io_thread")
+    @mock.patch("post.mail.eds.folder_get_uids")
+    def test_offline_slice_adds_camel_uids_missing_from_disk(
+        self,
+        folder_get_uids: mock.Mock,
+        get_io: mock.Mock,
+        cache: mock.Mock,
+        get_info: mock.Mock,
+        info_to_dict: mock.Mock,
+    ) -> None:
+        """Local-only slice copies Camel summary UIDs the index lacks (#500)."""
+        io_thread = mock.Mock()
+        io_thread.has_interactive_work_pending.return_value = False
+        get_io.return_value = io_thread
+        folder_get_uids.return_value = ["1", "3"]
+        ram = [{"uid": "1", "subject": "kept", "sort_date": 200}]
+        disk = [
+            {"uid": "1", "subject": "kept", "sort_date": 200},
+            {"uid": "2", "subject": "disk-only", "sort_date": 100},
+        ]
+        cache.load.return_value = (disk, 0, 2)
+        cache.save = mock.Mock()
+        get_info.return_value = mock.Mock()
+        info_to_dict.side_effect = lambda _info, uid=None, backend=None: {
+            "uid": uid,
+            "subject": "from-camel",
+            "sort_date": 300,
+            "flags": {"seen": True},
+        }
+        folder = mock.Mock()
+        folder.refresh_info_sync = mock.Mock()
+
+        mail = _heavy_mail_stub(messages=ram, total=2, folder=folder)
+        mail._cached_folder_stats_unlocked = mock.Mock(return_value=(0, 2))
+
+        progress = mail._continue_heavy_folder_index_unlocked(
+            "acct",
+            "Archive",
+            allow_refresh=False,
+        )
+        uids = {message["uid"] for message in progress.messages}
+        self.assertEqual(uids, {"1", "2", "3"})
+        self.assertTrue(progress.done)
+        folder.refresh_info_sync.assert_not_called()
+        cache.save.assert_called()
+        saved_uids = {message["uid"] for message in cache.save.call_args.args[2]}
+        self.assertEqual(saved_uids, {"1", "2", "3"})
+
     @mock.patch("post.mail.eds.folder_index_cache")
     def test_heavy_list_index_unions_disk_into_ram(
         self, cache: mock.Mock
