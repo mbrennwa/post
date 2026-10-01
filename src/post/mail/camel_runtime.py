@@ -97,6 +97,7 @@ class AccountCamelRuntime:
     )
     _alive: bool = field(default=False, init=False)
     _on_died: Callable[[str], None] | None = field(default=None, init=False, repr=False)
+    _died_fired: bool = field(default=False, init=False)
     _busy_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
@@ -151,11 +152,12 @@ class AccountCamelRuntime:
         assert self._proc.stdout is not None
         ready = read_message(self._proc.stdout)
         if ready is None or ready.get("type") != "ready":
-            self._stop_unlocked(kill=True)
+            self._stop_unlocked(kill=True, notify_died=False)
             raise CamelHelperError(
                 f"camel helper for {self.account_uid} did not become ready"
             )
         self._alive = True
+        self._died_fired = False
         self._reader_thread = threading.Thread(
             target=self._reader_main,
             name=f"camel-helper-reader-{self.account_uid[:8]}",
@@ -254,12 +256,21 @@ class AccountCamelRuntime:
                     }
                     pending["event"].set()
                 self._pending.clear()
+            self._fire_died()
+
+    def _fire_died(self) -> None:
+        """Notify once per helper lifetime (natural exit or kill/timeout, #503)."""
+        with self._lock:
+            if self._died_fired:
+                return
+            self._died_fired = True
             callback = self._on_died
-            if callback is not None:
-                try:
-                    callback(self.account_uid)
-                except Exception:
-                    log.debug("on_died callback failed", exc_info=True)
+        if callback is None:
+            return
+        try:
+            callback(self.account_uid)
+        except Exception:
+            log.debug("on_died callback failed", exc_info=True)
 
     def _busy_snapshot(self) -> tuple[str | None, float]:
         """Return the in-flight helper method and how long it has been running."""
@@ -464,7 +475,7 @@ class AccountCamelRuntime:
             deadline = time.monotonic() + max(0.1, timeout)
             while proc.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.05)
-            self._stop_unlocked(kill=True)
+            self._stop_unlocked(kill=True, notify_died=False)
 
     def _reap_dead_unlocked(self) -> None:
         """Drop handles for an already-exited helper without SIGKILL (#445)."""
@@ -489,8 +500,9 @@ class AccountCamelRuntime:
                 pass
         self._proc = None
 
-    def _stop_unlocked(self, *, kill: bool) -> None:
+    def _stop_unlocked(self, *, kill: bool, notify_died: bool = True) -> None:
         proc = self._proc
+        had_proc = proc is not None
         self._alive = False
         if proc is None:
             return
@@ -512,6 +524,11 @@ class AccountCamelRuntime:
                 except Exception:
                     pass
             self._proc = None
+        # Reader skips on_died when ``_proc`` is already cleared; fire here so
+        # watchdog/timeout/kill still release flush leases (#503 Phase 4).
+        # Intentional shutdown/ready-failure pass notify_died=False.
+        if had_proc and notify_died:
+            self._fire_died()
 
 
 @dataclass

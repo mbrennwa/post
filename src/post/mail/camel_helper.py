@@ -41,6 +41,8 @@ ALLOWED_METHODS = frozenset(
         "read_attachment_data",
         "save_draft",
         "delete_draft",
+        "empty_folder",
+        "delete_folder",
         "move_messages",
         "archive_messages",
         "move_messages_to_trash",

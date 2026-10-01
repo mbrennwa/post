@@ -126,6 +126,7 @@ from .operation_queue import (
     count_queued_operations,
     enqueue_operation,
     list_queued_operations,
+    release_all_flush_leases,
     release_flush_lease,
     remove_queued_operation,
 )
@@ -765,6 +766,10 @@ class MailService:
     )
     _visible_attachments_changed: Callable[[str, str, str, bool], None] | None = field(
         default=None, init=False, repr=False
+    )
+    # Hard flush failures from the last operation-queue flush (#503 Phase 2).
+    _last_flush_hard_failures: list[dict[str, Any]] = field(
+        default_factory=list, init=False, repr=False
     )
     _pending_mail_ops: int = field(default=0, init=False)
     _pending_mail_ops_cond: threading.Condition = field(
@@ -2236,6 +2241,9 @@ class MailService:
         service._reload_pending_local_removals_from_disk()
         if camel_helpers_enabled():
             def _on_helper_died(uid: str) -> None:
+                # Mid-flush kill leaves ``*.flushing`` leases; clear them so
+                # coalesce/resume can see the durable ops again (#503 Phase 4).
+                release_all_flush_leases()
                 service.set_account_connect_health(uid, "not_responding")
                 service.schedule_operation_queue_flush(uid)
 
@@ -3410,6 +3418,7 @@ class MailService:
         With per-account helpers, execution runs in the helper Camel tree — never
         against the UI process Evolution dirs.
         """
+        self._last_flush_hard_failures = []
         if camel_helpers_enabled():
             accounts = sorted(
                 {
@@ -3426,7 +3435,9 @@ class MailService:
                         [account_uid],
                         timeout=helper_timeout,
                     )
-                    flushed += int(result or 0)
+                    count, failures = self._normalize_flush_operation_result(result)
+                    flushed += count
+                    self._last_flush_hard_failures.extend(failures)
                 except Exception:
                     log.exception(
                         "Failed to flush operation queue via helper for %s",
@@ -3436,16 +3447,39 @@ class MailService:
             self._reload_pending_local_removals_from_disk()
             return flushed
         if is_mail_io_thread():
-            return self._flush_operation_queue_unlocked()
-        return get_mail_io_thread().run_sync(self._flush_operation_queue_unlocked)
+            result = self._flush_operation_queue_unlocked()
+        else:
+            result = get_mail_io_thread().run_sync(self._flush_operation_queue_unlocked)
+        count, failures = self._normalize_flush_operation_result(result)
+        self._last_flush_hard_failures.extend(failures)
+        return count
 
-    def flush_account_operation_queue(self, account_uid: str) -> int:
+    def flush_account_operation_queue(self, account_uid: str) -> dict[str, Any]:
         """Flush queued mutations for one account (helper entry point, #462)."""
         if is_mail_io_thread():
             return self._flush_operation_queue_unlocked(account_uid=account_uid)
         return get_mail_io_thread().run_sync(
             self._flush_operation_queue_unlocked, account_uid=account_uid
         )
+
+    @staticmethod
+    def _normalize_flush_operation_result(
+        result: Any,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        if isinstance(result, dict):
+            failures = result.get("hard_failures") or []
+            if not isinstance(failures, list):
+                failures = []
+            return int(result.get("flushed") or 0), [
+                item for item in failures if isinstance(item, dict)
+            ]
+        return int(result or 0), []
+
+    def consume_operation_flush_hard_failures(self) -> list[dict[str, Any]]:
+        """Return and clear hard failures from the last flush (#503)."""
+        failures = list(self._last_flush_hard_failures)
+        self._last_flush_hard_failures = []
+        return failures
 
     def schedule_operation_queue_flush(
         self, account_uid: str | None = None
@@ -3932,8 +3966,9 @@ class MailService:
 
     def _flush_operation_queue_unlocked(
         self, account_uid: str | None = None
-    ) -> int:
+    ) -> dict[str, Any]:
         flushed = 0
+        hard_failures: list[dict[str, Any]] = []
         skip_accounts: set[str] = set()
         self._flushing_operation_queue = True
         try:
@@ -4001,6 +4036,27 @@ class MailService:
                         queue_id,
                         operation.op_type,
                     )
+                    # Hard failure: keep the op, clear pending so the list can
+                    # show the rows again, and tell the UI to reload (#503).
+                    if operation.op_type in {
+                        "archive",
+                        "move_to_trash",
+                        "move_to_folder",
+                    }:
+                        self._clear_pending_local_removals(
+                            operation.account_uid,
+                            operation.folder_name,
+                            list(operation.message_uids),
+                        )
+                    hard_failures.append(
+                        {
+                            "account_uid": operation.account_uid,
+                            "folder_name": operation.folder_name,
+                            "message_uids": list(operation.message_uids),
+                            "op_type": operation.op_type,
+                            "error": str(exc),
+                        }
+                    )
                     break
                 else:
                     if operation.op_type in {
@@ -4046,7 +4102,7 @@ class MailService:
                     release_flush_lease(queue_id)
         finally:
             self._flushing_operation_queue = False
-        return flushed
+        return {"flushed": flushed, "hard_failures": hard_failures}
 
     def _flush_draft_queue_unlocked(self) -> int:
         flushed = 0
@@ -4393,6 +4449,40 @@ class MailService:
         cancellable: Gio.Cancellable | None = None,
     ) -> tuple[str, str]:
         """Save or update a draft. Returns (drafts_folder_name, message_uid)."""
+        attachments = self._coerce_compose_attachments(attachments)
+        if camel_helpers_enabled():
+            attachment_payload = None
+            if attachments:
+                attachment_payload = [
+                    {
+                        "filename": item.filename,
+                        "mime_type": item.mime_type,
+                        "data": item.data,
+                    }
+                    for item in attachments
+                ]
+            result = self._camel_helper_call(
+                "save_draft",
+                account_uid,
+                [account_uid],
+                {
+                    "to": to,
+                    "cc": cc,
+                    "bcc": bcc,
+                    "subject": subject,
+                    "body": body,
+                    "body_html": body_html,
+                    "in_reply_to": in_reply_to,
+                    "references": references,
+                    "existing_uid": existing_uid,
+                    "drafts_folder_name": drafts_folder_name,
+                    "attachments": attachment_payload,
+                },
+                timeout=max(120.0, _DRAFT_TIMEOUT_SECONDS + 30.0),
+            )
+            if isinstance(result, (list, tuple)) and len(result) == 2:
+                return str(result[0]), str(result[1])
+            raise RuntimeError("Helper save_draft returned an invalid result")
         return run_on_mail_thread(
             self._save_draft_unlocked,
             account_uid,
@@ -4409,6 +4499,36 @@ class MailService:
             attachments=attachments,
             cancellable=cancellable,
         )
+
+    @staticmethod
+    def _coerce_compose_attachments(
+        attachments: Sequence[Any] | None,
+    ) -> list[ComposeAttachment] | None:
+        if not attachments:
+            return None
+        coerced: list[ComposeAttachment] = []
+        for item in attachments:
+            if isinstance(item, ComposeAttachment):
+                coerced.append(item)
+                continue
+            if isinstance(item, dict):
+                data = item.get("data")
+                if isinstance(data, bytearray):
+                    data = bytes(data)
+                if not isinstance(data, bytes):
+                    data = b""
+                coerced.append(
+                    ComposeAttachment(
+                        filename=str(item.get("filename") or "attachment"),
+                        mime_type=str(
+                            item.get("mime_type") or "application/octet-stream"
+                        ),
+                        data=data,
+                    )
+                )
+                continue
+            raise TypeError(f"Unsupported draft attachment type: {type(item)!r}")
+        return coerced
 
     def _save_draft_unlocked(
         self,
@@ -4427,6 +4547,7 @@ class MailService:
         attachments: Sequence[ComposeAttachment] | None = None,
         cancellable: Gio.Cancellable | None = None,
     ) -> tuple[str, str]:
+        attachments = self._coerce_compose_attachments(attachments)
         account = self.get_account(account_uid)
         from_address = account.from_address or account.email
         if not from_address:
@@ -5019,10 +5140,20 @@ class MailService:
             )
 
     def delete_folder(self, account_uid: str, folder_name: str) -> None:
+        if camel_helpers_enabled():
+            self._camel_helper_call(
+                "delete_folder", account_uid, [account_uid, folder_name]
+            )
+            return
         with self._lock:
             self._delete_folder_unlocked(account_uid, folder_name)
 
     def empty_folder(self, account_uid: str, folder_name: str) -> dict[str, Any]:
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "empty_folder", account_uid, [account_uid, folder_name]
+            )
+            return result if isinstance(result, dict) else {}
         with self._lock:
             return self._empty_folder_unlocked(account_uid, folder_name)
 

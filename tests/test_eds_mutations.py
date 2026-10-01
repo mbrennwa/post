@@ -11,8 +11,11 @@ from post.mail.eds import MailService
 
 
 class DraftDispatchTests(unittest.TestCase):
+    @mock.patch("post.mail.eds.camel_helpers_enabled", return_value=False)
     @mock.patch("post.mail.eds.run_on_mail_thread")
-    def test_save_draft_uses_mail_thread(self, run_on_mail_thread) -> None:
+    def test_save_draft_uses_mail_thread(
+        self, run_on_mail_thread, _helpers_off
+    ) -> None:
         run_on_mail_thread.return_value = ("Drafts", "7")
         service = MailService(registry=mock.Mock())
 
@@ -28,6 +31,42 @@ class DraftDispatchTests(unittest.TestCase):
             "_save_draft_unlocked",
         )
         self.assertEqual(result, ("Drafts", "7"))
+
+    @mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True)
+    def test_save_draft_uses_helper_when_enabled(self, _helpers_on) -> None:
+        service = MailService(registry=mock.Mock())
+        with mock.patch.object(
+            service, "_camel_helper_call", return_value=("Drafts", "9")
+        ) as helper_call:
+            result = service.save_draft("acct-1", subject="Hi", body="Body")
+        self.assertEqual(result, ("Drafts", "9"))
+        helper_call.assert_called_once()
+        self.assertEqual(helper_call.call_args.args[0], "save_draft")
+
+    @mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True)
+    def test_empty_folder_uses_helper_when_enabled(self, _helpers_on) -> None:
+        service = MailService(registry=mock.Mock())
+        with mock.patch.object(
+            service,
+            "_camel_helper_call",
+            return_value={"removed_count": 3},
+        ) as helper_call:
+            result = service.empty_folder("acct-1", "Trash")
+        self.assertEqual(result["removed_count"], 3)
+        helper_call.assert_called_once_with(
+            "empty_folder", "acct-1", ["acct-1", "Trash"]
+        )
+
+    @mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True)
+    def test_delete_folder_uses_helper_when_enabled(self, _helpers_on) -> None:
+        service = MailService(registry=mock.Mock())
+        with mock.patch.object(
+            service, "_camel_helper_call", return_value=None
+        ) as helper_call:
+            service.delete_folder("acct-1", "Old")
+        helper_call.assert_called_once_with(
+            "delete_folder", "acct-1", ["acct-1", "Old"]
+        )
 
     def test_save_draft_unlocked_appends_locally(self) -> None:
         service = MailService(registry=mock.Mock())
