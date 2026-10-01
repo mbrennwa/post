@@ -22,14 +22,22 @@ from post.mail.operation_queue import (
 class ServiceLockReleaseTests(unittest.TestCase):
     def setUp(self) -> None:
         self._ops_tmpdir = tempfile.TemporaryDirectory()
+        self._pending_tmpdir = tempfile.TemporaryDirectory()
         self._ops_dir_patch = mock.patch(
             "post.mail.operation_queue.operations_dir",
             return_value=self._ops_tmpdir.name,
         )
+        self._pending_dir_patch = mock.patch(
+            "post.mail.pending_removals.pending_removals_dir",
+            return_value=self._pending_tmpdir.name,
+        )
         self._ops_dir_patch.start()
+        self._pending_dir_patch.start()
 
     def tearDown(self) -> None:
+        self._pending_dir_patch.stop()
         self._ops_dir_patch.stop()
+        self._pending_tmpdir.cleanup()
         self._ops_tmpdir.cleanup()
 
     def test_call_without_service_lock_releases_nested_lock(self) -> None:

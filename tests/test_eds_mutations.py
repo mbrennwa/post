@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from unittest import mock
 
@@ -1209,20 +1210,25 @@ class BulkArchiveHelperRoutingTests(unittest.TestCase):
 
     def test_bulk_archive_skips_pending_local_removals(self) -> None:
         service = MailService(registry=mock.Mock())
-        service._note_pending_local_removals("acct-1", "INBOX", ["r1"])
-        with (
-            mock.patch.object(
-                service,
-                "get_folder_messages",
-                return_value=(self._messages(), 1, 3, "local"),
-            ),
-            mock.patch.object(
-                service,
-                "archive_messages",
-                return_value={"moved_uids": ["r2"]},
-            ) as archive,
-        ):
-            result = service.archive_read_messages("acct-1", "INBOX")
+        with tempfile.TemporaryDirectory() as pending_dir:
+            with mock.patch(
+                "post.mail.pending_removals.pending_removals_dir",
+                return_value=pending_dir,
+            ):
+                service._note_pending_local_removals("acct-1", "INBOX", ["r1"])
+                with (
+                    mock.patch.object(
+                        service,
+                        "get_folder_messages",
+                        return_value=(self._messages(), 1, 3, "local"),
+                    ),
+                    mock.patch.object(
+                        service,
+                        "archive_messages",
+                        return_value={"moved_uids": ["r2"]},
+                    ) as archive,
+                ):
+                    result = service.archive_read_messages("acct-1", "INBOX")
 
-        archive.assert_called_once_with("acct-1", "INBOX", ["r2"])
-        self.assertEqual(result["archived_count"], 1)
+                archive.assert_called_once_with("acct-1", "INBOX", ["r2"])
+                self.assertEqual(result["archived_count"], 1)

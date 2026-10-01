@@ -121,11 +121,15 @@ from .draft_queue import (
 from .operation_queue import (
     OperationType,
     QueuedOperation,
+    acquire_flush_lease,
     coalesce_or_enqueue_operation,
     count_queued_operations,
+    enqueue_operation,
     list_queued_operations,
+    release_flush_lease,
     remove_queued_operation,
 )
+from . import pending_removals as pending_removals_store
 from .network_errors import (
     MESSAGE_NOT_CACHED_SIGN_IN,
     TOKEN_EXPIRED_FOLDER_MESSAGE,
@@ -2229,6 +2233,7 @@ class MailService:
             service._helper_bound_account_uid = account_uid
         service._ensure_mail_io_callbacks()
         service._drop_orphan_account_caches()
+        service._reload_pending_local_removals_from_disk()
         if camel_helpers_enabled():
             def _on_helper_died(uid: str) -> None:
                 service.set_account_connect_health(uid, "not_responding")
@@ -3427,6 +3432,8 @@ class MailService:
                         "Failed to flush operation queue via helper for %s",
                         account_uid,
                     )
+            # Helper cleared durable pending on disk; refresh UI RAM (#503).
+            self._reload_pending_local_removals_from_disk()
             return flushed
         if is_mail_io_thread():
             return self._flush_operation_queue_unlocked()
@@ -3941,8 +3948,9 @@ class MailService:
                     skip_accounts.add(operation.account_uid)
                     continue
                 self._flushing_queue_ids.add(queue_id)
+                acquire_flush_lease(queue_id)
                 try:
-                    self._execute_queued_operation_unlocked(operation)
+                    result = self._execute_queued_operation_unlocked(operation)
                 except Exception as exc:
                     if is_sign_in_required_error(exc):
                         self.set_account_connect_health(
@@ -3963,6 +3971,31 @@ class MailService:
                             operation.op_type,
                         )
                         break
+                    # Stale UID already gone from Graph/Camel — drop and continue
+                    # so one dead set_seen does not block Archive flush (#503).
+                    if isinstance(exc, GLib.Error) and (
+                        self._is_missing_message_error(exc)
+                        or self._is_graph_item_not_found_error(exc)
+                    ):
+                        log.info(
+                            "Queued operation %s (%s): message already gone; "
+                            "dropping (#503)",
+                            queue_id,
+                            operation.op_type,
+                        )
+                        if operation.op_type in {
+                            "archive",
+                            "move_to_trash",
+                            "move_to_folder",
+                        }:
+                            self._clear_pending_local_removals(
+                                operation.account_uid,
+                                operation.folder_name,
+                                list(operation.message_uids),
+                            )
+                        remove_queued_operation(queue_id)
+                        flushed += 1
+                        continue
                     log.exception(
                         "Failed to flush queued operation %s (%s)",
                         queue_id,
@@ -3970,20 +4003,47 @@ class MailService:
                     )
                     break
                 else:
-                    remove_queued_operation(queue_id)
                     if operation.op_type in {
                         "archive",
                         "move_to_trash",
                         "move_to_folder",
                     }:
-                        self._clear_pending_local_removals(
-                            operation.account_uid,
-                            operation.folder_name,
-                            operation.message_uids,
-                        )
-                    flushed += 1
+                        requested = [str(uid) for uid in operation.message_uids if uid]
+                        moved = [
+                            str(uid)
+                            for uid in (result or {}).get("moved_uids") or requested
+                            if uid
+                        ]
+                        moved_set = set(moved)
+                        remaining = [
+                            uid for uid in requested if uid not in moved_set
+                        ]
+                        if moved:
+                            self._clear_pending_local_removals(
+                                operation.account_uid,
+                                operation.folder_name,
+                                moved,
+                            )
+                        if remaining:
+                            # Partial soft-succeed: keep the remainder queued (#503).
+                            log.warning(
+                                "Queued operation %s partially flushed "
+                                "(%d moved, %d remaining)",
+                                queue_id,
+                                len(moved),
+                                len(remaining),
+                            )
+                            operation.message_uids = remaining
+                            enqueue_operation(operation, queue_id=queue_id)
+                        else:
+                            remove_queued_operation(queue_id)
+                            flushed += 1
+                    else:
+                        remove_queued_operation(queue_id)
+                        flushed += 1
                 finally:
                     self._flushing_queue_ids.discard(queue_id)
+                    release_flush_lease(queue_id)
         finally:
             self._flushing_operation_queue = False
         return flushed
@@ -4023,51 +4083,48 @@ class MailService:
             self._flushing_draft_queue = False
         return flushed
 
-    def _execute_queued_operation_unlocked(self, operation: QueuedOperation) -> None:
+    def _execute_queued_operation_unlocked(
+        self, operation: QueuedOperation
+    ) -> dict[str, Any]:
         if operation.op_type == "move_to_trash":
-            self._move_messages_to_trash_unlocked(
+            return self._move_messages_to_trash_unlocked(
                 operation.account_uid,
                 operation.folder_name,
                 list(operation.message_uids),
             )
-            return
         if operation.op_type == "archive":
-            self._archive_messages_unlocked(
+            return self._archive_messages_unlocked(
                 operation.account_uid,
                 operation.folder_name,
                 list(operation.message_uids),
             )
-            return
         if operation.op_type == "move_to_folder":
             if not operation.destination_folder:
                 raise ValueError("Queued move is missing destination folder")
-            self._move_messages_unlocked(
+            return self._move_messages_unlocked(
                 operation.account_uid,
                 operation.folder_name,
                 operation.destination_folder,
                 list(operation.message_uids),
             )
-            return
         if operation.op_type == "set_seen":
             if operation.seen is None:
                 raise ValueError("Queued seen update is missing seen flag")
-            self._set_messages_seen_unlocked(
+            return self._set_messages_seen_unlocked(
                 operation.account_uid,
                 operation.folder_name,
                 list(operation.message_uids),
                 seen=operation.seen,
             )
-            return
         if operation.op_type == "set_flagged":
             if operation.flagged is None:
                 raise ValueError("Queued flagged update is missing flagged flag")
-            self._set_messages_flagged_unlocked(
+            return self._set_messages_flagged_unlocked(
                 operation.account_uid,
                 operation.folder_name,
                 list(operation.message_uids),
                 flagged=operation.flagged,
             )
-            return
         raise ValueError(f"Unknown queued operation: {operation.op_type}")
 
     def _sent_folder_name_unlocked(self, account_uid: str) -> str | None:
@@ -4597,13 +4654,19 @@ class MailService:
         account_uid: str,
         folder_name: str,
         index: _FolderMessageIndex,
-    ) -> None:
-        """Install a folder index and merge correspondents (#313)."""
+    ) -> _FolderMessageIndex:
+        """Install a folder index and merge correspondents (#313).
+
+        Drops durable pending-removal UIDs so Camel rebuilds do not resurrect
+        locally archived rows onto disk (#503/#502).
+        """
+        index = self._index_without_pending_removals(account_uid, folder_name, index)
         with self._lock:
             self._folder_indexes[(account_uid, folder_name)] = index
         self._merge_correspondents_from_folder(
             account_uid, folder_name, index.messages
         )
+        return index
 
     def _remember_correspondents(
         self,
@@ -5596,8 +5659,12 @@ class MailService:
             index, source = self._get_folder_index_unlocked(
                 account_uid, folder_name, sync=sync
             )
+            messages = exclude_moved_provisional_messages(list(index.messages))
+            messages = self._filter_pending_local_removals(
+                account_uid, folder_name, messages
+            )
             return (
-                exclude_moved_provisional_messages(list(index.messages)),
+                messages,
                 index.unread,
                 index.total,
                 source,
@@ -5619,8 +5686,11 @@ class MailService:
             )
             if isinstance(result, (list, tuple)) and len(result) == 4:
                 messages, unread, total, source = result
+                filtered = self._filter_pending_local_removals(
+                    account_uid, folder_name, list(messages or [])
+                )
                 return (
-                    list(messages or []),
+                    filtered,
                     int(unread),
                     int(total),
                     source,  # type: ignore[return-value]
@@ -6593,7 +6663,7 @@ class MailService:
             index = self._build_folder_index_unlocked(
                 account_uid, folder_name, sync=False
             )
-            self._store_folder_index(account_uid, folder_name, index)
+            index = self._store_folder_index(account_uid, folder_name, index)
             if index.messages:
                 folder_index_cache.save(
                     account_uid,
@@ -6613,12 +6683,12 @@ class MailService:
                 account_uid, folder_name, index
             )
             if kept_source in ("memory", "disk_cache"):
-                self._store_folder_index(account_uid, folder_name, kept)
+                kept = self._store_folder_index(account_uid, folder_name, kept)
                 return kept, kept_source
             # "server" is a non-heavy union of Camel plus saved rows (#479).
             # Persist it; returning before save left the next open on the old list.
             to_save = kept if kept_source == "server" else index
-            self._store_folder_index(account_uid, folder_name, to_save)
+            to_save = self._store_folder_index(account_uid, folder_name, to_save)
             should_save = kept_source == "server" or (
                 _folder_index_is_cacheable(to_save)
                 and (
@@ -6653,13 +6723,13 @@ class MailService:
                 unread=unread,
                 total=total,
             )
-            self._store_folder_index(account_uid, folder_name, index)
+            index = self._store_folder_index(account_uid, folder_name, index)
             return index, "disk_cache"
 
         index = self._build_folder_index_unlocked(
             account_uid, folder_name, sync=False
         )
-        self._store_folder_index(account_uid, folder_name, index)
+        index = self._store_folder_index(account_uid, folder_name, index)
         if index.messages or index.total:
             if _folder_index_is_cacheable(index):
                 existing = folder_index_cache.load(account_uid, folder_name)
@@ -6680,7 +6750,7 @@ class MailService:
                         unread=unread,
                         total=total,
                     )
-                    self._store_folder_index(account_uid, folder_name, index)
+                    index = self._store_folder_index(account_uid, folder_name, index)
                     return index, "disk_cache"
                 folder_index_cache.save(
                     account_uid,
@@ -6699,7 +6769,7 @@ class MailService:
                         unread=unread,
                         total=total,
                     )
-                    self._store_folder_index(account_uid, folder_name, index)
+                    index = self._store_folder_index(account_uid, folder_name, index)
                     return index, "disk_cache"
                 if _should_save_heavy_folder_index(index.messages, existing):
                     folder_index_cache.save(
@@ -6734,7 +6804,7 @@ class MailService:
             unread=max(existing.unread, disk_unread),
             total=max(existing.total, disk_total, len(unioned)),
         )
-        self._store_folder_index(account_uid, folder_name, index)
+        index = self._store_folder_index(account_uid, folder_name, index)
         return index, "disk_cache"
 
     def _is_missing_folder_error(self, exc: GLib.Error) -> bool:
@@ -11014,18 +11084,26 @@ class MailService:
             "queued": queued,
         }
         # Local-first may have already applied flags; still STORE on flush (#462).
+        # Skip UIDs Camel no longer has — force-STORE on vanished RestIds
+        # ErrorItemNotFound-spams and stalls the whole queue (#503).
         if (
             self._flushing_operation_queue
             and message_uids
             and not changed_uids
         ):
-            self._persist_message_flag_changes_unlocked(
-                account_uid,
-                folder,
-                list(message_uids),
-                op_type="set_seen",
-                seen=seen,
-            )
+            present = [
+                uid
+                for uid in message_uids
+                if folder_get_message_info(folder, uid) is not None
+            ]
+            if present:
+                self._persist_message_flag_changes_unlocked(
+                    account_uid,
+                    folder,
+                    present,
+                    op_type="set_seen",
+                    seen=seen,
+                )
             result["queued"] = False
         self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
         return result
@@ -11075,13 +11153,19 @@ class MailService:
             and message_uids
             and not changed_uids
         ):
-            self._persist_message_flag_changes_unlocked(
-                account_uid,
-                folder,
-                list(message_uids),
-                op_type="set_flagged",
-                flagged=flagged,
-            )
+            present = [
+                uid
+                for uid in message_uids
+                if folder_get_message_info(folder, uid) is not None
+            ]
+            if present:
+                self._persist_message_flag_changes_unlocked(
+                    account_uid,
+                    folder,
+                    present,
+                    op_type="set_flagged",
+                    flagged=flagged,
+                )
             result["queued"] = False
         self._mirror_flag_result_to_folder_caches(account_uid, folder_name, result)
         return result
@@ -11371,18 +11455,76 @@ class MailService:
         )
         return index.unread, index.total
 
+    def _reload_pending_local_removals_from_disk(self) -> None:
+        """Refresh RAM pending-removal set from durable store (#503)."""
+        loaded = pending_removals_store.load_all_pending_removals()
+        self._pending_local_removals = {
+            key: set(uids) for key, uids in loaded.items() if uids
+        }
+
+    def folder_has_pending_local_removals(
+        self, account_uid: str, folder_name: str
+    ) -> bool:
+        """True when local-first MOVE UIDs are still hidden pending flush (#503)."""
+        key = (account_uid, folder_name)
+        if self._pending_local_removals.get(key):
+            return True
+        return bool(
+            pending_removals_store.load_pending_uids(account_uid, folder_name)
+        )
+
+    def _pending_uids_for_folder(
+        self, account_uid: str, folder_name: str
+    ) -> set[str]:
+        key = (account_uid, folder_name)
+        pending = set(self._pending_local_removals.get(key) or ())
+        pending.update(
+            pending_removals_store.load_pending_uids(account_uid, folder_name)
+        )
+        return pending
+
+    def _index_without_pending_removals(
+        self,
+        account_uid: str,
+        folder_name: str,
+        index: _FolderMessageIndex,
+    ) -> _FolderMessageIndex:
+        pending = self._pending_uids_for_folder(account_uid, folder_name)
+        if not pending or not index.messages:
+            return index
+        kept: list[dict] = []
+        removed_unread = 0
+        for message in index.messages:
+            uid = str(message.get("uid") or "")
+            if uid and uid in pending:
+                if not (message.get("flags") or {}).get("seen", False):
+                    removed_unread += 1
+                continue
+            kept.append(message)
+        if len(kept) == len(index.messages):
+            return index
+        unread = index.unread
+        total = index.total
+        removed = len(index.messages) - len(kept)
+        if unread >= 0:
+            unread = max(0, unread - removed_unread)
+        if total >= 0:
+            total = max(0, total - removed)
+        else:
+            total = len(kept)
+        return _FolderMessageIndex(messages=kept, unread=unread, total=total)
+
     def _note_pending_local_removals(
         self,
         account_uid: str,
         folder_name: str,
         message_uids: list[str],
     ) -> None:
+        durable = pending_removals_store.note_pending_uids(
+            account_uid, folder_name, message_uids
+        )
         key = (account_uid, folder_name)
-        bucket = self._pending_local_removals.setdefault(key, set())
-        for uid in message_uids:
-            text = str(uid)
-            if text:
-                bucket.add(text)
+        self._pending_local_removals[key] = set(durable)
 
     def _clear_pending_local_removals(
         self,
@@ -11390,13 +11532,13 @@ class MailService:
         folder_name: str,
         message_uids: list[str],
     ) -> None:
+        remaining = pending_removals_store.clear_pending_uids(
+            account_uid, folder_name, message_uids
+        )
         key = (account_uid, folder_name)
-        bucket = self._pending_local_removals.get(key)
-        if not bucket:
-            return
-        for uid in message_uids:
-            bucket.discard(str(uid))
-        if not bucket:
+        if remaining:
+            self._pending_local_removals[key] = set(remaining)
+        else:
             self._pending_local_removals.pop(key, None)
 
     def _filter_pending_local_removals(
@@ -11405,7 +11547,7 @@ class MailService:
         folder_name: str,
         messages: list[dict],
     ) -> list[dict]:
-        pending = self._pending_local_removals.get((account_uid, folder_name))
+        pending = self._pending_uids_for_folder(account_uid, folder_name)
         if not pending:
             return messages
         return [
@@ -11934,6 +12076,37 @@ class MailService:
 
         transfer_uids = self._transfer_uids_in_folder(source_folder, message_uids)
         if not transfer_uids:
+            # UIDs already absent from Camel summary (prior soft-succeed, server
+            # move, or stale queue). During flush, treat as done so the op and
+            # pending removals clear instead of ERROR-spamming forever (#503).
+            if self._flushing_operation_queue:
+                log.info(
+                    "Flush %s: %d UID(s) already absent from %s/%s; "
+                    "treating as done (#503)",
+                    op_type,
+                    len(message_uids),
+                    account_uid,
+                    source_folder_name,
+                )
+                source_unread = folder_get_unread_count(source_folder)
+                source_total = source_folder.get_message_count()
+                self._remove_messages_from_cache(
+                    account_uid,
+                    source_folder_name,
+                    list(message_uids),
+                    source_unread,
+                    source_total,
+                )
+                return {
+                    "moved_uids": list(message_uids),
+                    "destination_uids": [],
+                    "source_folder": source_folder_name,
+                    "source_folder_unread": source_unread,
+                    "source_folder_total": source_total,
+                    "destination_folder": dest_name,
+                    "destination_folder_unread": -1,
+                    "destination_folder_total": -1,
+                }
             raise ValueError("No matching messages to move")
 
         if not self._allow_online_store_unlocked(account_uid):

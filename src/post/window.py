@@ -2732,8 +2732,13 @@ class MainWindow(Adw.ApplicationWindow):
         # Graph fires multiple folder-changed events while Camel is still in
         # transfer_messages_to_sync; clearing early queues a reload storm
         # behind the hung mail I/O thread (#189).
+        # Local-first returns before MOVE; hold suppress until durable pending
+        # removals clear. List paths also filter pending UIDs (#503/#502).
         if self._suppress_sync_list_reload == key:
-            return True
+            if self._mail.folder_has_pending_local_removals(account_uid, folder_name):
+                return True
+            self._suppress_sync_list_reload = None
+            return False
         return False
 
     def _on_draft_saved(self, notification: SavedDraftNotification) -> None:
@@ -7500,8 +7505,11 @@ class MainWindow(Adw.ApplicationWindow):
         self._update_message_toolbar()
         self._notify_reader_windows_message_moved(uids)
 
-        if self._suppress_sync_list_reload == suppress_key:
-            self._suppress_sync_list_reload = None
+        # Local-first queues the MOVE; keep suppress while pending removals
+        # remain so Folder::changed cannot rebind stale Camel UIDs (#503/#502).
+        if not result.get("queued"):
+            if self._suppress_sync_list_reload == suppress_key:
+                self._suppress_sync_list_reload = None
         return False
 
     def _set_messages_seen(self, seen: bool) -> None:

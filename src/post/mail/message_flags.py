@@ -112,6 +112,8 @@ def persist_folder_flags(
     message_uids: list[str],
 ) -> None:
     """Save folder summary and push flag changes to the mail store."""
+    from gi.repository import GLib
+
     summary = folder.get_folder_summary()
     if summary is not None:
         summary.touch()
@@ -119,10 +121,26 @@ def persist_folder_flags(
             raise RuntimeError("Could not save folder summary after flag change")
 
     for message_uid in message_uids:
-        if not folder.synchronize_message_sync(camel_uid_to_api(message_uid), None):
-            raise RuntimeError(
-                f"Could not synchronize message {message_uid} after flag change"
-            )
+        try:
+            if not folder.synchronize_message_sync(
+                camel_uid_to_api(message_uid), None
+            ):
+                raise RuntimeError(
+                    f"Could not synchronize message {message_uid} after flag change"
+                )
+        except GLib.Error as exc:
+            text = f"{exc.message or ''} {exc}"
+            lowered = text.lower()
+            # Vanished RestId / UID during flush of a stale set_seen op (#503).
+            if (
+                "ErrorItemNotFound" in text
+                or "not found in the store" in lowered
+                or exc.matches(
+                    Camel.folder_error_quark(), Camel.FolderError.INVALID_UID
+                )
+            ):
+                continue
+            raise
 
     if not folder.synchronize_sync(False, None):
         raise RuntimeError("Could not synchronize folder after flag change")
