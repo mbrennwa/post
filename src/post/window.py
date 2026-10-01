@@ -331,6 +331,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._mail.set_visible_attachments_changed_callback(
             self._on_visible_attachments_classified
         )
+        self._mail.set_operation_flush_done_callback(self._on_operation_queue_flushed)
         self._sync_watcher = MailSyncWatcher(
             self._mail,
             on_folder_changed=self._on_sync_folder_changed,
@@ -844,17 +845,15 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _flush_operation_queue_worker(self) -> None:
         try:
-            flushed = self._mail.flush_operation_queue()
-            failures = self._mail.consume_operation_flush_hard_failures()
+            self._mail.flush_operation_queue()
         except Exception:
             log.exception("Failed to flush queued mail operations")
-            return
-        GLib.idle_add(self._on_operation_queue_flushed, flushed, failures)
 
     def _on_operation_queue_flushed(
         self,
         flushed: int,
         hard_failures: list[dict] | None = None,
+        undo_events: list[dict] | None = None,
     ) -> bool:
         failures = list(hard_failures or [])
         for failure in failures:
@@ -869,6 +868,10 @@ class MainWindow(Adw.ApplicationWindow):
                 self,
                 f"Could not sync queued mail action: {error}",
             )
+        self._apply_flush_undo_events(list(undo_events or []))
+        # Drop stashed copies once the UI has consumed this notify (#499).
+        self._mail.consume_operation_flush_hard_failures()
+        self._mail.consume_operation_flush_undo_events()
         self._clear_stale_queued_status_hint()
         self._refresh_status_display()
         if failures:
@@ -1900,22 +1903,32 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_stack.set_visible_child_name("empty")
 
         dest_folder = result.get("destination_folder")
-        dest_uids = result.get("destination_uids") or []
-        if dest_folder and dest_uids:
-            # Arm Undo immediately; present the toast on idle so dismissing the
-            # in-progress toast cannot swallow the Undo button (#261).
+        dest_uids = list(result.get("destination_uids") or [])
+        source_uids = [
+            str(uid)
+            for uid in (result.get("moved_uids") or [])
+            if uid
+        ]
+        if not source_uids and archived_count > 0:
+            # Local-first bulk archive always returns moved_uids; keep a
+            # synthetic count only as a last resort for toast arming (#499).
+            source_uids = []
+        move_state = self._sidebar.get_move_menu_state(account_uid, folder_name)
+        if not dest_folder:
+            dest_folder = move_state.get("archive_folder")
+        # Arm Undo immediately (cancel while queued; reverse after flush, #499).
+        if source_uids or dest_uids:
             self._arm_move_undo(
                 account_uid=account_uid,
                 source_folder=folder_name,
-                dest_folder=dest_folder,
+                dest_folder=dest_folder or "",
                 dest_uids=dest_uids,
+                source_uids=source_uids,
+                op_type="archive",
             )
             GLib.idle_add(self._show_move_undo_toast, status_label)
             self._set_status(f"{status_label}  ·  Ctrl+Z to undo")
         else:
-            # Still confirm success when Graph/Camel omit destination UIDs
-            # (Undo requires those UIDs; status-only was easy to miss after
-            # optimistic clear — #261).
             GLib.idle_add(
                 self._show_bulk_archive_done_toast,
                 status_label,
@@ -1948,16 +1961,23 @@ class MainWindow(Adw.ApplicationWindow):
         result: dict,
         status_label: str,
     ) -> None:
-        dest_folder = result.get("destination_folder")
-        dest_uids = result.get("destination_uids") or []
-        if not dest_folder or not dest_uids:
+        dest_folder = result.get("destination_folder") or ""
+        dest_uids = list(result.get("destination_uids") or [])
+        source_uids = [str(uid) for uid in (result.get("moved_uids") or []) if uid]
+        if not dest_uids and not source_uids:
             return
+        op_type = "archive"
+        if result.get("queued") and not dest_folder:
+            move_state = self._sidebar.get_move_menu_state(account_uid, source_folder)
+            dest_folder = str(move_state.get("archive_folder") or "")
         self._register_move_undo(
             status_label,
             account_uid=account_uid,
             source_folder=source_folder,
-            dest_folder=dest_folder,
+            dest_folder=str(dest_folder or ""),
             dest_uids=dest_uids,
+            source_uids=source_uids,
+            op_type=op_type,
         )
         self._set_status(f"{status_label}  ·  Ctrl+Z to undo")
 
@@ -7288,7 +7308,10 @@ class MainWindow(Adw.ApplicationWindow):
         undo = self._pending_move_undo
         if undo is None:
             return False
-        self._clear_move_undo()
+        # Keep token for awaiting-flush upgrade; drop toast/action until done.
+        self._dismiss_undo_toast_only()
+        self._undo_move_action.set_enabled(False)
+        self._pending_move_undo = None
         self._undo_message_move(undo)
         return True
 
@@ -7299,17 +7322,25 @@ class MainWindow(Adw.ApplicationWindow):
         source_folder: str,
         dest_folder: str,
         dest_uids: list[str],
+        source_uids: list[str] | None = None,
+        op_type: str = "move_to_folder",
+        awaiting_flush: bool = False,
     ) -> bool:
-        if not dest_uids:
-            log.warning("Move succeeded but destination UIDs are unknown; undo disabled")
+        source = [str(uid) for uid in (source_uids or []) if uid]
+        dest = [str(uid) for uid in (dest_uids or []) if uid]
+        if not source and not dest:
+            log.warning("Move succeeded but UIDs are unknown; undo disabled")
             return False
         self._pending_move_undo = {
             "account_uid": account_uid,
             "source_folder": source_folder,
-            "dest_folder": dest_folder,
-            "dest_uids": dest_uids,
+            "source_uids": source,
+            "dest_folder": dest_folder or "",
+            "dest_uids": dest,
+            "op_type": op_type,
+            "awaiting_flush": awaiting_flush,
         }
-        self._undo_move_action.set_enabled(True)
+        self._undo_move_action.set_enabled(not awaiting_flush)
         return True
 
     def _show_move_undo_toast(self, label: str) -> bool:
@@ -7342,12 +7373,16 @@ class MainWindow(Adw.ApplicationWindow):
         source_folder: str,
         dest_folder: str,
         dest_uids: list[str],
+        source_uids: list[str] | None = None,
+        op_type: str = "move_to_folder",
     ) -> None:
         if not self._arm_move_undo(
             account_uid=account_uid,
             source_folder=source_folder,
             dest_folder=dest_folder,
             dest_uids=dest_uids,
+            source_uids=source_uids,
+            op_type=op_type,
         ):
             return
         self._show_move_undo_toast(label)
@@ -7355,17 +7390,133 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_move_undo_dismissed(self, _toast: Adw.Toast) -> None:
         self._undo_toast = None
 
+    def _apply_flush_undo_events(self, events: list[dict]) -> None:
+        """Upgrade pending cancel-undo with dest UIDs after flush (#499)."""
+        undo = self._pending_move_undo
+        if undo is None or not events:
+            return
+        matched = False
+        for event in events:
+            if str(event.get("account_uid") or "") != undo.get("account_uid"):
+                continue
+            if str(event.get("source_folder") or "") != undo.get("source_folder"):
+                continue
+            moved = {
+                str(uid) for uid in (event.get("moved_uids") or []) if uid
+            }
+            source = {
+                str(uid) for uid in (undo.get("source_uids") or []) if uid
+            }
+            if source and moved and not (moved & source):
+                continue
+            matched = True
+            dest_folder = str(event.get("destination_folder") or "")
+            dest_uids = [
+                str(uid) for uid in (event.get("destination_uids") or []) if uid
+            ]
+            if dest_folder:
+                undo["dest_folder"] = dest_folder
+            if dest_uids:
+                existing = list(undo.get("dest_uids") or [])
+                seen = set(existing)
+                for uid in dest_uids:
+                    if uid not in seen:
+                        existing.append(uid)
+                        seen.add(uid)
+                undo["dest_uids"] = existing
+            op_type = event.get("op_type")
+            if op_type:
+                undo["op_type"] = op_type
+
+        if not matched:
+            return
+
+        self._pending_move_undo = undo
+        if undo.get("awaiting_flush"):
+            dest_folder = undo.get("dest_folder") or ""
+            dest_uids = list(undo.get("dest_uids") or [])
+            if dest_folder and dest_uids:
+                undo["awaiting_flush"] = False
+                self._pending_move_undo = None
+                self._run_immediate_reverse_undo(dict(undo))
+            else:
+                self._clear_move_undo()
+                show_error_toast(
+                    self,
+                    "Could not undo: destination unknown after sync",
+                )
+            return
+        self._undo_move_action.set_enabled(True)
+
     def _undo_message_move(self, undo: dict) -> None:
         def worker() -> None:
             error: Exception | None = None
             result: dict | None = None
             try:
-                result = self._mail.move_messages(
-                    undo["account_uid"],
-                    undo["dest_folder"],
-                    undo["source_folder"],
-                    undo["dest_uids"],
-                )
+                source_uids = [
+                    str(uid) for uid in (undo.get("source_uids") or []) if uid
+                ]
+                cancel_result: dict[str, Any] = {
+                    "cancelled_uids": [],
+                    "in_flight_uids": [],
+                }
+                if source_uids:
+                    cancel_result = self._mail.cancel_queued_transfers(
+                        undo["account_uid"],
+                        undo["source_folder"],
+                        source_uids,
+                    )
+                cancelled = [
+                    str(uid)
+                    for uid in (cancel_result.get("cancelled_uids") or [])
+                    if uid
+                ]
+                in_flight = [
+                    str(uid)
+                    for uid in (cancel_result.get("in_flight_uids") or [])
+                    if uid
+                ]
+                dest_folder = str(undo.get("dest_folder") or "")
+                dest_uids = [
+                    str(uid) for uid in (undo.get("dest_uids") or []) if uid
+                ]
+
+                if in_flight:
+                    GLib.idle_add(
+                        self._on_move_undo_awaiting_flush,
+                        undo,
+                        in_flight,
+                        cancelled,
+                        cancel_result,
+                    )
+                    return
+
+                if dest_uids and dest_folder:
+                    result = self._mail.move_messages_immediate(
+                        undo["account_uid"],
+                        dest_folder,
+                        undo["source_folder"],
+                        dest_uids,
+                    )
+                elif cancelled:
+                    result = {
+                        "moved_uids": cancelled,
+                        "source_folder": undo["source_folder"],
+                        "destination_folder": dest_folder or undo["source_folder"],
+                        "source_folder_unread": cancel_result.get(
+                            "source_folder_unread", -1
+                        ),
+                        "source_folder_total": cancel_result.get(
+                            "source_folder_total", -1
+                        ),
+                        "destination_folder_unread": -1,
+                        "destination_folder_total": -1,
+                        "cancelled": True,
+                    }
+                else:
+                    raise RuntimeError(
+                        "Could not undo: messages already left the folder"
+                    )
             except Exception as exc:
                 log.exception("Failed to undo message move")
                 error = exc
@@ -7376,6 +7527,78 @@ class MainWindow(Adw.ApplicationWindow):
         self._set_status("Restoring messages…")
         self._mail.begin_folder_transfer()
         self._mail.submit_interactive("undo_message_move", worker)
+
+    def _on_move_undo_awaiting_flush(
+        self,
+        undo: dict,
+        in_flight: list[str],
+        cancelled: list[str],
+        cancel_result: dict,
+    ) -> bool:
+        """Finish cancelled UIDs now; reverse the in-flight set when flush reports (#499)."""
+        if cancelled:
+            account_uid = undo["account_uid"]
+            source_folder = undo["source_folder"]
+            unread = cancel_result.get("source_folder_unread")
+            total = cancel_result.get("source_folder_total")
+            if (
+                unread is not None
+                and total is not None
+                and self._current_account
+                and self._current_account.uid == account_uid
+            ):
+                self._sidebar.update_folder_row(
+                    account_uid, source_folder, int(unread), int(total)
+                )
+            if (
+                self._current_account
+                and self._current_folder
+                and self._current_account.uid == account_uid
+                and self._current_folder == source_folder
+            ):
+                self._load_messages(account_uid, source_folder, sync=False)
+
+        self._arm_move_undo(
+            account_uid=undo["account_uid"],
+            source_folder=undo["source_folder"],
+            dest_folder=str(undo.get("dest_folder") or ""),
+            dest_uids=list(undo.get("dest_uids") or []),
+            source_uids=in_flight,
+            op_type=str(undo.get("op_type") or "move_to_folder"),
+            awaiting_flush=True,
+        )
+        self._set_status("Restoring messages…")
+        return False
+
+    def _run_immediate_reverse_undo(self, undo: dict) -> None:
+        def worker() -> None:
+            error: Exception | None = None
+            result: dict | None = None
+            try:
+                dest_folder = str(undo.get("dest_folder") or "")
+                dest_uids = [
+                    str(uid) for uid in (undo.get("dest_uids") or []) if uid
+                ]
+                if not dest_folder or not dest_uids:
+                    raise RuntimeError(
+                        "Could not undo: destination unknown after sync"
+                    )
+                result = self._mail.move_messages_immediate(
+                    undo["account_uid"],
+                    dest_folder,
+                    undo["source_folder"],
+                    dest_uids,
+                )
+            except Exception as exc:
+                log.exception("Failed to undo message move after flush")
+                error = exc
+            finally:
+                self._mail.end_folder_transfer()
+            GLib.idle_add(self._on_move_undo_finished, undo, result, error)
+
+        self._set_status("Restoring messages…")
+        self._mail.begin_folder_transfer()
+        self._mail.submit_interactive("undo_message_move_after_flush", worker)
 
     def _on_move_undo_finished(
         self,
@@ -7391,29 +7614,55 @@ class MainWindow(Adw.ApplicationWindow):
 
         account_uid = undo["account_uid"]
         source_folder = undo["source_folder"]
-        dest_folder = undo["dest_folder"]
+        dest_folder = str(undo.get("dest_folder") or "") or source_folder
+        cancelled = bool(result.get("cancelled"))
 
         if self._current_account and self._current_account.uid == account_uid:
-            source_unread = result.get("source_folder_unread")
-            source_total = result.get("source_folder_total")
-            if source_unread is not None and source_total is not None:
-                self._sidebar.update_folder_row(
-                    account_uid, dest_folder, source_unread, source_total
-                )
+            if cancelled:
+                source_unread = result.get("source_folder_unread")
+                source_total = result.get("source_folder_total")
+                if source_unread is not None and source_total is not None:
+                    self._sidebar.update_folder_row(
+                        account_uid,
+                        source_folder,
+                        int(source_unread),
+                        int(source_total),
+                    )
+            else:
+                # Reverse MOVE: result source is dest_folder, destination is
+                # the original source_folder.
+                source_unread = result.get("source_folder_unread")
+                source_total = result.get("source_folder_total")
+                if (
+                    source_unread is not None
+                    and source_total is not None
+                    and dest_folder
+                ):
+                    self._sidebar.update_folder_row(
+                        account_uid,
+                        dest_folder,
+                        int(source_unread),
+                        int(source_total),
+                    )
 
-            dest_unread = result.get("destination_folder_unread")
-            dest_total = result.get("destination_folder_total")
-            if dest_unread is not None and dest_total is not None:
-                self._sidebar.update_folder_row(
-                    account_uid, source_folder, dest_unread, dest_total
-                )
+                dest_unread = result.get("destination_folder_unread")
+                dest_total = result.get("destination_folder_total")
+                if dest_unread is not None and dest_total is not None:
+                    self._sidebar.update_folder_row(
+                        account_uid,
+                        source_folder,
+                        int(dest_unread),
+                        int(dest_total),
+                    )
 
             inbox_folder = self._sidebar.inbox_folder_for_account(account_uid)
             if inbox_folder in (source_folder, dest_folder):
                 self._sidebar.refresh_inbox_counts(account_uid)
 
             if self._current_folder in (source_folder, dest_folder):
-                self._load_messages(account_uid, self._current_folder)
+                self._load_messages(
+                    account_uid, self._current_folder, sync=False
+                )
             elif self._current_account and self._current_folder:
                 self._update_message_status(
                     self._current_account, self._current_folder
@@ -7479,19 +7728,42 @@ class MainWindow(Adw.ApplicationWindow):
         *,
         status_label: str | None = None,
     ) -> None:
-        moved_count = len(result.get("moved_uids") or [])
+        moved_uids = [
+            str(uid) for uid in (result.get("moved_uids") or uids or []) if uid
+        ]
+        moved_count = len(moved_uids)
         if status_label is None:
             status_label = self._move_status_label(destination, moved_count)
 
+        op_type = (
+            "move_to_trash"
+            if destination == "trash"
+            else "archive"
+            if destination == "archive"
+            else "move_to_folder"
+        )
+        dest_folder = str(result.get("destination_folder") or "")
+        dest_uids = [str(uid) for uid in (result.get("destination_uids") or []) if uid]
+        if not dest_folder:
+            move_state = self._sidebar.get_move_menu_state(account_uid, source_folder)
+            if destination == "trash":
+                dest_folder = str(move_state.get("trash_folder") or "")
+            elif destination == "archive":
+                dest_folder = str(move_state.get("archive_folder") or "")
+            else:
+                dest_folder = destination
+
         if result.get("queued"):
-            self._clear_move_undo()
-            op_type = (
-                "move_to_trash"
-                if destination == "trash"
-                else "archive"
-                if destination == "archive"
-                else "move_to_folder"
-            )
+            if moved_uids or dest_uids:
+                self._register_move_undo(
+                    status_label,
+                    account_uid=account_uid,
+                    source_folder=source_folder,
+                    dest_folder=dest_folder,
+                    dest_uids=dest_uids,
+                    source_uids=moved_uids,
+                    op_type=op_type,
+                )
             self._set_status(
                 self._queued_sync_status(
                     account_uid,
@@ -7504,8 +7776,6 @@ class MainWindow(Adw.ApplicationWindow):
             self._refresh_status_display()
             return
 
-        dest_folder = result.get("destination_folder")
-        dest_uids = result.get("destination_uids") or []
         if dest_folder and dest_uids:
             self._register_move_undo(
                 status_label,
@@ -7513,6 +7783,21 @@ class MainWindow(Adw.ApplicationWindow):
                 source_folder=source_folder,
                 dest_folder=dest_folder,
                 dest_uids=dest_uids,
+                source_uids=moved_uids,
+                op_type=op_type,
+            )
+            self._set_status(f"{status_label}  ·  Ctrl+Z to undo")
+        elif moved_uids:
+            # Non-queued path without dest UIDs: still allow cancel-style undo
+            # if anything remains queued (should be rare).
+            self._register_move_undo(
+                status_label,
+                account_uid=account_uid,
+                source_folder=source_folder,
+                dest_folder=dest_folder,
+                dest_uids=[],
+                source_uids=moved_uids,
+                op_type=op_type,
             )
             self._set_status(f"{status_label}  ·  Ctrl+Z to undo")
         else:
