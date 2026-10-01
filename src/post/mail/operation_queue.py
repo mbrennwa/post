@@ -97,6 +97,47 @@ def _operations_match_for_coalesce(
     )
 
 
+def flush_lease_path(queue_id: str) -> str:
+    return os.path.join(operations_dir(), f"{queue_id}.flushing")
+
+
+def acquire_flush_lease(queue_id: str) -> None:
+    """Mark ``queue_id`` in-flight so the UI process does not coalesce into it (#503)."""
+    directory = operations_dir()
+    os.makedirs(directory, exist_ok=True)
+    path = flush_lease_path(queue_id)
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".post-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"{time.time()}\n")
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def release_flush_lease(queue_id: str) -> None:
+    try:
+        os.unlink(flush_lease_path(queue_id))
+    except FileNotFoundError:
+        pass
+
+
+def list_flush_leased_ids() -> set[str]:
+    directory = operations_dir()
+    if not os.path.isdir(directory):
+        return set()
+    leased: set[str] = set()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return set()
+    for name in names:
+        if name.endswith(".flushing"):
+            leased.add(name.removesuffix(".flushing"))
+    return leased
+
+
 def coalesce_or_enqueue_operation(
     operation: QueuedOperation,
     *,
@@ -105,8 +146,10 @@ def coalesce_or_enqueue_operation(
     """Merge into a pending same-key op, or enqueue a new one (#462).
 
     ``skip_ids`` are operations currently executing (do not merge into them).
+    Disk flush leases from the helper process are always skipped (#503).
     """
-    skip = skip_ids or frozenset()
+    skip = set(skip_ids or ())
+    skip.update(list_flush_leased_ids())
     for queue_id, existing in list_queued_operations():
         if queue_id in skip:
             continue
@@ -156,6 +199,7 @@ def remove_queued_operation(queue_id: str) -> None:
         os.unlink(path)
     except FileNotFoundError:
         pass
+    release_flush_lease(queue_id)
 
 
 def count_queued_operations() -> int:
