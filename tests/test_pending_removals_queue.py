@@ -14,7 +14,9 @@ from post.mail.operation_queue import (
     acquire_flush_lease,
     coalesce_or_enqueue_operation,
     count_queued_operations,
+    list_flush_leased_ids,
     list_queued_operations,
+    release_all_flush_leases,
     release_flush_lease,
 )
 
@@ -84,6 +86,31 @@ class FlushLeaseCoalesceTests(unittest.TestCase):
             self.assertEqual(count_queued_operations(), 2)
         finally:
             release_flush_lease(first)
+
+    def test_release_all_flush_leases_clears_stuck_leases(self) -> None:
+        first = coalesce_or_enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["1"],
+            )
+        )
+        acquire_flush_lease(first)
+        self.assertEqual(list_flush_leased_ids(), {first})
+        release_all_flush_leases()
+        self.assertEqual(list_flush_leased_ids(), set())
+        # After lease clear, a same-key op may coalesce again (#503 Phase 4).
+        second = coalesce_or_enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["2"],
+            )
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(count_queued_operations(), 1)
 
 
 class PendingRemovalMailServiceTests(unittest.TestCase):
@@ -200,7 +227,8 @@ class PendingRemovalMailServiceTests(unittest.TestCase):
             "_execute_queued_operation_unlocked",
             return_value={"moved_uids": ["a"]},
         ):
-            flushed = self.service._flush_operation_queue_unlocked("acct-1")
+            result = self.service._flush_operation_queue_unlocked("acct-1")
+        flushed = int(result.get("flushed") or 0)
         self.assertEqual(flushed, 0)
         items = list_queued_operations()
         self.assertEqual(len(items), 1)
@@ -231,9 +259,34 @@ class PendingRemovalMailServiceTests(unittest.TestCase):
             "_execute_queued_operation_unlocked",
             return_value={"moved_uids": ["gone"]},
         ):
-            flushed = self.service._flush_operation_queue_unlocked("acct-1")
-        self.assertEqual(flushed, 1)
+            result = self.service._flush_operation_queue_unlocked("acct-1")
+        self.assertEqual(int(result.get("flushed") or 0), 1)
         self.assertEqual(list_queued_operations(), [])
+        self.assertEqual(pending_removals.load_pending_uids("acct-1", "INBOX"), set())
+
+    def test_hard_flush_failure_clears_pending_keeps_op(self) -> None:
+        coalesce_or_enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["x"],
+            )
+        )
+        self.service._note_pending_local_removals("acct-1", "INBOX", ["x"])
+        self.service._flushing_queue_ids = set()
+        self.service.get_account_connect_health = (  # type: ignore[method-assign]
+            lambda _uid: "ok"
+        )
+        with mock.patch.object(
+            self.service,
+            "_execute_queued_operation_unlocked",
+            side_effect=RuntimeError("boom"),
+        ):
+            result = self.service._flush_operation_queue_unlocked("acct-1")
+        self.assertEqual(int(result.get("flushed") or 0), 0)
+        self.assertEqual(len(result.get("hard_failures") or []), 1)
+        self.assertEqual(count_queued_operations(), 1)
         self.assertEqual(pending_removals.load_pending_uids("acct-1", "INBOX"), set())
 
     def test_transfer_during_flush_treats_empty_match_as_done(self) -> None:

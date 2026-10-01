@@ -322,9 +322,9 @@ class ServiceLockReleaseTests(unittest.TestCase):
             "_execute_queued_operation_unlocked",
             side_effect=_execute,
         ):
-            flushed = service._flush_operation_queue_unlocked()
+            result = service._flush_operation_queue_unlocked()
 
-        self.assertEqual(flushed, 1)
+        self.assertEqual(int(result.get("flushed") or 0), 1)
         remaining = list_queued_operations()
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0][0], dead_id)

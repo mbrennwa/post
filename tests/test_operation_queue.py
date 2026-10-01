@@ -13,8 +13,10 @@ from post.mail.operation_queue import (
     QueuedOperation,
     count_queued_operations,
     enqueue_operation,
+    format_queued_operation_status,
     list_queued_operations,
     offline_queue_status_text,
+    operation_action_label,
     operations_dir,
     remove_queued_operation,
 )
@@ -142,3 +144,18 @@ class OperationQueueTests(unittest.TestCase):
         )
         self.assertNotEqual(first, second)
         self.assertEqual(count_queued_operations(), 2)
+
+    def test_format_queued_operation_status_names_action_and_blocker(self) -> None:
+        self.assertEqual(operation_action_label("archive"), "Archive")
+        text = format_queued_operation_status(
+            account_label="Work",
+            op_type="archive",
+            folder_name="Inbox",
+            message_count=2,
+            blocker="syncing with mail server",
+        )
+        self.assertEqual(
+            text,
+            "Queued: Archive 2 in Work/Inbox — syncing with mail server",
+        )
+        self.assertNotIn("when online", text)

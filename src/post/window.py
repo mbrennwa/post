@@ -91,7 +91,11 @@ from post.mail.search import (
     search_filter_progress_fraction,
 )
 from post.mail.search_debug import list_reader_trace, search_trace, search_trace_timer
-from post.mail.operation_queue import offline_queue_status_text
+from post.mail.operation_queue import (
+    format_queued_operation_status,
+    offline_queue_status_text,
+    queued_operations_for_account,
+)
 from post.mail.draft_queue import (
     is_queued_draft_id,
     merge_queued_drafts_into_messages,
@@ -841,16 +845,37 @@ class MainWindow(Adw.ApplicationWindow):
     def _flush_operation_queue_worker(self) -> None:
         try:
             flushed = self._mail.flush_operation_queue()
+            failures = self._mail.consume_operation_flush_hard_failures()
         except Exception:
             log.exception("Failed to flush queued mail operations")
             return
-        if flushed <= 0:
-            return
-        GLib.idle_add(self._on_operation_queue_flushed, flushed)
+        GLib.idle_add(self._on_operation_queue_flushed, flushed, failures)
 
-    def _on_operation_queue_flushed(self, flushed: int) -> bool:
+    def _on_operation_queue_flushed(
+        self,
+        flushed: int,
+        hard_failures: list[dict] | None = None,
+    ) -> bool:
+        failures = list(hard_failures or [])
+        for failure in failures:
+            account_uid = str(failure.get("account_uid") or "")
+            folder_name = str(failure.get("folder_name") or "")
+            error = str(failure.get("error") or "unknown error")
+            if account_uid and folder_name:
+                if self._suppress_sync_list_reload == (account_uid, folder_name):
+                    self._suppress_sync_list_reload = None
+                self._load_messages(account_uid, folder_name, sync=False)
+            show_error_toast(
+                self,
+                f"Could not sync queued mail action: {error}",
+            )
+        self._clear_stale_queued_status_hint()
         self._refresh_status_display()
+        if failures:
+            return False
         if flushed <= 0:
+            return False
+        if self._mail.count_queued_operations() > 0:
             return False
         if flushed == 1:
             self._set_status("Synced 1 queued action")
@@ -3157,7 +3182,75 @@ class MainWindow(Adw.ApplicationWindow):
         self._status_hint = text
         self._refresh_status_display()
 
+    def _clear_stale_queued_status_hint(self) -> None:
+        """Drop a Queued… hint once the mutation queue is empty (#491)."""
+        hint = self._status_hint or ""
+        if not hint.startswith("Queued"):
+            return
+        if self._mail.count_queued_operations() > 0:
+            return
+        self._status_hint = ""
+
+    def _account_status_label(self, account_uid: str | None) -> str:
+        if not account_uid:
+            return "account"
+        try:
+            return self._sidebar.account_display_label(account_uid)
+        except Exception:
+            try:
+                account = self._mail.get_account(account_uid)
+            except Exception:
+                return account_uid
+            return account.display_label or account.name or account_uid
+
+    def _queued_operation_blocker(self, account_uid: str | None) -> str:
+        from post.preferences import get_account_user_online
+
+        if not self._network_available:
+            return "will sync when online"
+        if account_uid is not None:
+            health = self._mail.get_account_connect_health(account_uid)
+            if health == "needs_sign_in":
+                return "will sync after you sign in"
+            if not get_account_user_online(account_uid):
+                return "will sync when that account is online"
+            transfer = self._mail.get_account_transfer_state(account_uid)
+            if transfer in {"busy", "not_responding"}:
+                return "waiting on mail server"
+        return "syncing with mail server"
+
+    def _queued_sync_status(
+        self,
+        account_uid: str | None,
+        count: int,
+        *,
+        noun: str,
+        op_type: str | None = None,
+        folder_name: str | None = None,
+    ) -> str:
+        ops = queued_operations_for_account(account_uid)
+        if not ops and account_uid is not None:
+            ops = queued_operations_for_account(None)
+        if ops:
+            head = ops[0]
+            account_uid = head.account_uid
+            op_type = head.op_type
+            folder_name = head.folder_name
+            count = max(count, len(head.message_uids) or count)
+        if op_type is None:
+            op_type = "archive" if noun == "message" else "set_seen"
+        if folder_name is None:
+            folder_name = self._current_folder or "folder"
+        return format_queued_operation_status(
+            account_label=self._account_status_label(account_uid),
+            op_type=op_type,
+            folder_name=folder_name,
+            message_count=max(1, count),
+            blocker=self._queued_operation_blocker(account_uid),
+        )
+
     def _refresh_status_display(self) -> None:
+        self._clear_stale_queued_status_hint()
         draft_queued = self._mail.count_queued_drafts()
         if not self._network_available:
             send_queued = len(list_queued_outbound_messages())
@@ -3197,6 +3290,12 @@ class MainWindow(Adw.ApplicationWindow):
                     draft_queued_count=draft_queued,
                 )
             )
+            return
+        # Prefer a live queue summary over a stale hint when ops remain (#491).
+        if self._mail.count_queued_operations() > 0 and (
+            not self._status_hint or self._status_hint.startswith("Queued")
+        ):
+            self._status.set_label(self._queued_sync_status(None, 1, noun="action"))
             return
         self._status.set_label(self._status_hint)
 
@@ -7370,26 +7469,6 @@ class MainWindow(Adw.ApplicationWindow):
             return f"Moved {moved_count} messages to {label}"
         return f"Moved message to {label}"
 
-    def _queued_sync_status(
-        self,
-        account_uid: str | None,
-        count: int,
-        *,
-        noun: str,
-    ) -> str:
-        after_sign_in = (
-            account_uid is not None
-            and self._mail.get_account_connect_health(account_uid) == "needs_sign_in"
-        )
-        when = "after you sign in" if after_sign_in else "when online"
-        if noun == "message":
-            if count == 1:
-                return f"Queued 1 message — will sync {when}"
-            return f"Queued {count} messages — will sync {when}"
-        if count == 1:
-            return f"Queued 1 action — will sync {when}"
-        return f"Queued {count} actions — will sync {when}"
-
     def _finalize_move_status_and_undo(
         self,
         account_uid: str,
@@ -7406,11 +7485,20 @@ class MainWindow(Adw.ApplicationWindow):
 
         if result.get("queued"):
             self._clear_move_undo()
+            op_type = (
+                "move_to_trash"
+                if destination == "trash"
+                else "archive"
+                if destination == "archive"
+                else "move_to_folder"
+            )
             self._set_status(
                 self._queued_sync_status(
                     account_uid,
                     moved_count,
                     noun="message",
+                    op_type=op_type,
+                    folder_name=source_folder,
                 )
             )
             self._refresh_status_display()

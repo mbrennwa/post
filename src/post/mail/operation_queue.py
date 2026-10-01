@@ -138,6 +138,12 @@ def list_flush_leased_ids() -> set[str]:
     return leased
 
 
+def release_all_flush_leases() -> None:
+    """Drop every flush lease (helper crash / respawn, #503 Phase 4)."""
+    for queue_id in list(list_flush_leased_ids()):
+        release_flush_lease(queue_id)
+
+
 def coalesce_or_enqueue_operation(
     operation: QueuedOperation,
     *,
@@ -204,6 +210,45 @@ def remove_queued_operation(queue_id: str) -> None:
 
 def count_queued_operations() -> int:
     return len(list_queued_operations())
+
+
+def operation_action_label(op_type: str) -> str:
+    """Short user-facing verb for a queued mutation (#491)."""
+    return {
+        "archive": "Archive",
+        "move_to_trash": "Trash",
+        "move_to_folder": "Move",
+        "set_seen": "Mark read",
+        "set_flagged": "Flag",
+    }.get(op_type, "Sync")
+
+
+def queued_operations_for_account(
+    account_uid: str | None = None,
+) -> list[QueuedOperation]:
+    ops = [operation for _queue_id, operation in list_queued_operations()]
+    if account_uid is None:
+        return ops
+    return [operation for operation in ops if operation.account_uid == account_uid]
+
+
+def format_queued_operation_status(
+    *,
+    account_label: str,
+    op_type: str,
+    folder_name: str,
+    message_count: int,
+    blocker: str,
+) -> str:
+    """Status bar line for a durable mutation queue item (#491 / #503)."""
+    action = operation_action_label(op_type)
+    folder = folder_name.strip() or "folder"
+    account = account_label.strip() or "account"
+    if message_count <= 1:
+        what = f"{action} in {account}/{folder}"
+    else:
+        what = f"{action} {message_count} in {account}/{folder}"
+    return f"Queued: {what} — {blocker}"
 
 
 def offline_queue_status_text(
