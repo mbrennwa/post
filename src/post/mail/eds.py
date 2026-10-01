@@ -129,6 +129,7 @@ from .operation_queue import (
     release_all_flush_leases,
     release_flush_lease,
     remove_queued_operation,
+    remove_uids_from_queued_operations,
 )
 from . import pending_removals as pending_removals_store
 from .network_errors import (
@@ -771,6 +772,13 @@ class MailService:
     _last_flush_hard_failures: list[dict[str, Any]] = field(
         default_factory=list, init=False, repr=False
     )
+    # Successful transfer flush results for move undo upgrade (#499).
+    _last_flush_undo_events: list[dict[str, Any]] = field(
+        default_factory=list, init=False, repr=False
+    )
+    _operation_flush_done: (
+        Callable[[int, list[dict[str, Any]], list[dict[str, Any]]], None] | None
+    ) = field(default=None, init=False, repr=False)
     _pending_mail_ops: int = field(default=0, init=False)
     _pending_mail_ops_cond: threading.Condition = field(
         default_factory=threading.Condition, init=False, repr=False
@@ -2267,6 +2275,19 @@ class MailService:
         """UI callback when MIME classify updates the paperclip flag (#417)."""
         self._visible_attachments_changed = callback
 
+    def set_operation_flush_done_callback(
+        self,
+        callback: (
+            Callable[[int, list[dict[str, Any]], list[dict[str, Any]]], None]
+            | None
+        ),
+    ) -> None:
+        """UI callback after an operation-queue flush (interactive or background, #499).
+
+        Args are ``(flushed_count, hard_failures, undo_events)``.
+        """
+        self._operation_flush_done = callback
+
     def get_account_connect_health(self, account_uid: str) -> AccountConnectHealth:
         with self._lock:
             return self._account_connect_health.get(account_uid, "ok")
@@ -3419,6 +3440,7 @@ class MailService:
         against the UI process Evolution dirs.
         """
         self._last_flush_hard_failures = []
+        self._last_flush_undo_events = []
         if camel_helpers_enabled():
             accounts = sorted(
                 {
@@ -3435,9 +3457,12 @@ class MailService:
                         [account_uid],
                         timeout=helper_timeout,
                     )
-                    count, failures = self._normalize_flush_operation_result(result)
+                    count, failures, undo_events = (
+                        self._normalize_flush_operation_result(result)
+                    )
                     flushed += count
                     self._last_flush_hard_failures.extend(failures)
+                    self._last_flush_undo_events.extend(undo_events)
                 except Exception:
                     log.exception(
                         "Failed to flush operation queue via helper for %s",
@@ -3445,13 +3470,16 @@ class MailService:
                     )
             # Helper cleared durable pending on disk; refresh UI RAM (#503).
             self._reload_pending_local_removals_from_disk()
+            self._notify_operation_flush_done(flushed)
             return flushed
         if is_mail_io_thread():
             result = self._flush_operation_queue_unlocked()
         else:
             result = get_mail_io_thread().run_sync(self._flush_operation_queue_unlocked)
-        count, failures = self._normalize_flush_operation_result(result)
+        count, failures, undo_events = self._normalize_flush_operation_result(result)
         self._last_flush_hard_failures.extend(failures)
+        self._last_flush_undo_events.extend(undo_events)
+        self._notify_operation_flush_done(count)
         return count
 
     def flush_account_operation_queue(self, account_uid: str) -> dict[str, Any]:
@@ -3465,21 +3493,45 @@ class MailService:
     @staticmethod
     def _normalize_flush_operation_result(
         result: Any,
-    ) -> tuple[int, list[dict[str, Any]]]:
+    ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
         if isinstance(result, dict):
             failures = result.get("hard_failures") or []
             if not isinstance(failures, list):
                 failures = []
-            return int(result.get("flushed") or 0), [
-                item for item in failures if isinstance(item, dict)
-            ]
-        return int(result or 0), []
+            undo_events = result.get("undo_events") or []
+            if not isinstance(undo_events, list):
+                undo_events = []
+            return (
+                int(result.get("flushed") or 0),
+                [item for item in failures if isinstance(item, dict)],
+                [item for item in undo_events if isinstance(item, dict)],
+            )
+        return int(result or 0), [], []
 
     def consume_operation_flush_hard_failures(self) -> list[dict[str, Any]]:
         """Return and clear hard failures from the last flush (#503)."""
         failures = list(self._last_flush_hard_failures)
         self._last_flush_hard_failures = []
         return failures
+
+    def consume_operation_flush_undo_events(self) -> list[dict[str, Any]]:
+        """Return and clear transfer undo events from the last flush (#499)."""
+        events = list(self._last_flush_undo_events)
+        self._last_flush_undo_events = []
+        return events
+
+    def _notify_operation_flush_done(self, flushed: int) -> None:
+        callback = self._operation_flush_done
+        if callback is None:
+            return
+        failures = list(self._last_flush_hard_failures)
+        undo_events = list(self._last_flush_undo_events)
+        try:
+            from gi.repository import GLib
+
+            GLib.idle_add(callback, flushed, failures, undo_events)
+        except Exception:
+            log.debug("operation flush done callback failed", exc_info=True)
 
     def schedule_operation_queue_flush(
         self, account_uid: str | None = None
@@ -3492,14 +3544,25 @@ class MailService:
             self._operation_flush_scheduled = True
 
         def worker() -> None:
+            flushed = 0
+            had_hard_failures = False
             try:
-                self.flush_operation_queue()
+                flushed = self.flush_operation_queue()
+                # Read before the UI idle callback consumes the stash (#499).
+                had_hard_failures = bool(self._last_flush_hard_failures)
             except Exception:
                 log.exception("Background operation-queue flush failed")
             finally:
                 with self._operation_flush_lock:
                     self._operation_flush_scheduled = False
-                if count_queued_operations() > 0:
+                # Continue only after real progress. Immediate retry after a
+                # hard failure or offline defer spammed error toasts once
+                # background flush started notifying the UI (#499).
+                if (
+                    count_queued_operations() > 0
+                    and flushed > 0
+                    and not had_hard_failures
+                ):
                     self.schedule_operation_queue_flush()
 
         self.submit_background("flush_operation_queue", worker)
@@ -3969,6 +4032,7 @@ class MailService:
     ) -> dict[str, Any]:
         flushed = 0
         hard_failures: list[dict[str, Any]] = []
+        undo_events: list[dict[str, Any]] = []
         skip_accounts: set[str] = set()
         self._flushing_operation_queue = True
         try:
@@ -3980,6 +4044,22 @@ class MailService:
                 if self.get_account_connect_health(operation.account_uid) == (
                     "needs_sign_in"
                 ):
+                    skip_accounts.add(operation.account_uid)
+                    continue
+                if not self._network_available:
+                    log.warning(
+                        "Queued operation %s (%s) deferred: network unavailable",
+                        queue_id,
+                        operation.op_type,
+                    )
+                    break
+                if not get_account_user_online(operation.account_uid):
+                    log.warning(
+                        "Queued operation %s (%s) deferred: account offline (%s)",
+                        queue_id,
+                        operation.op_type,
+                        operation.account_uid,
+                    )
                     skip_accounts.add(operation.account_uid)
                     continue
                 self._flushing_queue_ids.add(queue_id)
@@ -4080,6 +4160,23 @@ class MailService:
                                 operation.folder_name,
                                 moved,
                             )
+                            dest_folder = (result or {}).get("destination_folder")
+                            dest_uids = [
+                                str(uid)
+                                for uid in (result or {}).get("destination_uids")
+                                or []
+                                if uid
+                            ]
+                            undo_events.append(
+                                {
+                                    "account_uid": operation.account_uid,
+                                    "source_folder": operation.folder_name,
+                                    "moved_uids": moved,
+                                    "destination_folder": dest_folder,
+                                    "destination_uids": dest_uids,
+                                    "op_type": operation.op_type,
+                                }
+                            )
                         if remaining:
                             # Partial soft-succeed: keep the remainder queued (#503).
                             log.warning(
@@ -4102,7 +4199,11 @@ class MailService:
                     release_flush_lease(queue_id)
         finally:
             self._flushing_operation_queue = False
-        return {"flushed": flushed, "hard_failures": hard_failures}
+        return {
+            "flushed": flushed,
+            "hard_failures": hard_failures,
+            "undo_events": undo_events,
+        }
 
     def _flush_draft_queue_unlocked(self) -> int:
         flushed = 0
@@ -10439,6 +10540,118 @@ class MailService:
             message_uids,
         )
 
+    def move_messages_immediate(
+        self,
+        account_uid: str,
+        source_folder: str,
+        destination_folder: str,
+        message_uids: list[str],
+    ) -> dict[str, Any]:
+        """Execute a real MOVE without local-first queueing (#499 undo)."""
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "move_messages_immediate",
+                account_uid,
+                [account_uid, source_folder, destination_folder, message_uids],
+                timeout=180.0,
+            )
+            return result if isinstance(result, dict) else {}
+        return run_on_mail_thread(
+            self._move_messages_unlocked,
+            account_uid,
+            source_folder,
+            destination_folder,
+            message_uids,
+        )
+
+    def cancel_queued_transfers(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+    ) -> dict[str, Any]:
+        """Cancel unflushed transfer UIDs and restore them to the folder index (#499)."""
+        uids = [str(uid) for uid in message_uids if uid]
+        if not uids:
+            return {
+                "cancelled_uids": [],
+                "in_flight_uids": [],
+                "source_folder_unread": -1,
+                "source_folder_total": -1,
+            }
+        stripped = remove_uids_from_queued_operations(
+            account_uid,
+            folder_name,
+            uids,
+            skip_ids=set(self._flushing_queue_ids),
+        )
+        cancelled = list(stripped.get("cancelled_uids") or [])
+        in_flight = list(stripped.get("in_flight_uids") or [])
+        if not cancelled:
+            return {
+                "cancelled_uids": [],
+                "in_flight_uids": in_flight,
+                "source_folder_unread": -1,
+                "source_folder_total": -1,
+            }
+        self._clear_pending_local_removals(account_uid, folder_name, cancelled)
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "restore_cancelled_transfer_messages",
+                account_uid,
+                [account_uid, folder_name, cancelled],
+                timeout=60.0,
+            )
+            restored = result if isinstance(result, dict) else {}
+            # Mirror helper folder-index onto this process so list reload works.
+            messages = list(restored.get("messages") or [])
+            unread = int(restored.get("source_folder_unread") or -1)
+            total = int(restored.get("source_folder_total") or -1)
+            if messages or unread >= 0 or total >= 0:
+                self._apply_restored_folder_messages(
+                    account_uid, folder_name, messages, unread=unread, total=total
+                )
+            return {
+                "cancelled_uids": cancelled,
+                "in_flight_uids": in_flight,
+                "source_folder_unread": unread,
+                "source_folder_total": total,
+            }
+        restored = run_on_mail_thread(
+            self._restore_cancelled_transfer_messages_unlocked,
+            account_uid,
+            folder_name,
+            cancelled,
+        )
+        return {
+            "cancelled_uids": cancelled,
+            "in_flight_uids": in_flight,
+            "source_folder_unread": int(
+                (restored or {}).get("source_folder_unread") or -1
+            ),
+            "source_folder_total": int(
+                (restored or {}).get("source_folder_total") or -1
+            ),
+        }
+
+    def restore_cancelled_transfer_messages(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+    ) -> dict[str, Any]:
+        """Helper entry: rebuild cancelled UIDs into the folder index from Camel."""
+        if is_mail_io_thread():
+            return self._restore_cancelled_transfer_messages_unlocked(
+                account_uid, folder_name, message_uids
+            )
+        return get_mail_io_thread().run_sync(
+            self._restore_cancelled_transfer_messages_unlocked,
+            account_uid,
+            folder_name,
+            message_uids,
+        )
+
     def mark_message_read(
         self, account_uid: str, folder_name: str, message_uid: str
     ) -> tuple[int, int]:
@@ -11671,6 +11884,159 @@ class MailService:
             self._pending_local_removals[key] = set(remaining)
         else:
             self._pending_local_removals.pop(key, None)
+
+    def _restore_cancelled_transfer_messages_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uids: list[str],
+    ) -> dict[str, Any]:
+        """Re-insert cancelled UIDs into the folder index from Camel (#499)."""
+        self._reload_pending_local_removals_from_disk()
+        uids = [str(uid) for uid in message_uids if uid]
+        if not uids:
+            return {
+                "messages": [],
+                "source_folder_unread": -1,
+                "source_folder_total": -1,
+            }
+        folder = self._require_folder_unlocked(account_uid, folder_name)
+        backend = self._backend_for_account(account_uid)
+        restored = self._message_dicts_for_uids_unlocked(
+            folder, uids, backend=backend or None
+        )
+        unread, total = self._merge_restored_messages_into_folder_cache_unlocked(
+            account_uid, folder_name, restored
+        )
+        return {
+            "messages": restored,
+            "source_folder_unread": unread,
+            "source_folder_total": total,
+        }
+
+    def _merge_restored_messages_into_folder_cache_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        messages: list[dict[str, Any]],
+    ) -> tuple[int, int]:
+        if not messages:
+            index = self._folder_indexes.get((account_uid, folder_name))
+            if index is None:
+                cached = folder_index_cache.load(account_uid, folder_name)
+                if cached is None:
+                    return -1, -1
+                return int(cached[1]), int(cached[2])
+            return index.unread, index.total
+
+        key = (account_uid, folder_name)
+        index = self._folder_indexes.get(key)
+        if index is None:
+            cached = folder_index_cache.load(account_uid, folder_name)
+            if cached is not None:
+                existing, unread, total = cached
+                index = _FolderMessageIndex(
+                    messages=list(existing),
+                    unread=unread,
+                    total=total,
+                )
+            else:
+                index = _FolderMessageIndex(messages=[], unread=0, total=0)
+            self._store_folder_index(account_uid, folder_name, index)
+
+        existing_uids = {
+            str(message.get("uid") or "")
+            for message in index.messages
+            if message.get("uid")
+        }
+        added = [
+            message
+            for message in messages
+            if str(message.get("uid") or "")
+            and str(message.get("uid") or "") not in existing_uids
+        ]
+        if added:
+            index.messages = list(added) + list(index.messages)
+            added_unread = sum(
+                1
+                for message in added
+                if not (message.get("flags") or {}).get("seen", False)
+            )
+            if index.unread >= 0:
+                index.unread += added_unread
+            if index.total >= 0:
+                index.total += len(added)
+            else:
+                index.total = len(index.messages)
+        folder_index_cache.save(
+            account_uid,
+            folder_name,
+            index.messages,
+            index.unread,
+            index.total,
+        )
+        return index.unread, index.total
+
+    def _apply_restored_folder_messages(
+        self,
+        account_uid: str,
+        folder_name: str,
+        messages: list[dict[str, Any]],
+        *,
+        unread: int,
+        total: int,
+    ) -> None:
+        """Apply helper-restored rows onto the UI-process folder index (#499)."""
+        key = (account_uid, folder_name)
+        index = self._folder_indexes.get(key)
+        if index is None:
+            cached = folder_index_cache.load(account_uid, folder_name)
+            if cached is not None:
+                existing, cached_unread, cached_total = cached
+                index = _FolderMessageIndex(
+                    messages=list(existing),
+                    unread=cached_unread,
+                    total=cached_total,
+                )
+            else:
+                index = _FolderMessageIndex(messages=[], unread=0, total=0)
+        existing_uids = {
+            str(message.get("uid") or "")
+            for message in index.messages
+            if message.get("uid")
+        }
+        added = [
+            message
+            for message in messages
+            if str(message.get("uid") or "")
+            and str(message.get("uid") or "") not in existing_uids
+        ]
+        if added:
+            index.messages = list(added) + list(index.messages)
+        if unread >= 0:
+            index.unread = unread
+        elif added:
+            index.unread = max(
+                0,
+                (index.unread if index.unread >= 0 else 0)
+                + sum(
+                    1
+                    for message in added
+                    if not (message.get("flags") or {}).get("seen", False)
+                ),
+            )
+        if total >= 0:
+            index.total = total
+        else:
+            index.total = len(index.messages)
+        self._store_folder_index(account_uid, folder_name, index)
+        folder_index_cache.save(
+            account_uid,
+            folder_name,
+            index.messages,
+            index.unread,
+            index.total,
+        )
 
     def _filter_pending_local_removals(
         self,

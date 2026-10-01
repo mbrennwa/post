@@ -208,6 +208,65 @@ def remove_queued_operation(queue_id: str) -> None:
     release_flush_lease(queue_id)
 
 
+def remove_uids_from_queued_operations(
+    account_uid: str,
+    folder_name: str,
+    message_uids: list[str],
+    *,
+    op_types: frozenset[str] | set[str] | None = None,
+    skip_ids: set[str] | frozenset[str] | None = None,
+) -> dict[str, list[str]]:
+    """Strip UIDs from matching transfer ops for undo (#499).
+
+    Ops under ``skip_ids`` or a disk flush lease are left alone (in flight).
+    Empty ops are deleted. Returns ``cancelled_uids`` and ``in_flight_uids``.
+    """
+    wanted = {str(uid) for uid in message_uids if uid}
+    if not wanted:
+        return {"cancelled_uids": [], "in_flight_uids": []}
+
+    transfer_types = op_types or frozenset(
+        {"archive", "move_to_trash", "move_to_folder"}
+    )
+    skip = set(skip_ids or ())
+    skip.update(list_flush_leased_ids())
+
+    cancelled: list[str] = []
+    cancelled_seen: set[str] = set()
+    in_flight: list[str] = []
+    in_flight_seen: set[str] = set()
+
+    for queue_id, operation in list_queued_operations():
+        if operation.account_uid != account_uid:
+            continue
+        if operation.folder_name != folder_name:
+            continue
+        if operation.op_type not in transfer_types:
+            continue
+        overlap = [uid for uid in operation.message_uids if uid in wanted]
+        if not overlap:
+            continue
+        if queue_id in skip:
+            for uid in overlap:
+                if uid not in in_flight_seen:
+                    in_flight_seen.add(uid)
+                    in_flight.append(uid)
+            continue
+        remaining = [uid for uid in operation.message_uids if uid not in wanted]
+        for uid in overlap:
+            if uid not in cancelled_seen:
+                cancelled_seen.add(uid)
+                cancelled.append(uid)
+        if remaining:
+            operation.message_uids = remaining
+            enqueue_operation(operation, queue_id=queue_id)
+        else:
+            remove_queued_operation(queue_id)
+
+    # UIDs never found in the queue are treated as already gone / flushed.
+    return {"cancelled_uids": cancelled, "in_flight_uids": in_flight}
+
+
 def count_queued_operations() -> int:
     return len(list_queued_operations())
 

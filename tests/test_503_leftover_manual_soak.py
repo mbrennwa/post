@@ -163,6 +163,7 @@ class HardFlushFailManualChecks(unittest.TestCase):
         win = MainWindow.__new__(MainWindow)
         win._suppress_sync_list_reload = ("acct-1", "INBOX")
         win._status_hint = "Queued: Archive in Work/INBOX — syncing with mail server"
+        win._pending_move_undo = None
         win._mail = mock.Mock()
         win._mail.count_queued_operations.return_value = 1
         win._status = mock.Mock()
@@ -173,6 +174,7 @@ class HardFlushFailManualChecks(unittest.TestCase):
 
         win._load_messages = _load  # type: ignore[method-assign]
         win._refresh_status_display = mock.Mock()  # type: ignore[method-assign]
+        win._clear_stale_queued_status_hint = mock.Mock()  # type: ignore[method-assign]
         with mock.patch("post.window.show_error_toast") as toast:
             MainWindow._on_operation_queue_flushed(
                 win,

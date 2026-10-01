@@ -145,6 +145,48 @@ class OperationQueueTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertEqual(count_queued_operations(), 2)
 
+    def test_remove_uids_from_queued_operations(self) -> None:
+        from post.mail.operation_queue import (
+            acquire_flush_lease,
+            remove_uids_from_queued_operations,
+        )
+
+        queue_id = enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["1", "2", "3"],
+            )
+        )
+        result = remove_uids_from_queued_operations(
+            "acct-1", "INBOX", ["2", "9"]
+        )
+        self.assertEqual(result["cancelled_uids"], ["2"])
+        self.assertEqual(result["in_flight_uids"], [])
+        items = list_queued_operations()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0][1].message_uids, ["1", "3"])
+
+        acquire_flush_lease(queue_id)
+        blocked = remove_uids_from_queued_operations(
+            "acct-1", "INBOX", ["1", "3"]
+        )
+        self.assertEqual(blocked["cancelled_uids"], [])
+        self.assertEqual(set(blocked["in_flight_uids"]), {"1", "3"})
+        self.assertEqual(
+            list_queued_operations()[0][1].message_uids, ["1", "3"]
+        )
+
+        from post.mail.operation_queue import release_flush_lease
+
+        release_flush_lease(queue_id)
+        emptied = remove_uids_from_queued_operations(
+            "acct-1", "INBOX", ["1", "3"]
+        )
+        self.assertEqual(set(emptied["cancelled_uids"]), {"1", "3"})
+        self.assertEqual(list_queued_operations(), [])
+
     def test_format_queued_operation_status_names_action_and_blocker(self) -> None:
         self.assertEqual(operation_action_label("archive"), "Archive")
         text = format_queued_operation_status(
