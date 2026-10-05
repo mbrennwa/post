@@ -76,7 +76,7 @@ class MessageListItem(GObject.Object):
         msg = self.message
         if not isinstance(msg, dict):
             return ""
-        row_key = msg.get("_search_row_key")
+        row_key = msg.get("_search_row_key") or msg.get("_message_id")
         if row_key:
             return str(row_key)
         return str(msg.get("uid") or "")
@@ -282,11 +282,23 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         ]
         if not items:
             return
+        selected_keys = self.get_selected_uids()
         at_top = self._is_scrolled_to_top()
         self._folder_name = folder_name
-        self._store.splice(0, 0, items)
-        # Prepend shifts every index; full rebuild is simplest and uncommon.
-        self._rebuild_list_key_positions()
+        restoring = self._restoring_selection
+        self._restoring_selection = True
+        try:
+            self._store.splice(0, 0, items)
+            # Prepend shifts every index; full rebuild is simplest and uncommon.
+            self._rebuild_list_key_positions()
+            if selected_keys:
+                self._selection.unselect_all()
+                for key in selected_keys:
+                    position = self._list_key_positions.get(key)
+                    if position is not None:
+                        self._selection.select_item(position, False)
+        finally:
+            self._restoring_selection = restoring
         if at_top:
             self._scroll_to_top_after_layout()
 
@@ -316,24 +328,41 @@ class VirtualMessageList(Gtk.ScrolledWindow):
         *,
         folder_name: str,
     ) -> None:
-        """Insert rows by ``sort_date`` (newest on top) without rebinding the list."""
+        """Insert rows by ``sort_date`` (newest on top) without rebinding the list.
+
+        Gtk selection is position-based; capture MessageId keys before splice and
+        re-select them afterward so streaming search cannot move the highlight onto
+        a different mail (#509).
+        """
         items = [
             MessageListItem(_copy_message_for_list(message)) for message in messages
         ]
         if not items:
             return
+        selected_keys = self.get_selected_uids()
         at_top = self._is_scrolled_to_top()
         self._folder_name = folder_name
         inserted_at_top = False
-        for item in items:
-            message = item.message
-            if not isinstance(message, dict):
-                continue
-            position = self._newest_first_insert_index(message)
-            if position == 0:
-                inserted_at_top = True
-            self._store.splice(position, 0, [item])
-        self._rebuild_list_key_positions()
+        restoring = self._restoring_selection
+        self._restoring_selection = True
+        try:
+            for item in items:
+                message = item.message
+                if not isinstance(message, dict):
+                    continue
+                position = self._newest_first_insert_index(message)
+                if position == 0:
+                    inserted_at_top = True
+                self._store.splice(position, 0, [item])
+            self._rebuild_list_key_positions()
+            if selected_keys:
+                self._selection.unselect_all()
+                for key in selected_keys:
+                    position = self._list_key_positions.get(key)
+                    if position is not None:
+                        self._selection.select_item(position, False)
+        finally:
+            self._restoring_selection = restoring
         if at_top and inserted_at_top:
             self._scroll_to_top_after_layout()
 

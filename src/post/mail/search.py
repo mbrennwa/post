@@ -66,7 +66,10 @@ def annotate_search_match(
     annotated = dict(message)
     annotated["_search_account_uid"] = account_uid
     annotated["_search_folder"] = folder_name
-    annotated["_search_row_key"] = make_search_row_key(account_uid, folder_name, uid)
+    row_key = make_search_row_key(account_uid, folder_name, uid)
+    annotated["_search_row_key"] = row_key
+    # Same encoding as folder MessageId keys (#509).
+    annotated["_message_id"] = row_key
     return annotated
 
 

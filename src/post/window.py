@@ -74,6 +74,15 @@ from post.mail.message_list_state import (
     prepended_message_count,
 )
 from post.mail.message_flags import FOLLOW_UP_FLAG_BACKENDS
+from post.mail.message_id import (
+    MessageId,
+    annotate_message_id,
+    body_matches_message_id,
+    format_message_id,
+    message_id_from_message,
+    message_list_key,
+    parse_message_id,
+)
 from post.mail.search import (
     MessageSearchQuery,
     SearchFilterProgress,
@@ -343,8 +352,11 @@ class MainWindow(Adw.ApplicationWindow):
         self._open_folder_poll_timer_id: int | None = None
         self._current_account: MailAccount | None = None
         self._current_folder: str | None = None
+        # Authoritative Selected MessageId key (NUL-separated); never a bare guess.
         self._current_message_uid: str | None = None
         self._current_message: dict | None = None
+        # MessageId key of the body currently shown in the reader (#509).
+        self._displayed_message_id: str | None = None
         self._messages_load_generation = 0
         self._message_read_generation = 0
         self._pending_message_read_uid: str | None = None
@@ -3455,32 +3467,28 @@ class MainWindow(Adw.ApplicationWindow):
         return self._search_scope.kind != SEARCH_SCOPE_FOLDER
 
     def _message_list_key(self, message: dict) -> str:
-        row_key = message.get("_search_row_key")
-        if row_key:
-            return str(row_key)
-        return str(message.get("uid") or "")
+        return message_list_key(message)
 
-    def _reader_shows_list_key(self, list_key: str) -> bool:
-        """True when the reader pane is displaying the message for ``list_key``."""
-        if self._current_message is None:
-            return False
-        if parse_search_row_key(list_key) is not None:
-            return self._message_list_key(self._current_message) == list_key
+    def _message_id_key_for_list_key(self, list_key: str | None) -> str | None:
+        """Normalize a list key (composite or bare uid) to a MessageId key."""
+        if not list_key:
+            return None
+        parsed = parse_message_id(list_key)
+        if parsed is not None:
+            return format_message_id(*parsed)
         location = self._message_location_for_list_key(list_key)
         if location is None:
+            return None
+        return format_message_id(*location)
+
+    def _reader_shows_list_key(self, list_key: str) -> bool:
+        """True when the reader is displaying the Selected MessageId ``list_key``."""
+        if self._current_message is None or self._displayed_message_id is None:
             return False
-        expected_account, expected_folder, expected_uid = location
-        message_uid = str(self._current_message.get("uid") or "")
-        if message_uid != expected_uid:
+        expected = self._message_id_key_for_list_key(list_key)
+        if expected is None:
             return False
-        loaded_location = self._loaded_message_source_location()
-        if loaded_location is None:
-            return False
-        loaded_account, loaded_folder = loaded_location
-        return (
-            loaded_account == expected_account
-            and loaded_folder == expected_folder
-        )
+        return self._displayed_message_id == expected
 
     def _loaded_message_source_location(self) -> tuple[str, str] | None:
         """Account/folder the loaded reader body was fetched from, if known."""
@@ -3498,21 +3506,33 @@ class MainWindow(Adw.ApplicationWindow):
         return None
 
     def _annotate_message_search_context(self, msg: dict, list_key: str) -> dict:
-        """Copy search row metadata onto a loaded body for reader/list sync."""
-        if parse_search_row_key(list_key) is None:
+        """Copy search row metadata onto a loaded body that matches ``list_key``."""
+        location = self._message_location_for_list_key(list_key)
+        if location is None:
+            return msg
+        account_uid, folder_name, message_uid = location
+        loaded_uid = str(msg.get("uid") or "")
+        previous_uid = str(msg.get("_previous_uid") or "")
+        if loaded_uid != message_uid and previous_uid != message_uid:
+            # Never stamp Selected's identity onto a different body (#509).
+            return msg
+        if parse_search_row_key(list_key) is None and not msg.get("_search_row_key"):
             return msg
         if self._current_folder_messages:
             for message in self._current_folder_messages:
                 if self._message_list_key(message) == list_key:
                     annotated = dict(msg)
-                    for key in ("_search_account_uid", "_search_folder", "_search_row_key"):
+                    for key in (
+                        "_search_account_uid",
+                        "_search_folder",
+                        "_search_row_key",
+                        "_message_id",
+                    ):
                         if message.get(key):
                             annotated[key] = message[key]
                     return annotated
-        parsed = parse_search_row_key(list_key)
-        if parsed is None:
+        if parse_search_row_key(list_key) is None:
             return msg
-        account_uid, folder_name, _message_uid = parsed
         return annotate_search_match(
             msg,
             account_uid=account_uid,
@@ -3522,16 +3542,91 @@ class MainWindow(Adw.ApplicationWindow):
     def _annotate_message_reader_context(self, msg: dict, list_key: str) -> dict:
         """Tag loaded bodies with list/search source so reader/list stay in sync."""
         annotated = self._annotate_message_search_context(msg, list_key)
-        if parse_search_row_key(list_key) is not None:
-            return annotated
         location = self._message_location_for_list_key(list_key)
         if location is None:
             return annotated
-        account_uid, folder_name, _message_uid = location
+        account_uid, folder_name, message_uid = location
+        loaded_uid = str(annotated.get("uid") or "")
+        previous_uid = str(annotated.get("_previous_uid") or "")
+        if loaded_uid != message_uid and previous_uid != message_uid:
+            return annotated
         tagged = dict(annotated)
         tagged["_list_account_uid"] = account_uid
         tagged["_list_folder"] = folder_name
+        tagged["_message_id"] = format_message_id(account_uid, folder_name, loaded_uid or message_uid)
         return tagged
+
+    def _set_selected_message(
+        self,
+        list_key: str | None,
+        *,
+        mark_seen: bool,
+        sync_list_selection: bool = False,
+    ) -> None:
+        """Set the authoritative Selected MessageId and load the reader for it.
+
+        List highlight and reader content both follow this identity (#509).
+        """
+        if list_key is None:
+            self._current_message_uid = None
+            self._current_message = None
+            self._displayed_message_id = None
+            self._mark_seen_intent_list_key = None
+            self._pending_message_read_uid = None
+            return
+
+        message_id_key = self._message_id_key_for_list_key(list_key)
+        if message_id_key is None:
+            return
+        # Prefer the list row's native key (composite MessageId or bare uid).
+        list_row = self._message_list_view.get_message(list_key)
+        if list_row is None and message_id_key != list_key:
+            list_row = self._message_list_view.get_message(message_id_key)
+        if list_row is not None:
+            selected_key = self._message_list_key(list_row) or list_key
+        elif parse_message_id(list_key) is not None:
+            selected_key = list_key
+        else:
+            selected_key = message_id_key
+
+        if sync_list_selection:
+            selected = self._message_list_view.get_selected_uids()
+            if len(selected) != 1 or (
+                selected[0] != list_key and selected[0] != selected_key
+            ):
+                if not self._message_list_view.select_uid(selected_key):
+                    self._message_list_view.select_uid(list_key)
+
+        if (
+            self._message_id_key_for_list_key(self._current_message_uid)
+            == message_id_key
+            and self._reader_shows_list_key(selected_key)
+        ):
+            if mark_seen:
+                self._mark_message_read_on_click_if_unread(selected_key)
+            return
+
+        if (
+            self._message_id_key_for_list_key(self._mark_seen_intent_list_key)
+            == message_id_key
+            and self._message_id_key_for_list_key(self._pending_message_read_uid)
+            == message_id_key
+        ):
+            # Click load already in flight for this MessageId (#388).
+            # Do not bump generation with a mark_seen=False reconcile/selection pass.
+            self._current_message_uid = selected_key
+            return
+
+        if mark_seen and self._mark_seen_when_reading_uid(selected_key):
+            self._mark_seen_intent_list_key = selected_key
+        elif (
+            self._message_id_key_for_list_key(self._mark_seen_intent_list_key)
+            != message_id_key
+        ):
+            self._mark_seen_intent_list_key = None
+
+        self._current_message_uid = selected_key
+        self._load_message_body_for_uid(selected_key, mark_seen=mark_seen)
 
     def _ensure_reader_matches_selection(self, *, mark_seen: bool | None = None) -> None:
         if self._message_list_view.is_restoring_selection():
@@ -3544,18 +3639,9 @@ class MainWindow(Adw.ApplicationWindow):
         if len(selected) != 1:
             return
         uid = selected[0]
-        if uid == self._current_message_uid and self._reader_shows_list_key(uid):
-            return
-        if (
-            uid == self._mark_seen_intent_list_key
-            and self._pending_message_read_uid == uid
-        ):
-            # Click load already in flight for this key — do not bump generation (#388).
-            return
         if mark_seen is None:
             mark_seen = self._mark_seen_when_reading_uid(uid)
-        self._current_message_uid = uid
-        self._load_message_body_for_uid(uid, mark_seen=mark_seen)
+        self._set_selected_message(uid, mark_seen=mark_seen)
 
     def _message_location_for_list_key(
         self, list_key: str
@@ -3938,6 +4024,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _show_message_unavailable_reader(self, message: str) -> None:
         self._current_message = None
+        self._displayed_message_id = None
         self._reader_pane.show_unavailable(message, dark=self._app_prefers_dark())
 
     def _remove_vanished_message(self, uid: str) -> None:
@@ -3946,8 +4033,14 @@ class MainWindow(Adw.ApplicationWindow):
 
         folder_name = self._current_folder
         removed = self._message_list_view.remove_uids([uid])
-        if uid == self._current_message_uid:
+        if (
+            uid == self._current_message_uid
+            or self._message_id_key_for_list_key(uid)
+            == self._message_id_key_for_list_key(self._current_message_uid)
+        ):
             self._current_message_uid = None
+            self._current_message = None
+            self._displayed_message_id = None
             set_active_message_uid(None)
             self._restore_message_folder = None
 
@@ -3977,6 +4070,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._mark_seen_intent_list_key = None
         self._current_message_uid = None
         self._current_message = None
+        self._displayed_message_id = None
         self._reader_pane.clear()
         self._update_message_toolbar()
         GLib.idle_add(self._reload_reader_for_selection_if_needed)
@@ -4234,6 +4328,33 @@ class MainWindow(Adw.ApplicationWindow):
             if row is not None:
                 self._upsert_message_in_folder_cache(dict(row), None)
 
+    def _messages_with_folder_message_ids(
+        self,
+        messages: list[dict],
+        folder_name: str,
+        *,
+        account: MailAccount | None = None,
+    ) -> list[dict]:
+        """Ensure folder rows carry a canonical MessageId (#509)."""
+        account_uid = account.uid if account is not None else (
+            self._current_account.uid if self._current_account is not None else None
+        )
+        if not account_uid or not folder_name:
+            return messages
+        annotated: list[dict] = []
+        for message in messages:
+            if message.get("_search_row_key") or message.get("_message_id"):
+                annotated.append(message)
+            else:
+                annotated.append(
+                    annotate_message_id(
+                        message,
+                        account_uid=account_uid,
+                        folder_name=folder_name,
+                    )
+                )
+        return annotated
+
     def _apply_folder_messages(
         self,
         messages: list[dict],
@@ -4241,6 +4362,9 @@ class MainWindow(Adw.ApplicationWindow):
         *,
         account: MailAccount | None = None,
     ) -> None:
+        messages = self._messages_with_folder_message_ids(
+            messages, folder_name, account=account
+        )
         self._message_list_view.set_messages(messages, folder_name=folder_name)
         if account is not None:
             self._update_message_status(account, folder_name)
@@ -4252,6 +4376,9 @@ class MainWindow(Adw.ApplicationWindow):
         *,
         account: MailAccount | None = None,
     ) -> None:
+        prepended = self._messages_with_folder_message_ids(
+            prepended, folder_name, account=account
+        )
         self._message_list_view.prepend_messages(prepended, folder_name=folder_name)
         if account is not None:
             self._update_message_status(account, folder_name)
@@ -4269,6 +4396,14 @@ class MainWindow(Adw.ApplicationWindow):
         # Keep full ``messages`` in ``_current_folder_messages``; only bind an
         # initial prefix into Gtk.ListView so huge folders do not freeze the
         # main thread. More rows append when the user scrolls near the end (#208).
+        if self._search_query is None:
+            messages = self._messages_with_folder_message_ids(
+                messages, folder_name, account=account
+            )
+            if self._current_folder_messages is not None:
+                self._current_folder_messages = self._messages_with_folder_message_ids(
+                    self._current_folder_messages, folder_name, account=account
+                )
         bind_messages = messages[:MESSAGE_LIST_UI_BIND_CAP]
         self._message_list_bound_count = len(bind_messages)
         # Prefetch only bound rows — walking 18k Archive headers on open stalls
@@ -4294,6 +4429,9 @@ class MainWindow(Adw.ApplicationWindow):
             next_offset = offset + batch_size
             batch = bind_messages[offset:next_offset]
             if batch:
+                batch = self._messages_with_folder_message_ids(
+                    batch, folder_name, account=account
+                )
                 self._message_list_view.append_messages(batch, folder_name=folder_name)
             if next_offset < len(bind_messages):
                 GLib.idle_add(append_batches, next_offset)
@@ -4328,6 +4466,9 @@ class MainWindow(Adw.ApplicationWindow):
         more = messages[already : already + MESSAGE_LIST_UI_BIND_MORE]
         if not more:
             return
+        more = self._messages_with_folder_message_ids(
+            more, folder_name, account=account
+        )
         self._message_list_view.append_messages(more, folder_name=folder_name)
         self._message_list_bound_count = already + len(more)
         if is_heavy_folder_name(folder_name):
@@ -5147,12 +5288,6 @@ class MainWindow(Adw.ApplicationWindow):
         if account is None or folder_name is None:
             return False
 
-        first_batch = not self._search_results_streamed
-        self._search_results_streamed = True
-        if first_batch:
-            self._update_search_scope_ui()
-            self._message_stack.set_visible_child_name("list")
-
         # Multi-folder hits must already carry the scanned folder (#477).
         # Sidebar ``_current_folder`` fallback is only for folder-scoped
         # cached header search, where the scanned folder is the sidebar one.
@@ -5179,6 +5314,15 @@ class MainWindow(Adw.ApplicationWindow):
             )
         if not annotated_batch:
             return False
+
+        first_batch = not self._search_results_streamed
+        # Only mark streamed after we know we will insert real hits. Otherwise a
+        # fully-dropped batch would make search-complete preserve an empty list
+        # and hide the final match set (#509).
+        self._search_results_streamed = True
+        if first_batch:
+            self._update_search_scope_ui()
+            self._message_stack.set_visible_child_name("list")
         for message in annotated_batch:
             list_reader_trace(
                 "search_hit",
@@ -5195,6 +5339,8 @@ class MainWindow(Adw.ApplicationWindow):
         if self._current_folder_messages is None:
             self._current_folder_messages = []
         insert_messages_newest_first(self._current_folder_messages, annotated_batch)
+        self._message_total = len(self._current_folder_messages)
+        self._update_message_status(account, folder_name)
         self._ensure_reader_matches_selection(mark_seen=False)
         return False
 
@@ -6162,7 +6308,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_list_source = source
         self._message_sync_in_progress = sync_pending
 
-        if self._search_query is not None and self._search_results_streamed:
+        if (
+            self._search_query is not None
+            and self._search_results_streamed
+            and (
+                self._message_list_view.item_count() > 0
+                or not messages
+            )
+        ):
             def streamed_after_list() -> None:
                 if self._search_query is None:
                     self._try_restore_selected_message(account.uid, folder_name)
@@ -6182,6 +6335,20 @@ class MainWindow(Adw.ApplicationWindow):
             if not sync_pending:
                 self._release_offline_sync_for_folder_work(load_id)
             return False
+
+        if (
+            self._search_query is not None
+            and self._search_results_streamed
+            and self._message_list_view.item_count() == 0
+            and messages
+        ):
+            # Streamed flag set without visible rows (e.g. dropped batches).
+            # Fall through and bind the complete match set (#509).
+            search_trace(
+                "search_loaded_complete_fallback_apply",
+                load_id=load_id,
+                match_count=len(messages),
+            )
 
         self._message_stack.set_visible_child_name("list")
 
@@ -6332,11 +6499,19 @@ class MainWindow(Adw.ApplicationWindow):
             self._pending_restore_message_uid = None
             return
 
+        candidates = [uid]
+        if parse_message_id(uid) is None:
+            candidates.append(format_message_id(account_uid, folder_name, uid))
+
         self._message_list_view.set_restoring_selection(True)
-        if self._message_list_view.select_uid(uid):
+        restored_key: str | None = None
+        for key in candidates:
+            if self._message_list_view.select_uid(key):
+                restored_key = key
+                break
+        if restored_key is not None:
             self._pending_restore_message_uid = None
-            self._current_message_uid = uid
-            self._load_message_body_for_uid(uid, mark_seen=False)
+            self._set_selected_message(restored_key, mark_seen=False)
         else:
             self._pending_restore_message_uid = None
             set_active_message_uid(None)
@@ -6748,9 +6923,6 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_message_list_item_pressed(self, uid: str) -> None:
         self._user_message_click_pending = True
         self._pending_restore_message_uid = None
-        selected = self._message_list_view.get_selected_uids()
-        if len(selected) != 1 or selected[0] != uid:
-            self._message_list_view.select_uid(uid)
         row = self._message_list_view.get_message(uid)
         location = self._message_location_for_list_key(uid)
         list_reader_trace(
@@ -6760,20 +6932,9 @@ class MainWindow(Adw.ApplicationWindow):
             row_uid=str((row or {}).get("uid") or ""),
             parsed_folder=(location[1] if location else None),
             parsed_uid=(location[2] if location else None),
-            reader_already_matches=(
-                uid == self._current_message_uid
-                and self._reader_shows_list_key(uid)
-            ),
+            reader_already_matches=self._reader_shows_list_key(uid),
         )
-        if uid == self._current_message_uid and self._reader_shows_list_key(uid):
-            self._mark_message_read_on_click_if_unread(uid)
-            return
-        if self._mark_seen_when_reading_uid(uid):
-            self._mark_seen_intent_list_key = uid
-        else:
-            self._mark_seen_intent_list_key = None
-        self._current_message_uid = uid
-        self._load_message_body_for_uid(uid, mark_seen=True)
+        self._set_selected_message(uid, mark_seen=True, sync_list_selection=True)
 
     def _on_message_list_context_menu(
         self, uid: str, widget: Gtk.Widget, x: float, y: float
@@ -8123,27 +8284,11 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         uid = selected[0]
-        if (
-            self._mark_seen_intent_list_key is not None
-            and uid != self._mark_seen_intent_list_key
-        ):
-            self._mark_seen_intent_list_key = None
-        if uid == self._current_message_uid and self._reader_shows_list_key(uid):
-            return False
-        if (
-            uid == self._mark_seen_intent_list_key
-            and self._pending_message_read_uid == uid
-        ):
-            # Press already started a mark_seen=True load for this key (#388).
-            self._user_message_click_pending = False
-            return False
-
         mark_seen = self._user_message_click_pending
         if mark_seen:
             self._pending_restore_message_uid = None
         self._user_message_click_pending = False
-        self._current_message_uid = uid
-        self._load_message_body_for_uid(uid, mark_seen=mark_seen)
+        self._set_selected_message(uid, mark_seen=mark_seen)
         return False
 
     def _on_message_list_item_activated(self, uid: str) -> None:
@@ -8264,12 +8409,15 @@ class MainWindow(Adw.ApplicationWindow):
         except ValueError:
             return
 
-        if not mark_seen and uid == self._mark_seen_intent_list_key:
+        request_id = self._message_id_key_for_list_key(uid)
+        intent_id = self._message_id_key_for_list_key(self._mark_seen_intent_list_key)
+        pending_id = self._message_id_key_for_list_key(self._pending_message_read_uid)
+        if not mark_seen and request_id is not None and request_id == intent_id:
             if self._mark_seen_when_reading_uid(uid):
                 # Click intent must not be superseded by programmatic mark_seen=False (#388).
                 mark_seen = True
             if (
-                self._pending_message_read_uid == uid
+                pending_id == request_id
                 and self._inflight_message_read_id is not None
             ):
                 # Keep the in-flight click load; do not bump generation.
@@ -8280,6 +8428,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._pending_message_read_uid = uid
         self._inflight_message_read_id = read_id
         self._current_message = None
+        self._displayed_message_id = None
         self._reader_pane.show_loading()
         viewing_outbox = is_post_outbox_folder(folder_name)
         viewing_drafts = self._sidebar.folder_is_drafts(account.uid, folder_name)
@@ -8493,16 +8642,24 @@ class MainWindow(Adw.ApplicationWindow):
     def _recover_stale_message_read(self, read_id: int, uid: str) -> bool:
         if read_id == self._message_read_generation:
             return False
-        if self._current_message_uid != uid or self._current_message is not None:
+        selected_id = self._message_id_key_for_list_key(self._current_message_uid)
+        completed_id = self._message_id_key_for_list_key(uid)
+        if (
+            selected_id is None
+            or completed_id is None
+            or selected_id != completed_id
+            or self._current_message is not None
+        ):
             return False
         if (
             self._inflight_message_read_id is not None
             and self._inflight_message_read_id != read_id
         ):
             return False
+        retry_key = self._current_message_uid or uid
         self._load_message_body_for_uid(
-            uid,
-            mark_seen=self._mark_seen_when_reading_uid(uid),
+            retry_key,
+            mark_seen=self._mark_seen_when_reading_uid(retry_key),
         )
         return False
 
@@ -8519,9 +8676,27 @@ class MainWindow(Adw.ApplicationWindow):
         if read_id != self._message_read_generation:
             return self._recover_stale_message_read(read_id, uid)
 
+        # Selection may have moved while this read was in flight (#509).
+        selected_id = self._message_id_key_for_list_key(self._current_message_uid)
+        completed_id = self._message_id_key_for_list_key(uid)
+        if (
+            selected_id is None
+            or completed_id is None
+            or selected_id != completed_id
+        ):
+            list_reader_trace(
+                "message_read_discard_stale_selection",
+                requested_list_key=uid,
+                selected_list_key=self._current_message_uid,
+            )
+            return False
+
         self._pending_message_read_uid = None
         self._inflight_message_read_id = None
-        if self._mark_seen_intent_list_key == uid:
+        if (
+            self._message_id_key_for_list_key(self._mark_seen_intent_list_key)
+            == completed_id
+        ):
             self._mark_seen_intent_list_key = None
 
         if isinstance(error, MessageNotAvailableError):
@@ -8545,6 +8720,7 @@ class MainWindow(Adw.ApplicationWindow):
                     self._mail.set_account_connect_health(
                         account_uid, "needs_sign_in"
                     )
+            self._displayed_message_id = None
             self._show_message_unavailable_reader(error.user_message())
             if not sign_in_required:
                 show_error_toast(self, error.user_message())
@@ -8573,6 +8749,7 @@ class MainWindow(Adw.ApplicationWindow):
                 error,
                 cached=False,
             )
+            self._displayed_message_id = None
             self._show_message_unavailable_reader(user_message)
             if not sign_in_required:
                 show_error_toast(self, user_message)
@@ -8595,9 +8772,28 @@ class MainWindow(Adw.ApplicationWindow):
             loaded_subject=str(msg.get("subject") or "")[:80],
             previous_uid=previous_uid or None,
         )
+        if requested_location is not None:
+            requested_id = MessageId.from_parts(*requested_location)
+            if requested_id is not None and not body_matches_message_id(
+                msg, requested_id
+            ):
+                list_reader_trace(
+                    "message_read_discard_uid_mismatch",
+                    requested_list_key=uid,
+                    requested_uid=requested_id.uid,
+                    loaded_uid=recovered_uid,
+                    loaded_subject=str(msg.get("subject") or "")[:80],
+                )
+                # Never display a foreign body as Selected (#509).
+                self._show_message_unavailable_reader(
+                    "Could not load the selected message."
+                )
+                return False
         if previous_uid and recovered_uid and previous_uid != recovered_uid:
             self._remap_folder_message_uids({previous_uid: recovered_uid})
             uid = self._remap_list_key(uid, {previous_uid: recovered_uid}) or uid
+            completed_id = self._message_id_key_for_list_key(uid) or completed_id
+            self._current_message_uid = uid
 
         self._reconcile_folder_index_headers_after_read(uid, msg)
         loaded_flags = msg.get("flags") or {}
@@ -8641,6 +8837,12 @@ class MainWindow(Adw.ApplicationWindow):
             )
         msg = self._annotate_message_reader_context(msg, uid)
         self._current_message = msg
+        displayed = message_id_from_message(msg)
+        self._displayed_message_id = (
+            displayed.key()
+            if displayed is not None
+            else self._message_id_key_for_list_key(uid)
+        )
         body = {
             "plain": msg.get("body_plain"),
             "html": msg.get("body_html"),
