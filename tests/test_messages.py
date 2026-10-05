@@ -562,12 +562,14 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         from post.window import MainWindow
 
         account = SimpleNamespace(uid="acct-1")
+        by_key = {str(m.get("_search_row_key") or m.get("uid")): m for m in messages}
         window = SimpleNamespace(
             _current_account=account,
             _current_folder=sidebar_folder,
             _current_folder_messages=list(messages),
             _current_message_uid=None,
             _current_message=None,
+            _displayed_message_id=None,
             _pending_restore_message_uid="old-plain-uid",
             _pending_message_read_uid=None,
             _inflight_message_read_id=None,
@@ -581,6 +583,10 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
             ),
             _message_list_view=mock.Mock(
                 get_selected_uids=mock.Mock(return_value=["selected-key"]),
+                get_message=mock.Mock(
+                    side_effect=lambda key: by_key.get(str(key))
+                ),
+                select_uid=mock.Mock(return_value=True),
             ),
         )
         window._message_list_key = lambda msg: MainWindow._message_list_key(
@@ -588,6 +594,11 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         )
         window._message_location_for_list_key = (
             lambda list_key: MainWindow._message_location_for_list_key(
+                window, list_key
+            )
+        )
+        window._message_id_key_for_list_key = (
+            lambda list_key: MainWindow._message_id_key_for_list_key(
                 window, list_key
             )
         )
@@ -600,7 +611,23 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         window._mark_seen_when_reading_uid = (
             lambda list_key: MainWindow._mark_seen_when_reading_uid(window, list_key)
         )
+        window._mark_message_read_on_click_if_unread = mock.Mock()
         window._load_message_body_for_uid = mock.Mock()
+        window._annotate_message_search_context = (
+            lambda msg, list_key: MainWindow._annotate_message_search_context(
+                window, msg, list_key
+            )
+        )
+        window._annotate_message_reader_context = (
+            lambda msg, list_key: MainWindow._annotate_message_reader_context(
+                window, msg, list_key
+            )
+        )
+        window._set_selected_message = (
+            lambda list_key, **kwargs: MainWindow._set_selected_message(
+                window, list_key, **kwargs
+            )
+        )
         return window
 
     def test_reader_shows_list_key_false_when_stale_body(self) -> None:
@@ -619,6 +646,7 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         window = self._window_stub(messages=[hit, stale])
         window._current_message_uid = hit["_search_row_key"]
         window._current_message = dict(stale)
+        window._displayed_message_id = stale["_message_id"]
 
         self.assertFalse(
             MainWindow._reader_shows_list_key(window, hit["_search_row_key"])
@@ -645,6 +673,7 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         window._message_list_view.get_selected_uids.return_value = [list_key]
         window._current_message_uid = list_key
         window._current_message = dict(stale)
+        window._displayed_message_id = stale["_message_id"]
 
         MainWindow._on_message_list_item_pressed(window, list_key)
 
@@ -678,12 +707,112 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         window._update_message_toolbar = mock.Mock()
         window._current_message_uid = list_key
         window._current_message = dict(stale)
+        window._displayed_message_id = stale["_message_id"]
 
         MainWindow._on_message_list_selection_changed_idle(window)
 
         window._load_message_body_for_uid.assert_called_once_with(
             list_key, mark_seen=False
         )
+
+    def test_annotate_does_not_forge_identity_on_uid_mismatch(self) -> None:
+        from post.window import MainWindow
+
+        hit = annotate_search_match(
+            {"uid": "100", "subject": "Apollon"},
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        window = self._window_stub(messages=[hit], sidebar_folder="INBOX")
+        foreign = {"uid": "200", "subject": "Galaxus", "body_plain": "nope"}
+
+        annotated = MainWindow._annotate_message_reader_context(
+            window, foreign, hit["_search_row_key"]
+        )
+
+        self.assertNotEqual(annotated.get("_search_row_key"), hit["_search_row_key"])
+        self.assertNotEqual(annotated.get("_message_id"), hit["_message_id"])
+        self.assertEqual(annotated["uid"], "200")
+
+    def test_on_message_read_discards_body_uid_mismatch(self) -> None:
+        from post.window import MainWindow
+
+        hit = annotate_search_match(
+            {"uid": "100", "subject": "Apollon"},
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        window = self._window_stub(messages=[hit], sidebar_folder="INBOX")
+        list_key = hit["_search_row_key"]
+        window._current_message_uid = list_key
+        window._message_read_generation = 1
+        window._show_message_unavailable_reader = MagicMock()
+
+        MainWindow._on_message_read(
+            window,
+            1,
+            list_key,
+            {"uid": "200", "subject": "Galaxus", "body_plain": "wrong"},
+            None,
+        )
+
+        window._show_message_unavailable_reader.assert_called_once()
+        self.assertIsNone(window._displayed_message_id)
+        window._reader_pane.show_message.assert_not_called()
+
+    def test_set_selected_message_click_a_then_b_loads_only_b(self) -> None:
+        from post.window import MainWindow
+
+        hit_a = annotate_search_match(
+            {"uid": "100", "subject": "A"},
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        hit_b = annotate_search_match(
+            {"uid": "200", "subject": "B"},
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        window = self._window_stub(
+            messages=[hit_a, hit_b], sidebar_folder="INBOX"
+        )
+
+        MainWindow._set_selected_message(
+            window, hit_a["_search_row_key"], mark_seen=True
+        )
+        MainWindow._set_selected_message(
+            window, hit_b["_search_row_key"], mark_seen=True
+        )
+
+        self.assertEqual(
+            window._load_message_body_for_uid.call_args_list[-1].args[0],
+            hit_b["_search_row_key"],
+        )
+        self.assertEqual(window._current_message_uid, hit_b["_search_row_key"])
+
+    def test_insert_messages_newest_first_preserves_selection_by_key(self) -> None:
+        """Streaming insert must not leave the highlight on a different MessageId."""
+        from post.message_list_view import VirtualMessageList
+
+        older = annotate_search_match(
+            {"uid": "200", "subject": "Galaxus", "sort_date": 100},
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        newer = annotate_search_match(
+            {"uid": "100", "subject": "Apollon", "sort_date": 300},
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        view = VirtualMessageList()
+        view.set_messages([older], folder_name="INBOX")
+        self.assertTrue(view.select_uid(older["_search_row_key"]))
+        self.assertEqual(view.get_selected_uids(), [older["_search_row_key"]])
+
+        view.insert_messages_newest_first([newer], folder_name="INBOX")
+
+        self.assertEqual(view.get_selected_uids(), [older["_search_row_key"]])
+        self.assertEqual(view.get_message(view.get_selected_uids()[0])["subject"], "Galaxus")
 
     def test_reader_shows_list_key_false_for_search_key_without_annotations(
         self,
@@ -697,6 +826,7 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         )
         window = self._window_stub(messages=[archive_hit], sidebar_folder="INBOX")
         window._current_message = {"uid": "100", "subject": "Inbox notification"}
+        window._displayed_message_id = None
 
         self.assertFalse(
             MainWindow._reader_shows_list_key(
@@ -732,6 +862,7 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
             _current_folder_messages=[stale],
             _current_message_uid=list_key,
             _current_message=dict(stale),
+            _displayed_message_id=stale["_message_id"],
             _mark_seen_intent_list_key=None,
             _pending_message_read_uid=None,
             _inflight_message_read_id=None,
@@ -740,11 +871,13 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
             ),
             _message_list_view=mock.Mock(
                 get_selected_uids=mock.Mock(return_value=[list_key]),
+                get_message=mock.Mock(return_value=hit),
                 is_restoring_selection=mock.Mock(return_value=False),
                 insert_messages_newest_first=mock.Mock(),
             ),
             _update_search_scope_ui=mock.Mock(),
             _load_message_body_for_uid=mock.Mock(),
+            _update_message_status=mock.Mock(),
             _is_multi_folder_scope=lambda: True,
         )
         window._message_list_key = lambda msg: MainWindow._message_list_key(
@@ -755,8 +888,18 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
                 window, list_key
             )
         )
+        window._message_id_key_for_list_key = (
+            lambda list_key: MainWindow._message_id_key_for_list_key(
+                window, list_key
+            )
+        )
         window._reader_shows_list_key = lambda list_key: MainWindow._reader_shows_list_key(
             window, list_key
+        )
+        window._set_selected_message = (
+            lambda list_key, **kwargs: MainWindow._set_selected_message(
+                window, list_key, **kwargs
+            )
         )
         window._ensure_reader_matches_selection = (
             lambda **kwargs: MainWindow._ensure_reader_matches_selection(
@@ -764,6 +907,7 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
             )
         )
         window._mark_seen_when_reading_uid = lambda _uid: True
+        window._mark_message_read_on_click_if_unread = mock.Mock()
 
         MainWindow._apply_search_matches(window, 1, [hit])
 
@@ -890,6 +1034,7 @@ class MarkReadOnClickTests(unittest.TestCase):
         from types import SimpleNamespace
         from unittest import mock
 
+        from post.mail.message_id import format_message_id
         from post.window import MainWindow
 
         account = SimpleNamespace(uid="acct-1")
@@ -898,6 +1043,7 @@ class MarkReadOnClickTests(unittest.TestCase):
             **message,
             "_list_account_uid": account.uid,
             "_list_folder": sidebar_folder,
+            "_message_id": format_message_id(account.uid, sidebar_folder, uid),
         }
         window = SimpleNamespace(
             _current_account=account,
@@ -905,7 +1051,10 @@ class MarkReadOnClickTests(unittest.TestCase):
             _current_folder_messages=[message],
             _current_message_uid=uid,
             _current_message=dict(tagged_message),
+            _displayed_message_id=tagged_message["_message_id"],
             _pending_restore_message_uid=None,
+            _pending_message_read_uid=None,
+            _inflight_message_read_id=None,
             _user_message_click_pending=False,
             _mark_seen_intent_list_key=None,
             _mail=mock.Mock(),
@@ -926,6 +1075,11 @@ class MarkReadOnClickTests(unittest.TestCase):
                 window, list_key
             )
         )
+        window._message_id_key_for_list_key = (
+            lambda list_key: MainWindow._message_id_key_for_list_key(
+                window, list_key
+            )
+        )
         window._loaded_message_source_location = (
             lambda: MainWindow._loaded_message_source_location(window)
         )
@@ -943,6 +1097,11 @@ class MarkReadOnClickTests(unittest.TestCase):
         window._mark_message_read_on_click_if_unread = (
             lambda list_key: MainWindow._mark_message_read_on_click_if_unread(
                 window, list_key
+            )
+        )
+        window._set_selected_message = (
+            lambda list_key, **kwargs: MainWindow._set_selected_message(
+                window, list_key, **kwargs
             )
         )
         window._load_message_body_for_uid = mock.Mock()
@@ -1043,6 +1202,7 @@ class MarkSeenClickIntentTests(unittest.TestCase):
             _current_folder_messages=[message],
             _current_message_uid=uid,
             _current_message=None,
+            _displayed_message_id=None,
             _pending_restore_message_uid=None,
             _pending_message_read_uid=None,
             _inflight_message_read_id=None,
@@ -1056,6 +1216,8 @@ class MarkSeenClickIntentTests(unittest.TestCase):
             ),
             _message_list_view=mock.Mock(
                 get_selected_uids=mock.Mock(return_value=[uid]),
+                get_message=mock.Mock(return_value=message),
+                select_uid=mock.Mock(return_value=True),
                 is_restoring_selection=mock.Mock(return_value=False),
             ),
             _message_stack=mock.Mock(
@@ -1070,11 +1232,22 @@ class MarkSeenClickIntentTests(unittest.TestCase):
                 window, list_key
             )
         )
+        window._message_id_key_for_list_key = (
+            lambda list_key: MainWindow._message_id_key_for_list_key(
+                window, list_key
+            )
+        )
         window._reader_shows_list_key = lambda list_key: MainWindow._reader_shows_list_key(
             window, list_key
         )
         window._mark_seen_when_reading_uid = (
             lambda list_key: MainWindow._mark_seen_when_reading_uid(window, list_key)
+        )
+        window._mark_message_read_on_click_if_unread = mock.Mock()
+        window._set_selected_message = (
+            lambda list_key, **kwargs: MainWindow._set_selected_message(
+                window, list_key, **kwargs
+            )
         )
         return window
 
@@ -1186,6 +1359,7 @@ class MarkSeenClickIntentTests(unittest.TestCase):
             _current_folder_messages=[],
             _current_message_uid=list_key,
             _current_message=None,
+            _displayed_message_id=None,
             _mark_seen_intent_list_key=list_key,
             _pending_message_read_uid=list_key,
             _inflight_message_read_id=3,
@@ -1194,11 +1368,14 @@ class MarkSeenClickIntentTests(unittest.TestCase):
             ),
             _message_list_view=mock.Mock(
                 get_selected_uids=mock.Mock(return_value=[list_key]),
+                get_message=mock.Mock(return_value=hit),
+                select_uid=mock.Mock(return_value=True),
                 is_restoring_selection=mock.Mock(return_value=False),
                 insert_messages_newest_first=mock.Mock(),
             ),
             _update_search_scope_ui=mock.Mock(),
             _load_message_body_for_uid=mock.Mock(),
+            _update_message_status=mock.Mock(),
             _is_multi_folder_scope=lambda: True,
             _sidebar=SimpleNamespace(
                 folder_is_drafts=lambda *_args: False,
@@ -1210,8 +1387,16 @@ class MarkSeenClickIntentTests(unittest.TestCase):
         window._message_location_for_list_key = (
             lambda key: MainWindow._message_location_for_list_key(window, key)
         )
+        window._message_id_key_for_list_key = (
+            lambda key: MainWindow._message_id_key_for_list_key(window, key)
+        )
         window._reader_shows_list_key = lambda key: MainWindow._reader_shows_list_key(
             window, key
+        )
+        window._set_selected_message = (
+            lambda key, **kwargs: MainWindow._set_selected_message(
+                window, key, **kwargs
+            )
         )
         window._ensure_reader_matches_selection = (
             lambda **kwargs: MainWindow._ensure_reader_matches_selection(
@@ -1219,6 +1404,7 @@ class MarkSeenClickIntentTests(unittest.TestCase):
             )
         )
         window._mark_seen_when_reading_uid = lambda _uid: True
+        window._mark_message_read_on_click_if_unread = mock.Mock()
 
         MainWindow._apply_search_matches(window, 1, [hit])
 
@@ -1255,6 +1441,7 @@ class MarkSeenClickIntentTests(unittest.TestCase):
 
         window._message_list_view.insert_messages_newest_first.assert_not_called()
         self.assertEqual(window._current_folder_messages, [])
+        self.assertFalse(window._search_results_streamed)
 
     def test_apply_search_matches_folder_scope_annotates_with_sidebar(self) -> None:
         from types import SimpleNamespace
@@ -1281,6 +1468,7 @@ class MarkSeenClickIntentTests(unittest.TestCase):
             ),
             _update_search_scope_ui=mock.Mock(),
             _ensure_reader_matches_selection=mock.Mock(),
+            _update_message_status=mock.Mock(),
             _is_multi_folder_scope=lambda: False,
         )
 
@@ -1336,12 +1524,18 @@ class ReaderListSyncTests(unittest.TestCase):
             _current_folder_messages=list(messages),
             _current_message=None,
             _current_message_uid=None,
+            _displayed_message_id=None,
         )
         window._message_list_key = lambda msg: MainWindow._message_list_key(
             window, msg
         )
         window._message_location_for_list_key = (
             lambda list_key: MainWindow._message_location_for_list_key(
+                window, list_key
+            )
+        )
+        window._message_id_key_for_list_key = (
+            lambda list_key: MainWindow._message_id_key_for_list_key(
                 window, list_key
             )
         )
@@ -1354,6 +1548,7 @@ class ReaderListSyncTests(unittest.TestCase):
         return window
 
     def test_reader_shows_list_key_false_when_uid_collides_across_accounts(self) -> None:
+        from post.mail.message_id import format_message_id
         from post.window import MainWindow
 
         inbox_row = {"uid": "100", "subject": "Work quote"}
@@ -1368,10 +1563,14 @@ class ReaderListSyncTests(unittest.TestCase):
             "_list_account_uid": "acct-other",
             "_list_folder": "INBOX",
         }
+        window._displayed_message_id = format_message_id(
+            "acct-other", "INBOX", "100"
+        )
 
         self.assertFalse(MainWindow._reader_shows_list_key(window, "100"))
 
     def test_reader_shows_list_key_true_when_list_context_matches(self) -> None:
+        from post.mail.message_id import format_message_id
         from post.window import MainWindow
 
         inbox_row = {"uid": "100", "subject": "Work quote"}
@@ -1386,10 +1585,14 @@ class ReaderListSyncTests(unittest.TestCase):
             "_list_account_uid": "acct-work",
             "_list_folder": "INBOX",
         }
+        window._displayed_message_id = format_message_id(
+            "acct-work", "INBOX", "100"
+        )
 
         self.assertTrue(MainWindow._reader_shows_list_key(window, "100"))
 
     def test_reader_shows_list_key_false_when_uid_collides_across_folders(self) -> None:
+        from post.mail.message_id import format_message_id
         from post.window import MainWindow
 
         inbox_row = {"uid": "55", "subject": "Inbox item"}
@@ -1404,6 +1607,9 @@ class ReaderListSyncTests(unittest.TestCase):
             "_list_account_uid": "acct-1",
             "_list_folder": "Archive",
         }
+        window._displayed_message_id = format_message_id(
+            "acct-1", "Archive", "55"
+        )
 
         self.assertFalse(MainWindow._reader_shows_list_key(window, "55"))
 
