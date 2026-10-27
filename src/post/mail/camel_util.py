@@ -17,6 +17,29 @@ log = logging.getLogger(__name__)
 
 _UID_B64_PREFIX = "uidb64:"
 _NUMERIC_UID_RE = re.compile(r"^[1-9][0-9]*$")
+# Mis-read IMAP reply words. Opaque ids (Microsoft 365) are kept.
+_IMAP_TOKEN_GARBAGE = frozenset(
+    {
+        "BAD",
+        "BYE",
+        "CAPABILITY",
+        "EXISTS",
+        "EXPUNGE",
+        "FETCH",
+        "FLAGS",
+        "LIST",
+        "LSUB",
+        "NO",
+        "OK",
+        "PREAUTH",
+        "QUOTA",
+        "RECENT",
+        "SEARCH",
+        "STATUS",
+        "STORE",
+        "UID",
+    }
+)
 
 
 class _GPtrArray(ctypes.Structure):
@@ -24,6 +47,17 @@ class _GPtrArray(ctypes.Structure):
         ("pdata", ctypes.POINTER(ctypes.c_void_p)),
         ("len", ctypes.c_uint),
     ]
+
+
+class _GError(ctypes.Structure):
+    _fields_ = [
+        ("domain", ctypes.c_uint32),
+        ("code", ctypes.c_int),
+        ("message", ctypes.c_char_p),
+    ]
+
+
+_glib_error_free: Any | None = None
 
 
 _libcamel_lib: ctypes.CDLL | None = None
@@ -59,11 +93,14 @@ def _get_libcamel() -> ctypes.CDLL:
             ctypes.c_char_p,
         ]
         lib.camel_folder_get_message_info.restype = ctypes.c_void_p
+        # camel_folder_search_by_expression(folder, expression, cancellable, error).
+        # A UID array is not an argument; passing the cancellable as GError**
+        # makes GLib reject the call and every search comes back empty.
         lib.camel_folder_search_by_expression.argtypes = [
             ctypes.c_void_p,
             ctypes.c_char_p,
             ctypes.c_void_p,
-            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.POINTER(_GError)),
         ]
         lib.camel_folder_search_by_expression.restype = ctypes.POINTER(_GPtrArray)
         lib.camel_folder_search_free.argtypes = [
@@ -83,16 +120,22 @@ def _gobject_pointer(value: Any) -> ctypes.c_void_p:
 
 
 def _decode_uid_bytes(raw: bytes) -> str | None:
-    """Decode a Camel UID C string; reject obvious non-UID garbage."""
+    """Decode a Camel UID C string; reject obvious non-UID garbage.
+
+    Numeric IMAP UIDs and opaque ids (Microsoft 365) are both real UIDs.
+    Keeping only numeric ids made Archive search return nothing.
+    """
     if not raw:
         return None
     try:
         text = raw.decode("ascii")
     except UnicodeDecodeError:
         return _UID_B64_PREFIX + base64.b64encode(raw).decode("ascii")
-    if _NUMERIC_UID_RE.match(text):
-        return text
-    return None
+    if not text or any(ord(ch) < 33 or ord(ch) == 127 for ch in text):
+        return None
+    if text in _IMAP_TOKEN_GARBAGE:
+        return None
+    return text
 
 
 def camel_uid_to_bytes(uid: str) -> bytes:
@@ -281,6 +324,48 @@ def _align_uids_to_scope(matches: list[str], scope_uids: list[str]) -> list[str]
     return aligned
 
 
+def _g_error_free(error: ctypes.POINTER(_GError)) -> None:
+    global _glib_error_free
+    if _glib_error_free is None:
+        path = ctypes.util.find_library("glib-2.0")
+        if not path:
+            return
+        glib = ctypes.CDLL(path)
+        glib.g_error_free.argtypes = [ctypes.c_void_p]
+        glib.g_error_free.restype = None
+        _glib_error_free = glib.g_error_free
+    _glib_error_free(ctypes.cast(error, ctypes.c_void_p))
+
+
+def _folder_search_by_expression(
+    lib: Any,
+    folder_ptr: ctypes.c_void_p,
+    expression: str,
+    cancel_ptr: ctypes.c_void_p,
+) -> Any:
+    """Call ``camel_folder_search_by_expression`` with a real ``GError **``."""
+    error = ctypes.POINTER(_GError)()
+    array = lib.camel_folder_search_by_expression(
+        folder_ptr,
+        expression.encode("utf-8"),
+        cancel_ptr,
+        ctypes.byref(error),
+    )
+    if error:
+        message = error.contents.message
+        text = (
+            message.decode("utf-8", "replace")
+            if message
+            else "camel folder search failed"
+        )
+        log.warning("Camel folder search failed: %s", text)
+        _g_error_free(error)
+        if array:
+            lib.camel_folder_search_free(folder_ptr, array)
+        return None
+    return array
+
+
 def folder_search_uids(
     folder: Any,
     expression: str,
@@ -305,11 +390,8 @@ def folder_search_uids(
         if cancellable is not None
         else ctypes.c_void_p()
     )
-    array = lib.camel_folder_search_by_expression(
-        folder_ptr,
-        expression.encode("utf-8"),
-        None,
-        cancel_ptr,
+    array = _folder_search_by_expression(
+        lib, folder_ptr, expression, cancel_ptr
     )
     if cancellable is not None and cancellable.is_cancelled():
         if array:
@@ -345,11 +427,8 @@ def folder_search_all_uids(
         if cancellable is not None
         else ctypes.c_void_p()
     )
-    array = lib.camel_folder_search_by_expression(
-        folder_ptr,
-        expression.encode("utf-8"),
-        None,
-        cancel_ptr,
+    array = _folder_search_by_expression(
+        lib, folder_ptr, expression, cancel_ptr
     )
     if cancellable is not None and cancellable.is_cancelled():
         if array:

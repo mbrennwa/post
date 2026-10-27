@@ -96,7 +96,6 @@ from post.mail.search import (
     make_search_row_key,
     parse_search_query,
     parse_search_row_key,
-    query_requires_body_scan,
     search_filter_progress_fraction,
 )
 from post.mail.search_debug import list_reader_trace, search_trace, search_trace_timer
@@ -362,8 +361,11 @@ class MainWindow(Adw.ApplicationWindow):
         self._pending_message_read_uid: str | None = None
         self._inflight_message_read_id: int | None = None
         self._message_total = -1
+        # Camel summary size for a heavy folder. The bound list is only a page.
+        self._heavy_summary_count = -1
         self._current_folder_messages: list[dict] | None = None
         self._message_list_bound_count = 0
+        self._message_page_fetch_inflight = False
         self._message_list_source = ""
         self._message_sync_in_progress = False
         self._message_list_populating = False
@@ -4462,6 +4464,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
         already = self._message_list_bound_count
         if already >= len(messages):
+            self._fetch_older_message_page()
             return
         more = messages[already : already + MESSAGE_LIST_UI_BIND_MORE]
         if not more:
@@ -4500,6 +4503,86 @@ class MainWindow(Adw.ApplicationWindow):
         self._update_message_status(account, folder_name)
         # Keep loading if the scrollbar is still pinned at the bottom (drag-to-end).
         self._message_list_view.after_content_appended()
+
+    def _fetch_older_message_page(self) -> None:
+        """Ask the helper for the next summary page once the bound rows run out."""
+        if self._message_page_fetch_inflight or self._search_query is not None:
+            return
+        messages = self._current_folder_messages
+        account = self._current_account
+        folder_name = self._current_folder
+        if not messages or account is None or not folder_name:
+            return
+        total = self._message_total
+        if total >= 0 and len(messages) >= total:
+            return
+        offset = len(messages)
+        load_id = self._messages_load_generation
+        self._message_page_fetch_inflight = True
+
+        def worker() -> None:
+            page: list[dict] = []
+            page_total = total
+            try:
+                page, _unread, page_total, _source = self._mail.folder_summary_page(
+                    account.uid,
+                    folder_name,
+                    offset=offset,
+                    limit=MESSAGE_LIST_UI_BIND_MORE,
+                )
+            except Exception:
+                log.debug(
+                    "Could not load older messages for %s/%s at %d",
+                    account.uid,
+                    folder_name,
+                    offset,
+                    exc_info=True,
+                )
+            GLib.idle_add(
+                self._on_older_message_page,
+                load_id,
+                account.uid,
+                folder_name,
+                offset,
+                page,
+                page_total,
+            )
+
+        self._mail.submit_background("older_message_page", worker)
+
+    def _on_older_message_page(
+        self,
+        load_id: int,
+        account_uid: str,
+        folder_name: str,
+        offset: int,
+        page: list[dict],
+        page_total: int,
+    ) -> bool:
+        self._message_page_fetch_inflight = False
+        if load_id != self._messages_load_generation:
+            return False
+        account = self._current_account
+        if (
+            account is None
+            or account.uid != account_uid
+            or self._current_folder != folder_name
+            or self._search_query is not None
+        ):
+            return False
+        current = list(self._current_folder_messages or [])
+        if offset != len(current):
+            return False
+        if isinstance(page_total, int) and page_total >= len(current):
+            self._message_total = page_total
+        if not page:
+            self._update_message_status(account, folder_name)
+            return False
+        current.extend(page)
+        self._current_folder_messages = current
+        self._message_list_view.reset_near_end()
+        self._on_message_list_near_end()
+        return False
 
     def _schedule_bind_unbound_heavy_messages(self, load_id: int) -> None:
         """Bind a small buffer of older rows without rebuilding the top (#208).
@@ -4689,6 +4772,8 @@ class MainWindow(Adw.ApplicationWindow):
         self, account_uid: str, folder_name: str
     ) -> bool:
         """True while Archive/etc. indexing should keep running for this folder."""
+        if self._search_query is not None:
+            return False
         return (
             self._heavy_index_in_progress == (account_uid, folder_name)
             and self._current_account is not None
@@ -4751,9 +4836,16 @@ class MainWindow(Adw.ApplicationWindow):
                 on_progress=_mid_refresh_progress,
             )
         except Exception as exc:
-            if isinstance(exc, GLib.Error) and exc.matches(
-                Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
-            ):
+            cancelled = (
+                isinstance(exc, GLib.Error)
+                and exc.matches(
+                    Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED
+                )
+            ) or "cancel" in str(exc).lower()
+            # A helper watchdog kill is not a reason to stop. The folder is
+            # still open and the server total is still ahead of the summary.
+            timed_out = "timed out" in str(exc).lower()
+            if cancelled or timed_out:
                 # Soft cancel / leave — resume if this folder is still open.
                 if self._heavy_index_still_active(account_uid, folder_name):
                     resume_id = self._messages_load_generation
@@ -4830,6 +4922,8 @@ class MainWindow(Adw.ApplicationWindow):
 
             GLib.timeout_add(250, _resume_after_yield)
             return
+        if not self._heavy_index_still_active(account_uid, folder_name):
+            return
         # Yield to interactive work, then resume from cursor.
         self._mail.submit_background(
             "heavy_folder_index",
@@ -4862,7 +4956,18 @@ class MainWindow(Adw.ApplicationWindow):
             self._remap_folder_message_uids(remaps)
 
         messages = progress.messages
-        indexed = len(messages)
+        reported = getattr(progress, "indexed", -1)
+        indexed = (
+            reported
+            if isinstance(reported, int) and reported >= len(messages)
+            else len(messages)
+        )
+        summary_total = (
+            progress.total
+            if isinstance(progress.total, int) and progress.total >= indexed
+            else indexed
+        )
+        self._heavy_summary_count = indexed
         cursor = progress.cursor or {}
         pipeline_id = str(cursor.get("pipeline_id") or "") or None
         if pipeline_id:
@@ -4964,9 +5069,22 @@ class MainWindow(Adw.ApplicationWindow):
                     self._heavy_index_in_progress = None
 
         current = self._current_folder_messages or []
-        # Always keep the in-memory list current so scroll-to-load-more can reach
-        # newly indexed *older* headers (Graph backfill rarely changes the top).
-        grew = indexed > len(current)
+        # A heavy-folder update is the newest page. Rows the user already
+        # scrolled in sit after that page and must stay in the list.
+        if (
+            messages
+            and len(current) > len(messages)
+            and message_list_fingerprint(current[: len(messages)])
+            == message_list_fingerprint(messages)
+        ):
+            if summary_total > self._message_total:
+                self._message_total = summary_total
+            self._update_message_status(account, folder_name)
+            if not keep_indexing:
+                GLib.idle_add(self._on_messages_sync_finished, load_id, False)
+            return False
+        # The payload is a page. Growth of the summary does not add rows here.
+        grew = len(messages) > len(current)
         top_unchanged = (
             bool(current)
             and bool(messages)
@@ -4996,10 +5114,10 @@ class MainWindow(Adw.ApplicationWindow):
         if message_lists_equivalent_for_ui(
             current,
             messages,
-            current_total=self._message_total,
-            refreshed_total=indexed,
+            current_total=len(current),
+            refreshed_total=len(messages),
         ):
-            will_catchup = indexed > self._message_list_bound_count > 0
+            will_catchup = len(messages) > self._message_list_bound_count > 0
             _log_heavy_pipeline(
                 "list",
                 account_uid,
@@ -5030,7 +5148,7 @@ class MainWindow(Adw.ApplicationWindow):
             # unbound older rows so the list length grows without a top rebuild.
             if will_catchup:
                 self._current_folder_messages = messages
-                self._message_total = indexed
+                self._message_total = summary_total
                 self._update_message_status(account, folder_name)
                 self._schedule_bind_unbound_heavy_messages(load_id)
             if not keep_indexing:
@@ -5039,7 +5157,7 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         self._current_folder_messages = messages
-        self._message_total = indexed
+        self._message_total = summary_total
         self._message_list_source = "local"
         if not messages:
             self._message_empty_label.set_label(f"No Messages in {folder_name}")
@@ -5356,12 +5474,10 @@ class MainWindow(Adw.ApplicationWindow):
         selected scope is respected (#173). Search unions grow-only disk
         with RAM so a smaller Camel summary cannot hide indexed headers (#363).
         """
-        return (
-            search_query is not None
-            and self._search_scope.kind == SEARCH_SCOPE_FOLDER
-            and folder_index_has_cache(account_uid, folder_name)
-            and not query_requires_body_scan(search_query)
-        )
+        # The folder-index is not a search domain (#513). Camel search runs
+        # in the helper.
+        del search_query, account_uid, folder_name
+        return False
 
     def _begin_chunked_cached_header_search(
         self,
@@ -5482,6 +5598,28 @@ class MainWindow(Adw.ApplicationWindow):
             return f"{text} · {detail}"
         return text
 
+    def _stop_heavy_index_for_search(
+        self,
+        account_uid: str,
+        folder_name: str,
+        scope: SearchScope,
+    ) -> None:
+        """Stop a header fetch that holds the account helper.
+
+        Selected-folder search of that same folder has to take the helper
+        too. Otherwise the search sits behind the fetch until it times out
+        with nothing to show.
+        """
+        del folder_name
+        indexing = self._heavy_index_in_progress
+        if indexing is None:
+            return
+        idx_account, _idx_folder = indexing
+        if scope.kind != SEARCH_SCOPE_ALL and idx_account != account_uid:
+            return
+        self._heavy_index_in_progress = None
+        self._mail.cancel_account_heavy_folder_index(idx_account)
+
     def _start_mail_search(
         self,
         load_id: int,
@@ -5513,6 +5651,7 @@ class MainWindow(Adw.ApplicationWindow):
                 None,
             )
 
+        self._stop_heavy_index_for_search(account_uid, folder_name, scope)
         kwargs = {
             "on_progress": on_progress,
             "on_matches": on_matches,
@@ -5609,8 +5748,15 @@ class MainWindow(Adw.ApplicationWindow):
             leaving_indexed = (
                 idx_account != account_uid or idx_folder != folder_name
             )
-            if leaving_indexed or not is_heavy_folder_name(folder_name):
-                self._mail.cancel_heavy_folder_index_refresh()
+            searching_this_account = (
+                self._search_query is not None and idx_account == account_uid
+            )
+            if (
+                leaving_indexed
+                or searching_this_account
+                or not is_heavy_folder_name(folder_name)
+            ):
+                self._mail.cancel_account_heavy_folder_index(idx_account)
                 if leaving_indexed:
                     self._mail.clear_heavy_folder_index_session(
                         idx_account, idx_folder
@@ -5689,6 +5835,7 @@ class MainWindow(Adw.ApplicationWindow):
             return messages, unread, total, source
 
         self._message_total = -1
+        self._heavy_summary_count = -1
         self._current_folder_messages = None
         self._message_list_bound_count = 0
         self._message_sync_in_progress = False
@@ -5925,6 +6072,11 @@ class MainWindow(Adw.ApplicationWindow):
                 source,
                 use_background_sync and not send_pending,
                 error,
+                # Refresh after the page is back. Starting it in parallel holds
+                # the helper, so the list and search wait on Archive (#513).
+                schedule_background_sync
+                if use_background_sync and not send_pending
+                else None,
             )
 
         def start_initial_worker() -> None:
@@ -6062,7 +6214,6 @@ class MainWindow(Adw.ApplicationWindow):
                     path="direct",
                 )
                 start_initial_worker()
-            schedule_background_sync()
 
         search_trace(
             "search_load_scheduled",
@@ -6572,41 +6723,43 @@ class MainWindow(Adw.ApplicationWindow):
             status = self._mail.get_folder_status_totals(account.uid, folder_name)
             if status is not None:
                 server_total = status[1]
-        indexed = (
-            len(self._current_folder_messages)
-            if self._current_folder_messages is not None
-            else total
-        )
+        summary_count = total if total >= 0 else shown
+        heavy_summary = self._heavy_summary_count
+        if isinstance(heavy_summary, int) and heavy_summary >= summary_count:
+            summary_count = heavy_summary
 
-        if is_heavy_folder_name(folder_name) and indexed >= 0:
+        if is_heavy_folder_name(folder_name) and summary_count >= 0:
+            # The list is a page. The count beside it is the summary, or the
+            # trusted server total while that summary is still catching up.
             trusted = status_total_is_trusted(folder_name, server_total)
-            if trusted and server_total > indexed:
-                if shown < indexed:
-                    self._set_status(
-                        self._with_load_status_detail(
-                            f"Showing {shown} of {indexed} indexed "
-                            f"(server {server_total}) in {label} / {folder_name}"
-                        )
-                    )
-                else:
-                    self._set_status(
-                        self._with_load_status_detail(
-                            f"{indexed} indexed of {server_total} on server "
-                            f"in {label} / {folder_name}"
-                        )
-                    )
-                return
-            if shown < indexed:
+            if (
+                self._message_sync_in_progress
+                and trusted
+                and isinstance(heavy_summary, int)
+                and server_total > heavy_summary >= 0
+            ):
                 self._set_status(
                     self._with_load_status_detail(
-                        f"Showing {shown} of {indexed} indexed "
+                        f"Fetching {folder_name} headers… "
+                        f"{heavy_summary} of {server_total} on server "
+                        f"in {label}"
+                    )
+                )
+                return
+            display_total = summary_count
+            if trusted and server_total > display_total:
+                display_total = server_total
+            if shown < display_total:
+                self._set_status(
+                    self._with_load_status_detail(
+                        f"Showing {shown} of {display_total} "
                         f"in {label} / {folder_name}"
                     )
                 )
-            else:
+            elif display_total >= 0:
                 self._set_status(
                     self._with_load_status_detail(
-                        f"{indexed} indexed in {label} / {folder_name}"
+                        f"{display_total} messages in {label} / {folder_name}"
                     )
                 )
             return

@@ -377,6 +377,70 @@ class AccountCamelRuntime:
                     exc_info=True,
                 )
 
+    def peek_summary_page(
+        self,
+        folder_name: str,
+        *,
+        offset: int,
+        limit: int,
+        timeout: float = 30.0,
+    ) -> Any:
+        """Read a summary page without waiting for the in-flight helper call.
+
+        Archive header fetch holds ``_serial`` for a long time. Scrolling the
+        list must still reach rows already in the helper summary.
+        """
+        self.ensure_started()
+        req_id = uuid.uuid4().hex
+        event = threading.Event()
+        pending: dict[str, Any] = {"event": event, "msg": None}
+        with self._lock:
+            if self._proc is None or self._proc.stdin is None or not self._alive:
+                raise CamelHelperError(
+                    f"camel helper not running for {self.account_uid}"
+                )
+            self._pending[req_id] = pending
+            write_message(
+                self._proc.stdin,
+                {
+                    "type": "summary_page",
+                    "id": req_id,
+                    "folder_name": folder_name,
+                    "offset": offset,
+                    "limit": limit,
+                },
+            )
+        finished = event.wait(timeout=max(0.1, timeout))
+        if not finished:
+            with self._lock:
+                self._pending.pop(req_id, None)
+            raise CamelHelperTimeout(
+                f"camel helper summary page timed out for {self.account_uid}"
+            )
+        msg = pending.get("msg") or {}
+        if not msg.get("ok"):
+            err = str(msg.get("error") or "camel helper summary page failed")
+            raise CamelHelperError(err, error_type=str(msg.get("error_type") or ""))
+        return msg.get("result")
+
+    def request_cancel_heavy_index(self) -> None:
+        """Stop an in-flight heavy-folder refresh without taking ``_serial``.
+
+        Search on another account must abort Archive header fetch in this
+        helper. The refresh cancellable lives in the helper process.
+        """
+        with self._lock:
+            if self._proc is None or self._proc.stdin is None or not self._alive:
+                return
+            try:
+                write_message(self._proc.stdin, {"type": "cancel_heavy_index"})
+            except Exception:
+                log.debug(
+                    "helper heavy-index cancel write failed account=%s",
+                    self.account_uid,
+                    exc_info=True,
+                )
+
     def _call_unlocked(
         self,
         method: str,
@@ -587,6 +651,25 @@ class CamelRuntimePool:
             runtime = self._runtimes.get(account_uid)
         if runtime is not None:
             runtime.request_cancel()
+
+    def request_cancel_heavy_index(self, account_uid: str) -> None:
+        """Stop heavy-folder refresh in ``account_uid``'s helper."""
+        with self._lock:
+            runtime = self._runtimes.get(account_uid)
+        if runtime is not None:
+            runtime.request_cancel_heavy_index()
+
+    def peek_summary_page(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        offset: int,
+        limit: int,
+    ) -> Any:
+        return self.get(account_uid).peek_summary_page(
+            folder_name, offset=offset, limit=limit
+        )
 
     def submit_worker(self, account_uid: str, func: Callable[[], None]) -> None:
         self.get(account_uid).submit_worker(func)

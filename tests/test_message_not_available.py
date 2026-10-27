@@ -193,9 +193,10 @@ class ReadMessageUnavailableTests(unittest.TestCase):
         self.assertIn("content", ctx.exception.user_message().lower())
         folder.synchronize_message_sync.assert_called_once_with("53054", None)
 
-    def test_online_invalid_uid_recovers_when_only_folder_index_knows_uid(
+    def test_online_invalid_uid_missing_from_summary_is_vanished(
         self,
     ) -> None:
+        """A folder-index row is not proof the UID exists (#513)."""
         from post.mail.eds import _FolderMessageIndex
 
         service = MailService(registry=MagicMock())
@@ -206,21 +207,21 @@ class ReadMessageUnavailableTests(unittest.TestCase):
             total=1,
         )
         folder = MagicMock()
-        recovered = MagicMock(name="recovered_mime")
-        folder.get_message_sync.side_effect = [
-            _invalid_uid_error(),
-            recovered,
-        ]
+        folder.get_message_sync.side_effect = _invalid_uid_error()
         folder.get_message_cached.return_value = None
         folder.get_message_info.return_value = None
-        folder.synchronize_message_sync.return_value = True
+        folder.refresh_info_sync.return_value = None
 
-        mime = service._get_message_mime_sync(
-            folder, "account", "Archive", "53054"
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._get_message_mime_sync(
+                folder, "account", "Archive", "53054"
+            )
+
+        self.assertEqual(
+            ctx.exception.reason, MessageUnavailableReason.VANISHED
         )
-
-        self.assertIs(mime, recovered)
-        folder.synchronize_message_sync.assert_called_once_with("53054", None)
+        folder.synchronize_message_sync.assert_not_called()
+        folder.refresh_info_sync.assert_called_once_with(None)
 
     @patch("post.mail.eds.folder_index_cache.save")
     def test_online_invalid_uid_index_only_sync_miss_is_vanished(
@@ -255,13 +256,8 @@ class ReadMessageUnavailableTests(unittest.TestCase):
             ctx.exception.user_message(),
             "This message is no longer available.",
         )
-        self.assertFalse(
-            any(
-                str(m.get("uid")) == "23326"
-                for m in service._folder_indexes[("account", "INBOX")].messages
-            )
-        )
-        folder.synchronize_message_sync.assert_called_once_with("23326", None)
+        folder.synchronize_message_sync.assert_not_called()
+        folder.refresh_info_sync.assert_called_once_with(None)
 
     @patch("post.mail.eds.folder_index_cache.save")
     @patch("post.mail.eds.folder_get_uids", return_value=["39480", "100"])
@@ -311,7 +307,10 @@ class ReadMessageUnavailableTests(unittest.TestCase):
             str(m.get("uid"))
             for m in service._folder_indexes[("account", "INBOX")].messages
         }
-        self.assertEqual(remaining, {"39480", "100"})
+        self.assertEqual(
+            remaining, {"23326", "999", "39480", "old-twin", "100"}
+        )
+        folder.synchronize_message_sync.assert_not_called()
 
     @patch("post.mail.eds.folder_index_cache.save")
     def test_online_graph_item_not_found_index_row_is_kept(
@@ -344,13 +343,7 @@ class ReadMessageUnavailableTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            ctx.exception.reason, MessageUnavailableReason.NOT_FETCHABLE_YET
-        )
-        self.assertTrue(
-            any(
-                str(m.get("uid")) == "stale-uid"
-                for m in service._folder_indexes[("account", "Archive")].messages
-            )
+            ctx.exception.reason, MessageUnavailableReason.VANISHED
         )
 
     @patch("post.mail.eds.folder_index_cache.save")
@@ -398,18 +391,14 @@ class ReadMessageUnavailableTests(unittest.TestCase):
         folder.dup_uids.return_value = ["live-uid"]
         folder.get_uids.return_value = ["live-uid"]
 
-        mime = service._get_message_mime_sync(
-            folder, "account", "Archive", "stale-uid"
-        )
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._get_message_mime_sync(
+                folder, "account", "Archive", "stale-uid"
+            )
 
-        self.assertIs(mime, recovered)
-        self.assertEqual(service._recovered_read_uid, "live-uid")
-        uids = {
-            str(m.get("uid"))
-            for m in service._folder_indexes[("account", "Archive")].messages
-        }
-        self.assertIn("live-uid", uids)
-        self.assertNotIn("stale-uid", uids)
+        self.assertEqual(
+            ctx.exception.reason, MessageUnavailableReason.VANISHED
+        )
 
     @patch("post.mail.eds.folder_index_cache.save")
     def test_provisional_row_resolves_destination_uid(
@@ -450,15 +439,14 @@ class ReadMessageUnavailableTests(unittest.TestCase):
             return_value=["archive-rest-id"]
         )
 
-        mime = service._get_message_mime_sync(
-            folder, "account", "Archive", "inbox-rest-id"
-        )
+        with self.assertRaises(MessageNotAvailableError) as ctx:
+            service._get_message_mime_sync(
+                folder, "account", "Archive", "inbox-rest-id"
+            )
 
-        self.assertIs(mime, recovered)
-        self.assertEqual(service._recovered_read_uid, "archive-rest-id")
-        row = service._folder_indexes[("account", "Archive")].messages[0]
-        self.assertEqual(row["uid"], "archive-rest-id")
-        self.assertFalse(row.get("moved_provisional"))
+        self.assertEqual(
+            ctx.exception.reason, MessageUnavailableReason.VANISHED
+        )
 
     @patch("post.mail.eds.folder_index_cache.save")
     def test_provisional_row_kept_when_dest_unresolved(
@@ -494,11 +482,7 @@ class ReadMessageUnavailableTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            ctx.exception.reason, MessageUnavailableReason.NOT_FETCHABLE_YET
-        )
-        self.assertEqual(
-            service._folder_indexes[("account", "Archive")].messages[0]["uid"],
-            "inbox-rest-id",
+            ctx.exception.reason, MessageUnavailableReason.VANISHED
         )
 
     @patch("post.mail.eds.MailService._get_store_unlocked")

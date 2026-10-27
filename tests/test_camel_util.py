@@ -87,6 +87,11 @@ class CamelUidEncodingTests(unittest.TestCase):
         self.assertIsNone(_decode_uid_bytes(b"LIST"))
         self.assertIsNone(_decode_uid_bytes(b"QUOTA"))
         self.assertIsNone(_decode_uid_bytes(b""))
+        self.assertIsNone(_decode_uid_bytes(b"has space"))
+
+    def test_keeps_opaque_ascii_uids(self) -> None:
+        opaque = b"A" * 40 + b"xyz"
+        self.assertEqual(_decode_uid_bytes(opaque), opaque.decode("ascii"))
 
 
 class FolderGetUidsTests(unittest.TestCase):
@@ -179,6 +184,9 @@ class FolderSearchUidsTests(unittest.TestCase):
         self.assertEqual(result, ["1"])
         read_uids.assert_called_once()
         lib.camel_folder_search_free.assert_called_once()
+        call_args = lib.camel_folder_search_by_expression.call_args[0]
+        self.assertFalse(call_args[2])
+        self.assertIsNotNone(call_args[3])
 
     def test_maps_numeric_match_to_index_uid(self) -> None:
         folder = mock.Mock()
@@ -200,6 +208,37 @@ class FolderSearchUidsTests(unittest.TestCase):
             )
 
         self.assertEqual(result, ["0042"])
+
+    def test_passes_cancellable_and_error_out_param(self) -> None:
+        folder = mock.Mock()
+        cancellable = mock.Mock()
+        cancellable.is_cancelled.return_value = False
+        lib = mock.Mock()
+        lib.camel_folder_search_by_expression.return_value = ctypes.c_void_p(0x1)
+        cancel_ptr = ctypes.c_void_p(9)
+
+        with (
+            mock.patch("post.mail.camel_util._get_libcamel", return_value=lib),
+            mock.patch(
+                "post.mail.camel_util._gobject_pointer",
+                side_effect=[ctypes.c_void_p(1), cancel_ptr],
+            ),
+            mock.patch(
+                "post.mail.camel_util._read_ptr_array_uids",
+                return_value=["1"],
+            ),
+        ):
+            result = folder_search_uids(
+                folder,
+                '(match-all (header-contains "Subject" "invoice"))',
+                ["1"],
+                cancellable=cancellable,
+            )
+
+        self.assertEqual(result, ["1"])
+        args = lib.camel_folder_search_by_expression.call_args[0]
+        self.assertEqual(args[2], cancel_ptr)
+        self.assertIsNotNone(args[3])
 
     def test_skips_binary_uids_in_scope_list(self) -> None:
         folder = mock.Mock()

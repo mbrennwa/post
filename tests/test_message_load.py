@@ -48,6 +48,9 @@ class EmptyFolderLoadCallbackTests(unittest.TestCase):
         window._message_list_source = "disk_cache"
         window._message_sync_in_progress = False
         window._message_list_view.item_count.return_value = 0
+        window._apply_pending_flag_overlay.side_effect = (
+            lambda _account, _folder, messages, unread: (messages, unread)
+        )
         return window
 
     def test_empty_disk_cache_still_runs_after_list_callback(self) -> None:

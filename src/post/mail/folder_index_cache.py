@@ -1,21 +1,23 @@
 # Copyright (C) 2026 mbrennwa
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Persist folder message index metadata for fast folder opens."""
+"""Retired folder-index files (#513).
+
+The helper Camel summary is the mailbox. ``load``, ``save``, and ``has_cache``
+do not read or write ``~/.cache/post/folder-index``. Existing files stay on
+disk until an account is removed.
+"""
 
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import os
 import shutil
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
 
-_CACHE_VERSION = 1
 _CACHE_ROOT = Path.home() / ".cache" / "post" / "folder-index"
 
 
@@ -33,148 +35,33 @@ def save(
     *,
     grow_only: bool = False,
 ) -> None:
-    """Persist folder index metadata.
-
-    When ``grow_only`` is True (heavy folders), never replace a larger on-disk
-    index with a smaller Camel summary (#208), unless the smaller list still
-    covers the same logical messages (RestId remap collapse, #267).
-    """
-    if grow_only:
-        existing = load(account_uid, folder_name)
-        if existing is not None:
-            existing_messages, existing_unread, existing_total = existing
-            if len(messages) < len(existing_messages):
-                from post.mail.message_list_state import (
-                    folder_index_covers_identities,
-                )
-
-                if not folder_index_covers_identities(
-                    messages, existing_messages
-                ):
-                    log.warning(
-                        "Refusing to shrink folder index for %s/%s "
-                        "(disk=%d, incoming=%d)",
-                        account_uid,
-                        folder_name,
-                        len(existing_messages),
-                        len(messages),
-                    )
-                    return
-                log.info(
-                    "Replacing folder index for %s/%s after RestId collapse "
-                    "(disk=%d, incoming=%d)",
-                    account_uid,
-                    folder_name,
-                    len(existing_messages),
-                    len(messages),
-                )
-            total = max(total, existing_total, len(messages))
-            if unread < 0:
-                unread = existing_unread
-    path = _cache_path(account_uid, folder_name)
-    payload = {
-        "version": _CACHE_VERSION,
-        "folder_name": folder_name,
-        "unread": unread,
-        "total": total,
-        "messages": messages,
-    }
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(".json.tmp")
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, separators=(",", ":"))
-        os.replace(tmp_path, path)
-    except OSError:
-        log.debug(
-            "Could not save folder index cache for %s / %r",
-            account_uid,
-            folder_name,
-            exc_info=True,
-        )
+    """Ignore writes. The Camel summary is the list (#513)."""
+    del account_uid, folder_name, messages, unread, total, grow_only
 
 
 def has_cache(account_uid: str, folder_name: str) -> bool:
-    return _cache_path(account_uid, folder_name).is_file()
+    del account_uid, folder_name
+    return False
 
 
 def cached_account_uids() -> list[str]:
-    """Return account uids that have a folder-index directory on disk."""
-    if not _CACHE_ROOT.is_dir():
-        return []
-    try:
-        return [path.name for path in _CACHE_ROOT.iterdir() if path.is_dir()]
-    except OSError:
-        return []
+    """The folder-index is not consulted (#513)."""
+    return []
 
 
 def cached_folder_names(account_uid: str) -> list[str]:
-    """Return folder names stored on disk for an account (no Camel)."""
-    account_dir = _CACHE_ROOT / account_uid
-    if not account_dir.is_dir():
-        return []
-    names: list[str] = []
-    try:
-        paths = list(account_dir.glob("*.json"))
-    except OSError:
-        return []
-    for path in paths:
-        try:
-            with path.open(encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            continue
-        name = payload.get("folder_name")
-        if isinstance(name, str) and name:
-            names.append(name)
-    return names
+    """The folder-index is not consulted (#513)."""
+    del account_uid
+    return []
 
 
 def load(
     account_uid: str,
     folder_name: str,
 ) -> tuple[list[dict[str, Any]], int, int] | None:
-    path = _cache_path(account_uid, folder_name)
-    if not path.is_file():
-        return None
-    try:
-        with path.open(encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        log.debug(
-            "Could not read folder index cache for %s / %r",
-            account_uid,
-            folder_name,
-            exc_info=True,
-        )
-        return None
-
-    if payload.get("version") != _CACHE_VERSION:
-        return None
-    if payload.get("folder_name") != folder_name:
-        return None
-
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        return None
-
-    unread = payload.get("unread")
-    total = payload.get("total")
-    if not isinstance(unread, int) or not isinstance(total, int):
-        return None
-
-    from post.mail.helpers import sort_messages_newest_first
-    from post.mail.message_list_state import normalize_folder_index_by_uid
-
-    # One-shot normalize for legacy grow-only caches that still hold dual RestIds.
-    messages = sort_messages_newest_first(
-        list(
-            normalize_folder_index_by_uid(
-                [msg for msg in messages if isinstance(msg, dict)]
-            ).values()
-        )
-    )
-    return messages, unread, total
+    """The folder-index is not a mailbox (#513)."""
+    del account_uid, folder_name
+    return None
 
 
 def invalidate(account_uid: str, folder_name: str) -> None:

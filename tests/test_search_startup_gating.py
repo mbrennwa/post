@@ -478,17 +478,17 @@ class CachedHeaderSearchGateTests(unittest.TestCase):
         self.window = mock.Mock()
         self.window._search_scope = SearchScope(SEARCH_SCOPE_FOLDER)
 
-    def test_folder_scope_header_query_uses_cache_when_present(self) -> None:
+    def test_folder_scope_header_query_does_not_scan_the_folder_index(self) -> None:
         query = parse_search_query("from:rebecca")
         with mock.patch(
             "post.window.folder_index_has_cache", return_value=True
         ) as has_cache:
-            self.assertTrue(
+            self.assertFalse(
                 MainWindow._should_use_cached_header_search(
                     self.window, query, "acct-1", "INBOX"
                 )
             )
-        has_cache.assert_called_once_with("acct-1", "INBOX")
+        has_cache.assert_not_called()
 
     def test_all_mail_header_query_skips_cache_fast_path(self) -> None:
         self.window._search_scope = SearchScope(SEARCH_SCOPE_ALL)
