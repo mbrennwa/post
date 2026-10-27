@@ -31,6 +31,7 @@ ALLOWED_METHODS = frozenset(
         "ping",
         "sleep_for_test",
         "sleep_until_heavy_cancel_for_test",
+        "sleep_until_folder_refresh_cancel_for_test",
         "get_oauth2_access_token_for_account",
         "list_folders",
         "get_folder_stats",
@@ -118,6 +119,34 @@ def _sleep_for_test(mail: Any, seconds: float) -> dict[str, Any]:
             clear(cancellable)
 
 
+def _sleep_until_folder_refresh_cancel_for_test(
+    mail: Any, seconds: float
+) -> dict[str, Any]:
+    """Wait until ``cancel_folder_refresh`` aborts the folder-refresh cancellable."""
+    import time
+
+    import gi
+
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio
+
+    cancellable = Gio.Cancellable()
+    register = getattr(mail, "_register_folder_refresh_cancellable", None)
+    unregister = getattr(mail, "_unregister_folder_refresh_cancellable", None)
+    if callable(register):
+        register(cancellable)
+    try:
+        deadline = time.monotonic() + max(0.0, seconds)
+        while time.monotonic() < deadline:
+            if cancellable.is_cancelled():
+                return {"slept": seconds, "cancelled": True}
+            time.sleep(0.05)
+        return {"slept": seconds, "cancelled": False}
+    finally:
+        if callable(unregister):
+            unregister(cancellable)
+
+
 def _sleep_until_heavy_cancel_for_test(mail: Any, seconds: float) -> dict[str, Any]:
     """Wait until ``cancel_heavy_index`` aborts the heavy-folder cancellable."""
     import time
@@ -153,6 +182,9 @@ def _dispatch(mail: Any, method: str, args: list[Any], kwargs: dict[str, Any]) -
     if method == "sleep_until_heavy_cancel_for_test":
         seconds = float(args[0]) if args else 0.0
         return _sleep_until_heavy_cancel_for_test(mail, seconds)
+    if method == "sleep_until_folder_refresh_cancel_for_test":
+        seconds = float(args[0]) if args else 0.0
+        return _sleep_until_folder_refresh_cancel_for_test(mail, seconds)
     if method not in ALLOWED_METHODS:
         raise PermissionError(f"method not allowed in camel helper: {method}")
     func = getattr(mail, method, None)
@@ -331,6 +363,11 @@ def main(argv: list[str] | None = None) -> int:
             if callable(cancel_heavy):
                 cancel_heavy()
             continue
+        if msg_type == "cancel_folder_refresh":
+            cancel_refresh = getattr(mail, "cancel_folder_refresh", None)
+            if callable(cancel_refresh):
+                cancel_refresh()
+            continue
         if msg_type == "summary_page":
             _write_summary_page(mail, msg, stdout, account_uid)
             continue
@@ -415,6 +452,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if callable(cancel_heavy):
                     cancel_heavy()
+            elif extra_type == "cancel_folder_refresh":
+                cancel_refresh = getattr(mail, "cancel_folder_refresh", None)
+                if callable(cancel_refresh):
+                    cancel_refresh()
             elif extra_type == "summary_page":
                 _write_summary_page(mail, extra, stdout, account_uid)
             elif extra_type == "shutdown":

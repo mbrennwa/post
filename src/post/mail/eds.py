@@ -243,6 +243,9 @@ _TRANSFER_POST_TIMEOUT_SECONDS = 30
 _FOLDER_STATS_TIMEOUT_SECONDS = 15
 # Bound get_message_sync so revoked GOA tokens cannot leave the reader hung (#341).
 _MESSAGE_READ_TIMEOUT_SECONDS = 30
+# Interactive read waits this long for the helper lock, then the reader shows
+# an error. The call that holds the lock keeps running (#494).
+_INTERACTIVE_HELPER_WAIT_SECONDS = 10.0
 # Helper RPCs that must preempt offline downsync and count as interactive (#482).
 _INTERACTIVE_HELPER_METHODS = frozenset({"read_message", "read_attachment_data"})
 # Network reconnect set_online_sync per store (#400). Same order as GOA
@@ -1633,6 +1636,22 @@ class MailService:
             return
         self.cancel_helper_op()
 
+    def preempt_interactive_read(self, account_uid: str) -> None:
+        """Stop helper work that would leave a message read on Loading (#494).
+
+        Cancels offline downsync, the Archive header fetch, and folder refresh.
+        Sidebar polls and ``offline_sync.cancel_account`` stay on the narrower
+        downsync cancel.
+        """
+        if camel_helpers_enabled() and account_uid:
+            self.preempt_account_helper_op(account_uid)
+            self.cancel_account_heavy_folder_index(account_uid)
+            self._camel_pool.request_cancel_folder_refresh(account_uid)
+            return
+        self.cancel_helper_op()
+        self.cancel_heavy_folder_index_refresh()
+        self.cancel_folder_refresh()
+
     def submit_interactive(
         self, name: str, func: Callable[..., Any], /, *args: Any, **kwargs: Any
     ) -> None:
@@ -1787,12 +1806,20 @@ class MailService:
     ) -> Any:
         """Invoke ``method`` in the per-account Camel helper (#437)."""
         interactive = method in _INTERACTIVE_HELPER_METHODS
+        wait_timeout = (
+            _INTERACTIVE_HELPER_WAIT_SECONDS if interactive else None
+        )
         if interactive:
             self._enter_helper_interactive()
-            self.preempt_account_helper_op(account_uid)
+            self.preempt_interactive_read(account_uid)
         try:
             return self._camel_helper_call_once(
-                method, account_uid, args, kwargs, timeout=timeout
+                method,
+                account_uid,
+                args,
+                kwargs,
+                timeout=timeout,
+                wait_timeout=wait_timeout,
             )
         finally:
             if interactive:
@@ -1806,6 +1833,7 @@ class MailService:
         kwargs: dict[str, Any] | None = None,
         *,
         timeout: float | None = 120.0,
+        wait_timeout: float | None = None,
     ) -> Any:
         goa_out: list[str] = []
         try:
@@ -1816,6 +1844,7 @@ class MailService:
                     args,
                     kwargs or {},
                     timeout=timeout,
+                    wait_timeout=wait_timeout,
                     goa_ensure_out=goa_out,
                 )
             except CamelHelperError as exc:
@@ -1855,6 +1884,7 @@ class MailService:
                         args,
                         kwargs or {},
                         timeout=timeout,
+                        wait_timeout=wait_timeout,
                         goa_ensure_out=goa_out,
                     )
                 raise
@@ -10621,6 +10651,7 @@ class MailService:
                     [account_uid, folder_name, message_uid],
                     {"mark_seen": mark_seen},
                 )
+            self.preempt_interactive_read(account_uid)
             return run_on_mail_thread(
                 self._read_message_unlocked,
                 account_uid,
@@ -10673,6 +10704,7 @@ class MailService:
             if isinstance(result, (list, tuple)) and len(result) == 2:
                 return str(result[0]), bytes(result[1])
             raise CamelHelperError("read_attachment_data: invalid helper result")
+        self.preempt_interactive_read(account_uid)
         return run_on_mail_thread(
             self._read_attachment_data_unlocked,
             account_uid,
