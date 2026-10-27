@@ -30,6 +30,7 @@ ALLOWED_METHODS = frozenset(
     {
         "ping",
         "sleep_for_test",
+        "sleep_until_heavy_cancel_for_test",
         "get_oauth2_access_token_for_account",
         "list_folders",
         "get_folder_stats",
@@ -117,18 +118,63 @@ def _sleep_for_test(mail: Any, seconds: float) -> dict[str, Any]:
             clear(cancellable)
 
 
+def _sleep_until_heavy_cancel_for_test(mail: Any, seconds: float) -> dict[str, Any]:
+    """Wait until ``cancel_heavy_index`` aborts the heavy-folder cancellable."""
+    import time
+
+    import gi
+
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio
+
+    cancellable = Gio.Cancellable()
+    register = getattr(mail, "_register_heavy_index_refresh_cancellable", None)
+    unregister = getattr(mail, "_unregister_heavy_index_refresh_cancellable", None)
+    if callable(register):
+        register(cancellable)
+    try:
+        deadline = time.monotonic() + max(0.0, seconds)
+        while time.monotonic() < deadline:
+            if cancellable.is_cancelled():
+                return {"slept": seconds, "cancelled": True}
+            time.sleep(0.05)
+        return {"slept": seconds, "cancelled": False}
+    finally:
+        if callable(unregister):
+            unregister(cancellable)
+
+
 def _dispatch(mail: Any, method: str, args: list[Any], kwargs: dict[str, Any]) -> Any:
     if method == "ping":
         return {"ok": True, "pid": os.getpid(), "account_uid": args[0] if args else None}
     if method == "sleep_for_test":
         seconds = float(args[0]) if args else 0.0
         return _sleep_for_test(mail, seconds)
+    if method == "sleep_until_heavy_cancel_for_test":
+        seconds = float(args[0]) if args else 0.0
+        return _sleep_until_heavy_cancel_for_test(mail, seconds)
     if method not in ALLOWED_METHODS:
         raise PermissionError(f"method not allowed in camel helper: {method}")
     func = getattr(mail, method, None)
     if func is None or not callable(func):
         raise AttributeError(f"MailService has no method {method!r}")
-    return func(*args, **kwargs)
+    result = func(*args, **kwargs)
+    if method == "continue_heavy_folder_index" and len(args) >= 2:
+        # Send the newest page, plus how many summary rows exist. The window
+        # must not treat the page length as the indexed count (#513).
+        from post.mail.message_list_state import MESSAGE_LIST_UI_BIND_CAP
+
+        full = list(getattr(result, "messages", []) or [])
+        return {
+            "messages": full[:MESSAGE_LIST_UI_BIND_CAP],
+            "unread": int(getattr(result, "unread", -1)),
+            "total": int(getattr(result, "total", len(full))),
+            "indexed": len(full),
+            "done": bool(getattr(result, "done", False)),
+            "cursor": dict(getattr(result, "cursor", {}) or {}),
+            "uid_remaps": dict(getattr(result, "uid_remaps", {}) or {}),
+        }
+    return result
 
 
 def _result_payload(req_id: Any, result: Any) -> dict[str, Any]:
@@ -152,6 +198,25 @@ def attach_ipc_goa_ensure(payload: dict[str, Any], mail: Any) -> dict[str, Any]:
     if outcome in ("ok", "failed"):
         payload["goa_ensure"] = outcome
     return payload
+
+
+def _write_summary_page(
+    mail: Any, msg: dict[str, Any], stdout: Any, account_uid: str
+) -> None:
+    """Answer a list page from memory while another helper call is running."""
+    from post.mail.camel_ipc import write_message
+
+    try:
+        result = mail.peek_folder_summary_page(
+            account_uid,
+            str(msg.get("folder_name") or ""),
+            offset=int(msg.get("offset") or 0),
+            limit=int(msg.get("limit") or 500),
+        )
+        write_message(stdout, _result_payload(msg.get("id"), result))
+    except Exception as exc:
+        log.debug("summary page failed", exc_info=True)
+        write_message(stdout, _error_payload(msg.get("id"), exc))
 
 
 def _error_payload(req_id: Any, exc: BaseException) -> dict[str, Any]:
@@ -261,6 +326,14 @@ def main(argv: list[str] | None = None) -> int:
             if callable(cancel_op):
                 cancel_op()
             continue
+        if msg_type == "cancel_heavy_index":
+            cancel_heavy = getattr(mail, "cancel_heavy_folder_index_refresh", None)
+            if callable(cancel_heavy):
+                cancel_heavy()
+            continue
+        if msg_type == "summary_page":
+            _write_summary_page(mail, msg, stdout, account_uid)
+            continue
         if msg_type != "call":
             write_message(
                 stdout,
@@ -336,6 +409,14 @@ def main(argv: list[str] | None = None) -> int:
                 cancel_op = getattr(mail, "cancel_helper_op", None)
                 if callable(cancel_op):
                     cancel_op()
+            elif extra_type == "cancel_heavy_index":
+                cancel_heavy = getattr(
+                    mail, "cancel_heavy_folder_index_refresh", None
+                )
+                if callable(cancel_heavy):
+                    cancel_heavy()
+            elif extra_type == "summary_page":
+                _write_summary_page(mail, extra, stdout, account_uid)
             elif extra_type == "shutdown":
                 cancel_op = getattr(mail, "cancel_helper_op", None)
                 if callable(cancel_op):

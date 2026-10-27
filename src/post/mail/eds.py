@@ -56,10 +56,7 @@ from .camel_runtime import (
 from .account_cache_gc import drop_orphan_account_caches
 from .evolution_cache_path import (
     cached_rfc822_candidates,
-    evolution_store_roots,
-    find_nonempty_rfc822,
     first_nonempty_path,
-    rfc822_digest,
 )
 from .helpers import (
     message_info_to_dict,
@@ -195,6 +192,7 @@ from .message_list_state import (
     find_folder_index_sibling_uids,
     folder_index_covers_identities,
     folder_index_headers_disagree,
+    MESSAGE_LIST_UI_BIND_CAP,
     is_heavy_folder_name,
     is_moved_provisional,
     is_trash_or_junk_folder_name,
@@ -219,10 +217,11 @@ from .search import (
     SearchFilterProgress,
     SearchMatchCallback,
     SearchProgressCallback,
-    SearchScanCursor,
+    SEARCH_MATCH_BATCH_SIZE,
+    SearchTerm,
     annotate_search_match,
-    filter_messages_by_query,
     query_requires_body_scan,
+    query_to_sexp_part,
 )
 from .search_debug import search_trace, search_trace_timer
 
@@ -376,6 +375,34 @@ class _FolderMessageIndex:
     total: int
 
 
+def _heavy_progress_from_helper(raw: Any) -> "HeavyFolderIndexProgress":
+    """Rebuild a progress value returned by the helper as a summary page."""
+    if isinstance(raw, HeavyFolderIndexProgress):
+        return raw
+    if not isinstance(raw, dict):
+        return HeavyFolderIndexProgress(
+            messages=[], unread=-1, total=-1, done=True
+        )
+    messages = raw.get("messages") or []
+    remaps = raw.get("uid_remaps") or {}
+    cursor = raw.get("cursor") or {}
+    indexed = raw.get("indexed")
+    return HeavyFolderIndexProgress(
+        messages=list(messages) if isinstance(messages, list) else [],
+        unread=int(raw["unread"]) if raw.get("unread") is not None else -1,
+        total=int(raw["total"]) if raw.get("total") is not None else -1,
+        done=bool(raw.get("done")),
+        cursor=dict(cursor) if isinstance(cursor, dict) else {},
+        uid_remaps={
+            str(key): str(value)
+            for key, value in remaps.items()
+        }
+        if isinstance(remaps, dict)
+        else {},
+        indexed=int(indexed) if isinstance(indexed, int) else -1,
+    )
+
+
 @dataclass
 class HeavyFolderIndexProgress:
     """One slice of a preemptible heavy-folder header index (#208)."""
@@ -387,6 +414,8 @@ class HeavyFolderIndexProgress:
     cursor: dict[str, Any] = field(default_factory=dict)
     # RestId remaps from identity upsert (old UID → new UID) for UI selection (#267).
     uid_remaps: dict[str, str] = field(default_factory=dict)
+    # Summary rows known to Camel. ``messages`` may be only the newest page (#513).
+    indexed: int = -1
 
 
 # Heavy-folder Graph refresh follows Evolution's model: run refresh_info to
@@ -400,6 +429,11 @@ _HEAVY_FOLDER_REFRESH_STALL_LIMIT = 8
 # One completed refresh_info per slice, then materialize and return to the UI.
 _HEAVY_FOLDER_REFRESH_PAGES_PER_SLICE = 1
 _HEAVY_FOLDER_REFRESH_SLICE_BUDGET_SECONDS = 960.0
+# One slice may use the whole budget, then materialize new headers. The
+# default 120s helper watchdog kills that call and stops Archive growth.
+_HEAVY_FOLDER_INDEX_IPC_TIMEOUT = (
+    _HEAVY_FOLDER_REFRESH_SLICE_BUDGET_SECONDS + 180.0
+)
 # Skip prepare_content_refresh once the local index is already substantial —
 # resetting M365 sync state throws away progress (#208).
 _HEAVY_FOLDER_PREPARE_MIN_INDEXED = 500
@@ -1576,6 +1610,17 @@ class MailService:
             cancellable = self._helper_op_cancellable
         if cancellable is not None:
             cancellable.cancel()
+
+    def cancel_account_heavy_folder_index(self, account_uid: str) -> None:
+        """Stop Archive/etc. header fetch for ``account_uid``.
+
+        In-process, cancels the heavy-index ``Gio.Cancellable``. With helpers,
+        that cancellable lives in the helper, so also send ``cancel_heavy_index``
+        without waiting on the helper lock.
+        """
+        self.cancel_heavy_folder_index_refresh()
+        if camel_helpers_enabled() and account_uid:
+            self._camel_pool.request_cancel_heavy_index(account_uid)
 
     def preempt_account_helper_op(self, account_uid: str) -> None:
         """Cancel in-flight offline downsync for ``account_uid`` (#482).
@@ -5268,7 +5313,7 @@ class MailService:
         re-queue UIDs already on the local-first path.
         """
         messages, unread, total, _source = self.get_folder_messages(
-            account_uid, folder_name, sync=False
+            account_uid, folder_name, sync=False, full=True
         )
         filtered = self._filter_pending_local_removals(
             account_uid, folder_name, list(messages or [])
@@ -5886,21 +5931,116 @@ class MailService:
         folder_name: str,
         *,
         sync: bool,
+        full: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        """Return this folder's Camel summary (#513).
+
+        The message list asks for a page. The next page is ``offset`` rows
+        further into the same newest-first summary, so scrolling Archive does
+        not stop after the first 500. Bulk actions pass ``full`` so they
+        select every UID in the summary. A heavy folder is not rebuilt here
+        when that summary is already in memory; its refresh runs separately.
+        """
+        heavy = is_heavy_folder_name(folder_name)
+        stored = self._folder_indexes.get((account_uid, folder_name))
+        if stored is not None and stored.messages and (heavy or not sync):
+            index = stored
+            source: FolderIndexSource = "memory"
+        else:
+            index = self._build_folder_index_unlocked(
+                account_uid,
+                folder_name,
+                sync=sync and not heavy,
+            )
+            index = self._store_folder_index(account_uid, folder_name, index)
+            source = "server" if sync and not heavy else "local"
+        messages = exclude_moved_provisional_messages(list(index.messages))
+        messages = self._filter_pending_local_removals(
+            account_uid, folder_name, messages
+        )
+        summary_count = len(messages)
+        if full:
+            page = messages
+        else:
+            start = max(0, int(offset))
+            size = (
+                MESSAGE_LIST_UI_BIND_CAP
+                if limit is None
+                else max(0, int(limit))
+            )
+            page = messages[start : start + size]
+        total = index.total if index.total >= summary_count else summary_count
+        return page, index.unread, total, source
+
+    def peek_folder_summary_page(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        offset: int = 0,
+        limit: int = MESSAGE_LIST_UI_BIND_CAP,
+    ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        """Return a summary page already in memory.
+
+        Safe while a heavy-folder refresh holds this helper. It does not open
+        the folder or take the helper call lock.
+        """
+        start = max(0, int(offset))
+        size = max(0, int(limit))
         with self._lock:
-            index, source = self._get_folder_index_unlocked(
-                account_uid, folder_name, sync=sync
+            index = self._folder_indexes.get((account_uid, folder_name))
+            if index is None or not index.messages:
+                stored: list[dict] = []
+                unread = -1
+                total = -1
+            else:
+                stored = list(index.messages[start : start + size])
+                summary_count = len(index.messages)
+                total = (
+                    index.total if index.total >= summary_count else summary_count
+                )
+                unread = index.unread
+        stored = self._filter_pending_local_removals(
+            account_uid, folder_name, stored
+        )
+        return stored, unread, total, "memory"
+
+    def folder_summary_page(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        offset: int = 0,
+        limit: int = MESSAGE_LIST_UI_BIND_CAP,
+    ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        """Next Archive page for the message list.
+
+        With a helper, this is answered while a header fetch is still running.
+        """
+        if camel_helpers_enabled():
+            result = self._camel_pool.peek_summary_page(
+                account_uid,
+                folder_name,
+                offset=offset,
+                limit=limit,
             )
-            messages = exclude_moved_provisional_messages(list(index.messages))
-            messages = self._filter_pending_local_removals(
-                account_uid, folder_name, messages
-            )
-            return (
-                messages,
-                index.unread,
-                index.total,
-                source,
-            )
+            if isinstance(result, (list, tuple)) and len(result) == 4:
+                messages, unread, total, source = result
+                filtered = self._filter_pending_local_removals(
+                    account_uid, folder_name, list(messages or [])
+                )
+                return (
+                    filtered,
+                    int(unread),
+                    int(total),
+                    source,  # type: ignore[return-value]
+                )
+            return [], -1, -1, "memory"
+        return self.peek_folder_summary_page(
+            account_uid, folder_name, offset=offset, limit=limit
+        )
 
     def get_folder_messages(
         self,
@@ -5908,13 +6048,23 @@ class MailService:
         folder_name: str,
         *,
         sync: bool = True,
+        full: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
         if camel_helpers_enabled():
+            kwargs: dict[str, Any] = {
+                "sync": sync,
+                "full": full,
+                "offset": offset,
+            }
+            if limit is not None:
+                kwargs["limit"] = limit
             result = self._camel_helper_call(
                 "get_folder_messages",
                 account_uid,
                 [account_uid, folder_name],
-                {"sync": sync},
+                kwargs,
             )
             if isinstance(result, (list, tuple)) and len(result) == 4:
                 messages, unread, total, source = result
@@ -5930,13 +6080,21 @@ class MailService:
             return [], -1, -1, "local"
         if is_mail_io_thread():
             return self._get_folder_messages_unlocked(
-                account_uid, folder_name, sync=sync
+                account_uid,
+                folder_name,
+                sync=sync,
+                full=full,
+                offset=offset,
+                limit=limit,
             )
         return get_mail_io_thread().run_sync(
             self._get_folder_messages_unlocked,
             account_uid,
             folder_name,
             sync=sync,
+            full=full,
+            offset=offset,
+            limit=limit,
         )
 
     def _ordered_searchable_folders_unlocked(self, account_uid: str) -> list[dict]:
@@ -5977,15 +6135,7 @@ class MailService:
             ),
             key=lambda folder: str(folder.get("full_name") or ""),
         )
-        ordered = priority + remaining
-        for name in folder_index_cache.cached_folder_names(account_uid):
-            if not name or name in seen:
-                continue
-            if is_post_outbox_folder(name) or is_virtual_folder(name):
-                continue
-            seen.add(name)
-            ordered.append({"full_name": name, "display_name": name})
-        return ordered
+        return priority + remaining
 
     def _prepare_single_folder_search_unlocked(
         self,
@@ -6080,6 +6230,29 @@ class MailService:
 
         return body_text_for_uid
 
+    def _coerce_search_query(
+        self,
+        query: MessageSearchQuery | list[dict] | None,
+        terms: list[dict] | None = None,
+    ) -> MessageSearchQuery:
+        if isinstance(query, MessageSearchQuery):
+            return query
+        raw = terms if isinstance(terms, list) else query if isinstance(query, list) else []
+        built: list[SearchTerm] = []
+        for item in raw:
+            if isinstance(item, SearchTerm):
+                built.append(item)
+            elif isinstance(item, dict):
+                value = item.get("value")
+                built.append(
+                    SearchTerm(
+                        field=str(item.get("field") or "text"),
+                        value=None if value is None else str(value),
+                        negated=bool(item.get("negated")),
+                    )
+                )
+        return MessageSearchQuery(terms=tuple(built))
+
     def _search_single_folder_index_unlocked(
         self,
         account_uid: str,
@@ -6089,43 +6262,38 @@ class MailService:
         cancellable: Gio.Cancellable,
         on_progress: SearchProgressCallback | None = None,
         on_matches: SearchMatchCallback | None = None,
+        part: str = "all",
     ) -> tuple[list[dict], int, FolderIndexSource]:
-        messages, unread, source, folder, needs_body = (
-            self._prepare_single_folder_search_unlocked(
-                account_uid,
-                folder_name,
-                query,
-            )
+        """Search this folder's Camel summary. The summary is the only UID set."""
+        if cancellable.is_cancelled():
+            return [], 0, "local"
+        folder = self._open_folder_unlocked(
+            account_uid, folder_name, allow_online=False
         )
+        if folder is None:
+            return [], 0, "local"
+        uids = [str(uid) for uid in folder_get_uids(folder) if uid]
+        unread = folder_get_unread_count(folder)
+        expression = query_to_sexp_part(query, part)
+        if not expression:
+            return [], unread, "local"
         search_trace(
             "search_filter_begin",
             account=account_uid,
             folder=folder_name,
-            message_count=len(messages),
-            needs_body=needs_body,
-            has_folder=folder is not None,
-            source=source,
+            message_count=len(uids),
+            needs_body=query_requires_body_scan(query),
+            has_folder=True,
+            source="local",
         )
-
-        messages_by_uid = {
-            str(message.get("uid") or ""): message
-            for message in messages
-            if message.get("uid")
-        }
-        filtered = filter_messages_by_query(
-            messages,
-            query,
-            body_text_for_uid=self._body_text_for_uid_loader(
-                folder,
-                account_uid=account_uid,
-                folder_name=folder_name,
-                messages_by_uid=messages_by_uid,
-                needs_body=needs_body,
-                cancellable=cancellable,
-            ),
-            is_cancelled=cancellable.is_cancelled,
-            on_progress=on_progress,
-            on_matches=on_matches,
+        if on_progress is not None:
+            on_progress(
+                SearchFilterProgress(0, len(uids), 0)
+            )
+        if not uids or cancellable.is_cancelled():
+            return [], unread, "local"
+        matched_uids = self._folder_search_uids_unlocked(
+            folder, expression, uids, cancellable
         )
         if cancellable.is_cancelled():
             search_trace(
@@ -6133,15 +6301,36 @@ class MailService:
                 account=account_uid,
                 folder=folder_name,
             )
-            return [], unread, source
-
+            return [], unread, "local"
+        backend = self._backend_for_account(account_uid)
+        messages: list[dict] = []
+        for uid in matched_uids:
+            info = folder_get_message_info(folder, uid)
+            if info is None:
+                continue
+            try:
+                messages.append(
+                    message_info_to_dict(info, uid=uid, backend=backend)
+                )
+            except (OSError, OverflowError, ValueError):
+                log.debug(
+                    "Skipping search hit %s in %r", uid, folder_name, exc_info=True
+                )
+        messages = sort_messages_newest_first(messages)
+        if on_matches is not None and messages:
+            for start in range(0, len(messages), SEARCH_MATCH_BATCH_SIZE):
+                on_matches(messages[start : start + SEARCH_MATCH_BATCH_SIZE])
+        if on_progress is not None:
+            on_progress(
+                SearchFilterProgress(len(uids), len(uids), len(messages))
+            )
         search_trace(
             "search_filter_result",
             account=account_uid,
             folder=folder_name,
-            match_count=len(filtered),
+            match_count=len(messages),
         )
-        return filtered, unread, source
+        return messages, unread, "local"
 
     def _search_folder_messages_unlocked(
         self,
@@ -6152,8 +6341,10 @@ class MailService:
         sync: bool,
         on_progress: SearchProgressCallback | None = None,
         on_matches: SearchMatchCallback | None = None,
+        part: str = "all",
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
         cancellable = self._begin_folder_search_unlocked()
+        self._register_helper_op_cancellable(cancellable)
         try:
             with search_trace_timer(
                 "search_folder",
@@ -6168,11 +6359,13 @@ class MailService:
                     cancellable=cancellable,
                     on_progress=on_progress,
                     on_matches=on_matches,
+                    part=part,
                 )
                 if cancellable.is_cancelled():
                     return [], unread, 0, source
                 return filtered, unread, len(filtered), source
         finally:
+            self._clear_helper_op_cancellable(cancellable)
             self._end_folder_search_unlocked(cancellable)
 
     def _search_folder_jobs_unlocked(
@@ -6360,36 +6553,6 @@ class MailService:
             folders_done = folder_index + 1
             matched_before_folder = len(matched)
 
-            if state["folder_ctx"] is None:
-                messages, unread, source, folder, needs_body = (
-                    self._prepare_single_folder_search_unlocked(
-                        account_uid,
-                        folder_name,
-                        query,
-                    )
-                )
-                state["folder_ctx"] = (
-                    messages,
-                    unread,
-                    source,
-                    folder,
-                    needs_body,
-                )
-                state["scan_cursor"] = SearchScanCursor()
-                search_trace(
-                    "search_filter_begin",
-                    account=account_uid,
-                    folder=folder_name,
-                    message_count=len(messages),
-                    needs_body=needs_body,
-                    has_folder=folder is not None,
-                    source=source,
-                )
-
-            messages, _unread, _source, folder, needs_body = state["folder_ctx"]
-            cursor = state["scan_cursor"]
-            assert isinstance(cursor, SearchScanCursor)
-
             def folder_on_matches(
                 batch: list[dict],
                 *,
@@ -6409,24 +6572,11 @@ class MailService:
                 matched.extend(annotated)
                 on_matches(annotated)
 
-            filter_messages_by_query(
-                messages,
+            _filtered, _unread, _source = self._search_single_folder_index_unlocked(
+                account_uid,
+                folder_name,
                 query,
-                body_text_for_uid=self._body_text_for_uid_loader(
-                    folder,
-                    account_uid=account_uid,
-                    folder_name=folder_name,
-                    messages_by_uid={
-                        str(message.get("uid") or ""): message
-                        for message in messages
-                        if message.get("uid")
-                    },
-                    needs_body=needs_body,
-                    cancellable=cancellable,
-                ),
-                is_cancelled=cancellable.is_cancelled,
-                should_yield=get_mail_io_thread().has_interactive_work_pending,
-                cursor=cursor,
+                cancellable=cancellable,
                 on_progress=lambda progress, al=account_label, fl=folder_label, fd=folders_done, mbf=matched_before_folder: report_folder_progress(
                     progress,
                     account_label=al,
@@ -6439,12 +6589,7 @@ class MailService:
             if cancellable.is_cancelled():
                 finish(cancelled=True)
                 return
-            if cursor.index < len(messages):
-                get_mail_io_thread().submit(run_folder)
-                return
 
-            state["folder_ctx"] = None
-            state["scan_cursor"] = None
             state["index"] = folder_index + 1
             get_mail_io_thread().submit(run_folder)
 
@@ -6452,6 +6597,180 @@ class MailService:
             run_folder()
         else:
             get_mail_io_thread().submit_front(run_folder)
+
+    def _search_terms_payload(self, query: MessageSearchQuery) -> list[dict]:
+        return [
+            {"field": term.field, "value": term.value, "negated": term.negated}
+            for term in query.terms
+        ]
+
+    def _helper_search_folder_jobs(
+        self, account_uids: list[str]
+    ) -> list[tuple[str, str, str]]:
+        """Folders to search, from the helper folder list. No folder-index."""
+        jobs: list[tuple[str, str, str]] = []
+        for account_uid in account_uids:
+            try:
+                folders = self.list_folders(account_uid)
+            except Exception:
+                log.debug(
+                    "Could not list folders for search on %s",
+                    account_uid,
+                    exc_info=True,
+                )
+                continue
+            searchable = [
+                folder
+                for folder in folders
+                if folder_can_contain_messages(folder)
+                and not is_post_outbox_folder(folder.get("full_name"))
+            ]
+            ordered = sorted(
+                searchable,
+                key=lambda folder: (
+                    0
+                    if str(folder.get("full_name") or "").upper()
+                    in {"INBOX", "INBOX/"}
+                    else 1
+                    if str(folder.get("full_name") or "").lower()
+                    in {"sent", "sent mail", "sent messages"}
+                    else 2,
+                    str(folder.get("full_name") or ""),
+                ),
+            )
+            for folder in ordered:
+                full_name = folder.get("full_name")
+                if not full_name:
+                    continue
+                jobs.append(
+                    (
+                        account_uid,
+                        str(full_name),
+                        str(folder.get("display_name") or full_name),
+                    )
+                )
+        return jobs
+
+    def _start_helper_search(
+        self,
+        account_uids: list[str],
+        query: MessageSearchQuery,
+        *,
+        folder_name: str | None = None,
+        on_progress: SearchProgressCallback | None = None,
+        on_matches: SearchMatchCallback | None = None,
+        on_complete: SearchCompleteCallback | None = None,
+    ) -> None:
+        """Run Camel folder search in each account helper and stream hits."""
+        terms = self._search_terms_payload(query)
+
+        def run() -> None:
+            # Header fetch holds this account's helper. Search has to take
+            # the lock, including when the folder being searched is the one
+            # still fetching headers.
+            for account_uid in account_uids:
+                try:
+                    self.cancel_account_heavy_folder_index(account_uid)
+                except Exception:
+                    log.debug(
+                        "Could not stop header fetch before search on %s",
+                        account_uid,
+                        exc_info=True,
+                    )
+            # A known folder is searched directly. Listing every folder first
+            # waits on the helper, so a selected-folder search never starts
+            # while another folder refresh holds that account.
+            if folder_name is not None and len(account_uids) == 1:
+                jobs = [(account_uids[0], folder_name, folder_name)]
+            else:
+                jobs = self._helper_search_folder_jobs(account_uids)
+                if folder_name is not None:
+                    jobs = [job for job in jobs if job[1] == folder_name]
+                    if not jobs and account_uids:
+                        jobs = [(account_uids[0], folder_name, folder_name)]
+            # Header hits first. A body scan that fails or runs long must
+            # not throw those hits away.
+            parts = ["header"]
+            if query_requires_body_scan(query):
+                parts.append("body")
+            matched: list[dict] = []
+            seen: set[tuple[str, str, str]] = set()
+            folders_total = len(jobs)
+            for index, (job_account, job_folder, folder_label) in enumerate(
+                jobs, start=1
+            ):
+                for part in parts:
+                    try:
+                        result = self._camel_helper_call(
+                            "search_folder_messages",
+                            job_account,
+                            [job_account, job_folder],
+                            {"terms": terms, "sync": False, "part": part},
+                        )
+                    except Exception:
+                        log.debug(
+                            "Helper search failed for %s/%s part=%s",
+                            job_account,
+                            job_folder,
+                            part,
+                            exc_info=True,
+                        )
+                        continue
+                    messages: list[dict] = []
+                    if isinstance(result, (list, tuple)) and result:
+                        raw_messages = result[0]
+                        if isinstance(raw_messages, list):
+                            messages = raw_messages
+                    annotated = []
+                    for message in messages:
+                        if not isinstance(message, dict):
+                            continue
+                        hit = annotate_search_match(
+                            message,
+                            account_uid=job_account,
+                            folder_name=job_folder,
+                        )
+                        key = (
+                            job_account,
+                            job_folder,
+                            str(hit.get("uid") or ""),
+                        )
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        annotated.append(hit)
+                    if annotated and on_matches is not None:
+                        on_matches(annotated)
+                    matched.extend(annotated)
+                if on_progress is not None:
+                    account_label = ""
+                    try:
+                        account_label = self.get_account(job_account).display_label
+                    except Exception:
+                        account_label = job_account
+                    on_progress(
+                        SearchFilterProgress(
+                            index,
+                            folders_total,
+                            len(matched),
+                            account_label=account_label,
+                            folder_label=folder_label,
+                            folders_done=index,
+                            folders_total=folders_total,
+                        )
+                    )
+            if on_complete is not None:
+                ordered = sort_messages_newest_first(matched)
+                on_complete((ordered, 0, len(ordered), "local"))
+
+        # Do not run this on the single mail I/O thread. A helper call there
+        # blocks every later search until that call returns (#513).
+        if is_mail_io_thread():
+            threading.Thread(
+                target=run, name="mail-job-front-search", daemon=True
+            ).start()
+        else:
+            run()
 
     def start_search_all_messages(
         self,
@@ -6461,6 +6780,15 @@ class MailService:
         on_matches: SearchMatchCallback | None = None,
         on_complete: SearchCompleteCallback | None = None,
     ) -> None:
+        if camel_helpers_enabled():
+            self._start_helper_search(
+                [account.uid for account in self.list_accounts()],
+                query,
+                on_progress=on_progress,
+                on_matches=on_matches,
+                on_complete=on_complete,
+            )
+            return
         if is_mail_io_thread():
             folder_jobs = self._folder_jobs_for_all_unlocked()
             self._start_search_folder_jobs(
@@ -6488,6 +6816,15 @@ class MailService:
         on_matches: SearchMatchCallback | None = None,
         on_complete: SearchCompleteCallback | None = None,
     ) -> None:
+        if camel_helpers_enabled():
+            self._start_helper_search(
+                [account_uid],
+                query,
+                on_progress=on_progress,
+                on_matches=on_matches,
+                on_complete=on_complete,
+            )
+            return
         if is_mail_io_thread():
             folder_jobs = self._folder_jobs_for_account_unlocked(account_uid)
             self._start_search_folder_jobs(
@@ -6517,6 +6854,16 @@ class MailService:
         on_matches: SearchMatchCallback | None = None,
         on_complete: SearchCompleteCallback | None = None,
     ) -> None:
+        if camel_helpers_enabled():
+            self._start_helper_search(
+                [account_uid],
+                query,
+                folder_name=folder_name,
+                on_progress=on_progress,
+                on_matches=on_matches,
+                on_complete=on_complete,
+            )
+            return
         if is_mail_io_thread():
             display = folder_name
             for folder in self._ordered_searchable_folders_unlocked(account_uid):
@@ -6635,29 +6982,34 @@ class MailService:
         self,
         account_uid: str,
         folder_name: str,
-        query: MessageSearchQuery,
+        query: MessageSearchQuery | list[dict] | None = None,
         *,
         sync: bool = False,
+        terms: list[dict] | None = None,
+        part: str = "all",
         on_progress: SearchProgressCallback | None = None,
         on_matches: SearchMatchCallback | None = None,
     ) -> tuple[list[dict], int, int, FolderIndexSource]:
+        parsed = self._coerce_search_query(query, terms)
         if is_mail_io_thread():
             return self._search_folder_messages_unlocked(
                 account_uid,
                 folder_name,
-                query,
+                parsed,
                 sync=sync,
                 on_progress=on_progress,
                 on_matches=on_matches,
+                part=part,
             )
         return get_mail_io_thread().run_sync(
             self._search_folder_messages_unlocked,
             account_uid,
             folder_name,
-            query,
+            parsed,
             sync=sync,
             on_progress=on_progress,
             on_matches=on_matches,
+            part=part,
         )
 
     def list_messages_with_stats(
@@ -7151,61 +7503,8 @@ class MailService:
                 found = first_nonempty_path(cached_rfc822_candidates(filename))
                 if found is not None:
                     return found
-        store_uid = None
-        parent = getattr(folder, "get_parent_store", None)
-        if callable(parent):
-            try:
-                store = parent()
-            except Exception:
-                store = None
-            uid_get = getattr(store, "get_uid", None) if store is not None else None
-            if callable(uid_get):
-                try:
-                    raw_uid = uid_get()
-                except Exception:
-                    raw_uid = None
-                if isinstance(raw_uid, str) and raw_uid:
-                    store_uid = raw_uid
-        folder_name = None
-        for attr in ("get_full_name", "get_display_name"):
-            name_get = getattr(folder, attr, None)
-            if not callable(name_get):
-                continue
-            try:
-                raw_name = name_get()
-            except Exception:
-                continue
-            if isinstance(raw_name, str) and raw_name:
-                folder_name = raw_name
-                break
-        if not store_uid:
-            return None
-        digest = rfc822_digest(api_uid)
-        names = [folder_name] if folder_name else []
-        if not folder_name or folder_name.lower() == "inbox":
-            names.extend(["Inbox", "INBOX"])
-        # Search helper private cache (when set) and system Evolution cache.
-        # Helpers use ~/.cache/post/camel-helper/<uid>/cache; pre-helper or
-        # UI-era bodies often still live under ~/.cache/evolution (#445 / GOA).
-        from post.mail.camel_paths import default_evolution_dirs, resolve_camel_dirs
-
-        cache_roots: list[str] = []
-        try:
-            _data, helper_or_env_cache = resolve_camel_dirs()
-            cache_roots.append(helper_or_env_cache)
-        except Exception:
-            pass
-        _sys_data, sys_cache = default_evolution_dirs()
-        cache_roots.append(sys_cache)
-        seen_roots: set[str] = set()
-        for cache_root in cache_roots:
-            if not cache_root or cache_root in seen_roots:
-                continue
-            seen_roots.add(cache_root)
-            for store_root in evolution_store_roots(cache_root, store_uid):
-                found = find_nonempty_rfc822(store_root, names, digest)
-                if found is not None:
-                    return found
+        # Camel's own filename is the cache lookup. Do not probe
+        # ~/.cache/evolution or MD5(uid) names (#513).
         return None
 
     def _construct_mime_from_rfc822_path(self, filename: str) -> Any | None:
@@ -7571,12 +7870,9 @@ class MailService:
         """Recover from online INVALID_UID before treating the message as vanished.
 
         Camel may report INVALID_UID when the folder summary is mid-refresh even
-        though the body is cached or the UID is still in Camel (#265). Listed
-        messages soft-fail so the row stays; only truly unknown UIDs are vanished.
-
-        If Camel does not know the UID and ``synchronize_message_sync`` also
-        reports INVALID_UID, the folder-index row is a ghost — drop it and
-        vanish (#451). Do not soft-fail as "still downloading".
+        though the body is cached or the UID is still in Camel (#265). A UID
+        in this summary with no body is downloaded, or reported as not ready.
+        Vanished means a refresh of this summary no longer has the UID (#513).
 
         Graph ``ErrorItemNotFound`` means that RestId is not in this folder
         (#294/#404). Remap to a same-identity live UID. If the row is still
@@ -7596,10 +7892,23 @@ class MailService:
             cause is not None and self._is_graph_item_not_found_error(cause)
         )
         camel_known = folder_get_message_info(folder, message_uid) is not None
-        index_known = self._folder_index_has_uid(
-            account_uid, folder_name, message_uid
-        )
-        known = camel_known or index_known
+        if not camel_known:
+            try:
+                folder.refresh_info_sync(None)
+            except Exception:
+                log.info(
+                    "Summary refresh before vanish check failed for %s in %r",
+                    message_uid,
+                    folder_name,
+                )
+            camel_known = folder_get_message_info(folder, message_uid) is not None
+            if not camel_known:
+                raise MessageNotAvailableError(
+                    message_uid,
+                    folder_name,
+                    reason=MessageUnavailableReason.VANISHED,
+                ) from cause
+        known = camel_known
         if known and not camel_uid_is_binary(message_uid):
             log.info(
                 "Message %s still known in %r but MIME not ready; "
@@ -7619,6 +7928,21 @@ class MailService:
                     )
                     graph_gone = True
                     cause = sync_exc
+                elif (
+                    isinstance(sync_exc, GLib.Error)
+                    and self._is_missing_message_error(sync_exc)
+                    and not camel_known
+                ):
+                    log.info(
+                        "UID %s in %r is not in the summary after sync",
+                        message_uid,
+                        folder_name,
+                    )
+                    raise MessageNotAvailableError(
+                        message_uid,
+                        folder_name,
+                        reason=MessageUnavailableReason.VANISHED,
+                    ) from sync_exc
                 elif is_sign_in_required_error(sync_exc):
                     cached = self._try_message_cached(folder, api_uid)
                     if cached is not None:
@@ -7629,26 +7953,6 @@ class MailService:
                     self._raise_uncached_sign_in(
                         account_uid, folder_name, message_uid, cause=sync_exc
                     )
-                elif (
-                    isinstance(sync_exc, GLib.Error)
-                    and self._is_missing_message_error(sync_exc)
-                    and not camel_known
-                ):
-                    log.info(
-                        "UID %s in %r confirmed missing after sync "
-                        "(stale folder-index row; treating as vanished)",
-                        message_uid,
-                        folder_name,
-                    )
-                    if index_known:
-                        self._reconcile_folder_index_after_confirmed_miss(
-                            folder, account_uid, folder_name, message_uid
-                        )
-                    raise MessageNotAvailableError(
-                        message_uid,
-                        folder_name,
-                        reason=MessageUnavailableReason.VANISHED,
-                    ) from sync_exc
                 else:
                     log_mail_error(
                         log,
@@ -8187,7 +8491,21 @@ class MailService:
         ``on_progress`` is invoked from the mail I/O thread when headers grow
         mid-``refresh_info`` (Evolution adds summary rows as Graph delta pages
         arrive; Post mirrors that so the UI is not frozen for minutes).
+
+        The UI receives a page of the Camel summary, not the folder-index (#513).
         """
+        if camel_helpers_enabled():
+            raw = self._camel_helper_call(
+                "continue_heavy_folder_index",
+                account_uid,
+                [account_uid, folder_name],
+                {"cursor": cursor, "allow_refresh": allow_refresh},
+                timeout=_HEAVY_FOLDER_INDEX_IPC_TIMEOUT,
+            )
+            progress = _heavy_progress_from_helper(raw)
+            if on_progress is not None:
+                on_progress(progress)
+            return progress
         return run_on_mail_thread(
             self._continue_heavy_folder_index_unlocked,
             account_uid,
@@ -11821,7 +12139,8 @@ class MailService:
         self, account_uid: str, folder_name: str
     ) -> set[str]:
         key = (account_uid, folder_name)
-        pending = set(self._pending_local_removals.get(key) or ())
+        pending_map = getattr(self, "_pending_local_removals", None) or {}
+        pending = set(pending_map.get(key) or ())
         pending.update(
             pending_removals_store.load_pending_uids(account_uid, folder_name)
         )

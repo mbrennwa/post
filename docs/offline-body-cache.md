@@ -12,9 +12,9 @@ Camel helpers ([#445](https://github.com/mbrennwa/post/issues/445),
 ## Settings
 
 **Settings → Offline** configures per-account **body** download into that
-account’s helper Camel cache. It does **not** store bodies in the folder-index
-(`~/.cache/post/folder-index/`). Header search (`from:`, `subject:`, …) uses
-the folder-index. `body:` and bare-word search need cached MIME
+account’s helper Camel cache. Header, flag, and body search run against that
+helper’s Camel summary. `body:` and bare-word search need the message stored
+in that cache
 ([#137](https://github.com/mbrennwa/post/issues/137),
 [#365](https://github.com/mbrennwa/post/issues/365)).
 
@@ -49,14 +49,14 @@ When a remote account is still **unset**, Post shows a required per-account dial
 - **`post.preferences`** — per-account `offline_body_sync` in `~/.config/post/preferences.json`
 - **`post.mail.offline_settings`** — maps preferences to `Camel.OfflineSettings` and folder `offline_sync`
 - **`post.mail.offline_sync`** — background body crawl driven by `OfflineBodySyncCoordinator` in the UI process; Camel `downsync_sync` / arrival `synchronize_message_sync` run via `MailService.list_offline_downsync_folders` / `offline_downsync_folder` / `synchronize_folder_message` on the per-account helper ([#451](https://github.com/mbrennwa/post/issues/451)). Per-folder 30s timeout does not abort the whole account pass; after heavy-folder downsync, re-indexes **local** Camel summary only (`allow_refresh=False`). Body cache does not grow the list past headers Camel already knows. **Arrival prefetch (#372):** when Camel learns a new UID (`Folder::changed` added UIDs, or `refresh_info` UID diff), Post queues a short per-UID fetch on the same background path. That fetch ignores the Archive/heavy-folder **hold** that pauses full-account downsync. Skip when offline policy is Off, the account is taken offline, the network is down, or a **non-empty** RFC822 is already cached (0-byte header stubs are fetched). Bursts are capped at 20 UIDs per folder. Interactive mail I/O preempts between UIDs; mid-FETCH cancel is bounded by the 15s timeout (serial helper IPC).
-- **`post.mail.eds` / folder-index** — message list + search candidates live in Post’s folder-index (`~/.cache/post/folder-index/`). Heavy folders (Archive/Trash/Junk/All Mail) use a **chunked, grow-only** background indexer when opened: local summary first, then async `refresh_info` with interactive pump so Graph can enlarge the Camel summary without freezing the UI. Opening a heavy folder holds **that account’s** full-account offline body sync while that folder’s header indexer is running (so Archive Graph catch-up is not abandoned for the same account’s Inbox crawl). Other accounts keep crawling ([#449](https://github.com/mbrennwa/post/issues/449); timing from [#407](https://github.com/mbrennwa/post/issues/407)). The hold lifts when indexing finishes or you leave the folder. Cancel/timeout retries server refresh while the folder stays open. Partial Camel counts must not shrink known STATUS totals (`folder-status` cache is grow-only; only trusted STATUS-sized observations lock in).
-- **`post.mail.search`** — `parse_search_query()` and `filter_messages_by_query()` filter the in-memory folder index; bare-word and `body:` terms load cached MIME and match via `searchable_body_text()` (human-readable body text, not raw base64 — [#111](https://github.com/mbrennwa/post/issues/111)). `query_to_sexp()` remains for libcamel integration tests.
+- **`post.mail.eds`** — the message list is a page of the helper Camel summary (#513). `~/.cache/post/folder-index/` is not read or written. Heavy folders (Archive/Trash/Junk/All Mail) refresh Camel in the helper: local summary page first, then async `refresh_info` so Graph can enlarge that summary without freezing the UI. Opening a heavy folder holds **that account’s** full-account offline body sync while that refresh is running. Other accounts keep crawling ([#449](https://github.com/mbrennwa/post/issues/449); timing from [#407](https://github.com/mbrennwa/post/issues/407)). The hold lifts when the refresh finishes or you leave the folder. Partial Camel counts must not shrink known STATUS totals (`folder-status` cache is grow-only; only trusted STATUS-sized observations lock in).
+- **`post.mail.search`** — `parse_search_query()` and `query_to_sexp()` compile the search box into a Camel expression. The helper runs that search on the summary. `filter_messages_by_query()` remains for tests.
 
-List and search require folder-index rows. Bodies in Camel’s cache alone are not enough for a message to appear in the list or search results.
+A message is in the list or in search results only when its UID is in the helper summary. A missing body is a download, not a second list.
 
 ## Search
 
-Folder search filters the folder-index (headers only). Header and flag terms match index metadata directly. Bare-word and `body:` terms load cached MIME and match human-readable body text via `searchable_body_text()`. Offline body download does not put bodies into the folder-index.
+Folder search runs in the helper against the Camel summary. Header, flag, and body terms are Camel's search expression. Body matches require the message to be stored in that Camel cache.
 
 Limits: per-folder only; attachment content not searched; offline body matches require cached MIME.
 

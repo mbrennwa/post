@@ -13,6 +13,7 @@ from post.mail.search import (
     parse_search_query,
     query_requires_body_scan,
     query_to_sexp,
+    query_to_sexp_part,
 )
 
 
@@ -174,6 +175,25 @@ class QueryToSexpTests(unittest.TestCase):
         self.assertIn('(header-contains "Subject" "Core")', sexp)
         self.assertIn('(body-contains "Core")', sexp)
         self.assertIn("(or ", sexp)
+
+    def test_header_part_omits_body(self) -> None:
+        query = parse_search_query("Core")
+        assert query is not None
+        sexp = query_to_sexp_part(query, "header")
+        assert sexp is not None
+        self.assertIn('(header-contains "Subject" "Core")', sexp)
+        self.assertNotIn("body-contains", sexp)
+
+    def test_body_part_is_body_only(self) -> None:
+        query = parse_search_query("Core")
+        assert query is not None
+        sexp = query_to_sexp_part(query, "body")
+        self.assertEqual(sexp, '(match-all (body-contains "Core"))')
+
+    def test_header_prefix_skips_body_part(self) -> None:
+        query = parse_search_query("from:alice")
+        assert query is not None
+        self.assertIsNone(query_to_sexp_part(query, "body"))
 
     def test_subject_prefix_is_header_only(self) -> None:
         query = parse_search_query("subject:Invoice")

@@ -35,6 +35,7 @@ _FAKE_HELPER = textwrap.dedent(
     write_message(stdout, {"type": "ready", "account_uid": account, "pid": os.getpid()})
     incoming = queue.Queue()
     cancel_event = threading.Event()
+    heavy_cancel_event = threading.Event()
 
     def reader():
         while True:
@@ -45,6 +46,20 @@ _FAKE_HELPER = textwrap.dedent(
             # Apply cancel immediately so a long call can observe it (#482).
             if msg.get("type") == "cancel":
                 cancel_event.set()
+                continue
+            if msg.get("type") == "cancel_heavy_index":
+                heavy_cancel_event.set()
+                continue
+            if msg.get("type") == "summary_page":
+                write_message(
+                    stdout,
+                    {
+                        "type": "result",
+                        "id": msg.get("id"),
+                        "ok": True,
+                        "result": [[{"uid": "older"}], 0, 20, "memory"],
+                    },
+                )
                 continue
             incoming.put(msg)
 
@@ -80,6 +95,25 @@ _FAKE_HELPER = textwrap.dedent(
                     break
                 time.sleep(0.05)
             cancel_event.clear()
+            write_message(
+                stdout,
+                {
+                    "type": "result",
+                    "id": msg.get("id"),
+                    "ok": True,
+                    "result": {"slept": args[0] if args else 0, "cancelled": cancelled},
+                },
+            )
+        elif method == "sleep_until_heavy_cancel_for_test":
+            seconds = float(args[0]) if args else 0
+            deadline = time.monotonic() + seconds
+            cancelled = False
+            while time.monotonic() < deadline:
+                if heavy_cancel_event.is_set():
+                    cancelled = True
+                    break
+                time.sleep(0.05)
+            heavy_cancel_event.clear()
             write_message(
                 stdout,
                 {
@@ -356,5 +390,77 @@ class FakeHelperRuntimeTests(unittest.TestCase):
             self.assertTrue(sleep_result.get("cancelled"))
             # Serial is free for another call.
             self.assertTrue(runtime.call("ping", ["acct-a"], timeout=10.0)["ok"])
+        finally:
+            runtime.kill()
+
+    def test_cancel_heavy_index_unblocks_without_serial(self) -> None:
+        """Search on another account must abort a heavy-folder refresh (#513)."""
+        import threading
+        import time
+
+        runtime = self._patch_runtime(AccountCamelRuntime(account_uid="acct-a"))
+        try:
+            results: dict[str, object] = {}
+
+            def long_call() -> None:
+                results["sleep"] = runtime.call(
+                    "sleep_until_heavy_cancel_for_test", [5.0], timeout=10.0
+                )
+
+            worker = threading.Thread(target=long_call, daemon=True)
+            worker.start()
+            time.sleep(0.2)
+            runtime.request_cancel_heavy_index()
+            worker.join(timeout=3.0)
+            self.assertFalse(worker.is_alive())
+            sleep_result = results.get("sleep")
+            self.assertIsInstance(sleep_result, dict)
+            assert isinstance(sleep_result, dict)
+            self.assertTrue(sleep_result.get("cancelled"))
+            self.assertTrue(runtime.call("ping", ["acct-a"], timeout=10.0)["ok"])
+        finally:
+            runtime.kill()
+
+    def test_summary_page_returns_while_a_call_is_in_flight(self) -> None:
+        """Scrolling Archive must not wait for the header fetch (#513)."""
+        import threading
+        import time
+
+        runtime = self._patch_runtime(AccountCamelRuntime(account_uid="acct-a"))
+        try:
+            def long_call() -> None:
+                runtime.call("sleep_for_test", [5.0], timeout=10.0)
+
+            worker = threading.Thread(target=long_call, daemon=True)
+            worker.start()
+            time.sleep(0.2)
+            page = runtime.peek_summary_page("Archive", offset=500, limit=500)
+            self.assertEqual(page[0], [{"uid": "older"}])
+            self.assertEqual(page[2], 20)
+            self.assertTrue(worker.is_alive())
+            runtime.request_cancel()
+            worker.join(timeout=3.0)
+        finally:
+            runtime.kill()
+
+    def test_summary_page_returns_while_a_call_is_in_flight(self) -> None:
+        """Scrolling Archive must not wait for the header fetch (#513)."""
+        import threading
+        import time
+
+        runtime = self._patch_runtime(AccountCamelRuntime(account_uid="acct-a"))
+        try:
+            def long_call() -> None:
+                runtime.call("sleep_for_test", [5.0], timeout=10.0)
+
+            worker = threading.Thread(target=long_call, daemon=True)
+            worker.start()
+            time.sleep(0.2)
+            page = runtime.peek_summary_page("Archive", offset=500, limit=500)
+            self.assertEqual(page[0], [{"uid": "older"}])
+            self.assertEqual(page[2], 20)
+            self.assertTrue(worker.is_alive())
+            runtime.request_cancel()
+            worker.join(timeout=3.0)
         finally:
             runtime.kill()

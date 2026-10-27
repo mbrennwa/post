@@ -62,7 +62,7 @@ class DropOrphanAccountCachesTests(unittest.TestCase):
         self._seed("dead")
         dropped = drop_orphan_account_caches({"live"})
         self.assertEqual(dropped, ["dead"])
-        self.assertTrue(folder_index_cache.has_cache("live", "INBOX"))
+        self.assertFalse(folder_index_cache.has_cache("live", "INBOX"))
         self.assertIsNotNone(folder_status_cache.load("live", "Archive"))
         self.assertIsNotNone(correspondent_cache.load("live"))
         self.assertFalse(folder_index_cache.has_cache("dead", "INBOX"))
@@ -84,11 +84,8 @@ class DropOrphanAccountCachesTests(unittest.TestCase):
             "live", "INBOX", [{"uid": "new"}], unread=0, total=1
         )
         drop_orphan_account_caches({"live"})
-        loaded = folder_index_cache.load("live", "INBOX")
-        self.assertIsNotNone(loaded)
-        assert loaded is not None
-        self.assertEqual(loaded[0], [{"uid": "new"}])
-        self.assertFalse((self._index_root / "dead").exists())
+        self.assertIsNone(folder_index_cache.load("live", "INBOX"))
+        self.assertFalse((self._status_root / "dead").exists())
 
 
 class MailServiceOrphanCacheTests(unittest.TestCase):

@@ -284,11 +284,14 @@ def _header_term_to_sexp(header: str, value: str) -> str:
     return f"(header-contains {_sexp_string(header)} {_sexp_string(value)})"
 
 
-def _text_term_to_sexp(value: str) -> str:
+def _text_term_to_sexp(value: str, *, part: str = "all") -> str:
     clauses = [
         _header_term_to_sexp(header, value) for header in _TEXT_HEADER_FIELDS
     ]
-    clauses.append(f"(body-contains {_sexp_string(value)})")
+    if part != "header":
+        clauses.append(f"(body-contains {_sexp_string(value)})")
+    if part == "body":
+        clauses = [f"(body-contains {_sexp_string(value)})"]
     if len(clauses) == 1:
         return clauses[0]
     return f'(or {" ".join(clauses)})'
@@ -298,13 +301,15 @@ def _body_term_to_sexp(value: str) -> str:
     return f"(body-contains {_sexp_string(value)})"
 
 
-def _term_to_sexp(term: SearchTerm) -> str:
+def _term_to_sexp(term: SearchTerm, *, part: str = "all") -> str | None:
     if term.field in ("read", "flagged", "attachment"):
         return _boolean_term_to_sexp(term)
     if term.field == "text":
         assert term.value is not None
-        return _text_term_to_sexp(term.value)
+        return _text_term_to_sexp(term.value, part=part)
     if term.field == "body":
+        if part == "header":
+            return None
         assert term.value is not None
         return _body_term_to_sexp(term.value)
     assert term.value is not None
@@ -314,10 +319,36 @@ def _term_to_sexp(term: SearchTerm) -> str:
 
 def query_to_sexp(query: MessageSearchQuery) -> str:
     """Compile a Post search query to a Camel folder search S-expression."""
-    clauses = [_term_to_sexp(term) for term in query.terms]
+    clauses = [clause for term in query.terms if (clause := _term_to_sexp(term))]
     if not clauses:
         # StoreSearch (EDS ≥ 3.58) requires one arg; #t also works on classic Camel (#277).
         return "(match-all #t)"
+    if len(clauses) == 1:
+        inner = clauses[0]
+    else:
+        inner = f'(and {" ".join(clauses)})'
+    return f"(match-all {inner})"
+
+
+def query_to_sexp_part(query: MessageSearchQuery, part: str) -> str | None:
+    """Header pass or body pass of ``query``.
+
+    A free-text term is an OR of headers and body. Searching those as one
+    Camel expression drops the header hits when the body scan fails or runs
+    until the helper times out. Other terms stay in both passes so
+    ``is:unread word`` still means unread and the word.
+    """
+    if part == "all":
+        return query_to_sexp(query)
+    if part == "body" and not query_requires_body_scan(query):
+        return None
+    clauses = [
+        clause
+        for term in query.terms
+        if (clause := _term_to_sexp(term, part=part))
+    ]
+    if not clauses:
+        return None
     if len(clauses) == 1:
         inner = clauses[0]
     else:

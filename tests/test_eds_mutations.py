@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from post.mail.eds import MailService
+from post.mail.eds import MailService, _FolderMessageIndex
 
 
 class DraftDispatchTests(unittest.TestCase):
@@ -1166,7 +1166,9 @@ class BulkArchiveHelperRoutingTests(unittest.TestCase):
         ):
             result = service.archive_read_messages("acct-1", "INBOX")
 
-        get_folder.assert_called_once_with("acct-1", "INBOX", sync=False)
+        get_folder.assert_called_once_with(
+            "acct-1", "INBOX", sync=False, full=True
+        )
         archive.assert_called_once_with("acct-1", "INBOX", ["r1", "r2"])
         run_mail.assert_not_called()
         self.assertEqual(result["archived_count"], 2)
@@ -1271,3 +1273,43 @@ class BulkArchiveHelperRoutingTests(unittest.TestCase):
 
                 archive.assert_called_once_with("acct-1", "INBOX", ["r2"])
                 self.assertEqual(result["archived_count"], 1)
+
+
+class FolderMessagePageTests(unittest.TestCase):
+    def test_archive_page_continues_past_the_first_screen(self) -> None:
+        service = MailService(registry=mock.Mock())
+        messages = [{"uid": str(i), "subject": "s", "flags": {}} for i in range(1200)]
+        service._store_folder_index(
+            "acct-1",
+            "Archive",
+            _FolderMessageIndex(messages=messages, unread=3, total=1200),
+        )
+
+        first, _unread, total, _source = service._get_folder_messages_unlocked(
+            "acct-1", "Archive", sync=False
+        )
+        older, _unread2, total2, _source2 = service._get_folder_messages_unlocked(
+            "acct-1", "Archive", sync=False, offset=500, limit=500
+        )
+
+        self.assertEqual([row["uid"] for row in first], [str(i) for i in range(500)])
+        self.assertEqual(
+            [row["uid"] for row in older], [str(i) for i in range(500, 1000)]
+        )
+        self.assertEqual(total, 1200)
+        self.assertEqual(total2, 1200)
+
+    def test_summary_page_reads_the_stored_index(self) -> None:
+        service = MailService(registry=mock.Mock())
+        messages = [{"uid": str(i), "subject": "s", "flags": {}} for i in range(800)]
+        service._store_folder_index(
+            "acct-1",
+            "Archive",
+            _FolderMessageIndex(messages=messages, unread=1, total=800),
+        )
+        page, _unread, total, source = service.peek_folder_summary_page(
+            "acct-1", "Archive", offset=500, limit=500
+        )
+        self.assertEqual([row["uid"] for row in page], [str(i) for i in range(500, 800)])
+        self.assertEqual(total, 800)
+        self.assertEqual(source, "memory")
