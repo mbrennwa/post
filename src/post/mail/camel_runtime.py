@@ -298,14 +298,18 @@ class AccountCamelRuntime:
         kwargs: dict[str, Any] | None = None,
         *,
         timeout: float | None = _DEFAULT_JOB_TIMEOUT,
+        wait_timeout: float | None = None,
         goa_ensure_out: list[str] | None = None,
     ) -> Any:
         """Run ``method`` in the helper; raise on failure / timeout / kill.
 
         When the helper reports an EnsureCredentials result, it is appended to
         ``goa_ensure_out`` before this method returns or raises.
+
+        ``wait_timeout`` bounds how long this call waits for ``_serial``. On
+        expiry the holding call keeps running and this helper is not killed.
         """
-        self._acquire_serial_for(method)
+        self._acquire_serial_for(method, wait_timeout=wait_timeout)
         try:
             self._set_busy(method)
             try:
@@ -321,15 +325,35 @@ class AccountCamelRuntime:
         finally:
             self._serial.release()
 
-    def _acquire_serial_for(self, method: str) -> None:
-        """Take ``_serial``, logging when this call waits on a busy helper."""
+    def _acquire_serial_for(
+        self, method: str, *, wait_timeout: float | None = None
+    ) -> None:
+        """Take ``_serial``, logging when this call waits on a busy helper.
+
+        ``wait_timeout`` raises ``CamelHelperTimeout`` without killing the
+        helper. Interactive reads use it so the reader can leave
+        "Loading message…" (#494).
+        """
         if self._serial.acquire(blocking=False):
             return
         wait_started = time.monotonic()
+        deadline = (
+            None
+            if wait_timeout is None
+            else wait_started + max(0.0, wait_timeout)
+        )
         next_log = wait_started + _BLOCKED_LOG_AFTER
         logged = False
         while True:
             now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                busy_method, busy_for = self._busy_snapshot()
+                raise CamelHelperTimeout(
+                    "timed out waiting for camel helper lock "
+                    f"account={self.account_uid} method={method} "
+                    f"behind={busy_method or 'unknown'} "
+                    f"busy_for={busy_for:.1f}s wait={wait_timeout:.0f}s"
+                )
             if now >= next_log:
                 busy_method, busy_for = self._busy_snapshot()
                 waited = now - wait_started
@@ -346,7 +370,12 @@ class AccountCamelRuntime:
                 logged = True
                 next_log = now + _BLOCKED_LOG_REPEAT
             remaining = next_log - time.monotonic()
-            if self._serial.acquire(timeout=max(0.05, min(0.25, remaining))):
+            slice_timeout = max(0.05, min(0.25, remaining))
+            if deadline is not None:
+                slice_timeout = min(
+                    slice_timeout, max(0.05, deadline - time.monotonic())
+                )
+            if self._serial.acquire(timeout=slice_timeout):
                 break
         if logged:
             log.warning(
@@ -429,14 +458,28 @@ class AccountCamelRuntime:
         Search on another account must abort Archive header fetch in this
         helper. The refresh cancellable lives in the helper process.
         """
+        self._request_cancel_message("cancel_heavy_index", "heavy-index cancel")
+
+    def request_cancel_folder_refresh(self) -> None:
+        """Stop an in-flight folder refresh without taking ``_serial`` (#494).
+
+        Interactive reads use this so ``refresh_info`` on a non-heavy folder
+        does not pin the reader. The cancellable lives in the helper process.
+        """
+        self._request_cancel_message(
+            "cancel_folder_refresh", "folder-refresh cancel"
+        )
+
+    def _request_cancel_message(self, msg_type: str, label: str) -> None:
         with self._lock:
             if self._proc is None or self._proc.stdin is None or not self._alive:
                 return
             try:
-                write_message(self._proc.stdin, {"type": "cancel_heavy_index"})
+                write_message(self._proc.stdin, {"type": msg_type})
             except Exception:
                 log.debug(
-                    "helper heavy-index cancel write failed account=%s",
+                    "helper %s write failed account=%s",
+                    label,
                     self.account_uid,
                     exc_info=True,
                 )
@@ -635,6 +678,7 @@ class CamelRuntimePool:
         kwargs: dict[str, Any] | None = None,
         *,
         timeout: float | None = _DEFAULT_JOB_TIMEOUT,
+        wait_timeout: float | None = None,
         goa_ensure_out: list[str] | None = None,
     ) -> Any:
         return self.get(account_uid).call(
@@ -642,6 +686,7 @@ class CamelRuntimePool:
             args,
             kwargs,
             timeout=timeout,
+            wait_timeout=wait_timeout,
             goa_ensure_out=goa_ensure_out,
         )
 
@@ -658,6 +703,13 @@ class CamelRuntimePool:
             runtime = self._runtimes.get(account_uid)
         if runtime is not None:
             runtime.request_cancel_heavy_index()
+
+    def request_cancel_folder_refresh(self, account_uid: str) -> None:
+        """Stop folder refresh in ``account_uid``'s helper (#494)."""
+        with self._lock:
+            runtime = self._runtimes.get(account_uid)
+        if runtime is not None:
+            runtime.request_cancel_folder_refresh()
 
     def peek_summary_page(
         self,

@@ -188,5 +188,77 @@ class HeavyFolderOfflineHoldTests(unittest.TestCase):
         self.assertEqual(window._offline_held_account_uid, "acct-1")
 
 
+class HeavyIndexResumeAfterReadTests(unittest.TestCase):
+    def _window(self) -> mock.Mock:
+        window = mock.Mock()
+        window._mail = mock.Mock()
+        window._heavy_index_in_progress = ("acct", "Archive")
+        window._search_query = None
+        window._current_account = mock.Mock(uid="acct")
+        window._current_folder = "Archive"
+        window._messages_load_generation = 3
+        window._heavy_index_still_active = (
+            lambda account_uid, folder_name: MainWindow._heavy_index_still_active(
+                window, account_uid, folder_name
+            )
+        )
+        window._adopt_heavy_index_load_id = (
+            lambda load_id, account_uid, folder_name: (
+                MainWindow._adopt_heavy_index_load_id(
+                    window, load_id, account_uid, folder_name
+                )
+            )
+        )
+        window._start_background_heavy_folder_index = mock.Mock()
+        return window
+
+    def test_resume_waits_until_the_read_finishes(self) -> None:
+        window = self._window()
+        window._mail.has_interactive_work_pending.return_value = True
+        with mock.patch("post.window.GLib.timeout_add") as timeout_add:
+            MainWindow._resume_heavy_index_when_idle(
+                window,
+                3,
+                "acct",
+                "Archive",
+                {"pending_server_refresh": True},
+                delay_ms=250,
+            )
+        timeout_add.assert_called_once()
+        delay, callback = timeout_add.call_args[0][:2]
+        self.assertEqual(delay, 250)
+        self.assertTrue(callback())
+        window._start_background_heavy_folder_index.assert_not_called()
+        window._mail.has_interactive_work_pending.return_value = False
+        self.assertFalse(callback())
+        window._start_background_heavy_folder_index.assert_called_once_with(
+            3,
+            "acct",
+            "Archive",
+            cursor={"pending_server_refresh": True},
+        )
+
+    def test_finished_slice_does_not_restart_while_a_read_is_pending(self) -> None:
+        window = self._window()
+        window._mail.has_interactive_work_pending.return_value = True
+        progress = mock.Mock(done=False, cursor={})
+        window._mail.continue_heavy_folder_index.return_value = progress
+        with (
+            mock.patch("post.window.GLib.timeout_add"),
+            mock.patch("post.window.GLib.idle_add"),
+        ):
+            MainWindow._run_heavy_folder_index_slice(
+                window, 3, "acct", "Archive", None
+            )
+        window._resume_heavy_index_when_idle.assert_called_once_with(
+            3,
+            "acct",
+            "Archive",
+            {},
+            delay_ms=250,
+        )
+        window._mail.submit_background.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

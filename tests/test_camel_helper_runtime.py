@@ -36,6 +36,7 @@ _FAKE_HELPER = textwrap.dedent(
     incoming = queue.Queue()
     cancel_event = threading.Event()
     heavy_cancel_event = threading.Event()
+    folder_refresh_cancel_event = threading.Event()
 
     def reader():
         while True:
@@ -49,6 +50,9 @@ _FAKE_HELPER = textwrap.dedent(
                 continue
             if msg.get("type") == "cancel_heavy_index":
                 heavy_cancel_event.set()
+                continue
+            if msg.get("type") == "cancel_folder_refresh":
+                folder_refresh_cancel_event.set()
                 continue
             if msg.get("type") == "summary_page":
                 write_message(
@@ -114,6 +118,25 @@ _FAKE_HELPER = textwrap.dedent(
                     break
                 time.sleep(0.05)
             heavy_cancel_event.clear()
+            write_message(
+                stdout,
+                {
+                    "type": "result",
+                    "id": msg.get("id"),
+                    "ok": True,
+                    "result": {"slept": args[0] if args else 0, "cancelled": cancelled},
+                },
+            )
+        elif method == "sleep_until_folder_refresh_cancel_for_test":
+            seconds = float(args[0]) if args else 0
+            deadline = time.monotonic() + seconds
+            cancelled = False
+            while time.monotonic() < deadline:
+                if folder_refresh_cancel_event.is_set():
+                    cancelled = True
+                    break
+                time.sleep(0.05)
+            folder_refresh_cancel_event.clear()
             write_message(
                 stdout,
                 {
@@ -464,3 +487,95 @@ class FakeHelperRuntimeTests(unittest.TestCase):
             worker.join(timeout=3.0)
         finally:
             runtime.kill()
+
+    def test_cancel_folder_refresh_unblocks_without_serial(self) -> None:
+        """An interactive read must abort folder refresh without the lock (#494)."""
+        import threading
+        import time
+
+        runtime = self._patch_runtime(AccountCamelRuntime(account_uid="acct-a"))
+        try:
+            results: dict[str, object] = {}
+
+            def long_call() -> None:
+                results["sleep"] = runtime.call(
+                    "sleep_until_folder_refresh_cancel_for_test",
+                    [5.0],
+                    timeout=10.0,
+                )
+
+            worker = threading.Thread(target=long_call, daemon=True)
+            worker.start()
+            time.sleep(0.2)
+            runtime.request_cancel_folder_refresh()
+            worker.join(timeout=3.0)
+            self.assertFalse(worker.is_alive())
+            sleep_result = results.get("sleep")
+            self.assertIsInstance(sleep_result, dict)
+            assert isinstance(sleep_result, dict)
+            self.assertTrue(sleep_result.get("cancelled"))
+            self.assertTrue(runtime.call("ping", ["acct-a"], timeout=10.0)["ok"])
+        finally:
+            runtime.kill()
+
+    def test_interactive_wait_timeout_leaves_holder_running(self) -> None:
+        """Giving up on the lock must not kill the helper (#494)."""
+        import threading
+        import time
+
+        runtime = self._patch_runtime(AccountCamelRuntime(account_uid="acct-a"))
+        try:
+            def long_call() -> None:
+                runtime.call("sleep_for_test", [2.0], timeout=10.0)
+
+            worker = threading.Thread(target=long_call, daemon=True)
+            worker.start()
+            time.sleep(0.2)
+            pid = runtime._proc.pid if runtime._proc is not None else None
+            self.assertIsNotNone(pid)
+            with self.assertRaises(CamelHelperTimeout):
+                runtime.call("ping", ["acct-a"], timeout=10.0, wait_timeout=0.4)
+            self.assertTrue(worker.is_alive())
+            self.assertEqual(runtime._proc.pid if runtime._proc else None, pid)
+            worker.join(timeout=4.0)
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(runtime.call("ping", ["acct-a"], timeout=10.0)["ok"])
+            self.assertEqual(runtime._proc.pid if runtime._proc else None, pid)
+        finally:
+            runtime.kill()
+
+
+class PreemptInteractiveReadTests(unittest.TestCase):
+    def _mail(self):
+        from post.mail.eds import MailService
+
+        mail = MailService.__new__(MailService)
+        mail.preempt_account_helper_op = mock.Mock()
+        mail.cancel_account_heavy_folder_index = mock.Mock()
+        mail._camel_pool = mock.Mock()
+        mail.cancel_helper_op = mock.Mock()
+        mail.cancel_heavy_folder_index_refresh = mock.Mock()
+        mail.cancel_folder_refresh = mock.Mock()
+        return mail
+
+    def test_helper_path_cancels_all_three_holders(self) -> None:
+        mail = self._mail()
+        with mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True):
+            mail.preempt_interactive_read("acct")
+        mail.preempt_account_helper_op.assert_called_once_with("acct")
+        mail.cancel_account_heavy_folder_index.assert_called_once_with("acct")
+        mail._camel_pool.request_cancel_folder_refresh.assert_called_once_with(
+            "acct"
+        )
+        mail.cancel_helper_op.assert_not_called()
+        mail.cancel_folder_refresh.assert_not_called()
+
+    def test_in_process_path_cancels_local_holders(self) -> None:
+        mail = self._mail()
+        with mock.patch("post.mail.eds.camel_helpers_enabled", return_value=False):
+            mail.preempt_interactive_read("acct")
+        mail.cancel_helper_op.assert_called_once_with()
+        mail.cancel_heavy_folder_index_refresh.assert_called_once_with()
+        mail.cancel_folder_refresh.assert_called_once_with()
+        mail.preempt_account_helper_op.assert_not_called()
+        mail._camel_pool.request_cancel_folder_refresh.assert_not_called()

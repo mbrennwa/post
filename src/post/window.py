@@ -4781,6 +4781,41 @@ class MainWindow(Adw.ApplicationWindow):
             and self._current_folder == folder_name
         )
 
+    def _resume_heavy_index_when_idle(
+        self,
+        load_id: int,
+        account_uid: str,
+        folder_name: str,
+        cursor: dict | None,
+        *,
+        delay_ms: int,
+    ) -> None:
+        """Start the next header-fetch slice after an interactive read (#494).
+
+        A cancelled slice used to resume on a fixed delay and could take the
+        helper lock again before ``read_message`` acquired it.
+        """
+
+        def resume() -> bool:
+            if not self._heavy_index_still_active(account_uid, folder_name):
+                return False
+            if self._mail.has_interactive_work_pending():
+                return True
+            adopted = self._adopt_heavy_index_load_id(
+                load_id, account_uid, folder_name
+            )
+            if adopted is None:
+                return False
+            self._start_background_heavy_folder_index(
+                adopted,
+                account_uid,
+                folder_name,
+                cursor=cursor,
+            )
+            return False
+
+        GLib.timeout_add(max(1, delay_ms), resume)
+
     def _adopt_heavy_index_load_id(
         self, load_id: int, account_uid: str, folder_name: str
     ) -> int | None:
@@ -4855,21 +4890,13 @@ class MainWindow(Adw.ApplicationWindow):
                         "status_seeded": True,
                         "did_prepare_content_refresh": True,
                     }
-
-                    def _resume_after_cancel() -> bool:
-                        if not self._heavy_index_still_active(
-                            account_uid, folder_name
-                        ):
-                            return False
-                        self._start_background_heavy_folder_index(
-                            resume_id,
-                            account_uid,
-                            folder_name,
-                            cursor=resume_cursor,
-                        )
-                        return False
-
-                    GLib.timeout_add(500, _resume_after_cancel)
+                    self._resume_heavy_index_when_idle(
+                        resume_id,
+                        account_uid,
+                        folder_name,
+                        resume_cursor,
+                        delay_ms=500,
+                    )
                     return
                 if self._heavy_index_in_progress == (account_uid, folder_name):
                     self._heavy_index_in_progress = None
@@ -4905,24 +4932,28 @@ class MainWindow(Adw.ApplicationWindow):
         cursor = progress.cursor or {}
         if cursor.get("yield_for_interactive"):
             # Avoid a tight background resubmit loop while interactive mail I/O
-            # is queued (#208).
-            def _resume_after_yield() -> bool:
-                adopted = self._adopt_heavy_index_load_id(
-                    load_id, account_uid, folder_name
-                )
-                if adopted is None:
-                    return False
-                self._start_background_heavy_folder_index(
-                    adopted,
-                    account_uid,
-                    folder_name,
-                    cursor=cursor,
-                )
-                return False
-
-            GLib.timeout_add(250, _resume_after_yield)
+            # is queued (#208). Also wait out a message read that cancelled
+            # this slice (#494).
+            self._resume_heavy_index_when_idle(
+                load_id,
+                account_uid,
+                folder_name,
+                cursor,
+                delay_ms=250,
+            )
             return
         if not self._heavy_index_still_active(account_uid, folder_name):
+            return
+        if self._mail.has_interactive_work_pending():
+            # The slice finished as a read was waiting. Do not take the helper
+            # lock again until that read returns (#494).
+            self._resume_heavy_index_when_idle(
+                load_id,
+                account_uid,
+                folder_name,
+                progress.cursor,
+                delay_ms=250,
+            )
             return
         # Yield to interactive work, then resume from cursor.
         self._mail.submit_background(
