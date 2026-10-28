@@ -90,6 +90,10 @@ def popup_attachment_menu(
 
     Dismisses any previous *popover* and returns the new instance so callers
     can keep a reference without calling ``set_menu_model`` on a live popover.
+
+    The popover is parented to *widget*'s parent when it has one (the
+    attachment column), not to a ``Gtk.Button``. A modal popover on the button
+    shares that widget's click grab and can freeze the window (#517).
     """
     dismiss_popover(popover)
     include_calendar = False
@@ -98,10 +102,18 @@ def popup_attachment_menu(
     new_popover = Gtk.PopoverMenu.new_from_model(
         build_attachment_menu(include_calendar=include_calendar)
     )
-    new_popover.set_parent(widget)
+    anchor = widget.get_parent() or widget
+    point_x, point_y = x, y
+    if anchor is not widget:
+        origin = widget.translate_coordinates(anchor, x, y)
+        if origin is None:
+            anchor = widget
+        else:
+            point_x, point_y = origin
+    new_popover.set_parent(anchor)
     rect = Gdk.Rectangle()
-    rect.x = int(x)
-    rect.y = int(y)
+    rect.x = int(point_x)
+    rect.y = int(point_y)
     rect.width = 1
     rect.height = 1
     new_popover.set_pointing_to(rect)

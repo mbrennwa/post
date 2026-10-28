@@ -188,19 +188,33 @@ class OpenAttachmentRoutingTests(unittest.TestCase):
         from post.attachment_open import open_attachment
 
         parent = MagicMock()
+        statuses: list[str] = []
         with (
-            patch("post.attachment_open.write_temp_attachment", return_value="/tmp/x.pdf"),
+            patch(
+                "post.attachment_open.write_temp_attachment",
+                return_value="/tmp/x.pdf",
+            ),
             patch("post.attachment_open.Gio") as gio,
+            patch("post.attachment_open.Gtk.FileLauncher") as launcher_cls,
         ):
-            gio.File.new_for_path.return_value.get_uri.return_value = "file:///tmp/x.pdf"
-            gio.AppInfo.launch_default_for_uri.return_value = True
+            gio.File.new_for_path.return_value = MagicMock()
+            launcher = launcher_cls.new.return_value
+            launcher.launch_finish.return_value = True
             open_attachment(
                 parent,
                 filename="waybill.pdf",
                 data=b"%PDF-fake",
                 mime_type="application/pdf",
+                on_status=statuses.append,
             )
-        gio.AppInfo.launch_default_for_uri.assert_called_once()
+            self.assertEqual(statuses, [])
+            gio.AppInfo.launch_default_for_uri.assert_not_called()
+            launcher.launch.assert_called_once()
+            launch_args = launcher.launch.call_args.args
+            self.assertIs(launch_args[0], parent)
+            self.assertIsNone(launch_args[1])
+            launch_args[2](launcher, MagicMock())
+        self.assertEqual(statuses, ["Opened waybill.pdf"])
 
 
 if __name__ == "__main__":

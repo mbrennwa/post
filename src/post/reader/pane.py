@@ -1251,6 +1251,7 @@ class MessageReaderPane(Gtk.Box):
         if widget is None:
             return
         self._on_attachment_context_menu(widget, x, y, index, mime_type, name)
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
 
     def _show_reader_document(self) -> None:
         self._clear_link_hover()

@@ -16,11 +16,67 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, Gtk
 
 from post.mail.helpers import looks_like_rfc822_attachment, write_temp_attachment
+from post.open_uri import _app_launch_context
 from post.toast import show_error_toast
 
 OnAddressEmail = Callable[[str], None]
 CanSearchMessages = Callable[[], bool]
 OnStatus = Callable[[str], None]
+
+
+def _report_open_error(parent: Gtk.Window, exc: BaseException) -> None:
+    message = getattr(exc, "message", None) or str(exc)
+    show_error_toast(parent, f"Could not open attachment: {message}")
+
+
+def _note_opened(filename: str, on_status: OnStatus | None) -> None:
+    if on_status is not None:
+        on_status(f"Opened {filename}")
+
+
+def _launch_desktop_file(
+    parent: Gtk.Window,
+    file: Gio.File,
+    filename: str,
+    on_status: OnStatus | None,
+) -> None:
+    """Launch *file* with the desktop handler, using the parent for activation."""
+    if hasattr(Gtk, "FileLauncher"):
+        launcher = Gtk.FileLauncher.new(file)
+
+        def on_finished(_launcher: Gtk.FileLauncher, result: Gio.AsyncResult) -> None:
+            try:
+                opened = bool(launcher.launch_finish(result))
+            except GLib.Error as exc:
+                if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                    return
+                _report_open_error(parent, exc)
+                return
+            if not opened:
+                show_error_toast(parent, "Could not open attachment")
+                return
+            _note_opened(filename, on_status)
+
+        # Parent supplies the Wayland/X11 activation token from the click,
+        # same as Gtk.UriLauncher for links. A null context drops the pointer
+        # grab and the next attachment menu popup waits forever (#517).
+        launcher.launch(parent, None, on_finished)
+        return
+
+    try:
+        opened = bool(
+            Gio.AppInfo.launch_default_for_uri(
+                file.get_uri(),
+                _app_launch_context(parent),
+            )
+        )
+    except GLib.Error as exc:
+        _report_open_error(parent, exc)
+        return
+    if not opened:
+        show_error_toast(parent, "Could not open attachment")
+        return
+    _note_opened(filename, on_status)
 
 
 def open_attachment(
@@ -51,14 +107,16 @@ def open_attachment(
 
     try:
         path = write_temp_attachment(filename, data)
-        file = Gio.File.new_for_path(path)
-        Gio.AppInfo.launch_default_for_uri(file.get_uri(), None)
-    except (OSError, GLib.Error) as exc:
-        message = getattr(exc, "message", None) or str(exc)
-        show_error_toast(parent, f"Could not open attachment: {message}")
+    except OSError as exc:
+        show_error_toast(parent, f"Could not open attachment: {exc}")
         return
-    if on_status is not None:
-        on_status(f"Opened {filename}")
+
+    _launch_desktop_file(
+        parent,
+        Gio.File.new_for_path(path),
+        filename,
+        on_status,
+    )
 
 
 def launch_attachment_with_app(
