@@ -49,6 +49,7 @@ from .lane_dispatch import (
     graph_http_worker,
 )
 from .camel_runtime import (
+    AccountCamelRuntime,
     CamelHelperError,
     CamelRuntimePool,
     camel_helpers_enabled,
@@ -151,11 +152,13 @@ from .send_queue import (
 from post.preferences import get_show_evolution_local
 from .account_status import AccountConnectHealth, AccountTransferState
 from .auth import (
+    GoaAttentionMonitor,
     GoaEnsureOutcome,
     PasswordPromptCallback,
     authenticate_service_sync,
     authentication_failed_error,
     ensure_goa_credentials,
+    goa_account_ids,
     open_gnome_online_accounts,
     source_uses_goa,
 )
@@ -894,6 +897,14 @@ class MailService:
     _helper_bound_account_uid: str | None = field(
         default=None, init=False, repr=False
     )
+    # Accounts whose helper is being discarded on purpose (#519). The died
+    # callback must not mark them not_responding or flush the old session.
+    _session_discard_uids: set[str] = field(
+        default_factory=set, init=False, repr=False
+    )
+    _goa_attention: GoaAttentionMonitor | None = field(
+        default=None, init=False, repr=False
+    )
     # In-flight Camel op cancellable (offline downsync) for cancel_helper_op (#482).
     _helper_op_cancellable: Gio.Cancellable | None = field(
         default=None, init=False, repr=False
@@ -1074,6 +1085,31 @@ class MailService:
 
     def is_network_available(self) -> bool:
         return self._network_available
+
+    def account_may_contact_server(self, account_uid: str) -> bool:
+        """True when this account may open a server connection.
+
+        False when the network is down, the user took the account offline,
+        or sign-in is required. Reads then use the local MIME cache (#519).
+        """
+        if not self._network_available:
+            return False
+        if not get_account_user_online(account_uid):
+            return False
+        if self.get_account_connect_health(account_uid) == "needs_sign_in":
+            return False
+        return True
+
+    def _running_helper(self, account_uid: str) -> AccountCamelRuntime | None:
+        if not camel_helpers_enabled():
+            return None
+        pool = self._camel_pool
+        if not isinstance(pool, CamelRuntimePool):
+            return None
+        runtime = pool.runtime_if_any(account_uid)
+        if runtime is None or not runtime.is_running():
+            return None
+        return runtime
 
     def hold_offline_body_sync(self, hold: bool, *, account_uid: str) -> None:
         """Pause or resume full-account offline body caching for one account.
@@ -1955,6 +1991,22 @@ class MailService:
             return None
         return str(token)
 
+    def _cached_account_folder_stats(
+        self, account_uid: str
+    ) -> dict[str, tuple[int, int]]:
+        with self._lock:
+            cached = list(self._folder_tree_cache.get(account_uid) or [])
+        stats: dict[str, tuple[int, int]] = {}
+        for folder in cached:
+            full_name = folder.get("full_name")
+            if not full_name:
+                continue
+            stats[str(full_name)] = (
+                int(folder.get("unread", -1)),
+                int(folder.get("total", -1)),
+            )
+        return stats
+
     def get_account_folder_stats_via_graph(
         self, account_uid: str
     ) -> dict[str, tuple[int, int]]:
@@ -1963,6 +2015,8 @@ class MailService:
         Obtains the OAuth token with a short mail-thread call, then performs
         Soup Graph requests on the caller thread (``post-graph-http``).
         """
+        if not self.account_may_contact_server(account_uid):
+            return self._cached_account_folder_stats(account_uid)
         token = self.get_oauth2_access_token_for_account(account_uid)
         if not token:
             # Dead GOA auth: badge via EnsureCredentials, then Camel fallback (#478).
@@ -2326,11 +2380,21 @@ class MailService:
             def _on_helper_died(uid: str) -> None:
                 # Mid-flush kill leaves ``*.flushing`` leases; clear them so
                 # coalesce/resume can see the durable ops again (#503 Phase 4).
+                # An intentional credential discard already released leases and
+                # must not reopen the gate (#519).
+                if uid in service._session_discard_uids:
+                    release_all_flush_leases()
+                    return
                 release_all_flush_leases()
                 service.set_account_connect_health(uid, "not_responding")
                 service.schedule_operation_queue_flush(uid)
 
             service._camel_pool.set_account_died_callback(_on_helper_died)
+            service._camel_pool.set_helper_started_callback(
+                service._seed_helper_contact_state
+            )
+        if camel_helpers_enabled():
+            service._start_goa_attention_monitor()
         return service
 
     def set_password_prompt(self, callback: PasswordPromptCallback | None) -> None:
@@ -2403,8 +2467,11 @@ class MailService:
         self, account_uid: str, health: AccountConnectHealth
     ) -> None:
         notify = False
+        became_needs_sign_in = False
         with self._lock:
             current = self._account_connect_health.get(account_uid, "ok")
+            if health == "needs_sign_in" and current != "needs_sign_in":
+                became_needs_sign_in = True
             if health == "ok":
                 if account_uid in self._account_connect_health:
                     del self._account_connect_health[account_uid]
@@ -2416,6 +2483,189 @@ class MailService:
                 notify = True
         if notify:
             self._notify_account_health_changed(account_uid)
+        if became_needs_sign_in:
+            self._discard_running_helper(account_uid)
+        elif notify and health != "needs_sign_in":
+            self._push_connect_health_to_helper(account_uid, health)
+
+    def apply_account_connect_health(
+        self, account_uid: str, health: str
+    ) -> None:
+        """Helper entry: record the UI process connect health (#519).
+
+        Does not discard a session. The UI process owns that decision.
+        """
+        if health not in ("ok", "needs_sign_in", "not_connected"):
+            return
+        self.set_account_connect_health(account_uid, health)  # type: ignore[arg-type]
+
+    def _discard_running_helper(self, account_uid: str) -> None:
+        """Kill the helper that was built with credentials that no longer work."""
+        if account_uid in self._session_discard_uids:
+            return
+        if self._running_helper(account_uid) is None:
+            return
+        self._session_discard_uids.add(account_uid)
+        try:
+            self.invalidate_account_connection(account_uid)
+        finally:
+            self._session_discard_uids.discard(account_uid)
+
+    def _push_connect_health_to_helper(
+        self, account_uid: str, health: str
+    ) -> None:
+        if self._running_helper(account_uid) is None:
+            return
+        try:
+            self._camel_pool.call(
+                account_uid,
+                "apply_account_connect_health",
+                [account_uid, health],
+                {},
+                timeout=30.0,
+            )
+        except Exception:
+            log.debug(
+                "Could not push connect health to helper %s",
+                account_uid,
+                exc_info=True,
+            )
+
+    def _seed_helper_contact_state(self, account_uid: str) -> None:
+        """Give a new helper the UI gate before it accepts other calls (#519)."""
+        network = self._network_available
+        health = self.get_account_connect_health(account_uid)
+        self._camel_pool.call(
+            account_uid,
+            "set_network_available",
+            [network],
+            {},
+            timeout=30.0,
+        )
+        self._camel_pool.call(
+            account_uid,
+            "apply_account_connect_health",
+            [account_uid, health],
+            {},
+            timeout=30.0,
+        )
+
+    def _push_network_to_running_helpers(self, available: bool) -> None:
+        if not camel_helpers_enabled():
+            return
+        pool = self._camel_pool
+        if not isinstance(pool, CamelRuntimePool):
+            return
+        for account_uid in pool.running_account_uids():
+            try:
+                pool.call(
+                    account_uid,
+                    "set_network_available",
+                    [bool(available)],
+                    {},
+                    timeout=30.0,
+                )
+            except Exception:
+                log.debug(
+                    "Could not push network state to helper %s",
+                    account_uid,
+                    exc_info=True,
+                )
+
+    def _start_goa_attention_monitor(self) -> None:
+        """Watch GOA for credential failure and replacement (#519)."""
+        if not camel_helpers_enabled() or self._goa_attention is not None:
+            return
+        monitor = GoaAttentionMonitor(self._on_goa_attention_changed)
+        try:
+            monitor.start()
+        except Exception:
+            log.debug("Could not watch GOA AttentionNeeded", exc_info=True)
+            return
+        self._goa_attention = monitor
+        try:
+            accounts = self.list_accounts()
+        except Exception:
+            log.debug("Could not prime GOA attention watch", exc_info=True)
+            return
+        for account in accounts:
+            source = self.registry.ref_source(account.uid)
+            if source is None:
+                continue
+            for goa_id in goa_account_ids(self.registry, source):
+                try:
+                    monitor.note_account(goa_id)
+                except Exception:
+                    log.debug(
+                        "GOA attention prime failed for %s", goa_id, exc_info=True
+                    )
+
+    def _on_goa_attention_changed(
+        self, goa_account_id: str, attention_needed: bool
+    ) -> None:
+        def work() -> None:
+            try:
+                self.handle_goa_attention(goa_account_id, attention_needed)
+            except Exception:
+                log.exception(
+                    "GOA attention confirmation failed for %s", goa_account_id
+                )
+
+        if is_mail_io_thread():
+            work()
+            return
+        get_mail_io_thread().submit_front(work)
+
+    def handle_goa_attention(
+        self, goa_account_id: str, attention_needed: bool
+    ) -> None:
+        """Confirm a GOA attention change in this process, then keep or drop the session.
+
+        ``EnsureCredentials`` runs here, not in the Camel helper. Failure voids
+        the session. Success discards the helper, clears ``needs_sign_in``, and
+        only then allows server work (#519).
+        """
+        log.info(
+            "GOA AttentionNeeded=%s account_id=%s; confirming credentials",
+            attention_needed,
+            goa_account_id,
+        )
+        account_uid = self._account_uid_for_goa_id(goa_account_id)
+        if account_uid is None:
+            return
+        source = self.registry.ref_source(account_uid)
+        if source is None or not source_uses_goa(self.registry, source):
+            return
+        outcome = ensure_goa_credentials(self.registry, source, None)
+        if outcome == "cancelled":
+            return
+        if outcome != "ok":
+            self.set_account_connect_health(account_uid, "needs_sign_in")
+            return
+        self.invalidate_account_connection(account_uid)
+        self.set_account_connect_health(account_uid, "ok")
+        self.schedule_offline_body_sync(account_uid)
+        self.schedule_operation_queue_flush(account_uid)
+
+    def _account_uid_for_goa_id(self, goa_account_id: str) -> str | None:
+        if not goa_account_id:
+            return None
+        try:
+            accounts = self.list_accounts()
+        except Exception:
+            log.debug("Could not map GOA account %s", goa_account_id, exc_info=True)
+            return None
+        for account in accounts:
+            source = self.registry.ref_source(account.uid)
+            if source is None:
+                continue
+            try:
+                ids = goa_account_ids(self.registry, source)
+            except Exception:
+                continue
+            if goa_account_id in ids:
+                return account.uid
+        return None
 
     def _notify_account_health_changed(self, account_uid: str) -> None:
         callback = self._account_health_changed
@@ -2510,7 +2760,15 @@ class MailService:
         Always dispatches to the mail I/O thread via ``submit_front`` (never
         ``run_sync``) so GTK stays responsive while GOA/OAuth reconnects (#400).
         Optional ``on_complete`` runs on the GTK thread after the pass finishes.
+
+        Inside a Camel helper this only records the flag the UI pushed (#519).
+        It does not schedule downsync; the UI process owns that.
         """
+        if not camel_helpers_enabled():
+            self._apply_network_available_sync(available)
+            if on_complete is not None:
+                GLib.idle_add(_run_on_gtk_thread, on_complete)
+            return
 
         def work() -> None:
             try:
@@ -2542,8 +2800,20 @@ class MailService:
                     stores_to_sync.append((account_uid, store))
         for account_uid, store in stores_to_sync:
             self._sync_store_online_with_timeout_unlocked(store, account_uid)
+        self._push_network_to_running_helpers(available)
         if available:
             self.offline_sync.schedule_all_accounts()
+
+    def _apply_network_available_sync(self, available: bool) -> None:
+        """Record network state without scheduling server work."""
+        with self._lock:
+            self._network_available = bool(available)
+            session = self._session
+        if session is not None:
+            try:
+                session.set_online(bool(available))
+            except Exception:
+                log.debug("Could not set Camel session online", exc_info=True)
 
     def go_online_sync(
         self,
@@ -2624,6 +2894,7 @@ class MailService:
                     stores_to_online.append((account_uid, store))
         for account_uid, store in stores_to_online:
             self._sync_store_online_with_timeout_unlocked(store, account_uid)
+        self._push_network_to_running_helpers(True)
         self.offline_sync.schedule_all_accounts()
 
     def _sync_store_online_with_timeout_unlocked(
@@ -3032,22 +3303,30 @@ class MailService:
         correspondent_cache.invalidate(account_uid)
 
     def invalidate_account_connection(self, account_uid: str) -> None:
-        """Drop cached Camel store/transport so the next open uses fresh credentials."""
+        """Drop cached Camel store/transport so the next open uses fresh credentials.
+
+        A running helper is killed without the crash callback, so the old
+        session is not flushed and is not marked ``not_responding`` (#519).
+        """
         if camel_helpers_enabled():
-            try:
-                self._camel_helper_call(
-                    "invalidate_account_connection",
-                    account_uid,
-                    [account_uid],
-                    timeout=30.0,
-                )
-            except CamelHelperError:
-                log.debug(
-                    "helper invalidate failed for %s; killing helper",
-                    account_uid,
-                    exc_info=True,
-                )
-            self._camel_pool.kill_account(account_uid)
+            if self._running_helper(account_uid) is not None:
+                self._session_discard_uids.add(account_uid)
+                try:
+                    self._camel_helper_call(
+                        "invalidate_account_connection",
+                        account_uid,
+                        [account_uid],
+                        timeout=30.0,
+                    )
+                except CamelHelperError:
+                    log.debug(
+                        "helper invalidate failed for %s; killing helper",
+                        account_uid,
+                        exc_info=True,
+                    )
+                release_all_flush_leases()
+                self._camel_pool.kill_account(account_uid, notify_died=False)
+                self._session_discard_uids.discard(account_uid)
             # Clear UI-side caches even when Camel lives in the helper.
             with self._lock:
                 self._folder_tree_cache.pop(account_uid, None)
@@ -3525,6 +3804,12 @@ class MailService:
             )
             flushed = 0
             for account_uid in accounts:
+                if not self.account_may_contact_server(account_uid):
+                    log.info(
+                        "Skipping operation flush for %s until it can contact the server",
+                        account_uid,
+                    )
+                    continue
                 try:
                     result = self._camel_helper_call(
                         "flush_account_operation_queue",
@@ -4116,26 +4401,17 @@ class MailService:
                     continue
                 if operation.account_uid in skip_accounts:
                     continue
-                if self.get_account_connect_health(operation.account_uid) == (
-                    "needs_sign_in"
-                ):
-                    skip_accounts.add(operation.account_uid)
-                    continue
-                if not self._network_available:
+                if not self.account_may_contact_server(operation.account_uid):
                     log.warning(
-                        "Queued operation %s (%s) deferred: network unavailable",
-                        queue_id,
-                        operation.op_type,
-                    )
-                    break
-                if not get_account_user_online(operation.account_uid):
-                    log.warning(
-                        "Queued operation %s (%s) deferred: account offline (%s)",
+                        "Queued operation %s (%s) deferred: account cannot "
+                        "contact the server (%s)",
                         queue_id,
                         operation.op_type,
                         operation.account_uid,
                     )
                     skip_accounts.add(operation.account_uid)
+                    if not self._network_available:
+                        break
                     continue
                 self._flushing_queue_ids.add(queue_id)
                 acquire_flush_lease(queue_id)
@@ -8167,7 +8443,9 @@ class MailService:
         *,
         allow_network: bool = True,
     ) -> Any:
-        offline = not self._network_available
+        offline = not self._network_available or not get_account_user_online(
+            account_uid
+        )
         mime = None
         self._recovered_read_uid = None
         api_uid = camel_uid_to_api(message_uid)
@@ -8187,7 +8465,7 @@ class MailService:
         try:
             mime = self._get_message_sync_with_timeout(folder, api_uid)
         except TimeoutError:
-            self.set_account_connect_health(account_uid, "needs_sign_in")
+            # A slow body read is not a dead sign-in (#519).
             mime = self._try_message_cached(folder, api_uid)
             if mime is not None:
                 return mime
@@ -11349,10 +11627,8 @@ class MailService:
         return False
 
     def _allow_network_unlocked(self, account_uid: str) -> bool:
-        """Return False when Graph must not be contacted (airplane or dead GOA)."""
-        if not self._network_available:
-            return False
-        if self.get_account_connect_health(account_uid) == "needs_sign_in":
+        """Return False when Graph must not be contacted (airplane, offline, or dead GOA)."""
+        if not self.account_may_contact_server(account_uid):
             return False
         return self._goa_credentials_ready_for_read_unlocked(account_uid)
 
@@ -11393,19 +11669,14 @@ class MailService:
             has_visible_attachments,
         )
 
-        if self.get_account_connect_health(account_uid) == "needs_sign_in":
-            allow_network = False
-        else:
-            allow_network = self._goa_credentials_ready_for_read_unlocked(
-                account_uid
-            )
+        allow_network = self._allow_network_unlocked(account_uid)
         folder = self._open_folder_for_message_read_unlocked(
             account_uid,
             folder_name,
             message_uid,
             allow_online=allow_network,
         )
-        if self.get_account_connect_health(account_uid) == "needs_sign_in":
+        if not self.account_may_contact_server(account_uid):
             allow_network = False
 
         info = folder_get_message_info(folder,message_uid)
@@ -11498,6 +11769,8 @@ class MailService:
                 result["references"] = normalize_references_header(references)
 
         # Empty extracted body still displays in the reader (#377); #341 stubs already raised.
+        # Flag persistence queues instead of calling the server while the gate
+        # is closed (_allow_online_store_unlocked, #519).
         if was_unread and mark_seen:
             try:
                 unread, total = self._mark_message_seen_unlocked(

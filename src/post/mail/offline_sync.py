@@ -170,6 +170,11 @@ class OfflineBodySyncCoordinator:
             return
         if not self._mail.is_network_available():
             return
+        if self._mail.get_account_connect_health(account_uid) == "needs_sign_in":
+            return
+        may_contact = getattr(self._mail, "account_may_contact_server", None)
+        if callable(may_contact) and may_contact(account_uid) is False:
+            return
         if account_uid in self._running:
             return
 

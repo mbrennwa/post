@@ -451,6 +451,7 @@ class MailSidebar:
             account_uid
             for account_uid in self._account_folders
             if not account_is_user_offline(account_uid)
+            and self._mail.account_may_contact_server(account_uid)
             and folder_names_for_count_refresh(
                 self._account_folders.get(account_uid, [])
             )
@@ -488,6 +489,14 @@ class MailSidebar:
                     generation,
                     account_uids,
                     index,
+                )
+                return
+            if not self._mail.account_may_contact_server(account_uid):
+                schedule_on_gtk_main(
+                    self._poll_account_folder_counts_at,
+                    generation,
+                    account_uids,
+                    index + 1,
                 )
                 return
 

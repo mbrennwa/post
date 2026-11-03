@@ -136,6 +136,13 @@ def _goa_account_ids(
     return ids
 
 
+def goa_account_ids(
+    registry: EDataServer.SourceRegistry, source: EDataServer.Source
+) -> list[str]:
+    """GOA account ids related to this mail source (empty when not GOA)."""
+    return _goa_account_ids(registry, source)
+
+
 def source_uses_goa(
     registry: EDataServer.SourceRegistry, source: EDataServer.Source
 ) -> bool:
@@ -355,6 +362,137 @@ def authenticate_service_sync(
         return False
 
     return False
+
+
+def goa_attention_should_confirm(
+    previous: bool | None, attention_needed: bool
+) -> bool:
+    """True when AttentionNeeded changed, or was already set at startup.
+
+    A first observation of ``False`` is the baseline, not a sign-in event.
+    """
+    if previous is None:
+        return attention_needed
+    return previous != attention_needed
+
+
+def read_goa_attention_needed(
+    bus: Gio.DBusConnection, account_id: str
+) -> bool | None:
+    """Read ``AttentionNeeded`` for one GOA account. None when it cannot be read."""
+    path = f"/org/gnome/OnlineAccounts/Accounts/{account_id}"
+    try:
+        result = bus.call_sync(
+            _GOA_BUS,
+            path,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            GLib.Variant("(ss)", (_GOA_IFACE, "AttentionNeeded")),
+            GLib.VariantType("(v)"),
+            Gio.DBusCallFlags.NONE,
+            5_000,
+            None,
+        )
+    except GLib.Error:
+        log.debug(
+            "Could not read GOA AttentionNeeded for %s", account_id, exc_info=True
+        )
+        return None
+    try:
+        unpacked = result.unpack()
+        value = unpacked[0] if isinstance(unpacked, tuple) else unpacked
+        return bool(value)
+    except (TypeError, IndexError, ValueError):
+        log.debug("Unexpected AttentionNeeded payload for %s", account_id, exc_info=True)
+        return None
+
+
+class GoaAttentionMonitor:
+    """Watch GOA ``AttentionNeeded`` from the UI process (#519).
+
+    On a real transition, ``on_changed(account_id, attention_needed)`` runs.
+    The caller confirms with one ``EnsureCredentials``; this monitor does not.
+    """
+
+    def __init__(self, on_changed: Callable[[str, bool], None]) -> None:
+        self._on_changed = on_changed
+        self._bus: Gio.DBusConnection | None = None
+        self._subscription_id = 0
+        self._last: dict[str, bool] = {}
+
+    def start(self) -> None:
+        self._bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self._subscription_id = self._bus.signal_subscribe(
+            _GOA_BUS,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            None,
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self._on_properties_changed,
+            None,
+        )
+
+    def note_account(self, account_id: str) -> None:
+        """Record the current flag. Report only when attention is already needed."""
+        bus = self._bus
+        if bus is None or not account_id:
+            return
+        needed = read_goa_attention_needed(bus, account_id)
+        if needed is None:
+            return
+        self._observe(account_id, needed)
+
+    def _on_properties_changed(self, *_args: object) -> None:
+        # connection, sender, path, interface, signal, params, user_data
+        if len(_args) < 6:
+            return
+        path = _args[2]
+        params = _args[5]
+        if not isinstance(path, str) or not path.startswith(
+            "/org/gnome/OnlineAccounts/Accounts/"
+        ):
+            return
+        unpack = getattr(params, "unpack", None)
+        if not callable(unpack):
+            return
+        try:
+            interface, changed, invalidated = unpack()
+        except (TypeError, ValueError):
+            return
+        if interface != _GOA_IFACE:
+            return
+        changed_map = changed if isinstance(changed, dict) else {}
+        invalidated_names = invalidated if isinstance(invalidated, (list, tuple)) else ()
+        if (
+            "AttentionNeeded" not in changed_map
+            and "AttentionNeeded" not in invalidated_names
+        ):
+            return
+        account_id = path.rstrip("/").rsplit("/", 1)[-1]
+        if not account_id:
+            return
+        if "AttentionNeeded" in changed_map:
+            needed = bool(changed_map["AttentionNeeded"])
+        else:
+            bus = self._bus
+            if bus is None:
+                return
+            read = read_goa_attention_needed(bus, account_id)
+            if read is None:
+                return
+            needed = read
+        self._observe(account_id, needed)
+
+    def _observe(self, account_id: str, attention_needed: bool) -> None:
+        previous = self._last.get(account_id)
+        self._last[account_id] = attention_needed
+        if not goa_attention_should_confirm(previous, attention_needed):
+            return
+        try:
+            self._on_changed(account_id, attention_needed)
+        except Exception:
+            log.exception("GOA attention handler failed for %s", account_id)
 
 
 def authentication_failed_error(message: str = "Authentication failed") -> GLib.Error:
