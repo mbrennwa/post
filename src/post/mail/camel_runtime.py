@@ -97,6 +97,9 @@ class AccountCamelRuntime:
     )
     _alive: bool = field(default=False, init=False)
     _on_died: Callable[[str], None] | None = field(default=None, init=False, repr=False)
+    _on_started: Callable[[str], None] | None = field(
+        default=None, init=False, repr=False
+    )
     _died_fired: bool = field(default=False, init=False)
     _busy_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
@@ -107,11 +110,35 @@ class AccountCamelRuntime:
     def set_died_callback(self, callback: Callable[[str], None] | None) -> None:
         self._on_died = callback
 
+    def set_started_callback(self, callback: Callable[[str], None] | None) -> None:
+        """Run after this helper is ready, before the call that started it."""
+        self._on_started = callback
+
+    def is_running(self) -> bool:
+        with self._lock:
+            proc = self._proc
+            return proc is not None and proc.poll() is None and self._alive
+
     def ensure_started(self) -> None:
+        started = False
         with self._lock:
             if self._proc is not None and self._proc.poll() is None and self._alive:
                 return
             self._start_unlocked()
+            started = True
+        if not started:
+            return
+        callback = self._on_started
+        if callback is None:
+            return
+        try:
+            callback(self.account_uid)
+        except Exception:
+            log.warning(
+                "helper contact-state seed failed account=%s",
+                self.account_uid,
+                exc_info=True,
+            )
 
     def _helper_command(self) -> list[str]:
         return [
@@ -565,9 +592,13 @@ class AccountCamelRuntime:
             daemon=True,
         ).start()
 
-    def kill(self) -> None:
+    def kill(self, *, notify_died: bool = True) -> None:
         with self._lock:
-            self._stop_unlocked(kill=True)
+            # Mark fired first so the reader thread cannot treat this kill as
+            # a crash and schedule a flush (#519).
+            if not notify_died:
+                self._died_fired = True
+            self._stop_unlocked(kill=True, notify_died=notify_died)
 
     def shutdown(self, *, timeout: float = 5.0) -> None:
         with self._lock:
@@ -647,11 +678,23 @@ class CamelRuntimePool:
     _on_account_died: Callable[[str], None] | None = field(
         default=None, init=False, repr=False
     )
+    _on_helper_started: Callable[[str], None] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def set_account_died_callback(
         self, callback: Callable[[str], None] | None
     ) -> None:
         self._on_account_died = callback
+
+    def set_helper_started_callback(
+        self, callback: Callable[[str], None] | None
+    ) -> None:
+        """Push UI gate state into a helper before its first real call (#519)."""
+        self._on_helper_started = callback
+        with self._lock:
+            for runtime in self._runtimes.values():
+                runtime.set_started_callback(callback)
 
     def get(self, account_uid: str) -> AccountCamelRuntime:
         with self._lock:
@@ -660,7 +703,20 @@ class CamelRuntimePool:
                 runtime = AccountCamelRuntime(account_uid=account_uid)
                 runtime.set_died_callback(self._handle_died)
                 self._runtimes[account_uid] = runtime
+            runtime.set_started_callback(self._on_helper_started)
             return runtime
+
+    def runtime_if_any(self, account_uid: str) -> AccountCamelRuntime | None:
+        with self._lock:
+            return self._runtimes.get(account_uid)
+
+    def running_account_uids(self) -> list[str]:
+        with self._lock:
+            return [
+                uid
+                for uid, runtime in self._runtimes.items()
+                if runtime.is_running()
+            ]
 
     def _handle_died(self, account_uid: str) -> None:
         callback = self._on_account_died
@@ -726,11 +782,11 @@ class CamelRuntimePool:
     def submit_worker(self, account_uid: str, func: Callable[[], None]) -> None:
         self.get(account_uid).submit_worker(func)
 
-    def kill_account(self, account_uid: str) -> None:
+    def kill_account(self, account_uid: str, *, notify_died: bool = True) -> None:
         with self._lock:
             runtime = self._runtimes.pop(account_uid, None)
         if runtime is not None:
-            runtime.kill()
+            runtime.kill(notify_died=notify_died)
 
     def shutdown_all(self) -> None:
         with self._lock:

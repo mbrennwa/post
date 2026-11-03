@@ -1677,7 +1677,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._set_status(f"Reconnecting {label}…")
 
         def work() -> None:
-            self._mail._invalidate_account_connection_unlocked(account_uid)
+            self._mail.invalidate_account_connection(account_uid)
             GLib.idle_add(self._finish_goa_reauth_reconnect, account_uid)
 
         self._mail.submit_front("goa_reauth_reconnect", work)

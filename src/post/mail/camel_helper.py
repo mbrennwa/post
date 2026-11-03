@@ -66,6 +66,7 @@ ALLOWED_METHODS = frozenset(
         "get_correspondents",
         "invalidate_account_connection",
         "set_network_available",
+        "apply_account_connect_health",
         "go_online_sync",
         "list_offline_downsync_folders",
         "offline_downsync_folder",
