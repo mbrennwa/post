@@ -139,6 +139,22 @@ class StoredBodyNeedsRichEditorTests(unittest.TestCase):
         self.assertFalse(stored_body_needs_rich_editor(None, "Hello"))
         self.assertFalse(stored_body_needs_rich_editor("", "Hello"))
 
+    def test_image_html_is_rich(self) -> None:
+        self.assertTrue(
+            stored_body_needs_rich_editor('<img src="cid:pic@post">', "")
+        )
+
+    def test_paste_captures_raster_images(self) -> None:
+        doc = build_editor_document()
+        self.assertIn("clipboardImageFile", doc)
+        self.assertIn("image/png", doc)
+        self.assertIn("image/webp", doc)
+        self.assertIn("insertInlineImage", doc)
+        self.assertIn("data-post-cid", doc)
+        self.assertIn('action: "inline-image"', doc)
+        self.assertIn('querySelector("img")', doc)
+        self.assertIn("htmlForHost", doc)
+
 
 class EditorHtmlPlainEquivalentTests(unittest.TestCase):
     def test_plain_to_simple_html(self) -> None:

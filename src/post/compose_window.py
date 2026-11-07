@@ -51,7 +51,10 @@ from post.mail.compose import (
     finalize_body_after_signature_sync,
     format_address_list,
     guess_attachment_mime_type,
+    html_image_count,
     load_attachment_from_path,
+    normalize_inline_image_mime,
+    split_dropped_paths,
     merge_user_body_with_signature,
     normalize_signature_text,
     normalize_email,
@@ -728,8 +731,8 @@ class ComposeWindow(Adw.Window):
         self.set_content(self._toast_overlay)
 
         _install_compose_drop_style()
-        self._setup_file_drop_target(self._toast_overlay)
-        self._setup_file_drop_target(self._body_view.web_view)
+        self._setup_file_drop_target(self._toast_overlay, on_text=False)
+        self._setup_file_drop_target(self._body_view.web_view, on_text=True)
 
         self._prefill_fields()
         self._tracking_edits = True
@@ -747,7 +750,7 @@ class ComposeWindow(Adw.Window):
         elif self._mode == "forward":
             GLib.idle_add(self._begin_load_forward_attachments)
 
-    def _setup_file_drop_target(self, widget: Gtk.Widget) -> None:
+    def _setup_file_drop_target(self, widget: Gtk.Widget, *, on_text: bool) -> None:
         drop_target = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
 
         def enter(
@@ -764,8 +767,8 @@ class ComposeWindow(Adw.Window):
         def drop(
             _target: Gtk.DropTarget,
             value: object,
-            _x: float,
-            _y: float,
+            x: float,
+            y: float,
         ) -> bool:
             self._toast_overlay.remove_css_class(_COMPOSE_DROP_HIGHLIGHT_CLASS)
             if self._saving_draft:
@@ -773,12 +776,43 @@ class ComposeWindow(Adw.Window):
             paths = _paths_from_drop_value(value)
             if not paths:
                 return False
+            if on_text:
+                return self._drop_paths_on_text(paths, x, y)
             return self._add_attachments_from_paths(paths) > 0
 
         drop_target.connect("enter", enter)
         drop_target.connect("leave", leave)
         drop_target.connect("drop", drop)
         widget.add_controller(drop_target)
+
+    def _drop_paths_on_text(self, paths: list[str], x: float, y: float) -> bool:
+        """Insert raster images into the body. Other files become attachments."""
+        images, files = split_dropped_paths(paths)
+        added = self._add_attachments_from_paths(files) if files else 0
+        for index, path in enumerate(images):
+            filename = os.path.basename(path) or path
+            try:
+                attachment = load_attachment_from_path(path)
+            except IsADirectoryError:
+                show_error_toast(self, f"Cannot attach folder: {filename}")
+                continue
+            except OSError as exc:
+                show_error_toast(self, f"Could not read {filename}: {exc}")
+                continue
+            mime = normalize_inline_image_mime(attachment.mime_type)
+            if mime is None:
+                self._attachments.append(attachment)
+                added += 1
+                self._mark_user_edited()
+                self._refresh_attachments_ui()
+                continue
+            drop_x: float | None = x if index == 0 else None
+            drop_y: float | None = y if index == 0 else None
+            self._body_view.insert_inline_image(
+                mime, attachment.data, drop_x, drop_y
+            )
+            added += 1
+        return added > 0
 
     def _on_attach_clicked(self, *_args) -> None:
         if self._saving_draft:
@@ -1631,6 +1665,7 @@ class ComposeWindow(Adw.Window):
             self._subject_entry.set_text(str(msg.get("subject") or ""))
             plain_body = str(msg.get("body_plain") or "")
             stored_html = (msg.get("body_html") or "").strip() or None
+            self._remember_message_inline_images(msg)
             self._set_body_from_stored(plain_body, stored_html)
             self._place_body_cursor_at_start()
             self._draft_body_html = stored_html
@@ -1658,6 +1693,7 @@ class ComposeWindow(Adw.Window):
             self._subject_entry.set_text(str(msg.get("subject") or ""))
             plain_body = str(msg.get("body_plain") or "")
             stored_html = (msg.get("body_html") or "").strip() or None
+            self._remember_message_inline_images(msg)
             self._set_body_from_stored(plain_body, stored_html)
             self._place_body_cursor_at_start()
             self._draft_body_html = stored_html
@@ -1905,8 +1941,21 @@ class ComposeWindow(Adw.Window):
     def _on_save_draft_clicked(self, *_args) -> None:
         self._begin_save_draft(close_when_done=False)
 
+    def _remember_message_inline_images(self, message: dict[str, Any] | None) -> None:
+        if not message:
+            return
+        images = message.get("inline_images") or {}
+        if isinstance(images, dict) and images:
+            self._body_view.remember_inline_images(images)
+
     def _resolve_outbound_body_html(self, body_plain: str) -> str | None:
-        if self._body_view.is_plain_mode():
+        editor_html = self._body_view.get_html()
+        # A pasted picture promotes the editor to HTML. If that notice has not
+        # landed yet, the image bytes or an img tag still mean the body is rich.
+        plain_mode = self._body_view.is_plain_mode() and not (
+            self._body_view.inline_images() or html_image_count(editor_html)
+        )
+        if plain_mode:
             if self._mode in ("reply", "reply-all", "forward"):
                 return build_outbound_html_for_compose(
                     body_plain=body_plain,
@@ -1917,7 +1966,6 @@ class ComposeWindow(Adw.Window):
                 )
             return None
 
-        editor_html = self._body_view.get_html()
         prepared = prepare_editor_html_for_send(editor_html)
         if self._mode in ("reply", "reply-all", "forward"):
             user_html: str | None = None
@@ -1949,6 +1997,8 @@ class ComposeWindow(Adw.Window):
                 body_plain == self._draft_body_plain_snapshot
                 and self._draft_body_html
                 and not is_plain_wrapper_html(self._draft_body_html, body_plain)
+                and html_image_count(editor_html)
+                <= html_image_count(self._draft_body_html)
             ):
                 return self._draft_body_html
             return prepared or None
@@ -2033,7 +2083,9 @@ class ComposeWindow(Adw.Window):
             and self._mode in ("draft", "send-again", "outbox")
         ):
             body = self._draft_body_plain_snapshot
-        body_html = self._resolve_outbound_body_html(body)
+        body_html = self._body_view.expand_inline_images(
+            self._resolve_outbound_body_html(body)
+        )
 
         in_reply_to = None
         references = None

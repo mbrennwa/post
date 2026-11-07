@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import json
 import logging
@@ -23,7 +24,12 @@ gi.require_version("JavaScriptCore", "6.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, JavaScriptCore, WebKit
 
 from post.open_uri import open_uri_externally
-from post.reader.html import ADAPT_TEXT_CSS, IMG_FIT_CSS
+from post.mail.compose import (
+    new_inline_content_id,
+    normalize_inline_image_mime,
+    parse_inline_image_data_url,
+)
+from post.reader.html import ADAPT_TEXT_CSS, IMG_FIT_CSS, resolve_cid_images
 from post.reader.pane import (
     apply_reader_link_hover,
     pointer_coords_in_widget,
@@ -111,6 +117,7 @@ __ADAPT_TEXT_CSS__
   let lastInputType = "";
   let lastPushAt = 0;
   let committed = null;
+  let postedInline = {};
   function currentMode() {
     return editor.getAttribute("contenteditable") === "plaintext-only"
       ? "plain"
@@ -131,6 +138,7 @@ __ADAPT_TEXT_CSS__
     return false;
   }
   function hasMeaningfulFormatting() {
+    if (editor.querySelector("img")) return true;
     if (editor.querySelector("blockquote.post_quote")) return true;
     if (editor.querySelector("a[href]")) return true;
     if (editor.querySelector("blockquote")) return true;
@@ -167,12 +175,144 @@ __ADAPT_TEXT_CSS__
       }
     });
   }
+  function newInlineCid() {
+    return "img-" + Math.random().toString(36).slice(2)
+      + Date.now().toString(36) + "@post";
+  }
+  function inlineMimeFromDataUrl(src) {
+    if (!src || src.indexOf("data:image/") !== 0) return "";
+    var semi = src.indexOf(";");
+    if (semi < 5) return "";
+    var mime = src.slice(5, semi).toLowerCase();
+    if (mime === "image/jpg") mime = "image/jpeg";
+    if (mime !== "image/png" && mime !== "image/jpeg"
+        && mime !== "image/gif" && mime !== "image/webp") {
+      return "";
+    }
+    if (src.indexOf(";base64,") !== semi) return "";
+    return mime;
+  }
+  function clipboardImageFile(clip) {
+    var types = ["image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"];
+    function matches(type) {
+      return types.indexOf((type || "").toLowerCase()) >= 0;
+    }
+    if (clip.items && clip.items.length) {
+      for (var i = 0; i < clip.items.length; i++) {
+        var item = clip.items[i];
+        if (!matches(item.type) || !item.getAsFile) continue;
+        var file = item.getAsFile();
+        if (file) return file;
+      }
+    }
+    if (clip.files && clip.files.length) {
+      for (var j = 0; j < clip.files.length; j++) {
+        if (matches(clip.files[j].type)) return clip.files[j];
+      }
+    }
+    return null;
+  }
+  function htmlIsOnlyImage(html) {
+    if (!html) return true;
+    var tmp = document.createElement("div");
+    tmp.innerHTML = html;
+    var imgs = tmp.querySelectorAll("img");
+    for (var i = 0; i < imgs.length; i++) imgs[i].remove();
+    var text = (tmp.textContent || "").replace(/\\s+/g, "");
+    return text.length === 0;
+  }
+  function publishInlineImage(cid, mime, src) {
+    if (!cid || postedInline[cid]) return;
+    postedInline[cid] = true;
+    try {
+      window.webkit.messageHandlers.__COMPOSE_ACTION__.postMessage({
+        action: "inline-image",
+        cid: cid,
+        mime: mime,
+        src: src
+      });
+    } catch (err) {}
+  }
+  function ensureInlineCids() {
+    editor.querySelectorAll("img").forEach(function (img) {
+      var src = img.getAttribute("src") || "";
+      var mime = inlineMimeFromDataUrl(src);
+      if (!mime) return;
+      var cid = img.getAttribute("data-post-cid") || "";
+      if (!cid) {
+        cid = newInlineCid();
+        img.setAttribute("data-post-cid", cid);
+      }
+      publishInlineImage(cid, mime, src);
+    });
+  }
+  function htmlForHost() {
+    ensureInlineCids();
+    var clone = editor.cloneNode(true);
+    clone.querySelectorAll("img[data-post-cid]").forEach(function (img) {
+      var cid = img.getAttribute("data-post-cid");
+      if (!cid) return;
+      if (inlineMimeFromDataUrl(img.getAttribute("src") || "")) {
+        img.setAttribute("src", "cid:" + cid);
+      }
+    });
+    return clone.innerHTML;
+  }
+  function insertInlineImageSrc(src, x, y, cid) {
+    if (!src) return;
+    pushUndo();
+    historyMuted = true;
+    try {
+      promoteToRich();
+      var img = document.createElement("img");
+      img.setAttribute("src", src);
+      if (!cid) cid = newInlineCid();
+      img.setAttribute("data-post-cid", cid);
+      var range = null;
+      if (typeof x === "number" && typeof y === "number") {
+        if (document.caretRangeFromPoint) {
+          range = document.caretRangeFromPoint(x, y);
+        } else if (document.caretPositionFromPoint) {
+          var pos = document.caretPositionFromPoint(x, y);
+          if (pos) {
+            range = document.createRange();
+            range.setStart(pos.offsetNode, pos.offset);
+            range.collapse(true);
+          }
+        }
+      }
+      if (!range || !editor.contains(range.startContainer)) {
+        var sel = window.getSelection();
+        if (sel && sel.rangeCount && editor.contains(sel.anchorNode)) {
+          range = sel.getRangeAt(0);
+        }
+      }
+      if (!range) {
+        range = document.createRange();
+        range.selectNodeContents(editor);
+        range.collapse(false);
+      }
+      range.collapse(true);
+      range.insertNode(img);
+      range.setStartAfter(img);
+      range.collapse(true);
+      var selection = window.getSelection();
+      if (selection) {
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      notify();
+    } finally {
+      historyMuted = false;
+      lastInputType = "";
+    }
+  }
   function notify() {
     try {
       stampLinks();
       window.webkit.messageHandlers.__COMPOSE_HANDLER__.postMessage({
         plain: editor.innerText,
-        html: editor.innerHTML,
+        html: htmlForHost(),
         mode: currentMode()
       });
     } catch (e) {}
@@ -418,10 +558,20 @@ __ADAPT_TEXT_CSS__
     }
   }
   editor.addEventListener("paste", function (e) {
-    if (editor.getAttribute("contenteditable") !== "plaintext-only") return;
     const clip = e.clipboardData;
     if (!clip) return;
+    const imageFile = clipboardImageFile(clip);
     const pastedHtml = (clip.getData("text/html") || "").trim();
+    if (imageFile && htmlIsOnlyImage(pastedHtml)) {
+      e.preventDefault();
+      const reader = new FileReader();
+      reader.onload = function () {
+        insertInlineImageSrc(String(reader.result || ""), null, null, "");
+      };
+      reader.readAsDataURL(imageFile);
+      return;
+    }
+    if (editor.getAttribute("contenteditable") !== "plaintext-only") return;
     if (!pastedHtml) return;
     e.preventDefault();
     pushUndo();
@@ -506,6 +656,9 @@ __ADAPT_TEXT_CSS__
       historyMuted = false;
       resetHistory();
       notify();
+    },
+    insertInlineImage: function (src, x, y, cid) {
+      insertInlineImageSrc(src, x, y, cid || "");
     },
     undoEdit: function () { undoEdit(); },
     redoEdit: function () { redoEdit(); },
@@ -647,6 +800,8 @@ def stored_body_needs_rich_editor(stored_html: str | None, plain: str) -> bool:
         return True
     if re.search(r"<blockquote\b", html_text, re.I):
         return True
+    if re.search(r"<img\b", html_text, re.I):
+        return True
     return False
 
 
@@ -738,6 +893,7 @@ class ComposeBodyEditor(Gtk.Box):
 
         self._cached_plain = ""
         self._cached_html = ""
+        self._inline_images: dict[str, tuple[str, bytes]] = {}
         self._edit_mode = "plain"
         self._loaded = False
         self._pending_cursor_start = False
@@ -868,7 +1024,78 @@ class ComposeBodyEditor(Gtk.Box):
         self._edit_mode = "rich"
         self._suppress_changed = True
         self._cached_html = fragment
-        self._load_document(body_html=fragment, edit_mode="true")
+        self._load_document(
+            body_html=self._html_for_display(fragment), edit_mode="true"
+        )
+
+    def inline_images(self) -> dict[str, tuple[str, bytes]]:
+        """Content-IDs for pictures inserted into this compose body."""
+        return dict(self._inline_images)
+
+    def remember_inline_image(
+        self, content_id: str, mime_type: str, data: bytes
+    ) -> None:
+        """Remember bytes for a ``cid:`` image so send and reload can embed it."""
+        cid = (content_id or "").strip()
+        if cid.lower().startswith("cid:"):
+            cid = cid[4:]
+        if cid.startswith("<") and cid.endswith(">"):
+            cid = cid[1:-1]
+        mime = normalize_inline_image_mime(mime_type)
+        if not cid or mime is None or not data:
+            return
+        self._inline_images[cid] = (mime, data)
+
+    def remember_inline_images(
+        self, images: dict[str, tuple[str, bytes]]
+    ) -> None:
+        """Remember inline images loaded from a draft or sent message."""
+        for content_id, value in images.items():
+            if not isinstance(value, tuple) or len(value) != 2:
+                continue
+            mime_type, data = value
+            if isinstance(data, bytes):
+                self.remember_inline_image(str(content_id), str(mime_type), data)
+
+    def _remember_posted_inline_image(self, cid: str, mime: str, src: str) -> None:
+        parsed = parse_inline_image_data_url(src)
+        if parsed is None:
+            return
+        parsed_mime, data = parsed
+        self.remember_inline_image(cid, mime or parsed_mime, data)
+
+    def expand_inline_images(self, body_html: str | None) -> str | None:
+        """Turn known ``cid:`` images back into ``data:`` URLs for MIME build."""
+        if not body_html or not self._inline_images:
+            return body_html
+        return resolve_cid_images(body_html, self._inline_images)
+
+    def _html_for_display(self, fragment: str) -> str:
+        """Show remembered inline images. The cached HTML keeps ``cid:`` URLs."""
+        displayed = self.expand_inline_images(fragment)
+        return fragment if displayed is None else displayed
+
+    def insert_inline_image(
+        self,
+        mime_type: str,
+        data: bytes,
+        x: float | None = None,
+        y: float | None = None,
+    ) -> None:
+        """Insert a raster image into the body at a drop point, or at the caret."""
+        mime = normalize_inline_image_mime(mime_type)
+        if mime is None or not data:
+            return
+        content_id = new_inline_content_id()
+        self.remember_inline_image(content_id, mime, data)
+        src = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+        x_arg = "null" if x is None else repr(float(x))
+        y_arg = "null" if y is None else repr(float(y))
+        self._run_js(
+            "if (window.__postCompose && window.__postCompose.insertInlineImage) "
+            "window.__postCompose.insertInlineImage("
+            f"{json.dumps(src)}, {x_arg}, {y_arg}, {json.dumps(content_id)});"
+        )
 
     def undo(self) -> None:
         self._run_js("if (window.__postCompose) window.__postCompose.undoEdit();")
@@ -1054,7 +1281,9 @@ class ComposeBodyEditor(Gtk.Box):
             if rewriter is not None:
                 fragment = rewriter(fragment, dark)
                 self._cached_html = fragment
-            self._load_document(body_html=fragment, edit_mode="true")
+            self._load_document(
+                body_html=self._html_for_display(fragment), edit_mode="true"
+            )
         else:
             self._load_document(
                 body_plain=self._cached_plain, edit_mode="plaintext-only"
@@ -1121,17 +1350,29 @@ class ComposeBodyEditor(Gtk.Box):
         action = ""
         text = ""
         href = ""
+        cid = ""
+        mime = ""
+        src = ""
         try:
             if value.is_object():
                 action_v = value.object_get_property("action")
                 text_v = value.object_get_property("text")
                 href_v = value.object_get_property("href")
+                cid_v = value.object_get_property("cid")
+                mime_v = value.object_get_property("mime")
+                src_v = value.object_get_property("src")
                 if action_v is not None and action_v.is_string():
                     action = action_v.to_string()
                 if text_v is not None and text_v.is_string():
                     text = text_v.to_string()
                 if href_v is not None and href_v.is_string():
                     href = href_v.to_string()
+                if cid_v is not None and cid_v.is_string():
+                    cid = cid_v.to_string()
+                if mime_v is not None and mime_v.is_string():
+                    mime = mime_v.to_string()
+                if src_v is not None and src_v.is_string():
+                    src = src_v.to_string()
         except Exception:
             log.debug("compose action message parse failed", exc_info=True)
             return
@@ -1139,6 +1380,8 @@ class ComposeBodyEditor(Gtk.Box):
             self._emit_link_request(text, href)
         elif action == "open-link":
             self._open_href(href)
+        elif action == "inline-image":
+            self._remember_posted_inline_image(cid, mime, src)
 
     def _open_href(self, href: str) -> None:
         uri = (href or "").strip()
