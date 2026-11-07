@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import os
 import re
@@ -1298,6 +1299,129 @@ def _camel_text_transfer_encoding(_payload: bytes) -> Any:
     return Camel.TransferEncoding.ENCODING_QUOTEDPRINTABLE
 
 
+_INLINE_IMAGE_MIME_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp"}
+)
+_INLINE_IMAGE_EXTENSIONS = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+_DATA_IMAGE_SRC_RE = re.compile(
+    r"""(?P<prefix>\bsrc\s*=\s*)(?P<quote>["'])"""
+    r"""data:(?P<mime>image/(?:png|jpe?g|gif|webp));base64,"""
+    r"""(?P<b64>[A-Za-z0-9+/=\s]+)(?P=quote)""",
+    re.IGNORECASE,
+)
+_IMG_TAG_RE = re.compile(r"<img\b", re.IGNORECASE)
+
+
+def normalize_inline_image_mime(mime_type: str) -> str | None:
+    """Return a raster MIME type that can sit inline in the message body."""
+    mime = (mime_type or "").split(";", 1)[0].strip().lower()
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+    if mime in _INLINE_IMAGE_MIME_TYPES:
+        return mime
+    return None
+
+
+def new_inline_content_id() -> str:
+    """Return a Content-ID for one composer inline image."""
+    return f"img-{uuid.uuid4().hex}@post"
+
+
+def html_image_count(body_html: str | None) -> int:
+    """Return how many img tags a fragment contains."""
+    return len(_IMG_TAG_RE.findall(body_html or ""))
+
+
+def parse_inline_image_data_url(src: str) -> tuple[str, bytes] | None:
+    """Decode a raster ``data:`` URL. Other URLs return None."""
+    text = (src or "").strip()
+    match = re.fullmatch(
+        r"data:(image/(?:png|jpe?g|gif|webp));base64,([A-Za-z0-9+/=\s]+)",
+        text,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    mime = normalize_inline_image_mime(match.group(1))
+    if mime is None:
+        return None
+    try:
+        data = base64.b64decode(re.sub(r"\s+", "", match.group(2)), validate=False)
+    except (ValueError, TypeError):
+        return None
+    if not data:
+        return None
+    return mime, data
+
+
+def path_is_inline_image(path: str) -> bool:
+    """True when a dropped path is a raster image that belongs in the text."""
+    if not path or os.path.isdir(path):
+        return False
+    guessed, _certain = Gio.content_type_guess(os.path.basename(path), None)
+    return normalize_inline_image_mime(guessed or "") is not None
+
+
+def split_dropped_paths(paths: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Split a text-area drop into inline images and file attachments.
+
+    Each path is judged on its own. Raster images are inline. Everything else,
+    including folders, is a file attachment.
+    """
+    images: list[str] = []
+    files: list[str] = []
+    for path in paths:
+        if path_is_inline_image(path):
+            images.append(path)
+        else:
+            files.append(path)
+    return images, files
+
+
+@dataclass(frozen=True)
+class ComposeInlineImage:
+    content_id: str
+    mime_type: str
+    data: bytes
+
+
+def extract_inline_data_images(
+    body_html: str,
+) -> tuple[str, list[ComposeInlineImage]]:
+    """Replace raster ``data:`` image URLs with ``cid:`` references.
+
+    ``https:`` images and existing ``cid:`` URLs are left unchanged.
+    """
+    images: list[ComposeInlineImage] = []
+
+    def replace(match: re.Match[str]) -> str:
+        parsed = parse_inline_image_data_url(
+            f"data:{match.group('mime')};base64,{match.group('b64')}"
+        )
+        if parsed is None:
+            return match.group(0)
+        mime, data = parsed
+        content_id = new_inline_content_id()
+        images.append(
+            ComposeInlineImage(content_id=content_id, mime_type=mime, data=data)
+        )
+        quote = match.group("quote")
+        return f"{match.group('prefix')}{quote}cid:{content_id}{quote}"
+
+    rewritten = _DATA_IMAGE_SRC_RE.sub(replace, body_html or "")
+    return rewritten, images
+
+
+def _inline_image_filename(mime_type: str) -> str:
+    extension = _INLINE_IMAGE_EXTENSIONS.get(mime_type, "img")
+    return f"image.{extension}"
+
+
 @dataclass(frozen=True)
 class ComposeAttachment:
     filename: str
@@ -1501,6 +1625,9 @@ def _build_alternative_multipart(
     from gi.repository import Camel
 
     alternative = Camel.Multipart.new()
+    # Camel.Multipart defaults to multipart/mixed, and set_mime_type drops the
+    # boundary, so the subtype is set first and the boundary after it.
+    alternative.set_mime_type("multipart/alternative")
     alternative.set_boundary(f"----post-alt-{uuid.uuid4().hex}")
 
     plain_part = Camel.MimePart.new()
@@ -1514,6 +1641,64 @@ def _build_alternative_multipart(
     alternative.add_part(html_part)
 
     return alternative
+
+
+def _build_related_multipart(
+    encoded_plain: bytes,
+    encoded_html: bytes,
+    images: Sequence[ComposeInlineImage],
+) -> Any:
+    """HTML alternative plus inline image parts (``multipart/related``)."""
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    related = Camel.Multipart.new()
+    related.set_mime_type("multipart/related")
+    related.set_boundary(f"----post-rel-{uuid.uuid4().hex}")
+    related.add_part(
+        _wrap_multipart_as_mime_part(
+            _build_alternative_multipart(encoded_plain, encoded_html),
+            "multipart/alternative",
+        )
+    )
+    for image in images:
+        part = Camel.MimePart.new()
+        part.set_content(image.data, image.mime_type)
+        part.set_content_id(image.content_id)
+        part.set_disposition("inline")
+        part.set_filename(_inline_image_filename(image.mime_type))
+        part.set_encoding(Camel.TransferEncoding.ENCODING_BASE64)
+        related.add_part(part)
+    return related
+
+
+def _add_file_attachment_parts(
+    multipart: Any, attachments: Sequence[ComposeAttachment]
+) -> None:
+    """Append ``Content-Disposition: attachment`` parts to a mixed multipart."""
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    for attachment in attachments:
+        part = Camel.MimePart.new()
+        part.set_content(attachment.data, attachment.mime_type)
+        safe_filename = _sanitize_header_field(
+            attachment.filename, field="Attachment filename"
+        )
+        if safe_filename.isascii():
+            part.set_disposition("attachment")
+            part.set_filename(safe_filename)
+        else:
+            part.set_header(
+                "Content-Disposition",
+                _attachment_content_disposition(safe_filename),
+            )
+        part.set_encoding(Camel.TransferEncoding.ENCODING_BASE64)
+        multipart.add_part(part)
 
 
 def _wrap_multipart_as_mime_part(multipart: Any, mime_type: str) -> Any:
@@ -1540,8 +1725,25 @@ def _set_message_body(
     gi.require_version("Camel", "1.2")
     from gi.repository import Camel
 
+    html_source, inline_images = extract_inline_data_images(body_html or "")
     encoded_plain = _encode_plain_body(body)
-    encoded_html = _encode_html_body(body_html) if body_html else None
+    encoded_html = _encode_html_body(html_source) if html_source.strip() else None
+
+    if encoded_html is not None and inline_images:
+        related = _build_related_multipart(encoded_plain, encoded_html, inline_images)
+        if not attachments:
+            message.props.content = related
+            message.set_mime_type("multipart/related")
+            return
+        multipart = Camel.Multipart.new()
+        multipart.set_boundary(f"----post-{uuid.uuid4().hex}")
+        multipart.add_part(
+            _wrap_multipart_as_mime_part(related, "multipart/related")
+        )
+        _add_file_attachment_parts(multipart, attachments)
+        message.props.content = multipart
+        message.set_mime_type("multipart/mixed")
+        return
 
     if not encoded_html and not attachments:
         message.set_content(encoded_plain, "text/plain; charset=utf-8")
@@ -1568,22 +1770,7 @@ def _set_message_body(
         body_part.set_encoding(_camel_text_transfer_encoding(encoded_plain))
         multipart.add_part(body_part)
 
-    for attachment in attachments or ():
-        part = Camel.MimePart.new()
-        part.set_content(attachment.data, attachment.mime_type)
-        safe_filename = _sanitize_header_field(
-            attachment.filename, field="Attachment filename"
-        )
-        if safe_filename.isascii():
-            part.set_disposition("attachment")
-            part.set_filename(safe_filename)
-        else:
-            part.set_header(
-                "Content-Disposition",
-                _attachment_content_disposition(safe_filename),
-            )
-        part.set_encoding(Camel.TransferEncoding.ENCODING_BASE64)
-        multipart.add_part(part)
+    _add_file_attachment_parts(multipart, attachments or ())
 
     message.props.content = multipart
     message.set_mime_type("multipart/mixed")

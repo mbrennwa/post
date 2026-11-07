@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import base64
 import unittest
 from unittest import mock
 
 from post.mail.compose import (
     ComposeAttachment,
+    extract_inline_data_images,
+    html_image_count,
+    split_dropped_paths,
     body_mentions_attachment,
     body_html_for_quoting,
     body_text_for_quoting,
@@ -49,6 +53,7 @@ from post.mail.helpers import (
     _QuotableHtmlParser,
     _mime_message_raw_bytes,
     extract_attachments,
+    extract_inline_images,
     extract_message_bodies,
     get_attachment_data,
     html_to_quotable_plain,
@@ -1870,6 +1875,95 @@ class HtmlForwardReplyTests(unittest.TestCase):
         extracted = extract_attachments(message)
         self.assertEqual(len(extracted), 1)
         self.assertEqual(extracted[0]["filename"], "doc.pdf")
+
+    def test_extract_inline_data_image_replaces_data_url(self) -> None:
+        payload = b"\x89PNG-bytes"
+        encoded = base64.b64encode(payload).decode("ascii")
+        html = (
+            '<p>Hi</p><img src="data:image/png;base64,'
+            f'{encoded}"><img src="cid:quote@local">'
+            '<img src="https://example.com/a.png">'
+        )
+        rewritten, images = extract_inline_data_images(html)
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0].mime_type, "image/png")
+        self.assertEqual(images[0].data, payload)
+        self.assertIn(f'src="cid:{images[0].content_id}"', rewritten)
+        self.assertNotIn("data:image", rewritten)
+        self.assertIn('src="cid:quote@local"', rewritten)
+        self.assertIn('src="https://example.com/a.png"', rewritten)
+        self.assertEqual(html_image_count(rewritten), 3)
+
+    def test_split_dropped_paths_keeps_raster_images_inline(self) -> None:
+        images, files = split_dropped_paths(
+            ["notes/shot.png", "notes/doc.pdf", "notes/anim.webp", "notes/plain.txt"]
+        )
+        self.assertEqual(images, ["notes/shot.png", "notes/anim.webp"])
+        self.assertEqual(files, ["notes/doc.pdf", "notes/plain.txt"])
+
+    def test_build_plain_mime_message_embeds_inline_image(self) -> None:
+        payload = b"\x89PNG-bytes"
+        encoded = base64.b64encode(payload).decode("ascii")
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Picture",
+            body="See this",
+            body_html=f'<p>See this</p><img src="data:image/png;base64,{encoded}">',
+        )
+        content_type = message.get_content_type()
+        self.assertIsNotNone(content_type)
+        self.assertEqual(content_type.simple(), "multipart/related")
+        images = extract_inline_images(message)
+        self.assertEqual(list(images.values()), [("image/png", payload)])
+        self.assertEqual(extract_attachments(message), [])
+        bodies = extract_message_bodies(message)
+        self.assertIn("cid:", bodies["html"] or "")
+        self.assertNotIn("data:image", bodies["html"] or "")
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertIn(b"multipart/related", raw)
+        self.assertIn(b"Content-Disposition: inline", raw)
+        _assert_rfc5322_line_lengths(raw)
+
+    def test_build_plain_mime_message_inline_image_and_file_attachment(self) -> None:
+        payload = b"GIF89a"
+        encoded = base64.b64encode(payload).decode("ascii")
+        message = build_plain_mime_message(
+            from_name="Alice",
+            from_address="alice@example.com",
+            to=["bob@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Both",
+            body="See this",
+            body_html=f'<img src="data:image/gif;base64,{encoded}">',
+            attachments=[
+                ComposeAttachment(
+                    filename="doc.pdf",
+                    mime_type="application/pdf",
+                    data=b"%PDF-fake",
+                )
+            ],
+        )
+        content_type = message.get_content_type()
+        self.assertIsNotNone(content_type)
+        self.assertEqual(content_type.simple(), "multipart/mixed")
+        images = extract_inline_images(message)
+        self.assertEqual(list(images.values()), [("image/gif", payload)])
+        extracted = extract_attachments(message)
+        self.assertEqual(len(extracted), 1)
+        self.assertEqual(extracted[0]["filename"], "doc.pdf")
+        raw = _mime_message_raw_bytes(message)
+        assert raw is not None
+        self.assertIn(b"multipart/related", raw)
+        self.assertIn(b"multipart/alternative", raw)
+        self.assertIn(b"Content-Disposition: inline", raw)
+        self.assertIn(b"Content-Disposition: attachment", raw)
+        _assert_rfc5322_line_lengths(raw)
 
     def test_build_plain_mime_message_omits_bcc_when_requested(self) -> None:
         message = build_plain_mime_message(
