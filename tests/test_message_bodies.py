@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import email
 import unittest
 
 import gi
@@ -15,6 +16,9 @@ from post.mail.helpers import (
     _decode_text_bytes,
     _decode_text_part,
     extract_attachments,
+    extract_attachments_from_email_message,
+    extract_inline_images,
+    extract_inline_images_from_email_message,
     extract_message_bodies,
     extract_message_bodies_from_bytes,
 )
@@ -335,6 +339,204 @@ Content-Disposition: attachment; filename="ATT00001.htm"
         bodies = extract_message_bodies(message)
         self.assertIn("HTML reply", bodies["html"] or "")
         self.assertNotIn("Quoted original", bodies["html"] or "")
+
+
+def _mixed_with_inline_photo(*, content_id: str | None = None) -> email.message.EmailMessage:
+    """text, inline jpeg, text. The shape iPad Mail uses for a body photo."""
+    msg = email.message.EmailMessage(policy=email.policy.default)
+    msg["Subject"] = "Hello"
+    msg.make_mixed()
+
+    leading = email.message.EmailMessage()
+    leading.set_content("Good morning")
+    msg.attach(leading)
+
+    image = email.message.EmailMessage()
+    image.set_content(
+        b"\xff\xd8\xff\xd9",
+        maintype="image",
+        subtype="jpeg",
+        disposition="inline",
+        filename="photo.jpg",
+    )
+    if content_id:
+        image["Content-ID"] = f"<{content_id}>"
+    msg.attach(image)
+
+    trailing = email.message.EmailMessage()
+    trailing.set_content("Sent from my tablet")
+    msg.attach(trailing)
+    return msg
+
+
+class LooseInlineImageBodyTests(unittest.TestCase):
+    def test_inline_photo_sits_between_text_parts(self) -> None:
+        msg = _mixed_with_inline_photo()
+        raw = msg.as_bytes()
+        bodies = extract_message_bodies_from_bytes(raw)
+        self.assertEqual(bodies["plain"], "Good morning\nSent from my tablet")
+        html_body = bodies["html"] or ""
+        self.assertLess(
+            html_body.find("Good morning"),
+            html_body.find("<img"),
+        )
+        self.assertLess(
+            html_body.find("<img"),
+            html_body.find("Sent from my tablet"),
+        )
+        self.assertIn('src="cid:post-inline-0@post"', html_body)
+        images = extract_inline_images_from_email_message(msg)
+        self.assertEqual(set(images), {"post-inline-0@post"})
+        self.assertEqual(images["post-inline-0@post"][0], "image/jpeg")
+        self.assertEqual(images["post-inline-0@post"][1], b"\xff\xd8\xff\xd9")
+        self.assertEqual(extract_attachments_from_email_message(msg), [])
+
+        wrapped = extract_message_bodies(_FakeMimeMessage(raw))
+        self.assertEqual(wrapped["plain"], bodies["plain"])
+        self.assertEqual(wrapped["html"], bodies["html"])
+
+    def test_existing_content_id_is_reused(self) -> None:
+        msg = _mixed_with_inline_photo(content_id="keep-me@post")
+        bodies = extract_message_bodies_from_bytes(msg.as_bytes())
+        self.assertIn('src="cid:keep-me@post"', bodies["html"] or "")
+        self.assertNotIn("post-inline-", bodies["html"] or "")
+        images = extract_inline_images_from_email_message(msg)
+        self.assertIn("keep-me@post", images)
+
+    def test_attachment_image_stays_a_file(self) -> None:
+        msg = email.message.EmailMessage(policy=email.policy.default)
+        msg["Subject"] = "File"
+        msg.make_mixed()
+        leading = email.message.EmailMessage()
+        leading.set_content("See attached")
+        msg.attach(leading)
+        image = email.message.EmailMessage()
+        image.set_content(
+            b"\xff\xd8\xff\xd9",
+            maintype="image",
+            subtype="jpeg",
+            disposition="attachment",
+            filename="photo.jpg",
+        )
+        msg.attach(image)
+        bodies = extract_message_bodies_from_bytes(msg.as_bytes())
+        self.assertEqual((bodies["plain"] or "").strip(), "See attached")
+        self.assertIsNone(bodies["html"])
+        names = [
+            item["filename"]
+            for item in extract_attachments_from_email_message(msg)
+        ]
+        self.assertEqual(names, ["photo.jpg"])
+
+    def test_image_without_disposition_stays_a_file(self) -> None:
+        raw = b"""From: a@example.com
+To: b@example.com
+Subject: Named
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mixed"
+
+--mixed
+Content-Type: text/plain; charset="utf-8"
+
+Hello
+--mixed
+Content-Type: image/jpeg; name="photo.jpg"
+
+/9j/wA==
+--mixed--
+"""
+        bodies = extract_message_bodies_from_bytes(raw)
+        self.assertEqual((bodies["plain"] or "").strip(), "Hello")
+        self.assertIsNone(bodies["html"])
+        msg = email.message_from_bytes(raw, policy=email.policy.default)
+        names = [
+            item["filename"]
+            for item in extract_attachments_from_email_message(msg)
+        ]
+        self.assertIn("photo.jpg", names)
+
+    def test_html_body_is_not_reassembled(self) -> None:
+        msg = email.message.EmailMessage(policy=email.policy.default)
+        msg["Subject"] = "HTML"
+        msg.make_alternative()
+        plain = email.message.EmailMessage()
+        plain.set_content("Plain reply")
+        html = email.message.EmailMessage()
+        html.set_content('<p>HTML reply</p><img src="cid:logo@local">', subtype="html")
+        msg.attach(plain)
+        msg.attach(html)
+        logo = email.message.EmailMessage()
+        logo.set_content(
+            b"png",
+            maintype="image",
+            subtype="png",
+            disposition="inline",
+            filename="logo.png",
+        )
+        logo["Content-ID"] = "<logo@local>"
+        # The logo belongs to the HTML body, so the message must stay as sent.
+        related = email.message.EmailMessage()
+        related.make_related()
+        related.attach(msg)
+        related.attach(logo)
+
+        bodies = extract_message_bodies_from_bytes(related.as_bytes())
+        self.assertIn("<p>HTML reply</p>", bodies["html"] or "")
+        self.assertNotIn("<pre>", bodies["html"] or "")
+        images = extract_inline_images_from_email_message(related)
+        self.assertIn("logo@local", images)
+        self.assertNotIn("post-inline-0@post", images)
+        self.assertEqual(extract_attachments_from_email_message(related), [])
+
+    def test_signed_wrapper_still_places_the_photo(self) -> None:
+        inner = _mixed_with_inline_photo()
+        outer = email.message.EmailMessage(policy=email.policy.default)
+        outer["Subject"] = "Signed"
+        outer.set_type("multipart/signed")
+        outer.set_param("protocol", "application/pkcs7-signature")
+        outer.set_param("micalg", "sha-256")
+        outer.attach(inner)
+        signature = email.message.EmailMessage()
+        signature.set_content(
+            b"sig",
+            maintype="application",
+            subtype="pkcs7-signature",
+            filename="smime.p7s",
+        )
+        outer.attach(signature)
+
+        bodies = extract_message_bodies_from_bytes(outer.as_bytes())
+        self.assertIn("Good morning", bodies["plain"] or "")
+        self.assertIn("Sent from my tablet", bodies["plain"] or "")
+        self.assertIn('src="cid:post-inline-0@post"', bodies["html"] or "")
+        self.assertEqual(extract_attachments_from_email_message(outer), [])
+
+    def test_camel_inline_photo_matches_email_ids(self) -> None:
+        mixed = Camel.Multipart.new()
+        mixed.set_boundary("loose-bound")
+        leading = Camel.MimePart.new()
+        leading.set_content(b"Good morning\n", "text/plain; charset=utf-8")
+        mixed.add_part(leading)
+        image = Camel.MimePart.new()
+        image.set_content(b"\xff\xd8\xff\xd9", "image/jpeg")
+        image.set_disposition("inline")
+        image.set_filename("photo.jpg")
+        mixed.add_part(image)
+        trailing = Camel.MimePart.new()
+        trailing.set_content(b"Sent from my tablet\n", "text/plain; charset=utf-8")
+        mixed.add_part(trailing)
+        message = Camel.MimeMessage.new()
+        message.set_subject("Hello")
+        message.props.content = mixed
+        message.set_mime_type("multipart/mixed")
+
+        bodies = extract_message_bodies(message)
+        images = extract_inline_images(message)
+        self.assertEqual(bodies["plain"], "Good morning\nSent from my tablet")
+        self.assertIn('src="cid:post-inline-0@post"', bodies["html"] or "")
+        self.assertEqual(set(images), {"post-inline-0@post"})
+        self.assertEqual(images["post-inline-0@post"][1], b"\xff\xd8\xff\xd9")
+        self.assertEqual(extract_attachments(message), [])
 
 
 if __name__ == "__main__":

@@ -1716,6 +1716,7 @@ class ComposeWindow(Adw.Window):
             self._quoted_html_source = body_html_for_quoting(self._reply_to)
             self._quoted_plain_expected = quoted
             if self._quoted_html_source:
+                self._remember_message_inline_images(self._reply_to)
                 fragment = compose_html_quote_prefill(
                     mode=self._mode,
                     reply_to=self._reply_to,
@@ -1744,6 +1745,7 @@ class ComposeWindow(Adw.Window):
             self._quoted_html_source = body_html_for_quoting(self._reply_to)
             self._quoted_plain_expected = quoted
             if self._quoted_html_source:
+                self._remember_message_inline_images(self._reply_to)
                 fragment = compose_html_quote_prefill(
                     mode=self._mode,
                     reply_to=self._reply_to,

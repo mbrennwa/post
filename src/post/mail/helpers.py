@@ -1166,6 +1166,359 @@ def _promote_attached_html_if_needed(
         bodies["html"] = attached_html[0]
 
 
+@dataclass(frozen=True)
+class _LooseInlinePiece:
+    """One text block or inline image in a multipart/mixed body with no HTML."""
+
+    text: str | None = None
+    mime_type: str | None = None
+    data: bytes | None = None
+    content_id: str | None = None
+
+
+def _loose_disposition(value: Any) -> str | None:
+    if value is None:
+        return None
+    token = str(value).strip().lower().split(";", 1)[0].strip()
+    if token in ("inline", "attachment"):
+        return token
+    return None
+
+
+def _render_loose_inline_pieces(
+    pieces: list[_LooseInlinePiece],
+) -> tuple[str | None, str, dict[str, tuple[str, bytes]]] | None:
+    """Plain text, HTML, and cid map for inline images that have no HTML body.
+
+    iPad Mail places a photo between text parts and marks it inline, with no
+    Content-ID (#527). Images that already have a Content-ID keep that id.
+    """
+    if not any(piece.data for piece in pieces):
+        return None
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+    images: dict[str, tuple[str, bytes]] = {}
+    synthetic = 0
+    for piece in pieces:
+        if piece.text is not None:
+            text = piece.text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+            if not text.strip():
+                continue
+            plain_parts.append(text)
+            html_parts.append(f"<pre>{html.escape(text)}</pre>")
+            continue
+        if not piece.data or not piece.mime_type:
+            continue
+        cid = piece.content_id or ""
+        if not cid:
+            cid = f"post-inline-{synthetic}@post"
+            synthetic += 1
+        images[cid] = (piece.mime_type, piece.data)
+        html_parts.append(f'<img src="cid:{html.escape(cid, quote=True)}">')
+    if not images:
+        return None
+    plain = "\n".join(plain_parts) if plain_parts else None
+    return plain, "\n".join(html_parts), images
+
+
+def _apply_loose_inline_body(
+    bodies: dict[str, str | None],
+    rendered: tuple[str | None, str, dict[str, tuple[str, bytes]]] | None,
+) -> None:
+    if rendered is None or _usable_html_body(bodies.get("html")):
+        return
+    plain, html_body, _images = rendered
+    bodies["plain"] = plain
+    bodies["html"] = html_body
+
+
+def _email_real_html_part(part: Any) -> bool:
+    if part.get_content_type() != "text/html":
+        return False
+    return _loose_disposition(part.get_content_disposition()) != "attachment"
+
+
+def _email_first_plain_text(part: Any) -> str | None:
+    ctype = part.get_content_type()
+    if is_rfc822_mime(ctype):
+        return None
+    if ctype.startswith("multipart/"):
+        payload = part.get_payload()
+        if isinstance(payload, list):
+            for child in payload:
+                found = _email_first_plain_text(child)
+                if found:
+                    return found
+        return None
+    if ctype != "text/plain":
+        return None
+    if _loose_disposition(part.get_content_disposition()) == "attachment":
+        return None
+    return _email_part_text(part)
+
+
+def _email_subtree_has_real_html(part: Any) -> bool:
+    ctype = part.get_content_type()
+    if is_rfc822_mime(ctype):
+        return False
+    if _email_real_html_part(part):
+        return True
+    if ctype.startswith("multipart/"):
+        payload = part.get_payload()
+        if isinstance(payload, list):
+            return any(_email_subtree_has_real_html(child) for child in payload)
+    return False
+
+
+def _collect_email_loose_pieces(
+    part: Any,
+    pieces: list[_LooseInlinePiece],
+    *,
+    is_root: bool = True,
+) -> bool:
+    """Append mixed-body pieces. Return True when a real HTML body exists."""
+    ctype = part.get_content_type()
+    if is_rfc822_mime(ctype) and not is_root:
+        return False
+    if ctype == "multipart/alternative":
+        if _email_subtree_has_real_html(part):
+            return True
+        text = _email_first_plain_text(part)
+        if text:
+            pieces.append(_LooseInlinePiece(text=text))
+        return False
+    if ctype.startswith("multipart/"):
+        payload = part.get_payload()
+        if isinstance(payload, list):
+            for child in payload:
+                child_type = child.get_content_type()
+                filename = child.get_filename() if hasattr(child, "get_filename") else None
+                if skip_multipart_signed_signature(child_type, filename, ctype):
+                    continue
+                if _collect_email_loose_pieces(child, pieces, is_root=False):
+                    return True
+        return False
+    if _email_real_html_part(part):
+        return True
+    if ctype == "text/plain":
+        if _loose_disposition(part.get_content_disposition()) == "attachment":
+            return False
+        text = _email_part_text(part)
+        if text:
+            pieces.append(_LooseInlinePiece(text=text))
+        return False
+    if ctype.startswith("image/") and _loose_disposition(
+        part.get_content_disposition()
+    ) == "inline":
+        payload = part.get_payload(decode=True) or b""
+        if not isinstance(payload, (bytes, bytearray)) or not payload:
+            return False
+        content_id = part.get("Content-ID")
+        cid = _normalize_content_id(str(content_id)) if content_id else None
+        pieces.append(
+            _LooseInlinePiece(
+                mime_type=ctype,
+                data=bytes(payload),
+                content_id=cid or None,
+            )
+        )
+    return False
+
+
+def _loose_inline_render_from_email_message(
+    msg: Any,
+) -> tuple[str | None, str, dict[str, tuple[str, bytes]]] | None:
+    pieces: list[_LooseInlinePiece] = []
+    if _collect_email_loose_pieces(msg, pieces):
+        return None
+    return _render_loose_inline_pieces(pieces)
+
+
+def _loose_inline_render_from_bytes(
+    raw: bytes,
+) -> tuple[str | None, str, dict[str, tuple[str, bytes]]] | None:
+    import email
+    import email.policy
+
+    try:
+        msg = email.message_from_bytes(raw, policy=email.policy.default)
+    except Exception:
+        return None
+    return _loose_inline_render_from_email_message(msg)
+
+
+def _camel_content_type_simple(part: Any) -> str | None:
+    if not hasattr(part, "get_content_type"):
+        return None
+    content_type = part.get_content_type()
+    if content_type is None:
+        return None
+    try:
+        return content_type.simple()
+    except Exception:
+        return None
+
+
+def _camel_child_parts(part: Any) -> list[Any]:
+    mime_type = _camel_content_type_simple(part)
+    if not mime_type or not mime_type.startswith("multipart/"):
+        return []
+    import gi
+
+    gi.require_version("Camel", "1.2")
+    from gi.repository import Camel
+
+    if isinstance(part, Camel.Multipart):
+        children: list[Any] = []
+        for index in range(part.get_number()):
+            child = part.get_part(index)
+            if child is not None:
+                children.append(child)
+        return children
+    wrapper = part.get_content() if hasattr(part, "get_content") else None
+    if wrapper is not None and hasattr(wrapper, "get_number") and hasattr(
+        wrapper, "get_part"
+    ):
+        children = []
+        for index in range(wrapper.get_number()):
+            child = wrapper.get_part(index)
+            if child is not None:
+                children.append(child)
+        return children
+    return []
+
+
+def _camel_part_filename(part: Any) -> str | None:
+    if not hasattr(part, "get_filename"):
+        return None
+    try:
+        return part.get_filename()
+    except Exception:
+        return None
+
+
+def _camel_part_disposition(part: Any) -> str | None:
+    if not hasattr(part, "get_disposition"):
+        return None
+    try:
+        return _loose_disposition(part.get_disposition())
+    except Exception:
+        return None
+
+
+def _camel_real_html_part(part: Any) -> bool:
+    if _camel_content_type_simple(part) != "text/html":
+        return False
+    return _camel_part_disposition(part) != "attachment"
+
+
+def _camel_subtree_has_real_html(part: Any) -> bool:
+    mime_type = _camel_content_type_simple(part)
+    if mime_type is None or is_rfc822_mime(mime_type):
+        return False
+    if _camel_real_html_part(part):
+        return True
+    if mime_type.startswith("multipart/"):
+        return any(_camel_subtree_has_real_html(child) for child in _camel_child_parts(part))
+    return False
+
+
+def _camel_first_plain_text(part: Any) -> str | None:
+    mime_type = _camel_content_type_simple(part)
+    if mime_type is None or is_rfc822_mime(mime_type):
+        return None
+    if mime_type.startswith("multipart/"):
+        for child in _camel_child_parts(part):
+            found = _camel_first_plain_text(child)
+            if found:
+                return found
+        return None
+    if mime_type != "text/plain":
+        return None
+    if _camel_part_disposition(part) == "attachment":
+        return None
+    return _decode_text_part(part)
+
+
+def _camel_loose_content_id(part: Any) -> str | None:
+    content_id = part.get_content_id() if hasattr(part, "get_content_id") else None
+    if not content_id and hasattr(part, "get_header"):
+        try:
+            content_id = part.get_header("Content-ID")
+        except Exception:
+            content_id = None
+    if not content_id:
+        return None
+    cid = _normalize_content_id(str(content_id))
+    return cid or None
+
+
+def _collect_camel_loose_pieces(
+    part: Any,
+    pieces: list[_LooseInlinePiece],
+    *,
+    is_root: bool = True,
+) -> bool:
+    """Append mixed-body pieces. Return True when a real HTML body exists."""
+    mime_type = _camel_content_type_simple(part)
+    if mime_type is None:
+        return False
+    if is_rfc822_mime(mime_type) and not is_root:
+        return False
+    if mime_type == "multipart/alternative":
+        if _camel_subtree_has_real_html(part):
+            return True
+        text = _camel_first_plain_text(part)
+        if text:
+            pieces.append(_LooseInlinePiece(text=text))
+        return False
+    if mime_type.startswith("multipart/"):
+        for child in _camel_child_parts(part):
+            child_type = _camel_content_type_simple(child)
+            if skip_multipart_signed_signature(
+                child_type, _camel_part_filename(child), mime_type
+            ):
+                continue
+            if _collect_camel_loose_pieces(child, pieces, is_root=False):
+                return True
+        return False
+    if _camel_real_html_part(part):
+        return True
+    if mime_type == "text/plain":
+        if _camel_part_disposition(part) == "attachment":
+            return False
+        text = _decode_text_part(part)
+        if text:
+            pieces.append(_LooseInlinePiece(text=text))
+        return False
+    if mime_type.startswith("image/") and _camel_part_disposition(part) == "inline":
+        data = _decode_attachment_part(part)
+        if not data:
+            return False
+        pieces.append(
+            _LooseInlinePiece(
+                mime_type=mime_type,
+                data=data,
+                content_id=_camel_loose_content_id(part),
+            )
+        )
+    return False
+
+
+def _loose_inline_render_from_camel(
+    mime_msg: Any,
+) -> tuple[str | None, str, dict[str, tuple[str, bytes]]] | None:
+    if _camel_content_type_simple(mime_msg) is None:
+        raw = _mime_message_raw_bytes(mime_msg)
+        if not raw:
+            return None
+        return _loose_inline_render_from_bytes(raw)
+    pieces: list[_LooseInlinePiece] = []
+    if _collect_camel_loose_pieces(mime_msg, pieces):
+        return None
+    return _render_loose_inline_pieces(pieces)
+
+
 def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:
     """Return plain-text and HTML bodies from a Camel.MimeMessage.
 
@@ -1173,6 +1526,10 @@ def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:
     ``ATT00001.htm``) are not used as the HTML body when a usable inline
     body exists (#344). Empty or tag-only stubs do not count (#370).
     Attached HTML is a last resort only when nothing else remains.
+
+    A ``multipart/mixed`` message with no real HTML body is reassembled in
+    part order when it contains ``Content-Disposition: inline`` images
+    (#527). Those images are referenced from the synthetic HTML by ``cid:``.
     """
     bodies: dict[str, str | None] = {"plain": None, "html": None}
     attached_html: list[str] = []
@@ -1180,6 +1537,7 @@ def extract_message_bodies(mime_msg: Any) -> dict[str, str | None]:
     if bodies["plain"] is None and bodies["html"] is None:
         _email_module_fallback(mime_msg, bodies, attached_html)
     _promote_attached_html_if_needed(bodies, attached_html)
+    _apply_loose_inline_body(bodies, _loose_inline_render_from_camel(mime_msg))
     return bodies
 
 
@@ -1189,6 +1547,7 @@ def extract_message_bodies_from_bytes(raw: bytes) -> dict[str, str | None]:
     attached_html: list[str] = []
     _email_bodies_from_bytes(raw, bodies, attached_html)
     _promote_attached_html_if_needed(bodies, attached_html)
+    _apply_loose_inline_body(bodies, _loose_inline_render_from_bytes(raw))
     return bodies
 
 
@@ -1379,7 +1738,11 @@ def extract_attachments_from_email_message(msg: Any) -> list[dict[str, Any]]:
 def extract_inline_images_from_email_message(
     msg: Any,
 ) -> dict[str, tuple[str, bytes]]:
-    """CID images from *msg*, excluding parts nested inside attached emails."""
+    """CID images from *msg*, excluding parts nested inside attached emails.
+
+    Inline images with no Content-ID are included when the message has no
+    real HTML body, under the same ids the synthetic body uses (#527).
+    """
     images: dict[str, tuple[str, bytes]] = {}
     for part in _iter_email_parts_excluding_nested_messages(msg):
         content_id = part.get("Content-ID")
@@ -1392,6 +1755,9 @@ def extract_inline_images_from_email_message(
         if not payload:
             continue
         images[_normalize_content_id(str(content_id))] = (mime_type, payload)
+    rendered = _loose_inline_render_from_email_message(msg)
+    if rendered is not None:
+        images.update(rendered[2])
     return images
 
 
@@ -1477,11 +1843,18 @@ def _normalize_content_id(content_id: str) -> str:
 
 
 def extract_inline_images(mime_msg: Any) -> dict[str, tuple[str, bytes]]:
-    """Return Content-ID -> (mime_type, raw bytes) for inline image parts."""
+    """Return Content-ID -> (mime_type, raw bytes) for inline image parts.
+
+    Includes inline images that have no Content-ID when they are placed in
+    a synthetic body (#527). Those ids match ``extract_message_bodies``.
+    """
     images: dict[str, tuple[str, bytes]] = {}
     _walk_inline_image_parts(mime_msg, images)
     if not images:
         _email_collect_inline_images(mime_msg, images)
+    rendered = _loose_inline_render_from_camel(mime_msg)
+    if rendered is not None:
+        images.update(rendered[2])
     return images
 
 
