@@ -245,6 +245,7 @@ class WindowMoveUndoArmingTests(unittest.TestCase):
         win._message_stack = mock.Mock()
         win._update_sidebar_from_move_result = mock.Mock()  # type: ignore[method-assign]
         win._update_message_toolbar = mock.Mock()  # type: ignore[method-assign]
+        win._reconcile_open_folder_list = mock.Mock()  # type: ignore[method-assign]
         with mock.patch("post.window.GLib") as glib:
             glib.idle_add = mock.Mock()
             MainWindow._on_sidebar_bulk_archive_finished(
@@ -265,6 +266,9 @@ class WindowMoveUndoArmingTests(unittest.TestCase):
         self.assertEqual(
             glib.idle_add.call_args.args[0], win._show_move_undo_toast
         )
+        win._reconcile_open_folder_list.assert_called_once_with("acct-1", "INBOX")
+        win._message_list_view.remove_uids.assert_not_called()
+        self.assertEqual(win._suppress_sync_list_reload, ("acct-1", "INBOX"))
 
     def test_flush_undo_events_upgrade_pending(self) -> None:
         win = self._window()
@@ -321,6 +325,238 @@ class WindowMoveUndoArmingTests(unittest.TestCase):
         )
         win._run_immediate_reverse_undo.assert_called_once()
         self.assertIsNone(win._pending_move_undo)
+
+
+class OpenFolderReconcileTests(unittest.TestCase):
+    def _window(self) -> MainWindow:
+        win = MainWindow.__new__(MainWindow)
+        win._sidebar = mock.Mock()
+        win._sidebar.inbox_folder_for_account.return_value = "INBOX"
+        win._sidebar.folder_is_drafts.return_value = False
+        win._search_query = None
+        win._message_sync_in_progress = False
+        win._message_list_populating = False
+        win._folder_reconcile_inflight = False
+        win._folder_reconcile_again = None
+        win._messages_load_generation = 1
+        win._message_list_bound_count = 0
+        win._pending_flag_changes = {}
+        win._reader_windows = []
+        win._current_message = None
+        win._current_message_uid = None
+        win._pending_restore_message_uid = None
+        win._restore_message_folder = None
+        win._message_list_view = mock.Mock()
+        win._message_list_view.get_message.return_value = None
+        win._message_empty_label = mock.Mock()
+        win._message_stack = mock.Mock()
+        win._update_message_toolbar = mock.Mock()  # type: ignore[method-assign]
+        win._update_message_status = mock.Mock()  # type: ignore[method-assign]
+        win._apply_messages_to_list = mock.Mock()  # type: ignore[method-assign]
+        win._clear_reader = mock.Mock()  # type: ignore[method-assign]
+        return win
+
+    def _viewing_inbox(self, win: MainWindow) -> None:
+        win._current_account = mock.Mock(uid="acct-1")
+        win._current_folder = "INBOX"
+
+    def test_partial_scope_does_not_guess_rows_from_cache(self) -> None:
+        win = self._window()
+        self._viewing_inbox(win)
+        win._clear_move_undo = mock.Mock()  # type: ignore[method-assign]
+        win._dismiss_bulk_archive_progress_toast = mock.Mock()  # type: ignore[method-assign]
+        win._message_total = 2
+        cached = [
+            {"uid": "1", "subject": "Read", "flags": {"seen": True, "flagged": False}},
+            {"uid": "2", "subject": "Unread", "flags": {"seen": False, "flagged": False}},
+        ]
+        win._current_folder_messages = list(cached)
+        MainWindow._on_sidebar_move_started(
+            win, "acct-1", "INBOX", "read_unflagged", ""
+        )
+        win._message_list_view.remove_uids.assert_not_called()
+        win._message_list_view.clear.assert_not_called()
+        self.assertEqual(win._current_folder_messages, cached)
+        self.assertEqual(win._suppress_sync_list_reload, ("acct-1", "INBOX"))
+
+    def test_archive_all_still_clears_the_open_list(self) -> None:
+        win = self._window()
+        self._viewing_inbox(win)
+        win._clear_move_undo = mock.Mock()  # type: ignore[method-assign]
+        win._dismiss_bulk_archive_progress_toast = mock.Mock()  # type: ignore[method-assign]
+        win._message_total = 2
+        win._message_list_view.item_count.return_value = 0
+        win._current_folder_messages = [
+            {"uid": "1", "subject": "Read", "flags": {"seen": True}},
+        ]
+        MainWindow._on_sidebar_move_started(win, "acct-1", "INBOX", "all", "")
+        win._message_list_view.clear.assert_called_once()
+        self.assertEqual(win._current_folder_messages, [])
+        self.assertEqual(win._message_total, 0)
+
+    def test_zero_count_bulk_archive_reconciles(self) -> None:
+        win = self._window()
+        self._viewing_inbox(win)
+        win._dismiss_bulk_archive_progress_toast = mock.Mock()  # type: ignore[method-assign]
+        win._suppress_sync_list_reload = ("acct-1", "INBOX")
+        win._reconcile_open_folder_list = mock.Mock()  # type: ignore[method-assign]
+        win._load_messages = mock.Mock()  # type: ignore[method-assign]
+        MainWindow._on_sidebar_bulk_archive_finished(
+            win, "acct-1", "INBOX", {"archived_count": 0}, "Nothing to archive"
+        )
+        win._reconcile_open_folder_list.assert_called_once_with("acct-1", "INBOX")
+        win._load_messages.assert_not_called()
+        self.assertIsNone(win._suppress_sync_list_reload)
+
+    def test_single_move_keeps_selection_removal_and_reconciles(self) -> None:
+        win = self._window()
+        self._viewing_inbox(win)
+        win._message_total = 2
+        win._current_folder_messages = [
+            {"uid": "1", "subject": "A"},
+            {"uid": "2", "subject": "B"},
+        ]
+        win._message_list_view.remove_uids.return_value = 1
+        win._message_list_view.item_count.return_value = 1
+        win._suppress_sync_list_reload = ("acct-1", "INBOX")
+        win._update_sidebar_from_move_result = mock.Mock()  # type: ignore[method-assign]
+        win._finalize_move_status_and_undo = mock.Mock()  # type: ignore[method-assign]
+        win._notify_reader_windows_message_moved = mock.Mock()  # type: ignore[method-assign]
+        win._reconcile_open_folder_list = mock.Mock()  # type: ignore[method-assign]
+        MainWindow._on_messages_moved(
+            win,
+            "acct-1",
+            "INBOX",
+            ["1"],
+            "Archive",
+            {"queued": True, "moved_uids": ["1"]},
+            None,
+        )
+        win._message_list_view.remove_uids.assert_called_once_with(["1"])
+        self.assertEqual(
+            [message["uid"] for message in win._current_folder_messages],
+            ["2"],
+        )
+        win._reconcile_open_folder_list.assert_called_once_with("acct-1", "INBOX")
+        self.assertEqual(win._suppress_sync_list_reload, ("acct-1", "INBOX"))
+
+    def test_reconcile_fetches_a_local_page_off_the_gtk_thread(self) -> None:
+        win = self._window()
+        self._viewing_inbox(win)
+        win._current_folder_messages = [{"uid": "1", "subject": "A"}]
+        win._mail = mock.Mock()
+        page = ([{"uid": "1", "subject": "A", "flags": {"seen": True}}], 0, 1, "cache")
+        win._mail.get_folder_messages.return_value = page
+        scheduled: list = []
+
+        def submit(_name: str, func, *args, **kwargs) -> None:
+            scheduled.append(func)
+
+        win._mail.submit_interactive.side_effect = submit
+        MainWindow._reconcile_open_folder_list(win, "acct-1", "INBOX")
+        win._mail.get_folder_messages.assert_not_called()
+        self.assertEqual(len(scheduled), 1)
+        with mock.patch("post.window.GLib.idle_add") as idle_add:
+            scheduled[0]()
+        win._mail.get_folder_messages.assert_called_once_with(
+            "acct-1",
+            "INBOX",
+            sync=False,
+            limit=500,
+        )
+        idle_add.assert_called_once()
+        self.assertTrue(win._folder_reconcile_inflight)
+
+    def test_equivalent_page_patches_flags_without_rebinding(self) -> None:
+        win = self._window()
+        self._viewing_inbox(win)
+        win._message_total = 2
+        win._current_folder_messages = [
+            {"uid": "1", "subject": "A", "flags": {"seen": False, "flagged": False}},
+            {"uid": "2", "subject": "B", "flags": {"seen": True, "flagged": False}},
+        ]
+        refreshed = [
+            {"uid": "1", "subject": "A", "flags": {"seen": True, "flagged": False}},
+            {"uid": "2", "subject": "B", "flags": {"seen": True, "flagged": False}},
+        ]
+        account = win._current_account
+        assert account is not None
+        MainWindow._apply_reconciled_folder_page(
+            win, account, "INBOX", refreshed, 0, 2
+        )
+        win._message_list_view.update_message_flags.assert_called_once_with(
+            "1", {"seen": True}
+        )
+        win._apply_messages_to_list.assert_not_called()
+        win._message_list_view.clear.assert_not_called()
+        self.assertEqual(win._messages_load_generation, 1)
+
+    def test_page_missing_archived_uids_rebinds(self) -> None:
+        win = self._window()
+        self._viewing_inbox(win)
+        win._message_total = 2
+        win._current_folder_messages = [
+            {"uid": "1", "subject": "Read", "flags": {"seen": True, "flagged": False}},
+            {"uid": "2", "subject": "Unread", "flags": {"seen": False, "flagged": False}},
+        ]
+        remaining = [
+            {"uid": "2", "subject": "Unread", "flags": {"seen": False, "flagged": False}},
+        ]
+        account = win._current_account
+        assert account is not None
+        MainWindow._apply_reconciled_folder_page(
+            win, account, "INBOX", remaining, 1, 1
+        )
+        win._apply_messages_to_list.assert_called_once()
+        applied = win._apply_messages_to_list.call_args.args[0]
+        self.assertEqual([message["uid"] for message in applied], ["2"])
+        win._message_list_view.update_message_flags.assert_not_called()
+        self.assertEqual(
+            [message["uid"] for message in win._current_folder_messages or []],
+            ["2"],
+        )
+        self.assertEqual(win._message_total, 1)
+        win._message_stack.set_visible_child_name.assert_called_with("list")
+
+    def test_reconcile_timer_starts_and_stops_with_the_open_folder_poll(self) -> None:
+        win = self._window()
+        win._open_folder_poll_timer_id = None
+        win._open_folder_reconcile_timer_id = None
+        with mock.patch("post.window.GLib") as glib:
+            glib.timeout_add_seconds.side_effect = [11, 22]
+            MainWindow._start_open_folder_poll(win)
+            intervals = [call.args[0] for call in glib.timeout_add_seconds.call_args_list]
+            self.assertEqual(intervals, [5, 30])
+            self.assertEqual(win._open_folder_reconcile_timer_id, 11)
+            self.assertEqual(win._open_folder_poll_timer_id, 22)
+            MainWindow._stop_open_folder_poll(win)
+        glib.source_remove.assert_any_call(11)
+        glib.source_remove.assert_any_call(22)
+        self.assertIsNone(win._open_folder_reconcile_timer_id)
+        self.assertIsNone(win._open_folder_poll_timer_id)
+
+    def test_reconcile_tick_skips_while_list_is_populating_or_searching(self) -> None:
+        win = self._window()
+        self._viewing_inbox(win)
+        win._sync_watcher = mock.Mock(running=True)
+        win._open_folder_reconcile_timer_id = 7
+        win._reconcile_open_folder_list = mock.Mock()  # type: ignore[method-assign]
+        win._message_list_populating = True
+        self.assertTrue(MainWindow._on_open_folder_reconcile_tick(win))
+        win._message_list_populating = False
+        win._search_query = object()
+        self.assertTrue(MainWindow._on_open_folder_reconcile_tick(win))
+        win._reconcile_open_folder_list.assert_not_called()
+        win._search_query = None
+        self.assertTrue(MainWindow._on_open_folder_reconcile_tick(win))
+        win._reconcile_open_folder_list.assert_called_once_with("acct-1", "INBOX")
+
+    def test_reconcile_tick_stops_when_the_watcher_stops(self) -> None:
+        win = self._window()
+        win._sync_watcher = mock.Mock(running=False)
+        win._open_folder_reconcile_timer_id = 7
+        self.assertFalse(MainWindow._on_open_folder_reconcile_tick(win))
+        self.assertIsNone(win._open_folder_reconcile_timer_id)
 
 
 if __name__ == "__main__":
