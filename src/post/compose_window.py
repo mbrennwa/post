@@ -494,6 +494,13 @@ _TO_PLACEHOLDER = "Add a recipient in the To field"
 _CC_PLACEHOLDER = "Optional"
 _BCC_PLACEHOLDER = "Optional"
 _SUBJECT_PLACEHOLDER = "Subject is required"
+_FORWARD_ATTACHMENTS_LOADING = "Loading attachments…"
+_FORWARD_ATTACHMENTS_MISSING_SOURCE = (
+    "Could not load attachments for this message."
+)
+_FORWARD_ATTACHMENTS_INCOMPLETE = (
+    "Could not load all attachments from the original message."
+)
 _COMPLETION_MATCH_LIMIT = 20
 _COMPLETION_DEBOUNCE_MS = 500
 
@@ -554,6 +561,8 @@ class ComposeWindow(Adw.Window):
         self._draft_save_timeout_id: int | None = None
         self._close_while_saving_dialog: Adw.AlertDialog | None = None
         self._attachments: list[ComposeAttachment] = []
+        self._forward_attachments_pending = False
+        self._forward_attachments_error: str | None = None
         self._close_when_saved = False
         self._unsaved_dialog: Adw.AlertDialog | None = None
         self._missing_attachment_dialog: Adw.AlertDialog | None = None
@@ -702,6 +711,7 @@ class ComposeWindow(Adw.Window):
         self._attachments_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self._attachments_box.set_visible(False)
         headers.append(self._attachments_box)
+        self._arm_forward_attachment_gate()
 
         content.append(headers)
 
@@ -857,13 +867,65 @@ class ComposeWindow(Adw.Window):
             self._refresh_attachments_ui()
         return added
 
+    def _forward_attachments_block_actions(self) -> bool:
+        return (
+            self._forward_attachments_pending
+            or self._forward_attachments_error is not None
+        )
+
+    def _forward_attachments_can_retry(self) -> bool:
+        return (
+            self._forward_attachments_error is not None
+            and not self._forward_attachments_pending
+            and bool(self._source_folder_name)
+            and bool(self._source_message_uid)
+        )
+
+    def _arm_forward_attachment_gate(self) -> None:
+        if self._mode != "forward" or self._reply_to is None:
+            return
+        if not (self._reply_to.get("attachments") or []):
+            return
+        if not self._source_folder_name or not self._source_message_uid:
+            self._forward_attachments_error = _FORWARD_ATTACHMENTS_MISSING_SOURCE
+        else:
+            self._forward_attachments_pending = True
+        self._refresh_attachments_ui()
+
+    def _forward_attachment_status_row(self) -> Gtk.Widget | None:
+        if self._forward_attachments_pending:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            label = Gtk.Label(label=_FORWARD_ATTACHMENTS_LOADING)
+            label.add_css_class("dim-label")
+            label.set_xalign(0)
+            label.set_hexpand(True)
+            row.append(label)
+            return row
+        error = self._forward_attachments_error
+        if not error:
+            return None
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        label = Gtk.Label(label=error)
+        label.set_xalign(0)
+        label.set_hexpand(True)
+        label.set_wrap(True)
+        row.append(label)
+        if self._forward_attachments_can_retry():
+            retry = Gtk.Button(label="Retry")
+            retry.connect("clicked", self._on_retry_forward_attachments_clicked)
+            row.append(retry)
+        return row
+
     def _refresh_attachments_ui(self) -> None:
         while child := self._attachments_box.get_first_child():
             self._attachments_box.remove(child)
-        if not self._attachments:
+        status_row = self._forward_attachment_status_row()
+        if status_row is None and not self._attachments:
             self._attachments_box.set_visible(False)
             return
         self._attachments_box.set_visible(True)
+        if status_row is not None:
+            self._attachments_box.append(status_row)
         for index, attachment in enumerate(self._attachments):
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
 
@@ -984,8 +1046,11 @@ class ComposeWindow(Adw.Window):
             return False
 
         account_uid = self._account.uid
+        expected = len(attachments_meta)
 
         def worker() -> None:
+            loaded: list[ComposeAttachment] = []
+            error_message: str | None = None
             try:
                 loaded = self._mail.read_compose_attachments(
                     account_uid,
@@ -994,12 +1059,51 @@ class ComposeWindow(Adw.Window):
                 )
             except Exception as exc:
                 log_mail_error(log, "Could not load forward attachments", exc)
-                loaded = []
-                message = format_attachment_error(exc)
-                GLib.idle_add(lambda: show_error_toast(self, message))
-            GLib.idle_add(self._on_draft_attachments_loaded, loaded)
+                error_message = format_attachment_error(exc)
+            GLib.idle_add(
+                self._on_forward_attachments_loaded,
+                loaded,
+                error_message,
+                expected,
+            )
 
         self._mail.submit_interactive("load_forward_attachments", worker)
+        return False
+
+    def _on_retry_forward_attachments_clicked(self, _button: Gtk.Button) -> None:
+        if self._saving_draft or not self._forward_attachments_can_retry():
+            return
+        self._forward_attachments_error = None
+        self._forward_attachments_pending = True
+        self._refresh_attachments_ui()
+        self._update_send_enabled()
+        self._update_save_draft_enabled()
+        self._begin_load_forward_attachments()
+
+    def _on_forward_attachments_loaded(
+        self,
+        loaded: list[ComposeAttachment],
+        error_message: str | None,
+        expected: int,
+    ) -> bool:
+        if self._mode != "forward":
+            return False
+        if error_message or len(loaded) < expected:
+            if not error_message:
+                error_message = _FORWARD_ATTACHMENTS_INCOMPLETE
+            self._forward_attachments_pending = False
+            self._forward_attachments_error = error_message
+            self._refresh_attachments_ui()
+            self._update_send_enabled()
+            self._update_save_draft_enabled()
+            show_error_toast(self, error_message)
+            return False
+        self._attachments = list(loaded) + list(self._attachments)
+        self._forward_attachments_pending = False
+        self._forward_attachments_error = None
+        self._refresh_attachments_ui()
+        self._update_send_enabled()
+        self._update_save_draft_enabled()
         return False
 
     def _on_draft_attachments_loaded(
@@ -1558,10 +1662,16 @@ class ComposeWindow(Adw.Window):
     def _update_send_enabled(self) -> None:
         if self._saving_draft:
             return
+        if self._forward_attachments_block_actions():
+            self._send_btn.set_sensitive(False)
+            return
         self._send_btn.set_sensitive(self._validate_send_fields())
 
     def _update_save_draft_enabled(self) -> None:
         if self._saving_draft:
+            return
+        if self._forward_attachments_block_actions():
+            self._save_draft_btn.set_sensitive(False)
             return
         self._save_draft_btn.set_sensitive(self._user_edited)
 
@@ -2113,7 +2223,7 @@ class ComposeWindow(Adw.Window):
         )
 
     def _begin_save_draft(self, *, close_when_done: bool) -> None:
-        if self._saving_draft:
+        if self._saving_draft or self._forward_attachments_block_actions():
             return
 
         try:
@@ -2283,6 +2393,8 @@ class ComposeWindow(Adw.Window):
         return False
 
     def _on_send_clicked(self, *_args) -> None:
+        if self._forward_attachments_block_actions():
+            return
         try:
             (
                 to_addrs,
