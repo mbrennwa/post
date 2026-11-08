@@ -152,7 +152,6 @@ from post.mail.helpers import (
     flag_menu_label,
     format_from_search_query,
     insert_messages_newest_first,
-    message_matches_bulk_archive_scope,
     message_row_is_signature_suspect,
     perform_one_click_unsubscribe,
     read_menu_items,
@@ -201,6 +200,8 @@ from post.wrap_label import WrappingLabel
 log = logging.getLogger(__name__)
 
 MESSAGE_LIST_SYNC_STATUS = "Syncing with Server"
+# Local page check while a folder is open. The 30s poll stays the server backstop.
+_OPEN_FOLDER_RECONCILE_SECONDS = 5
 
 _SIDEBAR_TOP_INSET = 12
 _SEARCH_PROGRESS_UI_INTERVAL_US = 100_000
@@ -349,6 +350,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._folder_count_poll_timer_id: int | None = None
         self._folder_count_poll_deferred_id: int | None = None
         self._open_folder_poll_timer_id: int | None = None
+        self._open_folder_reconcile_timer_id: int | None = None
+        self._folder_reconcile_inflight = False
+        self._folder_reconcile_again: tuple[str, str] | None = None
         self._current_account: MailAccount | None = None
         self._current_folder: str | None = None
         # Authoritative Selected MessageId key (NUL-separated); never a bare guess.
@@ -1839,40 +1843,26 @@ class MainWindow(Adw.ApplicationWindow):
         ):
             return
 
+        # Partial scopes (read, read unflagged) do not guess rows from the
+        # folder cache. The list re-reads the local page when the archive
+        # finishes. Scope "all" can clear immediately; nothing remains.
+        if scope != "all":
+            return
+
         messages = list(self._current_folder_messages or [])
-        if scope == "all":
-            list_keys = [
-                self._message_list_key(message)
-                for message in messages
-                if self._message_list_key(message)
-            ]
-            # Clear everything visible even if the folder-message cache is empty.
-            self._message_list_view.clear()
-            self._current_folder_messages = []
-            if self._message_total >= 0:
-                self._message_total = 0
-        else:
-            list_keys = [
-                self._message_list_key(message)
-                for message in messages
-                if self._message_list_key(message)
-                and message_matches_bulk_archive_scope(message, scope)
-            ]
-            if not list_keys:
-                return
-            self._message_list_view.remove_uids(list_keys)
-            moved_keys = set(list_keys)
-            self._current_folder_messages = [
-                message
-                for message in messages
-                if self._message_list_key(message) not in moved_keys
-            ]
-            if self._message_total >= 0:
-                self._message_total = max(0, self._message_total - len(list_keys))
+        list_keys = [
+            self._message_list_key(message)
+            for message in messages
+            if self._message_list_key(message)
+        ]
+        self._message_list_view.clear()
+        self._current_folder_messages = []
+        if self._message_total >= 0:
+            self._message_total = 0
 
         cleared_current = any(
             key == self._current_message_uid for key in list_keys
-        ) or (scope == "all" and self._current_message_uid is not None)
+        ) or self._current_message_uid is not None
         if cleared_current:
             self._clear_reader()
             set_active_message_uid(None)
@@ -1896,13 +1886,7 @@ class MainWindow(Adw.ApplicationWindow):
         if result is None or archived_count <= 0:
             if self._suppress_sync_list_reload == suppress_key:
                 self._suppress_sync_list_reload = None
-            if (
-                self._current_account
-                and self._current_folder
-                and self._current_account.uid == account_uid
-                and self._current_folder == folder_name
-            ):
-                self._load_messages(account_uid, folder_name, sync=False)
+            self._reconcile_open_folder_list(account_uid, folder_name)
             return
 
         self._update_sidebar_from_move_result(account_uid, result)
@@ -1949,9 +1933,15 @@ class MainWindow(Adw.ApplicationWindow):
             )
             self._set_status(status_label)
 
-        if self._suppress_sync_list_reload == suppress_key:
-            self._suppress_sync_list_reload = None
+        # Local-first returns before MOVE. Keep the server reload suppressed
+        # while pending removals exist so a stale snapshot cannot put archived
+        # rows back (#261, #502). A non-queued result already finished on the
+        # server, so the flag can drop.
+        if not (result or {}).get("queued"):
+            if self._suppress_sync_list_reload == suppress_key:
+                self._suppress_sync_list_reload = None
         self._update_message_toolbar()
+        self._reconcile_open_folder_list(account_uid, folder_name)
 
     def _on_sidebar_bulk_archive_error(
         self, account_uid: str, folder_name: str, _error: Exception
@@ -2255,6 +2245,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _start_open_folder_poll(self) -> None:
         """Poll open folder when live push is unavailable (#270 Graph; #351 IMAP)."""
+        self._start_open_folder_reconcile_timer()
         if self._open_folder_poll_timer_id is not None:
             return
         self._open_folder_poll_timer_id = GLib.timeout_add_seconds(
@@ -2262,10 +2253,43 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
     def _stop_open_folder_poll(self) -> None:
+        self._stop_open_folder_reconcile_timer()
         timer_id = self._open_folder_poll_timer_id
         if timer_id is not None:
             GLib.source_remove(timer_id)
             self._open_folder_poll_timer_id = None
+
+    def _start_open_folder_reconcile_timer(self) -> None:
+        """Re-read the open folder locally so a missed wake-up still corrects the list."""
+        if self._open_folder_reconcile_timer_id is not None:
+            return
+        self._open_folder_reconcile_timer_id = GLib.timeout_add_seconds(
+            _OPEN_FOLDER_RECONCILE_SECONDS,
+            self._on_open_folder_reconcile_tick,
+        )
+
+    def _stop_open_folder_reconcile_timer(self) -> None:
+        timer_id = self._open_folder_reconcile_timer_id
+        if timer_id is not None:
+            GLib.source_remove(timer_id)
+            self._open_folder_reconcile_timer_id = None
+
+    def _on_open_folder_reconcile_tick(self) -> bool:
+        if not self._sync_watcher.running:
+            self._open_folder_reconcile_timer_id = None
+            return False
+        account = self._current_account
+        folder_name = self._current_folder
+        if account is None or folder_name is None:
+            return True
+        if (
+            self._search_query is not None
+            or self._message_sync_in_progress
+            or self._message_list_populating
+        ):
+            return True
+        self._reconcile_open_folder_list(account.uid, folder_name)
+        return True
 
     @staticmethod
     def _backend_uses_open_folder_poll(backend: str | None) -> bool:
@@ -2295,6 +2319,178 @@ class MainWindow(Adw.ApplicationWindow):
             return True
         self._sync_current_folder_messages(account.uid, folder_name)
         return True
+
+    def _reconcile_open_folder_list(self, account_uid: str, folder_name: str) -> None:
+        """Re-read the open folder locally and patch or rebind the list.
+
+        The page is the helper summary with pending local removals already
+        subtracted (``get_folder_messages(sync=False)``). Helper IPC runs on
+        the mail job queue, not the GTK thread.
+        """
+        if self._search_query is not None or is_post_outbox_folder(folder_name):
+            return
+        if not self._is_viewing_folder(account_uid, folder_name):
+            return
+        if self._folder_reconcile_inflight:
+            self._folder_reconcile_again = (account_uid, folder_name)
+            return
+        account = self._current_account
+        if account is None or account.uid != account_uid:
+            return
+
+        self._folder_reconcile_inflight = True
+        load_id = self._messages_load_generation
+        limit = max(
+            MESSAGE_LIST_UI_BIND_CAP,
+            int(self._message_list_bound_count or 0),
+            len(self._current_folder_messages or []),
+        )
+
+        def fetch() -> None:
+            fetched: tuple[list[dict], int, int] | None
+            try:
+                page, unread, total, _source = self._mail.get_folder_messages(
+                    account_uid,
+                    folder_name,
+                    sync=False,
+                    limit=limit,
+                )
+                fetched = (list(page), int(unread), int(total))
+            except Exception:
+                log.exception(
+                    "Open folder reconcile failed for %s/%s",
+                    account_uid,
+                    folder_name,
+                )
+                fetched = None
+
+            def deliver() -> bool:
+                self._on_open_folder_reconciled(
+                    account_uid,
+                    folder_name,
+                    load_id,
+                    fetched,
+                )
+                return False
+
+            GLib.idle_add(deliver)
+
+        self._mail.submit_interactive("reconcile_open_folder", fetch)
+
+    def _on_open_folder_reconciled(
+        self,
+        account_uid: str,
+        folder_name: str,
+        load_id: int,
+        fetched: tuple[list[dict], int, int] | None,
+    ) -> None:
+        try:
+            if (
+                fetched is not None
+                and load_id == self._messages_load_generation
+                and self._search_query is None
+                and self._is_viewing_folder(account_uid, folder_name)
+            ):
+                account = self._current_account
+                if account is not None:
+                    messages, unread, total = fetched
+                    self._apply_reconciled_folder_page(
+                        account,
+                        folder_name,
+                        messages,
+                        unread,
+                        total,
+                    )
+        finally:
+            self._folder_reconcile_inflight = False
+            again = self._folder_reconcile_again
+            self._folder_reconcile_again = None
+        if again is not None:
+            self._reconcile_open_folder_list(again[0], again[1])
+
+    def _folder_page_contains_message(
+        self, messages: list[dict], list_key: str
+    ) -> bool:
+        wanted = {list_key}
+        normalized = self._message_id_key_for_list_key(list_key)
+        if normalized:
+            wanted.add(normalized)
+        for message in messages:
+            key = self._message_list_key(message)
+            if key in wanted:
+                return True
+            uid = str(message.get("uid") or "")
+            if uid and uid in wanted:
+                return True
+        return False
+
+    def _apply_reconciled_folder_page(
+        self,
+        account: MailAccount,
+        folder_name: str,
+        messages: list[dict],
+        unread: int,
+        total: int,
+    ) -> None:
+        """Patch flags when the page is the same set, otherwise rebind it."""
+        account_uid = account.uid
+        messages, _unread = self._apply_pending_flag_overlay(
+            account_uid, folder_name, messages, unread
+        )
+        messages, total = self._with_queued_drafts(
+            account_uid, folder_name, messages, total
+        )
+        current = list(self._current_folder_messages or [])
+        if message_lists_equivalent_for_ui(
+            current,
+            messages,
+            current_total=self._message_total,
+            refreshed_total=total,
+        ):
+            if self._reconcile_refreshed_message_flags(messages):
+                self._update_message_toolbar()
+            return
+
+        if self._current_message_uid and self._folder_page_contains_message(
+            current, self._current_message_uid
+        ):
+            if self._folder_page_contains_message(messages, self._current_message_uid):
+                self._pending_restore_message_uid = self._current_message_uid
+                self._restore_message_folder = (account_uid, folder_name)
+            else:
+                self._clear_reader()
+                set_active_message_uid(None)
+                self._restore_message_folder = None
+                self._pending_restore_message_uid = None
+
+        self._current_folder_messages = messages
+        self._message_total = total
+        if not messages:
+            self._message_list_view.clear()
+            self._message_list_bound_count = 0
+            self._message_empty_label.set_label(f"No Messages in {folder_name}")
+            self._message_stack.set_visible_child_name("empty")
+            self._update_message_status(account, folder_name)
+            self._update_message_toolbar()
+            return
+
+        # Drop in-flight batch appends of the previous page before rebinding.
+        self._message_list_populating = False
+        self._messages_load_generation += 1
+        apply_load_id = self._messages_load_generation
+        self._message_stack.set_visible_child_name("list")
+
+        def after_rebind() -> None:
+            self._try_restore_selected_message(account_uid, folder_name)
+
+        self._apply_messages_to_list(
+            messages,
+            folder_name,
+            account=account,
+            load_id=apply_load_id,
+            on_complete=after_rebind,
+        )
+        self._update_message_toolbar()
 
     def _on_sync_folder_changed(self, account_uid: str, folder_name: str) -> None:
         search_trace(
@@ -8228,6 +8424,9 @@ class MainWindow(Adw.ApplicationWindow):
         if not result.get("queued"):
             if self._suppress_sync_list_reload == suppress_key:
                 self._suppress_sync_list_reload = None
+        # Selection keys already left the list. Re-read the folder page in case
+        # that removal missed a row, or the page changed for another reason.
+        self._reconcile_open_folder_list(account_uid, folder_name)
         return False
 
     def _set_messages_seen(self, seen: bool) -> None:
