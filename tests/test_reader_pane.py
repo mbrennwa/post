@@ -7,13 +7,16 @@ import unittest
 from typing import Any
 from unittest.mock import MagicMock
 
+import math
+
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Pango", "1.0")
 gi.require_version("WebKit", "6.0")
 gi.require_version("Gio", "2.0")
 
-from gi.repository import Gio, Gtk, WebKit
+from gi.repository import Gio, Gtk, Pango, WebKit
 
 from post.preferences import MESSAGE_APPEARANCE_ADAPT_TEXT
 from post.reader.image_menu import (
@@ -25,11 +28,15 @@ from post.reader.image_menu import (
     LABEL_SAVE_PICTURE,
 )
 from post.reader.pane import (
+    RECIPIENT_HEADER_FALLBACK_LINE_PX,
+    RECIPIENT_HEADER_SCROLL_LINES,
     MessageReaderPane,
     apply_reader_link_hover,
     prepend_address_context_menu_items,
     reader_link_hover_origin,
     reader_link_tooltip_text,
+    recipient_header_scroll_max_height,
+    recipient_header_visible_height,
     strip_reader_context_menu,
 )
 
@@ -73,6 +80,32 @@ def _make_pane(
         on_search_messages_from=on_search_messages_from,
         can_search_messages=can_search_messages or (lambda: True),
     )
+
+
+def _header_row_widgets(pane: MessageReaderPane) -> list[Gtk.Widget]:
+    rows: list[Gtk.Widget] = []
+    child = pane._reader_meta.get_next_sibling()
+    while child is not None:
+        rows.append(child)
+        child = child.get_next_sibling()
+    return rows
+
+
+def _header_row_named(pane: MessageReaderPane, name: str) -> Gtk.Widget:
+    for row in _header_row_widgets(pane):
+        label = _header_label(row)
+        if label is not None and label.get_label().startswith(f"{name}:"):
+            return row
+    raise AssertionError(f"missing header row {name}")
+
+
+def _header_label(row: Gtk.Widget) -> Gtk.Label | None:
+    widget: Gtk.Widget | None = row
+    if isinstance(widget, Gtk.ScrolledWindow):
+        widget = widget.get_child()
+    if isinstance(widget, Gtk.Viewport):
+        widget = widget.get_child()
+    return widget if isinstance(widget, Gtk.Label) else None
 
 
 def _sample_message(*, seen: bool = True, flagged: bool = False) -> dict[str, Any]:
@@ -128,16 +161,124 @@ class MessageReaderPaneTests(unittest.TestCase):
             message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
         )
         self.assertFalse(self.pane._reader_meta.get_visible())
-        rows: list[Gtk.Widget] = []
-        child = self.pane._reader_meta.get_next_sibling()
-        while child is not None:
-            rows.append(child)
-            child = child.get_next_sibling()
+        rows = _header_row_widgets(self.pane)
         self.assertGreaterEqual(len(rows), 3)
-        labels = [row.get_label() for row in rows if isinstance(row, Gtk.Label)]
+        labels: list[str] = []
+        for row in rows:
+            label = _header_label(row)
+            if label is not None:
+                labels.append(label.get_label())
         self.assertTrue(any(lab.startswith("From:") for lab in labels))
         self.assertTrue(any(lab.startswith("To:") for lab in labels))
         self.assertTrue(any(lab.startswith("Date:") for lab in labels))
+
+    def test_recipient_header_scroll_max_height_is_three_lines(self) -> None:
+        self.assertEqual(recipient_header_scroll_max_height(20), 60)
+        self.assertEqual(recipient_header_scroll_max_height(1), 3)
+        self.assertEqual(
+            recipient_header_scroll_max_height(0), RECIPIENT_HEADER_SCROLL_LINES
+        )
+        self.assertEqual(
+            recipient_header_scroll_max_height(-5), RECIPIENT_HEADER_SCROLL_LINES
+        )
+
+    def test_recipient_header_visible_height_covers_third_line(self) -> None:
+        label = Gtk.Label()
+        layout = label.create_pango_layout("word " * 80)
+        layout.set_width(120 * Pango.SCALE)
+        layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+        self.assertGreater(layout.get_line_count(), RECIPIENT_HEADER_SCROLL_LINES)
+        height = recipient_header_visible_height(layout)
+        iterator = layout.get_iter()
+        y1 = 0
+        for _ in range(RECIPIENT_HEADER_SCROLL_LINES):
+            _y0, y1 = iterator.get_line_yrange()
+            iterator.next_line()
+        self.assertEqual(height, math.ceil(y1 / Pango.SCALE))
+        truncated = (int(y1) // Pango.SCALE)
+        self.assertGreaterEqual(height, truncated)
+        self.assertLess(height, layout.get_pixel_size()[1])
+
+        short = label.create_pango_layout("one line")
+        self.assertEqual(
+            recipient_header_visible_height(short),
+            short.get_pixel_size()[1],
+        )
+
+    def test_recipient_headers_scroll_other_fields_do_not(self) -> None:
+        msg = _sample_message()
+        msg["reply_to"] = "Other <other@example.com>"
+        msg["cc"] = "Carol <carol@example.com>"
+        msg["bcc"] = "Dave <dave@example.com>"
+        self.pane.show_message(
+            msg,
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        rows: dict[str, Gtk.Widget] = {}
+        for row in _header_row_widgets(self.pane):
+            label = _header_label(row)
+            self.assertIsNotNone(label)
+            assert label is not None
+            name = label.get_label().split(":", 1)[0]
+            rows[name] = row
+        for name in ("From", "Reply-To", "Date"):
+            self.assertIsInstance(rows[name], Gtk.Label)
+        expected_cap = recipient_header_scroll_max_height(
+            RECIPIENT_HEADER_FALLBACK_LINE_PX
+        )
+        for name in ("To", "Cc", "Bcc"):
+            scroll = rows[name]
+            self.assertIsInstance(scroll, Gtk.ScrolledWindow)
+            h_policy, v_policy = scroll.get_policy()
+            self.assertEqual(h_policy, Gtk.PolicyType.NEVER)
+            self.assertEqual(v_policy, Gtk.PolicyType.AUTOMATIC)
+            self.assertTrue(scroll.get_propagate_natural_height())
+            self.assertFalse(scroll.get_propagate_natural_width())
+            self.assertFalse(scroll.get_vexpand())
+            self.assertFalse(scroll.get_overlay_scrolling())
+            self.assertEqual(scroll.get_max_content_height(), expected_cap)
+
+    def test_recipient_header_height_follows_text_until_three_lines(self) -> None:
+        short = _make_pane()
+        short.show_message(
+            _sample_message(),
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        short_to = _header_row_named(short, "To")
+        short_label = _header_label(short_to)
+        self.assertIsNotNone(short_label)
+        assert short_label is not None
+        width = 480
+        label_height = short_label.measure(Gtk.Orientation.VERTICAL, width)[1]
+        scroll_min, scroll_nat, *_rest = short_to.measure(Gtk.Orientation.VERTICAL, width)
+        self.assertEqual(scroll_nat, label_height)
+        self.assertLessEqual(scroll_min, label_height)
+
+        long = _make_pane()
+        msg = _sample_message()
+        msg["to"] = ", ".join(f"Person {i} <p{i}@example.com>" for i in range(80))
+        long.show_message(
+            msg,
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        long_to = _header_row_named(long, "To")
+        long_label = _header_label(long_to)
+        self.assertIsNotNone(long_label)
+        assert long_label is not None
+        cap = long_to.get_max_content_height()
+        self.assertGreater(long_label.measure(Gtk.Orientation.VERTICAL, width)[1], cap)
+        long_min, long_nat, *_rest = long_to.measure(Gtk.Orientation.VERTICAL, width)
+        self.assertEqual(long_nat, cap)
+        self.assertLessEqual(long_min, cap)
 
     def test_address_menu_callbacks(self) -> None:
         composed: list[str] = []

@@ -5,19 +5,21 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from typing import Any
 
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Pango", "1.0")
 gi.require_version("WebKit", "6.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
 gi.require_version("Graphene", "1.0")
 
-from gi.repository import Gdk, Gio, GLib, Graphene, Gtk, WebKit
+from gi.repository import Gdk, Gio, GLib, Graphene, Gtk, Pango, WebKit
 
 from post.attachment_open import open_attachment
 from post.mail.helpers import (
@@ -52,6 +54,11 @@ from post.wrap_label import (
     set_label_wrap_mode,
 )
 
+# To / Cc / Bcc stay within this many wrapped lines; the rest scrolls (#496).
+_RECIPIENT_HEADER_LABELS = frozenset({"To", "Cc", "Bcc"})
+RECIPIENT_HEADER_SCROLL_LINES = 3
+RECIPIENT_HEADER_FALLBACK_LINE_PX = 20
+
 # Browser chrome — meaningless for HTML loaded into the reading pane.
 _READER_CONTEXT_MENU_BLOCKLIST = frozenset(
     {
@@ -61,6 +68,70 @@ _READER_CONTEXT_MENU_BLOCKLIST = frozenset(
         WebKit.ContextMenuAction.RELOAD,
     }
 )
+
+
+def recipient_header_scroll_max_height(line_px: int) -> int:
+    """Fallback pixel cap before the label's layout is ready."""
+    return max(1, int(line_px)) * RECIPIENT_HEADER_SCROLL_LINES
+
+
+def recipient_header_visible_height(
+    layout: Pango.Layout,
+    max_lines: int = RECIPIENT_HEADER_SCROLL_LINES,
+) -> int | None:
+    """Pixel height of the first ``max_lines`` lines, rounded up.
+
+    Truncating each line to whole pixels and multiplying clips the last line,
+    because Pango line heights are fractional (#496).
+    """
+    if layout is None or max_lines < 1 or layout.get_line_count() < 1:
+        return None
+    if layout.get_line_count() <= max_lines:
+        return max(1, layout.get_pixel_size()[1])
+    iterator = layout.get_iter()
+    y1 = 0
+    for _ in range(max_lines):
+        _y0, y1 = iterator.get_line_yrange()
+        if not iterator.next_line():
+            break
+    if y1 <= 0:
+        return None
+    return max(1, math.ceil(y1 / Pango.SCALE))
+
+
+class RecipientHeaderScroll(Gtk.ScrolledWindow):
+    """Scrolled To/Cc/Bcc row whose height follows the text, up to three lines.
+
+    A plain ``Gtk.ScrolledWindow`` reports the scrollbar's minimum height even
+    when the text is a single line. Measuring the child and clamping to
+    ``max-content-height`` keeps a short list compact and still scrolls a long
+    one (#496).
+    """
+
+    __gtype_name__ = "PostRecipientHeaderScroll"
+
+    def do_measure(
+        self, orientation: Gtk.Orientation, for_size: int
+    ) -> tuple[int, int, int, int]:
+        if orientation != Gtk.Orientation.VERTICAL:
+            minimum, natural, _min_baseline, _nat_baseline = (
+                Gtk.ScrolledWindow.do_measure(self, orientation, for_size)
+            )
+            # Baselines apply to vertical measurement only.
+            return minimum, natural, -1, -1
+        child = self.get_child()
+        if child is None:
+            return Gtk.ScrolledWindow.do_measure(self, orientation, for_size)
+        minimum, natural, _min_baseline, _nat_baseline = child.measure(
+            orientation, for_size
+        )
+        cap = self.get_max_content_height()
+        if cap >= 0:
+            minimum = min(minimum, cap)
+            natural = min(natural, cap)
+        if natural < minimum:
+            natural = minimum
+        return minimum, natural, -1, -1
 
 
 def strip_reader_context_menu(menu: WebKit.ContextMenu) -> None:
@@ -850,7 +921,44 @@ class MessageReaderPane(Gtk.Box):
         value.set_width_chars(1)
         value.set_hexpand(True)
         value.set_halign(Gtk.Align.FILL)
+        if row.label in _RECIPIENT_HEADER_LABELS:
+            return self._scroll_recipient_header(value)
         return value
+
+    def _scroll_recipient_header(self, value: Gtk.Label) -> Gtk.ScrolledWindow:
+        """Cap To/Cc/Bcc at three lines and scroll the rest (#496)."""
+        scroll = RecipientHeaderScroll()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_propagate_natural_width(False)
+        scroll.set_hexpand(True)
+        scroll.set_vexpand(False)
+        scroll.set_halign(Gtk.Align.FILL)
+        scroll.set_overlay_scrolling(False)
+        scroll.set_max_content_height(
+            recipient_header_scroll_max_height(RECIPIENT_HEADER_FALLBACK_LINE_PX)
+        )
+        scroll.set_child(value)
+
+        def _schedule_limit(*_args: object) -> None:
+            GLib.idle_add(self._sync_recipient_header_limit, scroll, value)
+
+        scroll.connect("map", _schedule_limit)
+        # Reflow changes where the third line ends; width settles after allocate.
+        scroll.connect("notify::width", _schedule_limit)
+        return scroll
+
+    def _sync_recipient_header_limit(
+        self, scroll: Gtk.ScrolledWindow, label: Gtk.Label
+    ) -> bool:
+        layout = label.get_layout()
+        if layout is None:
+            return False
+        height = recipient_header_visible_height(layout)
+        if height is None or scroll.get_max_content_height() == height:
+            return False
+        scroll.set_max_content_height(height)
+        return False
 
     def _sync_address_search_action(self) -> None:
         self._address_search_action.set_enabled(bool(self._can_search_messages()))
