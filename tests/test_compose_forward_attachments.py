@@ -1,10 +1,12 @@
 # Copyright (C) 2026 mbrennwa
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Forward compose loads original attachments (#263)."""
+"""Forward compose loads original attachments (#263, #512)."""
 
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -15,7 +17,12 @@ gi.require_version("GLib", "2.0")
 
 from gi.repository import Gtk
 
-from post.compose_window import ComposeWindow
+from post.compose_window import (
+    ComposeWindow,
+    _FORWARD_ATTACHMENTS_INCOMPLETE,
+    _FORWARD_ATTACHMENTS_LOADING,
+    _FORWARD_ATTACHMENTS_MISSING_SOURCE,
+)
 from post.mail.compose import ComposeAttachment
 from post.mail.eds import MailAccount
 
@@ -130,6 +137,18 @@ class ComposeForwardAttachmentsTests(unittest.TestCase):
         )
         return self.window
 
+    def _fill_recipient(self, window: ComposeWindow) -> None:
+        window._tracking_edits = False
+        window._to_entry.set_text("bob@example.com")
+        window._tracking_edits = True
+        window._update_field_hints()
+        window._update_send_enabled()
+        window._update_save_draft_enabled()
+
+    def _mark_edited(self, window: ComposeWindow) -> None:
+        window._user_edited = True
+        window._update_save_draft_enabled()
+
     def test_forward_loads_attachments_from_source_message(self) -> None:
         loaded = [
             ComposeAttachment(
@@ -169,8 +188,10 @@ class ComposeForwardAttachmentsTests(unittest.TestCase):
         self.mail.read_compose_attachments.assert_not_called()
         self.assertEqual(window._attachments, [])
         self.assertFalse(window._attachments_box.get_visible())
+        self._fill_recipient(window)
+        self.assertTrue(window._send_btn.get_sensitive())
 
-    def test_forward_without_source_location_skips_load(self) -> None:
+    def test_forward_without_source_location_blocks_send(self) -> None:
         window = self._open_forward(
             attachments_meta=[
                 {
@@ -187,6 +208,192 @@ class ComposeForwardAttachmentsTests(unittest.TestCase):
 
         self.mail.read_compose_attachments.assert_not_called()
         self.assertEqual(window._attachments, [])
+        self.assertEqual(
+            window._forward_attachments_error,
+            _FORWARD_ATTACHMENTS_MISSING_SOURCE,
+        )
+        self.assertIn(
+            _FORWARD_ATTACHMENTS_MISSING_SOURCE,
+            _widget_labels(window._attachments_box),
+        )
+        self.assertIsNone(_button_with_label(window._attachments_box, "Retry"))
+        self._fill_recipient(window)
+        self._mark_edited(window)
+        self.assertFalse(window._send_btn.get_sensitive())
+        self.assertFalse(window._save_draft_btn.get_sensitive())
+
+    def test_forward_blocks_send_until_attachments_load(self) -> None:
+        loaded = [_attachment("notes.txt")]
+        self.mail.read_compose_attachments.return_value = loaded
+        window = self._open_forward(attachments_meta=_attachment_meta("notes.txt"))
+        self._fill_recipient(window)
+        self._mark_edited(window)
+
+        self.assertTrue(window._forward_attachments_pending)
+        self.assertIn(
+            _FORWARD_ATTACHMENTS_LOADING,
+            _widget_labels(window._attachments_box),
+        )
+        self.assertTrue(window._attach_files_btn.get_sensitive())
+        self.assertFalse(window._send_btn.get_sensitive())
+        self.assertFalse(window._save_draft_btn.get_sensitive())
+        with mock.patch.object(window, "_proceed_with_send") as proceed:
+            window._on_send_clicked()
+            proceed.assert_not_called()
+        window._begin_save_draft(close_when_done=False)
+        self.assertFalse(window._saving_draft)
+
+        self._drain_forward_load()
+
+        self.assertFalse(window._forward_attachments_pending)
+        self.assertIsNone(window._forward_attachments_error)
+        self.assertNotIn(
+            _FORWARD_ATTACHMENTS_LOADING,
+            _widget_labels(window._attachments_box),
+        )
+        self.assertEqual(window._attachments[0].filename, "notes.txt")
+        self.assertTrue(window._send_btn.get_sensitive())
+        self.assertTrue(window._save_draft_btn.get_sensitive())
+
+    def test_forward_load_error_keeps_send_disabled_until_retry(self) -> None:
+        self.mail.read_compose_attachments.side_effect = OSError("offline")
+        window = self._open_forward(attachments_meta=_attachment_meta("notes.txt"))
+        self._fill_recipient(window)
+        self._mark_edited(window)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "photo.png")
+            with open(path, "wb") as handle:
+                handle.write(b"png")
+            self.assertEqual(window._add_attachments_from_paths([path]), 1)
+            self._drain_forward_load()
+
+        self.assertEqual(
+            [item.filename for item in window._attachments],
+            ["photo.png"],
+        )
+        self.assertEqual(
+            window._forward_attachments_error,
+            "Attachment error: offline",
+        )
+        self.assertFalse(window._send_btn.get_sensitive())
+        self.assertFalse(window._save_draft_btn.get_sensitive())
+        retry = _button_with_label(window._attachments_box, "Retry")
+        self.assertIsNotNone(retry)
+
+        loaded = [_attachment("notes.txt")]
+        self.mail.read_compose_attachments.side_effect = None
+        self.mail.read_compose_attachments.return_value = loaded
+        assert retry is not None
+        retry.emit("clicked")
+        self._drain_forward_load()
+
+        self.assertEqual(self.mail.read_compose_attachments.call_count, 2)
+        self.assertEqual(
+            [item.filename for item in window._attachments],
+            ["notes.txt", "photo.png"],
+        )
+        self.assertIsNone(window._forward_attachments_error)
+        self.assertTrue(window._send_btn.get_sensitive())
+        self.assertTrue(window._save_draft_btn.get_sensitive())
+
+    def test_forward_empty_load_is_failure(self) -> None:
+        self._assert_incomplete_load(returned=[])
+
+    def test_forward_short_load_is_failure(self) -> None:
+        self._assert_incomplete_load(returned=[_attachment("notes.txt")])
+
+    def _assert_incomplete_load(self, *, returned: list[ComposeAttachment]) -> None:
+        self.mail.read_compose_attachments.return_value = returned
+        window = self._open_forward(
+            attachments_meta=_attachment_meta("notes.txt", "ticket.pdf")
+        )
+        self._fill_recipient(window)
+        self._mark_edited(window)
+        self._drain_forward_load()
+
+        self.assertEqual(window._attachments, [])
+        self.assertEqual(
+            window._forward_attachments_error,
+            _FORWARD_ATTACHMENTS_INCOMPLETE,
+        )
+        self.assertFalse(window._send_btn.get_sensitive())
+        self.assertFalse(window._save_draft_btn.get_sensitive())
+        retry = _button_with_label(window._attachments_box, "Retry")
+        self.assertIsNotNone(retry)
+
+        self.mail.read_compose_attachments.return_value = [
+            _attachment("notes.txt"),
+            _attachment("ticket.pdf", b"pdf"),
+        ]
+        assert retry is not None
+        retry.emit("clicked")
+        self._drain_forward_load()
+
+        self.assertEqual(self.mail.read_compose_attachments.call_count, 2)
+        self.assertEqual(
+            [item.filename for item in window._attachments],
+            ["notes.txt", "ticket.pdf"],
+        )
+        self.assertTrue(window._send_btn.get_sensitive())
+
+    def test_forward_keeps_user_files_added_during_load(self) -> None:
+        self.mail.read_compose_attachments.return_value = [_attachment("notes.txt")]
+        window = self._open_forward(attachments_meta=_attachment_meta("notes.txt"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "photo.png")
+            with open(path, "wb") as handle:
+                handle.write(b"png")
+            self.assertEqual(window._add_attachments_from_paths([path]), 1)
+            self._drain_forward_load()
+
+        self.assertEqual(
+            [item.filename for item in window._attachments],
+            ["notes.txt", "photo.png"],
+        )
+
+
+def _attachment(filename: str, data: bytes = b"hello") -> ComposeAttachment:
+    return ComposeAttachment(
+        filename=filename,
+        mime_type="text/plain",
+        data=data,
+    )
+
+
+def _attachment_meta(*filenames: str) -> list[dict]:
+    return [
+        {"index": index, "filename": filename, "mime_type": "text/plain"}
+        for index, filename in enumerate(filenames)
+    ]
+
+
+def _widget_labels(widget: Gtk.Widget) -> list[str]:
+    found: list[str] = []
+
+    def walk(child: Gtk.Widget | None) -> None:
+        while child is not None:
+            if isinstance(child, Gtk.Label):
+                found.append(child.get_label())
+            walk(child.get_first_child())
+            child = child.get_next_sibling()
+
+    walk(widget.get_first_child())
+    return found
+
+
+def _button_with_label(widget: Gtk.Widget, label: str) -> Gtk.Button | None:
+    found: Gtk.Button | None = None
+
+    def walk(child: Gtk.Widget | None) -> None:
+        nonlocal found
+        while child is not None:
+            if isinstance(child, Gtk.Button) and child.get_label() == label:
+                found = child
+            walk(child.get_first_child())
+            child = child.get_next_sibling()
+
+    walk(widget.get_first_child())
+    return found
 
 
 if __name__ == "__main__":
