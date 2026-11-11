@@ -60,6 +60,7 @@ ALLOWED_METHODS = frozenset(
         "set_messages_flagged",
         "mark_message_read",
         "flush_send_queue",
+        "flush_account_send_queue",
         "deliver_outbound_queue_item",
         "continue_heavy_folder_index",
         "search_folder_messages",

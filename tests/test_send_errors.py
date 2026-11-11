@@ -10,7 +10,9 @@ from gi.repository import GLib
 from post.mail.send_errors import (
     SendError,
     SYSTEM_MAIL_EXTERNAL_RECIPIENTS,
+    SentCopyNotFiled,
     format_outbox_failure_toast,
+    format_sent_copy_failure_toast,
     is_compose_validation_error,
     is_permanent_send_error,
     user_send_error_message,
@@ -193,3 +195,15 @@ class SendErrorMessageTests(unittest.TestCase):
             "“test” could not be sent. The message is still in Outbox. "
             f"{TOKEN_EXPIRED_FOLDER_MESSAGE}",
         )
+
+
+class SentCopyNotFiledTests(unittest.TestCase):
+    def test_filing_failure_is_not_permanent_and_says_the_message_was_sent(self) -> None:
+        exc = SentCopyNotFiled("The message was sent, but a copy could not be saved in Sent.")
+        self.assertFalse(is_permanent_send_error(exc))
+        toast = format_sent_copy_failure_toast(
+            subject="Hello", to=["user@example.com"]
+        )
+        self.assertIn("was sent", toast)
+        self.assertIn("still in Outbox", toast)
+        self.assertNotIn("could not be sent", toast)

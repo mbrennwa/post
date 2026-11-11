@@ -634,6 +634,18 @@ class IsSystemFolderTests(unittest.TestCase):
         )
         self.assertFalse(state["show_delete"])
 
+    def test_sent_type_flag_is_not_the_outbox_type(self) -> None:
+        self.assertTrue(
+            is_sent_folder(
+                {"full_name": "Gesendet", "display_name": "Gesendet", "flags": 5120}
+            )
+        )
+        self.assertFalse(
+            is_sent_folder(
+                {"full_name": "Outbox", "display_name": "Outbox", "flags": 2048}
+            )
+        )
+
     def test_sent_folder_without_type_flags_is_protected(self) -> None:
         folder = {"full_name": "Sent", "display_name": "Sent", "flags": 0}
         self.assertTrue(is_system_folder(folder, type_mask=self.TYPE_MASK))

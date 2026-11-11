@@ -44,12 +44,15 @@ from post.mail.send_queue import (
     list_queued_outbound_messages,
     load_queued_attachments,
     load_queued_outbound_message,
+    mark_outbound_submitted,
     park_outbound_message,
+    remember_outbound_mime_identifiers,
     persist_outbound_send,
     queued_to_list_dict,
     read_queued_message,
     remaining_send_delay_seconds,
     remove_queued_outbound_message,
+    set_outbound_sent_copy_error,
     soonest_pending_send_after,
     try_load_queued_outbound_message,
 )
@@ -736,3 +739,38 @@ class ParkOutboundMessageTests(unittest.TestCase):
             "They are still in Outbox",
             format_parked_startup_toast(2, "This message is too large to send."),
         )
+
+
+class SubmittedOutboxItemTests(unittest.TestCase):
+    def test_message_id_and_filing_error_round_trip_without_parking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                queue_id = enqueue_outbound_message(
+                    QueuedOutboundMessage(
+                        account_uid="acct-1",
+                        to=["user@example.com"],
+                        cc=None,
+                        bcc=None,
+                        subject="Hello",
+                        body="Body",
+                    )
+                )
+                remember_outbound_mime_identifiers(
+                    queue_id,
+                    "<id@example.com>",
+                    "Tue, 10 Nov 2026 20:00:00 +0100",
+                )
+                mark_outbound_submitted(queue_id)
+                set_outbound_sent_copy_error(queue_id, "Sent folder is not available")
+                loaded = load_queued_outbound_message(queue_id)
+
+        self.assertEqual(loaded.message_id, "<id@example.com>")
+        self.assertEqual(loaded.message_date, "Tue, 10 Nov 2026 20:00:00 +0100")
+        self.assertTrue(loaded.submitted)
+        self.assertEqual(loaded.sent_copy_error, "Sent folder is not available")
+        self.assertFalse(is_outbound_parked(loaded))
+        self.assertTrue(is_outbound_ready_to_send(loaded))
+        item = queued_to_list_dict(queue_id, loaded, from_label="me@example.com")
+        self.assertIn("Sent copy not saved", item["preview_to"])
+        self.assertIn("user@example.com", item["preview_to"])
+        self.assertEqual(item["sent_copy_error"], "Sent folder is not available")
