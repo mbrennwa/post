@@ -35,6 +35,10 @@ class QueuedOutboundMessage:
     send_after: float | None = None
     attachments: list[dict[str, str]] | None = None
     send_error: str | None = None
+    message_id: str | None = None
+    message_date: str | None = None
+    submitted: bool = False
+    sent_copy_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -79,6 +83,18 @@ class QueuedOutboundMessage:
             send_error=(
                 str(data["send_error"])
                 if data.get("send_error")
+                else None
+            ),
+            message_id=(
+                str(data["message_id"]) if data.get("message_id") else None
+            ),
+            message_date=(
+                str(data["message_date"]) if data.get("message_date") else None
+            ),
+            submitted=bool(data.get("submitted")),
+            sent_copy_error=(
+                str(data["sent_copy_error"])
+                if data.get("sent_copy_error")
                 else None
             ),
         )
@@ -286,14 +302,7 @@ def enqueue_outbound_message(
     queue_id = queue_id or new_outbound_queue_id()
     if attachment_payloads:
         message.attachments = _write_attachment_sidecars(queue_id, attachment_payloads)
-    payload = message.to_dict()
-    payload["queued_at"] = message.queued_at or time.time()
-    if message.send_after is not None:
-        payload["send_after"] = message.send_after
-    if message.send_error:
-        payload["send_error"] = message.send_error
-    else:
-        payload.pop("send_error", None)
+    payload = _outbound_queue_payload(message)
     path = os.path.join(directory, f"{queue_id}.json")
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".post-", suffix=".tmp")
     try:
@@ -307,12 +316,7 @@ def enqueue_outbound_message(
     return queue_id
 
 
-def _rewrite_queued_outbound_message(
-    queue_id: str,
-    message: QueuedOutboundMessage,
-) -> None:
-    directory = outbox_dir()
-    os.makedirs(directory, exist_ok=True)
+def _outbound_queue_payload(message: QueuedOutboundMessage) -> dict[str, Any]:
     payload = message.to_dict()
     payload["queued_at"] = message.queued_at or time.time()
     if message.send_after is not None:
@@ -321,6 +325,29 @@ def _rewrite_queued_outbound_message(
         payload["send_error"] = message.send_error
     else:
         payload.pop("send_error", None)
+    if message.message_id:
+        payload["message_id"] = message.message_id
+    else:
+        payload.pop("message_id", None)
+    if message.message_date:
+        payload["message_date"] = message.message_date
+    else:
+        payload.pop("message_date", None)
+    payload["submitted"] = bool(message.submitted)
+    if message.sent_copy_error:
+        payload["sent_copy_error"] = message.sent_copy_error
+    else:
+        payload.pop("sent_copy_error", None)
+    return payload
+
+
+def _rewrite_queued_outbound_message(
+    queue_id: str,
+    message: QueuedOutboundMessage,
+) -> None:
+    directory = outbox_dir()
+    os.makedirs(directory, exist_ok=True)
+    payload = _outbound_queue_payload(message)
     path = os.path.join(directory, f"{queue_id}.json")
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".post-", suffix=".tmp")
     try:
@@ -365,6 +392,33 @@ def clear_outbound_send_error(queue_id: str) -> bool:
     message.send_error = None
     _rewrite_queued_outbound_message(queue_id, message)
     return True
+
+
+def remember_outbound_mime_identifiers(
+    queue_id: str,
+    message_id: str,
+    message_date: str,
+) -> None:
+    """Store the Message-ID and Date before SMTP so a retry reuses them."""
+    message = load_queued_outbound_message(queue_id)
+    message.message_id = message_id
+    message.message_date = message_date
+    _rewrite_queued_outbound_message(queue_id, message)
+
+
+def mark_outbound_submitted(queue_id: str) -> None:
+    """Record that SMTP accepted this item. A later attempt only files Sent."""
+    message = load_queued_outbound_message(queue_id)
+    message.submitted = True
+    message.sent_copy_error = None
+    _rewrite_queued_outbound_message(queue_id, message)
+
+
+def set_outbound_sent_copy_error(queue_id: str, error: str) -> None:
+    """Remember a Sent-filing failure without parking the item."""
+    message = load_queued_outbound_message(queue_id)
+    message.sent_copy_error = error
+    _rewrite_queued_outbound_message(queue_id, message)
 
 
 def list_queued_outbound_messages() -> list[tuple[str, QueuedOutboundMessage]]:
@@ -506,6 +560,9 @@ def _preview_to_text(to_text: str) -> str:
     return to_text[:57] + "..."
 
 
+_SENT_COPY_ROW_HINT = "Sent copy not saved"
+
+
 def queued_to_list_dict(
     queue_id: str,
     message: QueuedOutboundMessage,
@@ -522,6 +579,12 @@ def queued_to_list_dict(
         "sort_date": message.queued_at,
         "flags": {"seen": True},
     }
+    if message.sent_copy_error:
+        recipient = item["preview_to"]
+        item["preview_to"] = (
+            f"{_SENT_COPY_ROW_HINT} · {recipient}" if recipient else _SENT_COPY_ROW_HINT
+        )
+        item["sent_copy_error"] = message.sent_copy_error
     if message.send_after is not None:
         item["send_after"] = message.send_after
     return item

@@ -87,7 +87,9 @@ from post.mail.network_errors import (
 from post.mail.send_errors import (
     SendError,
     SendQueued,
+    SentCopyNotFiled,
     format_outbox_failure_toast,
+    format_sent_copy_failure_toast,
     is_permanent_send_error,
     user_send_error_message,
 )
@@ -405,8 +407,13 @@ def _finish_outbound_send(
     success_status: str | None,
 ) -> bool:
     if error is not None:
-        message = user_send_error_message(error)
-        if request.queue_id:
+        if isinstance(error, SentCopyNotFiled):
+            message = format_sent_copy_failure_toast(
+                subject=request.subject, to=request.to
+            )
+        else:
+            message = user_send_error_message(error)
+        if request.queue_id and not isinstance(error, SentCopyNotFiled):
             if is_permanent_send_error(error):
                 try:
                     park_outbound_message(request.queue_id, message)

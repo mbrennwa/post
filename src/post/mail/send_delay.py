@@ -26,7 +26,9 @@ from .send_queue import (
 )
 from .send_errors import (
     SendQueued,
+    SentCopyNotFiled,
     format_outbox_failure_toast,
+    format_sent_copy_failure_toast,
     is_permanent_send_error,
     user_send_error_message,
 )
@@ -126,6 +128,14 @@ class OutboundSendDelayScheduler:
                 self._mail.end_outbound_send()
         except FileNotFoundError:
             pass
+        except SentCopyNotFiled:
+            log.warning("Sent copy was not saved for outbox item %s", queue_id)
+            self._notify_send_error_idle(
+                format_sent_copy_failure_toast(
+                    subject=message.subject,
+                    to=message.to,
+                )
+            )
         except SendQueued:
             log.debug("Delayed send deferred for outbox item %s", queue_id)
         except Exception as exc:

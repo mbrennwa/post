@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from post.mail.send_delay import OutboundSendDelayScheduler
-from post.mail.send_errors import SendError
+from post.mail.send_errors import SendError, SentCopyNotFiled
 from post.mail.send_queue import (
     QueuedOutboundMessage,
     enqueue_outbound_message,
@@ -94,6 +94,41 @@ class DelayedSendErrorTests(unittest.TestCase):
         self.assertIn("Sign-in expired", errors[0])
         self.assertIn("still in Outbox", errors[0])
         self.assertIn("Hello", errors[0])
+
+    def test_filing_failure_toasts_without_parking(self) -> None:
+        mail = mock.Mock()
+        mail.deliver_outbound_queue_item.side_effect = SentCopyNotFiled(
+            "The message was sent, but a copy could not be saved in Sent. "
+            "It is still in Outbox."
+        )
+        errors: list[str] = []
+        scheduler = OutboundSendDelayScheduler(
+            mail,
+            on_send_error=errors.append,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp),
+                mock.patch("post.mail.send_delay.GLib.idle_add", side_effect=_run_idle_add),
+            ):
+                queue_id = enqueue_outbound_message(
+                    QueuedOutboundMessage(
+                        account_uid="acct-1",
+                        to=["user@example.com"],
+                        cc=None,
+                        bcc=None,
+                        subject="Hello",
+                        body="Body",
+                    )
+                )
+                scheduler._deliver_worker(queue_id)
+                loaded = load_queued_outbound_message(queue_id)
+
+        self.assertFalse(is_outbound_parked(loaded))
+        self.assertEqual(loaded.send_error, None)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("was sent", errors[0])
+        self.assertNotIn("could not be sent", errors[0])
 
     def test_send_now_retries_parked_item(self) -> None:
         mail = mock.Mock()

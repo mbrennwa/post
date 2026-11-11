@@ -100,10 +100,13 @@ from .local_delivery import all_recipients_local, can_deliver_locally, deliver_l
 from .io_thread import get_mail_io_thread, is_mail_io_thread, run_on_mail_thread
 from .send_errors import (
     MESSAGE_QUEUED,
+    SENT_COPY_NOT_SAVED,
     SYSTEM_MAIL_EXTERNAL_RECIPIENTS,
     SendError,
     SendQueued,
+    SentCopyNotFiled,
     format_outbox_failure_toast,
+    format_sent_copy_failure_toast,
     is_permanent_send_error,
     user_send_error_message,
 )
@@ -146,8 +149,11 @@ from .send_queue import (
     list_queued_outbound_messages,
     load_queued_attachments,
     load_queued_outbound_message,
+    mark_outbound_submitted,
     park_outbound_message,
+    remember_outbound_mime_identifiers,
     remove_queued_outbound_message,
+    set_outbound_sent_copy_error,
 )
 from post.preferences import get_show_evolution_local
 from .account_status import AccountConnectHealth, AccountTransferState
@@ -167,6 +173,7 @@ from .compose import (
     addresses_to_internet_address,
     build_draft_mime_message,
     build_plain_mime_message,
+    OutboundMimeIdentifiers,
     new_outbound_mime_identifiers,
     normalize_references_header,
     read_compose_attachments_from_message,
@@ -234,6 +241,7 @@ log = logging.getLogger(__name__)
 _SKIP_BACKENDS = frozenset({"rss", "vfolder"})
 DEFAULT_MESSAGE_PAGE_SIZE = 50
 _SEND_TIMEOUT_SECONDS = 30
+_SEND_AND_FILE_TIMEOUT_SECONDS = 90.0
 _DRAFT_TIMEOUT_SECONDS = 30
 # Camel transfer_messages_to_sync can hang on M365 after Graph already moved
 # the message. Bound the call and soft-succeed when source UIDs are gone.
@@ -3781,10 +3789,94 @@ class MailService:
 
     def flush_send_queue(self, *, force: bool = False) -> FlushSendQueueResult:
         """Try to send queued outbox messages."""
+        if camel_helpers_enabled():
+            return self._flush_send_queue_via_helpers(force=force)
         if is_mail_io_thread():
             return self._flush_send_queue_unlocked(force=force)
         return get_mail_io_thread().run_sync(
             self._flush_send_queue_unlocked, force=force
+        )
+
+    def flush_account_send_queue(
+        self, account_uid: str, *, force: bool = False
+    ) -> dict[str, Any]:
+        """Flush one account's Outbox from inside its Camel helper."""
+        if is_mail_io_thread():
+            result = self._flush_send_queue_unlocked(
+                force=force, account_uid=account_uid
+            )
+        else:
+            result = get_mail_io_thread().run_sync(
+                self._flush_send_queue_unlocked,
+                force=force,
+                account_uid=account_uid,
+            )
+        return {
+            "sent": result.sent,
+            "error_message": result.error_message,
+            "failed_account_uid": result.failed_account_uid,
+            "parked_count": result.parked_count,
+            "sign_in_required": result.sign_in_required,
+        }
+
+    def _flush_send_queue_via_helpers(
+        self, *, force: bool
+    ) -> FlushSendQueueResult:
+        counts: dict[str, int] = {}
+        for _queue_id, message in list_queued_outbound_messages():
+            counts[message.account_uid] = counts.get(message.account_uid, 0) + 1
+        sent = 0
+        parked_count = 0
+        error_message: str | None = None
+        failed_account_uid: str | None = None
+        sign_in_required = False
+        for account_uid in sorted(counts):
+            if not self.account_may_contact_server(account_uid):
+                continue
+            timeout = max(
+                120.0, _SEND_AND_FILE_TIMEOUT_SECONDS * counts[account_uid]
+            )
+            try:
+                payload = self._camel_helper_call(
+                    "flush_account_send_queue",
+                    account_uid,
+                    [account_uid],
+                    {"force": force},
+                    timeout=timeout,
+                )
+            except CamelHelperError as exc:
+                if exc.error_type == "SentCopyNotFiled":
+                    if error_message is None:
+                        error_message = SENT_COPY_NOT_SAVED
+                        failed_account_uid = account_uid
+                    continue
+                log.warning(
+                    "Send queue flush failed for account %s: %s",
+                    account_uid,
+                    exc,
+                )
+                if error_message is None:
+                    error_message = user_send_error_message(exc)
+                    failed_account_uid = account_uid
+                continue
+            if not isinstance(payload, dict):
+                continue
+            sent += int(payload.get("sent") or 0)
+            parked_count += int(payload.get("parked_count") or 0)
+            if payload.get("sign_in_required"):
+                sign_in_required = True
+            helper_error = payload.get("error_message")
+            if error_message is None and helper_error:
+                error_message = str(helper_error)
+                failed_account_uid = (
+                    str(payload.get("failed_account_uid") or "") or account_uid
+                )
+        return FlushSendQueueResult(
+            sent=sent,
+            error_message=error_message,
+            failed_account_uid=failed_account_uid,
+            parked_count=parked_count,
+            sign_in_required=sign_in_required,
         )
 
     def flush_operation_queue(self, *, helper_timeout: float = 180.0) -> int:
@@ -3993,11 +4085,28 @@ class MailService:
             )
 
     def deliver_outbound_queue_item(self, queue_id: str) -> None:
-        """SMTP-deliver a persisted outbox item and remove it on success."""
+        """SMTP-deliver a persisted outbox item and remove it once Sent is filed."""
+        if camel_helpers_enabled():
+            queued = load_queued_outbound_message(queue_id)
+            try:
+                self._camel_helper_call(
+                    "deliver_outbound_queue_item",
+                    queued.account_uid,
+                    [queue_id],
+                    timeout=_SEND_AND_FILE_TIMEOUT_SECONDS,
+                )
+            except CamelHelperError as exc:
+                self._reraise_sent_copy_helper_error(exc)
+            return
         if is_mail_io_thread():
             self._deliver_outbound_queue_item_impl(queue_id)
             return
         get_mail_io_thread().run_sync(self._deliver_outbound_queue_item_impl, queue_id)
+
+    def _reraise_sent_copy_helper_error(self, exc: CamelHelperError) -> None:
+        if exc.error_type == "SentCopyNotFiled":
+            raise SentCopyNotFiled(SENT_COPY_NOT_SAVED) from exc
+        raise exc
 
     def _deliver_outbound_queue_item_impl(self, queue_id: str) -> None:
         with self._lock:
@@ -4073,7 +4182,36 @@ class MailService:
             "references": references,
             "attachments": attachments,
         }
-        outbound_ids = new_outbound_mime_identifiers(from_address)
+        queued_item = None
+        if queue_id:
+            try:
+                queued_item = load_queued_outbound_message(queue_id)
+            except FileNotFoundError:
+                queued_item = None
+        if (
+            queued_item is not None
+            and queued_item.message_id
+            and queued_item.message_date
+        ):
+            outbound_ids = OutboundMimeIdentifiers(
+                message_id=queued_item.message_id,
+                date=queued_item.message_date,
+            )
+        else:
+            outbound_ids = new_outbound_mime_identifiers(from_address)
+            if queue_id:
+                try:
+                    remember_outbound_mime_identifiers(
+                        queue_id,
+                        outbound_ids.message_id,
+                        outbound_ids.date,
+                    )
+                except FileNotFoundError:
+                    log.debug(
+                        "Outbox item %s vanished before its Message-ID was stored",
+                        queue_id,
+                    )
+        already_submitted = queued_item is not None and queued_item.submitted
 
         message = build_plain_mime_message(
             **compose_kwargs,
@@ -4098,6 +4236,20 @@ class MailService:
         if recipients.length() == 0:
             raise ValueError("At least one recipient is required")
 
+        if already_submitted:
+            log.debug(
+                "Outbox item %s was already accepted; filing the Sent copy",
+                queue_id,
+            )
+            self._append_sent_copy_and_finish_queue_item(
+                account_uid,
+                sent_message,
+                queue_id,
+                send_start=send_start,
+                from_queue=from_queue,
+            )
+            return
+
         if account_uid == POST_LOCAL_ACCOUNT_UID:
             local_config = read_local_mail_config(self.registry)
             if local_config is not None and local_config.enabled:
@@ -4117,13 +4269,13 @@ class MailService:
                         if key[0] == account_uid:
                             self._folder_indexes.pop(key, None)
                     self._correspondent_indexes.pop(account_uid, None)
-                    self._append_to_sent_folder_unlocked(account_uid, sent_message)
-                    if queue_id:
-                        remove_queued_outbound_message(queue_id)
-                    log.debug(
-                        "Send finished account=%s in %.2fs (local delivery)",
+                    self._mark_outbound_submitted(queue_id)
+                    self._append_sent_copy_and_finish_queue_item(
                         account_uid,
-                        time.monotonic() - send_start,
+                        sent_message,
+                        queue_id,
+                        send_start=send_start,
+                        from_queue=from_queue,
                     )
                     return
                 if not all_recipients_local(
@@ -4148,6 +4300,8 @@ class MailService:
             ok, _user_stop = transport.send_to_sync(
                 message, sender, recipients, cancellable
             )
+            if ok:
+                self._mark_outbound_submitted(queue_id)
         except GLib.Error as exc:
             log.debug(
                 "SMTP send finished in %.2fs cancelled=%s",
@@ -4214,6 +4368,17 @@ class MailService:
             from_queue=from_queue,
         )
 
+    def _mark_outbound_submitted(self, queue_id: str | None) -> None:
+        if not queue_id:
+            return
+        try:
+            mark_outbound_submitted(queue_id)
+        except FileNotFoundError:
+            log.debug(
+                "Outbox item %s vanished before it was marked submitted",
+                queue_id,
+            )
+
     def _append_sent_copy_and_finish_queue_item(
         self,
         account_uid: str,
@@ -4223,7 +4388,20 @@ class MailService:
         send_start: float,
         from_queue: bool = False,
     ) -> None:
-        self._append_to_sent_folder_unlocked(account_uid, sent_message)
+        try:
+            stored = self._append_to_sent_folder_unlocked(account_uid, sent_message)
+        except Exception:
+            log.exception(
+                "Failed to save a copy to Sent for account %s", account_uid
+            )
+            stored = False
+        if queue_id and not stored:
+            try:
+                set_outbound_sent_copy_error(queue_id, SENT_COPY_NOT_SAVED)
+            except FileNotFoundError:
+                log.debug("Outbox item %s vanished before Sent filing failed", queue_id)
+                return
+            raise SentCopyNotFiled(SENT_COPY_NOT_SAVED)
         if queue_id:
             remove_queued_outbound_message(queue_id)
         log.debug(
@@ -4259,7 +4437,9 @@ class MailService:
             attachment_payloads=attachments,
         )
 
-    def _flush_send_queue_unlocked(self, *, force: bool = False) -> FlushSendQueueResult:
+    def _flush_send_queue_unlocked(
+        self, *, force: bool = False, account_uid: str | None = None
+    ) -> FlushSendQueueResult:
         sent = 0
         error_message: str | None = None
         failed_account_uid: str | None = None
@@ -4270,6 +4450,8 @@ class MailService:
         sign_in_required = False
         skip_accounts: set[str] = set()
         for queue_id, queued in list_queued_outbound_messages():
+            if account_uid is not None and queued.account_uid != account_uid:
+                continue
             if queued.account_uid in skip_accounts:
                 continue
             if not force and is_outbound_parked(queued):
@@ -4295,6 +4477,18 @@ class MailService:
                         from_queue=True,
                         queue_id=queue_id,
                     )
+                except SentCopyNotFiled:
+                    log.warning(
+                        "Sent copy was not saved for outbox item %s",
+                        queue_id,
+                    )
+                    if error_message is None:
+                        error_message = format_sent_copy_failure_toast(
+                            subject=queued.subject,
+                            to=queued.to,
+                        )
+                        failed_account_uid = queued.account_uid
+                    continue
                 except SendQueued:
                     break
                 except SendError as exc:
@@ -4657,7 +4851,7 @@ class MailService:
         if cached is not None:
             sent_info = find_folder_by_type(
                 cached,
-                Camel.FolderInfoFlags.TYPE_OUTBOX,
+                Camel.FolderInfoFlags.TYPE_SENT,
                 type_mask=Camel.FOLDER_TYPE_MASK,
                 name_fallbacks=frozenset({"sent", "sent mail", "sent messages"}),
             )
@@ -4667,7 +4861,7 @@ class MailService:
         folders = self._list_folders_unlocked(account_uid)
         sent_info = find_folder_by_type(
             folders,
-            Camel.FolderInfoFlags.TYPE_OUTBOX,
+            Camel.FolderInfoFlags.TYPE_SENT,
             type_mask=Camel.FOLDER_TYPE_MASK,
             name_fallbacks=frozenset({"sent", "sent mail", "sent messages"}),
         )
@@ -4677,10 +4871,11 @@ class MailService:
 
     def _append_to_sent_folder_unlocked(
         self, account_uid: str, message: Camel.MimeMessage
-    ) -> None:
+    ) -> bool:
+        """Return True when the Sent copy is stored, or when none is required."""
         folder_name = self._sent_folder_name_unlocked(account_uid)
         if not folder_name:
-            return
+            return True
 
         folder = self._open_folder_unlocked(account_uid, folder_name)
         if folder is None:
@@ -4689,7 +4884,7 @@ class MailService:
                 folder_name,
                 account_uid,
             )
-            return
+            return False
 
         cancellable = Gio.Cancellable()
         timer = threading.Timer(_SEND_TIMEOUT_SECONDS, cancellable.cancel)
@@ -4711,13 +4906,13 @@ class MailService:
                     folder_name,
                     exc.message,
                 )
-            return
+            return False
         finally:
             timer.cancel()
 
         if not ok:
             log.warning("Could not append message to Sent folder %r", folder_name)
-            return
+            return False
 
         if appended_uid:
             message_uid = str(appended_uid)
@@ -4746,6 +4941,7 @@ class MailService:
         except GLib.Error:
             log.debug("Failed to refresh Sent folder after append", exc_info=True)
         self._invalidate_folder_index(account_uid, folder_name)
+        return True
 
     def _drafts_folder_name_unlocked(
         self,

@@ -23,6 +23,16 @@ class SendError(Exception):
         self.user_message = message
 
 
+class SentCopyNotFiled(SendError):
+    """SMTP accepted the message, but the Sent copy was not stored."""
+
+
+SENT_COPY_NOT_SAVED = (
+    "The message was sent, but a copy could not be saved in Sent. "
+    "It is still in Outbox."
+)
+
+
 SYSTEM_MAIL_EXTERNAL_RECIPIENTS = (
     "System mail can only send to addresses on this computer (user@localhost)."
 )
@@ -164,6 +174,21 @@ def _outbox_failure_action(reason: str) -> str:
     return text
 
 
+def format_sent_copy_failure_toast(
+    *,
+    subject: str | None = None,
+    to: Sequence[str] | None = None,
+) -> str:
+    """Toast when SMTP succeeded and the Sent copy was not stored."""
+    if subject or to:
+        label = format_outbound_item_label(subject, to)
+        return (
+            f"{label} was sent, but a copy could not be saved in Sent. "
+            "The message is still in Outbox."
+        )
+    return SENT_COPY_NOT_SAVED
+
+
 def format_outbox_failure_toast(
     reason: str,
     *,
@@ -299,6 +324,8 @@ def is_compose_validation_error(exc: BaseException) -> bool:
 
 def is_permanent_send_error(exc: BaseException) -> bool:
     """Return True when retrying this send will not succeed without a user change."""
+    if isinstance(exc, SentCopyNotFiled):
+        return False
     if isinstance(exc, SendQueued):
         return False
     if isinstance(exc, TimeoutError):
