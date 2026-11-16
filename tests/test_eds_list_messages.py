@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 from post.mail.eds import MailService
+from post.mail.fetch_policy import MESSAGE_READ_MAX_SECONDS
 
 
 class ListMessagesPageDispatchTests(unittest.TestCase):
@@ -65,6 +66,8 @@ class ReadPathDispatchTests(unittest.TestCase):
             "acct-1",
             ["acct-1", "INBOX", "42"],
             {"mark_seen": False},
+            # Above the helper's own size-scaled limit; expiry would kill it (#537).
+            timeout=MESSAGE_READ_MAX_SECONDS + 60.0,
         )
         self.assertEqual(result, {"uid": "1"})
 

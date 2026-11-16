@@ -35,10 +35,10 @@ class DownsyncExpressionTests(unittest.TestCase):
     def test_off_returns_none(self) -> None:
         self.assertIsNone(downsync_expression_for_mode(OFFLINE_BODY_SYNC_OFF))
 
-    def test_enabled_modes_use_match_all(self) -> None:
+    def test_enabled_modes_use_size_bounded_match_all(self) -> None:
         self.assertEqual(
             downsync_expression_for_mode(OFFLINE_BODY_SYNC_ALL),
-            "(match-all #t)",
+            "(match-all (< (get-size) 10240))",
         )
 
 

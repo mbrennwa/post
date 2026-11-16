@@ -562,7 +562,7 @@ class PreemptInteractiveReadTests(unittest.TestCase):
         mail = self._mail()
         with mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True):
             mail.preempt_interactive_read("acct")
-        mail.preempt_account_helper_op.assert_called_once_with("acct")
+        mail.preempt_account_helper_op.assert_called_once_with("acct", "all")
         mail.cancel_account_heavy_folder_index.assert_called_once_with("acct")
         mail._camel_pool.request_cancel_folder_refresh.assert_called_once_with(
             "acct"
@@ -574,7 +574,7 @@ class PreemptInteractiveReadTests(unittest.TestCase):
         mail = self._mail()
         with mock.patch("post.mail.eds.camel_helpers_enabled", return_value=False):
             mail.preempt_interactive_read("acct")
-        mail.cancel_helper_op.assert_called_once_with()
+        mail.cancel_helper_op.assert_called_once_with("all")
         mail.cancel_heavy_folder_index_refresh.assert_called_once_with()
         mail.cancel_folder_refresh.assert_called_once_with()
         mail.preempt_account_helper_op.assert_not_called()

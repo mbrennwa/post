@@ -201,7 +201,7 @@ class OfflineBodySyncCoordinator:
         else:
             cancel_op = getattr(self._mail, "cancel_helper_op", None)
             if callable(cancel_op):
-                cancel_op()
+                cancel_op("background")
 
     def cancel_all(self) -> None:
         """Cancel full-account downsync only. Arrival prefetch keeps its queue."""

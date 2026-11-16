@@ -211,6 +211,18 @@ def _dispatch(mail: Any, method: str, args: list[Any], kwargs: dict[str, Any]) -
     return result
 
 
+def _cancel_helper_op(mail: Any, msg: dict[str, Any]) -> None:
+    """Cancel the in-flight op; ``scope`` limits it to background work (#537)."""
+    cancel_op = getattr(mail, "cancel_helper_op", None)
+    if not callable(cancel_op):
+        return
+    scope = msg.get("scope")
+    if scope in ("all", "background"):
+        cancel_op(scope)
+    else:
+        cancel_op()
+
+
 def _result_payload(req_id: Any, result: Any) -> dict[str, Any]:
     return {"type": "result", "id": req_id, "ok": True, "result": result}
 
@@ -273,6 +285,7 @@ def _error_payload(req_id: Any, exc: BaseException) -> dict[str, Any]:
                 "message_uid": exc.message_uid,
                 "folder_name": exc.folder_name,
                 "reason": exc.reason,
+                "size_bytes": exc.size_bytes,
             }
     except Exception:
         pass
@@ -311,6 +324,13 @@ def main(argv: list[str] | None = None) -> int:
 
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
+    try:
+        from post.mail.eds import set_helper_event_sink
+
+        # Progress events (e.g. "downloading message") reach the UI mid-call.
+        set_helper_event_sink(lambda event: write_message(stdout, event))
+    except Exception:
+        log.debug("could not install helper event sink", exc_info=True)
     write_message(
         stdout,
         {"type": "ready", "account_uid": account_uid, "pid": os.getpid()},
@@ -356,9 +376,7 @@ def main(argv: list[str] | None = None) -> int:
             write_message(stdout, {"type": "bye", "id": msg.get("id")})
             return 0
         if msg_type == "cancel":
-            cancel_op = getattr(mail, "cancel_helper_op", None)
-            if callable(cancel_op):
-                cancel_op()
+            _cancel_helper_op(mail, msg)
             continue
         if msg_type == "cancel_heavy_index":
             cancel_heavy = getattr(mail, "cancel_heavy_folder_index_refresh", None)
@@ -445,9 +463,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             extra_type = extra.get("type")
             if extra_type == "cancel":
-                cancel_op = getattr(mail, "cancel_helper_op", None)
-                if callable(cancel_op):
-                    cancel_op()
+                _cancel_helper_op(mail, extra)
             elif extra_type == "cancel_heavy_index":
                 cancel_heavy = getattr(
                     mail, "cancel_heavy_folder_index_refresh", None

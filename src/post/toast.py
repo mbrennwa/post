@@ -43,10 +43,12 @@ def show_error_toast(
     *,
     heading: str | None = None,
     timeout: int = 8,
-) -> None:
+) -> Adw.Toast | None:
     """Show a high-priority toast for an error or warning."""
     text = message if not heading else f"{heading}: {message}"
-    show_toast(parent, text, priority=Adw.ToastPriority.HIGH, timeout=timeout)
+    return show_toast(
+        parent, text, priority=Adw.ToastPriority.HIGH, timeout=timeout
+    )
 
 
 def _toast_host_window(parent: ToastParent) -> Gtk.Window | Adw.ApplicationWindow | Adw.Window:
