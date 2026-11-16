@@ -111,6 +111,7 @@ from post.mail.draft_queue import (
     remove_queued_draft,
 )
 from post.mail.send_delay import OutboundSendDelayScheduler
+from post.mail.fetch_policy import download_note
 from post.mail.network_errors import (
     format_attachment_error,
     format_folder_load_error,
@@ -337,6 +338,7 @@ class MainWindow(Adw.ApplicationWindow):
         )
         self._mail.set_password_prompt(self._prompt_account_password)
         self._mail.set_account_health_changed_callback(self._on_account_health_changed)
+        self._mail.set_message_download_listener(self._on_message_download)
         self._mail.set_visible_attachments_changed_callback(
             self._on_visible_attachments_classified
         )
@@ -2375,6 +2377,9 @@ class MainWindow(Adw.ApplicationWindow):
 
             GLib.idle_add(deliver)
 
+        # The open folder is user-visible: do not queue behind a background
+        # body fetch on the same account helper (#537).
+        self._mail.preempt_background_op(account_uid)
         self._mail.submit_interactive("reconcile_open_folder", fetch)
 
     def _on_open_folder_reconciled(
@@ -4219,6 +4224,54 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self._search_query = query
         self._load_messages(account.uid, folder_name)
+
+    def _on_message_download(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        size_bytes: int | None,
+    ) -> None:
+        """A read found no local copy and is downloading (any thread, #537)."""
+        note = download_note(size_bytes)
+        if note is None:
+            return
+        GLib.idle_add(
+            self._show_message_download_note,
+            account_uid,
+            folder_name,
+            message_uid,
+            note,
+        )
+
+    def _show_message_download_note(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        note: str,
+    ) -> bool:
+        pending = self._pending_message_read_uid
+        if pending is None or self._inflight_message_read_id is None:
+            return False
+        if self._current_message is not None:
+            return False
+        location = self._message_location_for_list_key(pending)
+        if location is None or tuple(location) != (
+            account_uid,
+            folder_name,
+            message_uid,
+        ):
+            return False
+        self._reader_pane.show_loading(note)
+        return False
+
+    def _retry_message_read(self, uid: str) -> None:
+        """Re-run a timed-out read if *uid* is still the selected message."""
+        selected = self._message_id_key_for_list_key(self._current_message_uid)
+        if selected is None or selected != self._message_id_key_for_list_key(uid):
+            return
+        self._load_message_body_for_uid(uid, mark_seen=True)
 
     def _show_message_unavailable_reader(self, message: str) -> None:
         self._current_message = None
@@ -8812,6 +8865,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._inflight_message_read_id = read_id
         self._current_message = None
         self._displayed_message_id = None
+        # Plain "Loading message…": a download note is shown only once the
+        # helper reports that Camel has no local copy (_on_message_download).
         self._reader_pane.show_loading()
         viewing_outbox = is_post_outbox_folder(folder_name)
         viewing_drafts = self._sidebar.folder_is_drafts(account.uid, folder_name)
@@ -9105,7 +9160,19 @@ class MainWindow(Adw.ApplicationWindow):
                     )
             self._displayed_message_id = None
             self._show_message_unavailable_reader(error.user_message())
-            if not sign_in_required:
+            if error.reason == MessageUnavailableReason.READ_TIMEOUT:
+                # Slow server, not offline: offer a retry (#537).
+                toast = show_error_toast(self, error.user_message())
+                if toast is not None:
+                    toast.set_button_label("Retry")
+                    toast.connect(
+                        "button-clicked",
+                        lambda _t, key=uid: self._retry_message_read(key),
+                    )
+            elif (
+                not sign_in_required
+                and error.reason != MessageUnavailableReason.SUPERSEDED
+            ):
                 show_error_toast(self, error.user_message())
             return False
 
@@ -9131,6 +9198,7 @@ class MainWindow(Adw.ApplicationWindow):
             user_message = format_message_read_error(
                 error,
                 cached=False,
+                network_available=self._network_available,
             )
             self._displayed_message_id = None
             self._show_message_unavailable_reader(user_message)

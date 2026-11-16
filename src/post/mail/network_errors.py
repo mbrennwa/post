@@ -16,6 +16,15 @@ from gi.repository import GLib
 from .send_errors import _is_localhost_refused
 
 OFFLINE_FOLDER_MESSAGE = "Offline — folders unavailable until you reconnect."
+OFFLINE_MESSAGE_READ_MESSAGE = (
+    "Offline — this message isn't available until you reconnect."
+)
+MESSAGE_READ_TIMEOUT_MESSAGE = (
+    "The mail server did not respond in time. Select the message again to retry."
+)
+SERVER_TIMEOUT_FOLDER_MESSAGE = (
+    "The mail server did not respond in time. Try again in a moment."
+)
 SIGN_IN_FOLDER_MESSAGE = (
     "Sign-in required — reconnect this account to load folders."
 )
@@ -78,6 +87,52 @@ def _error_text(exc: BaseException) -> str:
     return str(exc)
 
 
+# Evidence that the machine cannot reach the server at all.
+_CONNECTIVITY_TOKENS = (
+    "could not connect",
+    "connection refused",
+    "network is unreachable",
+    "no route to host",
+    "name or service not known",
+    "temporary failure",
+    "network error",
+    "must be working online",
+    "error resolving",
+    "name resolution",
+)
+
+# A request that started but did not finish. Says nothing about whether the
+# network is down: a large body on a slow link looks exactly like this (#537).
+_TIMEOUT_TOKENS = (
+    "timed out",
+    "timeout",
+    "i/o error",
+    "connection reset",
+    "broken pipe",
+)
+
+
+def is_connectivity_error(exc: BaseException) -> bool:
+    """True only for failures that show the server is unreachable."""
+    if isinstance(exc, TimeoutError):
+        return False
+    text = _error_text(exc)
+    if _is_localhost_refused(text):
+        return False
+    lowered = text.lower()
+    return any(token in lowered for token in _CONNECTIVITY_TOKENS)
+
+
+def is_timeout_error(exc: BaseException) -> bool:
+    """True when a request was cut off or went silent (not proof of offline)."""
+    if isinstance(exc, TimeoutError):
+        return True
+    if is_connectivity_error(exc):
+        return False
+    lowered = _error_text(exc).lower()
+    return any(token in lowered for token in _TIMEOUT_TOKENS)
+
+
 def is_network_unavailable_error(exc: BaseException) -> bool:
     """Return True for DNS/network failures and Camel offline-service errors."""
     if is_queueable_network_error(exc):
@@ -133,11 +188,29 @@ def _is_token_expired_error(exc: BaseException) -> bool:
 
 
 def format_message_read_error(
-    exc: BaseException, *, cached: bool = True
+    exc: BaseException,
+    *,
+    cached: bool = True,
+    network_available: bool | None = None,
 ) -> str:
-    """User-facing message-read failure text (never raw GLib/Camel dumps)."""
-    if is_network_unavailable_error(exc):
-        return OFFLINE_FOLDER_MESSAGE
+    """User-facing message-read failure text (never raw GLib/Camel dumps).
+
+    "Offline" is claimed only when the system reports no network or the error
+    proves the server is unreachable; a timeout alone is reported as a slow
+    server (#537). Message reads never talk about folders.
+    """
+    user_message = getattr(exc, "user_message", None)
+    if callable(user_message):
+        try:
+            text = user_message()
+        except Exception:
+            text = None
+        if text:
+            return str(text)
+    if network_available is False or is_connectivity_error(exc):
+        return OFFLINE_MESSAGE_READ_MESSAGE
+    if is_timeout_error(exc):
+        return MESSAGE_READ_TIMEOUT_MESSAGE
     if is_sign_in_required_error(exc):
         if not cached:
             return MESSAGE_NOT_CACHED_SIGN_IN
@@ -162,10 +235,14 @@ def format_attachment_error(exc: BaseException) -> str:
     return f"Attachment error: {exc}"
 
 
-def format_folder_load_error(exc: BaseException) -> str:
+def format_folder_load_error(
+    exc: BaseException, *, network_available: bool | None = None
+) -> str:
     """User-facing folder-list failure text (never raw GLib/Camel dumps)."""
-    if is_network_unavailable_error(exc):
+    if network_available is False or is_connectivity_error(exc):
         return OFFLINE_FOLDER_MESSAGE
+    if is_timeout_error(exc):
+        return SERVER_TIMEOUT_FOLDER_MESSAGE
     if _is_token_expired_error(exc):
         return TOKEN_EXPIRED_FOLDER_MESSAGE
     if is_sign_in_required_error(exc):

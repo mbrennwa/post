@@ -12,6 +12,7 @@ import gi
 gi.require_version("Camel", "1.2")
 from gi.repository import Camel
 
+from post.mail.fetch_policy import BACKGROUND_FETCH_MAX_KB
 from post.preferences import (
     OFFLINE_BODY_SYNC_ALL,
     OFFLINE_BODY_SYNC_LAST_MONTH,
@@ -22,9 +23,15 @@ from post.preferences import (
     get_account_user_online,
 )
 
-# Bare "(match-all)" fails CamelStoreSearch (EDS ≥ 3.58): argc must be 1.
-# "(match-all #t)" matches everything on classic FolderSearch and StoreSearch (#277).
-_DOWNSYNC_EXPRESSION = "(match-all #t)"
+# Bare "(match-all)" fails CamelStoreSearch (EDS ≥ 3.58): argc must be 1
+# (#277), so the match-all always wraps an expression.
+#
+# Background downsync only takes bodies below BACKGROUND_FETCH_MAX_KB.
+# ``(get-size)`` is in kilobytes. Larger messages are fetched when the user
+# opens them, with a size-scaled limit: a background fetch of a ~34 MB body
+# would hold the account's single helper process and was cancelled and
+# restarted at every launch (#537).
+_DOWNSYNC_EXPRESSION = f"(match-all (< (get-size) {BACKGROUND_FETCH_MAX_KB}))"
 
 
 _SECONDS_PER_DAY = 86400

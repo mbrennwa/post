@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import json
 import struct
+import threading
 from typing import Any, BinaryIO
 
 _HEADER = struct.Struct("!I")
@@ -36,11 +37,17 @@ def _decode_obj(obj: Any) -> Any:
     return obj
 
 
+_write_lock = threading.Lock()
+
+
 def write_message(stream: BinaryIO, payload: dict[str, Any]) -> None:
     raw = json.dumps(_encode_obj(payload), separators=(",", ":")).encode("utf-8")
-    stream.write(_HEADER.pack(len(raw)))
-    stream.write(raw)
-    stream.flush()
+    # A helper writes results from its main thread and progress events from
+    # the call's worker thread; header and body must stay one frame (#537).
+    with _write_lock:
+        stream.write(_HEADER.pack(len(raw)))
+        stream.write(raw)
+        stream.flush()
 
 
 def _read_exact(stream: BinaryIO, size: int) -> bytes | None:

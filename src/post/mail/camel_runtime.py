@@ -100,6 +100,9 @@ class AccountCamelRuntime:
     _on_started: Callable[[str], None] | None = field(
         default=None, init=False, repr=False
     )
+    _on_event: Callable[[str, dict], None] | None = field(
+        default=None, init=False, repr=False
+    )
     _died_fired: bool = field(default=False, init=False)
     _busy_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
@@ -113,6 +116,25 @@ class AccountCamelRuntime:
     def set_started_callback(self, callback: Callable[[str], None] | None) -> None:
         """Run after this helper is ready, before the call that started it."""
         self._on_started = callback
+
+    def set_event_callback(
+        self, callback: Callable[[str, dict], None] | None
+    ) -> None:
+        """Receive progress events the helper pushes while a call runs (#537)."""
+        self._on_event = callback
+
+    def _dispatch_event(self, msg: dict) -> None:
+        callback = self._on_event
+        if callback is None:
+            return
+        try:
+            callback(self.account_uid, msg)
+        except Exception:
+            log.debug(
+                "helper event callback failed account=%s",
+                self.account_uid,
+                exc_info=True,
+            )
 
     def is_running(self) -> bool:
         with self._lock:
@@ -223,6 +245,9 @@ class AccountCamelRuntime:
                 msg = read_message(proc.stdout)
                 if msg is None:
                     break
+                if msg.get("type") == "event":
+                    self._dispatch_event(msg)
+                    continue
                 if msg.get("type") != "result":
                     continue
                 req_id = str(msg.get("id") or "")
@@ -414,18 +439,23 @@ class AccountCamelRuntime:
                 threading.current_thread().name,
             )
 
-    def request_cancel(self) -> None:
+    def request_cancel(self, scope: str = "all") -> None:
         """Ask the helper to cancel its in-flight Camel op without taking ``_serial`` (#482).
 
         Safe to call while another thread holds ``call()`` / ``_serial`` waiting
         for a long ``offline_downsync_folder``. The helper must keep reading
         stdin while that call runs.
+
+        ``scope="background"`` cancels only downsync / prefetch work, never a
+        message read the user is waiting for (#537).
         """
         with self._lock:
             if self._proc is None or self._proc.stdin is None or not self._alive:
                 return
             try:
-                write_message(self._proc.stdin, {"type": "cancel"})
+                write_message(
+                    self._proc.stdin, {"type": "cancel", "scope": scope}
+                )
             except Exception:
                 log.debug(
                     "helper cancel write failed account=%s",
@@ -681,6 +711,9 @@ class CamelRuntimePool:
     _on_helper_started: Callable[[str], None] | None = field(
         default=None, init=False, repr=False
     )
+    _on_helper_event: Callable[[str, dict], None] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def set_account_died_callback(
         self, callback: Callable[[str], None] | None
@@ -696,6 +729,15 @@ class CamelRuntimePool:
             for runtime in self._runtimes.values():
                 runtime.set_started_callback(callback)
 
+    def set_helper_event_callback(
+        self, callback: Callable[[str, dict], None] | None
+    ) -> None:
+        """Forward helper progress events (``type == "event"``) to *callback*."""
+        self._on_helper_event = callback
+        with self._lock:
+            for runtime in self._runtimes.values():
+                runtime.set_event_callback(callback)
+
     def get(self, account_uid: str) -> AccountCamelRuntime:
         with self._lock:
             runtime = self._runtimes.get(account_uid)
@@ -704,6 +746,7 @@ class CamelRuntimePool:
                 runtime.set_died_callback(self._handle_died)
                 self._runtimes[account_uid] = runtime
             runtime.set_started_callback(self._on_helper_started)
+            runtime.set_event_callback(self._on_helper_event)
             return runtime
 
     def runtime_if_any(self, account_uid: str) -> AccountCamelRuntime | None:
@@ -746,12 +789,12 @@ class CamelRuntimePool:
             goa_ensure_out=goa_ensure_out,
         )
 
-    def request_cancel(self, account_uid: str) -> None:
+    def request_cancel(self, account_uid: str, scope: str = "all") -> None:
         """Cancel in-flight helper Camel work for ``account_uid`` (#482)."""
         with self._lock:
             runtime = self._runtimes.get(account_uid)
         if runtime is not None:
-            runtime.request_cancel()
+            runtime.request_cancel(scope)
 
     def request_cancel_heavy_index(self, account_uid: str) -> None:
         """Stop heavy-folder refresh in ``account_uid``'s helper."""

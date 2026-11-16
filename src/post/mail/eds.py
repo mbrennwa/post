@@ -213,6 +213,13 @@ from .message_list_state import (
     union_folder_index_messages,
     upsert_folder_index_by_identity,
 )
+from .fetch_policy import (
+    background_fetch_allowed,
+    BACKGROUND_FETCH_MAX_BYTES,
+    fetch_timeout_seconds,
+    format_size,
+    MESSAGE_READ_MAX_SECONDS,
+)
 from .offline_settings import apply_offline_settings_to_store, apply_offline_sync_to_folder
 from .offline_sync import (
     OfflineBodySyncCoordinator,
@@ -254,6 +261,13 @@ _TRANSFER_POST_TIMEOUT_SECONDS = 30
 _FOLDER_STATS_TIMEOUT_SECONDS = 15
 # Bound get_message_sync so revoked GOA tokens cannot leave the reader hung (#341).
 _MESSAGE_READ_TIMEOUT_SECONDS = 30
+# Helper cancel scopes / op kinds (#537). Reads register as ``read`` so that
+# only another read (scope ``all``) can abort them, never an automatic folder
+# load (scope ``background``).
+HELPER_OP_BACKGROUND = "background"
+HELPER_OP_READ = "read"
+CANCEL_SCOPE_ALL = "all"
+CANCEL_SCOPE_BACKGROUND = "background"
 # Interactive read waits this long for the helper lock, then the reader shows
 # an error. The call that holds the lock keeps running (#494).
 _INTERACTIVE_HELPER_WAIT_SECONDS = 10.0
@@ -293,6 +307,11 @@ class MessageUnavailableReason:
     NOT_CACHED_OFFLINE = "not_cached_offline"
     NOT_CACHED_SIGN_IN = "not_cached_sign_in"
     NOT_FETCHABLE_YET = "not_fetchable_yet"
+    # The server did not deliver the body within the size-scaled limit (#537).
+    # This is a slow or stalled transfer, not "no network".
+    READ_TIMEOUT = "read_timeout"
+    # A newer interactive read took over the helper; the result is stale.
+    SUPERSEDED = "superseded"
 
 
 class MessageNotAvailableError(LookupError):
@@ -304,13 +323,24 @@ class MessageNotAvailableError(LookupError):
         folder_name: str | None = None,
         *,
         reason: str = MessageUnavailableReason.VANISHED,
+        size_bytes: int | None = None,
     ) -> None:
         self.message_uid = message_uid
         self.folder_name = folder_name
         self.reason = reason
+        self.size_bytes = size_bytes
         super().__init__(message_uid)
 
     def user_message(self) -> str:
+        if self.reason == MessageUnavailableReason.READ_TIMEOUT:
+            size = format_size(self.size_bytes)
+            detail = f" ({size})" if size else ""
+            return (
+                f"The server did not deliver this message{detail} in time. "
+                "Select it again to retry."
+            )
+        if self.reason == MessageUnavailableReason.SUPERSEDED:
+            return "Loading was interrupted. Select the message again."
         if self.reason == MessageUnavailableReason.NOT_CACHED_OFFLINE:
             return (
                 "This message isn't available offline yet. "
@@ -754,6 +784,15 @@ EDS_REGISTRY_RECONNECT_AFTER_LOCAL_ERROR = (
 )
 
 
+# Set only inside a Camel helper process: pushes progress events to the UI.
+_helper_event_sink: Callable[[dict[str, Any]], None] | None = None
+
+
+def set_helper_event_sink(sink: Callable[[dict[str, Any]], None] | None) -> None:
+    global _helper_event_sink
+    _helper_event_sink = sink
+
+
 def source_registry_new_sync(
     *,
     failure_message: str = EDS_REGISTRY_CONNECT_ERROR,
@@ -916,6 +955,12 @@ class MailService:
     # In-flight Camel op cancellable (offline downsync) for cancel_helper_op (#482).
     _helper_op_cancellable: Gio.Cancellable | None = field(
         default=None, init=False, repr=False
+    )
+    # "background" (downsync / prefetch) or "read" (user-requested body fetch).
+    _helper_op_kind: str = field(default="background", init=False, repr=False)
+    # UI: told when a message read has to download from the server (#537).
+    _message_download_listener: Callable[[str, str, str, int | None], None] | None = (
+        field(default=None, init=False, repr=False)
     )
     _helper_op_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
@@ -1323,7 +1368,17 @@ class MailService:
                 account_uid,
                 [account_uid, folder_name, message_uid],
                 {"force": force, "mode": mode},
-                timeout=ARRIVAL_PREFETCH_TIMEOUT_SECONDS + 10.0,
+                # Safety net above the helper's size-scaled limit; expiry kills
+                # the helper, so it must never be the shorter one (#537).
+                timeout=(
+                    MESSAGE_READ_MAX_SECONDS + 30.0
+                    if force
+                    else fetch_timeout_seconds(
+                        BACKGROUND_FETCH_MAX_BYTES,
+                        base_seconds=float(ARRIVAL_PREFETCH_TIMEOUT_SECONDS),
+                    )
+                    + 10.0
+                ),
             )
             if not isinstance(result, dict):
                 return {"status": "failed"}
@@ -1554,11 +1609,26 @@ class MailService:
             if not message_within_offline_age(sync_mode, raw):
                 return {"status": "skipped"}
 
+        size_bytes = self._message_size_hint(folder, message_uid)
+        if not force and not background_fetch_allowed(size_bytes):
+            # Big bodies are fetched when the user opens them; a background
+            # fetch would pin this account's single helper (#537).
+            log.debug(
+                "Arrival prefetch skipped for %s: %s exceeds background limit",
+                api_uid,
+                format_size(size_bytes),
+            )
+            return {"status": "skipped"}
+        prefetch_limit = fetch_timeout_seconds(
+            size_bytes, base_seconds=float(ARRIVAL_PREFETCH_TIMEOUT_SECONDS)
+        )
+
         fetch_cancellable = Gio.Cancellable()
+        self._register_helper_op_cancellable(fetch_cancellable)
         stop_watch = threading.Event()
 
         def _watch_timeout() -> None:
-            deadline = time.monotonic() + ARRIVAL_PREFETCH_TIMEOUT_SECONDS
+            deadline = time.monotonic() + prefetch_limit
             while not stop_watch.is_set():
                 if time.monotonic() >= deadline:
                     fetch_cancellable.cancel()
@@ -1577,7 +1647,7 @@ class MailService:
         except GLib.Error as exc:
             if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
                 elapsed = time.monotonic() - started
-                if elapsed >= ARRIVAL_PREFETCH_TIMEOUT_SECONDS * 0.9:
+                if elapsed >= prefetch_limit * 0.9:
                     log.debug(
                         "Arrival prefetch timed out after %.1fs for %s",
                         elapsed,
@@ -1593,6 +1663,7 @@ class MailService:
         finally:
             stop_watch.set()
             watcher.join(timeout=1.0)
+            self._clear_helper_op_cancellable(fetch_cancellable)
 
         visible = self.classify_cached_visible_attachments(
             account_uid, folder_name, message_uid, folder=folder
@@ -1640,9 +1711,14 @@ class MailService:
                 0, self._helper_interactive_pending - 1
             )
 
-    def _register_helper_op_cancellable(self, cancellable: Gio.Cancellable) -> None:
+    def _register_helper_op_cancellable(
+        self,
+        cancellable: Gio.Cancellable,
+        kind: str = HELPER_OP_BACKGROUND,
+    ) -> None:
         with self._helper_op_lock:
             self._helper_op_cancellable = cancellable
+            self._helper_op_kind = kind
 
     def _clear_helper_op_cancellable(
         self, cancellable: Gio.Cancellable | None = None
@@ -1650,13 +1726,24 @@ class MailService:
         with self._helper_op_lock:
             if cancellable is None or self._helper_op_cancellable is cancellable:
                 self._helper_op_cancellable = None
+                self._helper_op_kind = HELPER_OP_BACKGROUND
 
-    def cancel_helper_op(self) -> None:
-        """Cancel the in-flight Camel op registered for this process (#482)."""
+    def cancel_helper_op(self, scope: str = CANCEL_SCOPE_ALL) -> None:
+        """Cancel the in-flight Camel op registered for this process (#482).
+
+        ``scope="background"`` cancels only downsync / prefetch work, so an
+        automatic folder load never aborts a message the user asked to read
+        (#537). ``scope="all"`` also cancels an in-flight user read, for a
+        newer read that supersedes it.
+        """
         with self._helper_op_lock:
             cancellable = self._helper_op_cancellable
-        if cancellable is not None:
-            cancellable.cancel()
+            kind = self._helper_op_kind
+        if cancellable is None:
+            return
+        if scope == CANCEL_SCOPE_BACKGROUND and kind != HELPER_OP_BACKGROUND:
+            return
+        cancellable.cancel()
 
     def cancel_account_heavy_folder_index(self, account_uid: str) -> None:
         """Stop Archive/etc. header fetch for ``account_uid``.
@@ -1669,16 +1756,38 @@ class MailService:
         if camel_helpers_enabled() and account_uid:
             self._camel_pool.request_cancel_heavy_index(account_uid)
 
-    def preempt_account_helper_op(self, account_uid: str) -> None:
+    def preempt_account_helper_op(
+        self, account_uid: str, scope: str = CANCEL_SCOPE_BACKGROUND
+    ) -> None:
         """Cancel in-flight offline downsync for ``account_uid`` (#482).
 
         With helpers, sends a cancel IPC message without waiting on ``_serial``.
         In-process, cancels the registered chunk cancellable directly.
+
+        Defaults to ``scope="background"``: only downsync / prefetch is
+        cancelled, never a message read the user is waiting for (#537).
         """
         if camel_helpers_enabled():
-            self._camel_pool.request_cancel(account_uid)
+            self._camel_pool.request_cancel(account_uid, scope=scope)
             return
-        self.cancel_helper_op()
+        self.cancel_helper_op(scope)
+
+    def preempt_background_op(self, account_uid: str | None) -> None:
+        """Foreground work (open folder / list) must not queue behind downsync.
+
+        The helper runs one call at a time, so a running background body
+        download would otherwise delay a folder load by up to its whole
+        timeout (#537). Safe to call at any time: with nothing running it is a
+        no-op, and a user read is never cancelled by it.
+        """
+        if not account_uid:
+            return
+        try:
+            self.preempt_account_helper_op(account_uid, CANCEL_SCOPE_BACKGROUND)
+        except Exception:
+            log.debug(
+                "Could not preempt background op for %s", account_uid, exc_info=True
+            )
 
     def preempt_interactive_read(self, account_uid: str) -> None:
         """Stop helper work that would leave a message read on Loading (#494).
@@ -1688,11 +1797,12 @@ class MailService:
         downsync cancel.
         """
         if camel_helpers_enabled() and account_uid:
-            self.preempt_account_helper_op(account_uid)
+            # A newer read supersedes an in-flight read too (scope "all").
+            self.preempt_account_helper_op(account_uid, CANCEL_SCOPE_ALL)
             self.cancel_account_heavy_folder_index(account_uid)
             self._camel_pool.request_cancel_folder_refresh(account_uid)
             return
-        self.cancel_helper_op()
+        self.cancel_helper_op(CANCEL_SCOPE_ALL)
         self.cancel_heavy_folder_index_refresh()
         self.cancel_folder_refresh()
 
@@ -1802,6 +1912,12 @@ class MailService:
         def locked_worker() -> None:
             folder_job_lock().run(account_uid, folder, func, *args, **kwargs)
 
+        if epic_lane == "foreground" and account_uid and not use_graph:
+            # The account has one helper. Cancel an in-flight background
+            # fetch (downsync / arrival prefetch) so this user-driven job is
+            # not queued behind it (#537). Background work requeues itself.
+            self.preempt_background_op(account_uid)
+
         log.debug(
             "Mail job epic_lane=%s queue=%s runner=%s name=%s account=%s folder=%s",
             epic_lane,
@@ -1909,8 +2025,14 @@ class MailService:
                     reason = str(
                         details.get("reason") or MessageUnavailableReason.VANISHED
                     )
+                    raw_size = details.get("size_bytes")
                     raise MessageNotAvailableError(
-                        uid, folder, reason=reason
+                        uid,
+                        folder,
+                        reason=reason,
+                        size_bytes=(
+                            int(raw_size) if isinstance(raw_size, (int, float)) else None
+                        ),
                     ) from exc
                 # One retry after a crashed helper. Do not kill_account first — the
                 # process is already dead; an extra kill storms SIGKILL (-9) and
@@ -2401,9 +2523,79 @@ class MailService:
             service._camel_pool.set_helper_started_callback(
                 service._seed_helper_contact_state
             )
+            service._camel_pool.set_helper_event_callback(
+                service._on_helper_event
+            )
         if camel_helpers_enabled():
             service._start_goa_attention_monitor()
         return service
+
+    def set_message_download_listener(
+        self,
+        callback: Callable[[str, str, str, int | None], None] | None,
+    ) -> None:
+        """Call ``callback(account_uid, folder_name, message_uid, size_bytes)``
+        when a read finds no local copy and starts downloading (#537).
+
+        May run on a non-GTK thread.
+        """
+        self._message_download_listener = callback
+
+    def _on_helper_event(self, account_uid: str, event: dict[str, Any]) -> None:
+        if event.get("event") != "message_download":
+            return
+        raw_size = event.get("size_bytes")
+        self._notify_message_download(
+            account_uid,
+            str(event.get("folder_name") or ""),
+            str(event.get("message_uid") or ""),
+            int(raw_size) if isinstance(raw_size, (int, float)) else None,
+        )
+
+    def _notify_message_download(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        size_bytes: int | None,
+    ) -> None:
+        listener = self._message_download_listener
+        if listener is None:
+            return
+        try:
+            listener(account_uid, folder_name, message_uid, size_bytes)
+        except Exception:
+            log.debug("message download listener failed", exc_info=True)
+
+    def _emit_message_download(
+        self,
+        account_uid: str,
+        folder_name: str | None,
+        message_uid: str | None,
+        size_bytes: int | None,
+    ) -> None:
+        """Tell the UI a read is about to download (from the helper: over IPC)."""
+        if not folder_name or not message_uid:
+            return
+        sink = _helper_event_sink
+        if sink is not None:
+            try:
+                sink(
+                    {
+                        "type": "event",
+                        "event": "message_download",
+                        "account_uid": account_uid,
+                        "folder_name": folder_name,
+                        "message_uid": message_uid,
+                        "size_bytes": size_bytes,
+                    }
+                )
+            except Exception:
+                log.debug("helper event emit failed", exc_info=True)
+            return
+        self._notify_message_download(
+            account_uid, folder_name, message_uid, size_bytes
+        )
 
     def set_password_prompt(self, callback: PasswordPromptCallback | None) -> None:
         self._password_prompt = callback
@@ -8542,16 +8734,58 @@ class MailService:
             raise MessageNotAvailableError(message_uid, folder_name) from cause
         raise MessageNotAvailableError(message_uid, folder_name)
 
+    @staticmethod
+    def _message_size_hint(folder: Camel.Folder, message_uid: str) -> int | None:
+        """Server-reported size of *message_uid* from Camel's summary, if known."""
+        try:
+            info = folder_get_message_info(folder, message_uid)
+            size = info.get_size() if info is not None else None
+        except Exception:
+            return None
+        if isinstance(size, int) and size > 0:
+            return size
+        return None
+
     def _get_message_sync_with_timeout(
         self,
         folder: Camel.Folder,
         api_uid: str,
+        *,
+        account_uid: str = "",
+        message_uid: str | None = None,
+        folder_name: str | None = None,
+        size_bytes: int | None = None,
     ) -> Any:
-        cancellable = Gio.Cancellable()
-        timer = threading.Timer(
-            _MESSAGE_READ_TIMEOUT_SECONDS, cancellable.cancel
+        """``get_message_sync`` bounded by a limit that scales with the size.
+
+        Camel fetches a body in one piece and drops a fetch that is cancelled
+        part-way, so a fixed 30 s cap made a ~34 MB message impossible to
+        read: every attempt restarted from zero (#537). The limit is
+        ``fetch_timeout_seconds(size_bytes)``.
+
+        The read registers as the helper's ``read`` op: a newer read cancels
+        it (the UI discards that stale result), an automatic folder load does
+        not.
+        """
+        limit = fetch_timeout_seconds(
+            size_bytes, base_seconds=float(_MESSAGE_READ_TIMEOUT_SECONDS)
         )
+        cancellable = Gio.Cancellable()
+        timed_out = threading.Event()
+
+        def _expire() -> None:
+            timed_out.set()
+            cancellable.cancel()
+
+        timer = threading.Timer(limit, _expire)
+        timer.daemon = True
         timer.start()
+        self._register_helper_op_cancellable(cancellable, HELPER_OP_READ)
+        # Callers reach here only after the local-copy check missed, so this
+        # is a real server download; let the reader say so (#537).
+        self._emit_message_download(
+            account_uid, folder_name, message_uid, size_bytes
+        )
         try:
             return folder.get_message_sync(api_uid, cancellable)
         except GLib.Error as exc:
@@ -8559,12 +8793,31 @@ class MailService:
                 cached = self._try_message_cached(folder, api_uid)
                 if cached is not None:
                     return cached
-                raise TimeoutError(
-                    f"Timed out loading message {api_uid}"
+                uid = message_uid if message_uid is not None else api_uid
+                if timed_out.is_set():
+                    log.warning(
+                        "Message %s not delivered within %.0fs (size=%s)",
+                        api_uid,
+                        limit,
+                        format_size(size_bytes) or "unknown",
+                    )
+                    raise MessageNotAvailableError(
+                        uid,
+                        folder_name,
+                        reason=MessageUnavailableReason.READ_TIMEOUT,
+                        size_bytes=size_bytes,
+                    ) from exc
+                # Cancelled by a newer read that took over the helper.
+                raise MessageNotAvailableError(
+                    uid,
+                    folder_name,
+                    reason=MessageUnavailableReason.SUPERSEDED,
+                    size_bytes=size_bytes,
                 ) from exc
             raise
         finally:
             timer.cancel()
+            self._clear_helper_op_cancellable(cancellable)
 
     def _raise_uncached_sign_in(
         self,
@@ -8659,7 +8912,14 @@ class MailService:
         if cached is not None:
             return cached
         try:
-            mime = self._get_message_sync_with_timeout(folder, api_uid)
+            mime = self._get_message_sync_with_timeout(
+                folder,
+                api_uid,
+                account_uid=account_uid,
+                message_uid=message_uid,
+                folder_name=folder_name,
+                size_bytes=self._message_size_hint(folder, message_uid),
+            )
         except TimeoutError:
             # A slow body read is not a dead sign-in (#519).
             mime = self._try_message_cached(folder, api_uid)
@@ -11124,6 +11384,9 @@ class MailService:
                     account_uid,
                     [account_uid, folder_name, message_uid],
                     {"mark_seen": mark_seen},
+                    # The helper enforces the size-scaled read limit itself;
+                    # this is only a safety net above its longest limit (#537).
+                    timeout=MESSAGE_READ_MAX_SECONDS + 60.0,
                 )
             self.preempt_interactive_read(account_uid)
             return run_on_mail_thread(

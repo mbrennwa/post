@@ -1129,10 +1129,12 @@ class MessageReaderPane(Gtk.Box):
         if not self.get_clipboard().set_content(provider):
             self._image_error("Could not copy picture")
 
-    def show_loading(self) -> None:
+    def show_loading(self, note: str | None = None) -> None:
+        """Show the loading state; *note* (e.g. "Downloading 33.8 MB…") replaces
+        the default text for a transfer long enough to notice (#537)."""
         self._current_message = None
         self._current_body = {"plain": None, "html": None}
-        self._reader_subject.set_label("Loading message…")
+        self._reader_subject.set_label(note or "Loading message…")
         self._reader_subject.set_visible(True)
         self._set_reader_meta_status("")
         self._clear_attachments()

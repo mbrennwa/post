@@ -246,6 +246,10 @@ class ReaderWindow(Adw.ApplicationWindow):
         self._read_toggle_btn.set_sensitive(True)
         self._flag_toggle_btn.set_sensitive(True)
 
+    def _retry_load(self) -> None:
+        self._reader_pane.show_loading()
+        self._load_message()
+
     def _load_message(self) -> None:
         self._read_generation += 1
         read_id = self._read_generation
@@ -304,7 +308,16 @@ class ReaderWindow(Adw.ApplicationWindow):
             )
             self.set_title("Message unavailable")
             self._refresh_flag_toggle_buttons()
-            if not sign_in_required:
+            if error.reason == MessageUnavailableReason.READ_TIMEOUT:
+                # Slow server, not offline: offer a retry (#537).
+                toast = show_error_toast(self, error.user_message())
+                if toast is not None:
+                    toast.set_button_label("Retry")
+                    toast.connect("button-clicked", lambda _t: self._retry_load())
+            elif (
+                not sign_in_required
+                and error.reason != MessageUnavailableReason.SUPERSEDED
+            ):
                 show_error_toast(self, error.user_message())
             return False
 
@@ -321,6 +334,7 @@ class ReaderWindow(Adw.ApplicationWindow):
             user_message = format_message_read_error(
                 error,
                 cached=False,
+                network_available=Gio.NetworkMonitor.get_default().get_network_available(),
             )
             self._reader_pane.show_unavailable(
                 user_message,
