@@ -272,7 +272,13 @@ CANCEL_SCOPE_BACKGROUND = "background"
 # an error. The call that holds the lock keeps running (#494).
 _INTERACTIVE_HELPER_WAIT_SECONDS = 10.0
 # Helper RPCs that must preempt offline downsync and count as interactive (#482).
-_INTERACTIVE_HELPER_METHODS = frozenset({"read_message", "read_attachment_data"})
+_INTERACTIVE_HELPER_METHODS = frozenset(
+    {
+        "read_message",
+        "read_attachment_data",
+        "read_compose_attachment_payloads",
+    }
+)
 # Network reconnect set_online_sync per store (#400). Same order as GOA
 # EnsureCredentials so one dead OAuth account cannot pin a Camel worker / GTK.
 _NETWORK_RECONNECT_TIMEOUT_SECONDS = 15
@@ -813,6 +819,39 @@ def source_registry_new_sync(
     if registry is None:
         raise RuntimeError(failure_message)
     return registry
+
+
+def _compose_attachments_from_payloads(result: Any) -> list[ComposeAttachment]:
+    """Rebuild compose attachments from the helper's JSON records (#533)."""
+    if not isinstance(result, list):
+        raise CamelHelperError(
+            "read_compose_attachment_payloads: invalid helper result"
+        )
+    attachments: list[ComposeAttachment] = []
+    for item in result:
+        if not isinstance(item, dict):
+            raise CamelHelperError(
+                "read_compose_attachment_payloads: invalid helper result"
+            )
+        filename = item.get("filename")
+        mime_type = item.get("mime_type")
+        data = item.get("data")
+        if (
+            not isinstance(filename, str)
+            or not isinstance(mime_type, str)
+            or not isinstance(data, (bytes, bytearray))
+        ):
+            raise CamelHelperError(
+                "read_compose_attachment_payloads: invalid helper result"
+            )
+        attachments.append(
+            ComposeAttachment(
+                filename=filename,
+                mime_type=mime_type,
+                data=bytes(data),
+            )
+        )
+    return attachments
 
 
 @dataclass
@@ -11456,13 +11495,51 @@ class MailService:
         folder_name: str,
         message_uid: str,
     ) -> list[ComposeAttachment]:
-        """Load all attachment payloads for compose (e.g. forward) in one MIME fetch."""
+        """Load all attachment payloads for compose (e.g. forward) in one MIME fetch.
+
+        The folder lives in the account helper (#533). The helper returns plain
+        records; ComposeAttachment cannot cross the IPC pipe.
+        """
+        if camel_helpers_enabled():
+            result = self._camel_helper_call(
+                "read_compose_attachment_payloads",
+                account_uid,
+                [account_uid, folder_name, message_uid],
+                timeout=MESSAGE_READ_MAX_SECONDS + 60.0,
+            )
+            return _compose_attachments_from_payloads(result)
         return run_on_mail_thread(
             self._read_compose_attachments_unlocked,
             account_uid,
             folder_name,
             message_uid,
         )
+
+    def read_compose_attachment_payloads(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+    ) -> list[dict[str, Any]]:
+        """JSON-safe attachment bytes for the helper pipe (#533).
+
+        Called inside the helper, where helpers are off, so this runs the
+        unlocked read on the helper mail thread and does not call back out.
+        """
+        attachments = run_on_mail_thread(
+            self._read_compose_attachments_unlocked,
+            account_uid,
+            folder_name,
+            message_uid,
+        )
+        return [
+            {
+                "filename": item.filename,
+                "mime_type": item.mime_type,
+                "data": item.data,
+            }
+            for item in attachments
+        ]
 
     def toggle_message_seen(
         self, account_uid: str, folder_name: str, message_uid: str

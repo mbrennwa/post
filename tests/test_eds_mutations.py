@@ -7,7 +7,13 @@ import tempfile
 import unittest
 from unittest import mock
 
-from post.mail.eds import MailService, _FolderMessageIndex
+from post.mail.camel_helper import ALLOWED_METHODS
+from post.mail.eds import (
+    MailService,
+    _FolderMessageIndex,
+    _INTERACTIVE_HELPER_METHODS,
+)
+from post.mail.fetch_policy import MESSAGE_READ_MAX_SECONDS
 
 
 class DraftDispatchTests(unittest.TestCase):
@@ -99,22 +105,39 @@ class DraftDispatchTests(unittest.TestCase):
         service._append_draft_unlocked.assert_called_once()
         self.assertEqual((folder_name, uid), ("Drafts", "draft-1"))
 
-    @mock.patch("post.mail.eds.run_on_mail_thread")
-    def test_read_compose_attachments_uses_mail_thread(
-        self, run_on_mail_thread
+    @mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True)
+    def test_read_compose_attachments_uses_camel_helper(
+        self, _helpers_on
     ) -> None:
-        run_on_mail_thread.return_value = []
         service = MailService(registry=mock.Mock())
+        payload = [
+            {
+                "filename": "notes.txt",
+                "mime_type": "text/plain",
+                "data": b"hello",
+            }
+        ]
+        with mock.patch.object(
+            service,
+            "_camel_helper_call",
+            return_value=payload,
+        ) as helper_call:
+            result = service.read_compose_attachments("acct-1", "INBOX", "1")
 
-        result = service.read_compose_attachments("acct-1", "INBOX", "1")
-
-        run_on_mail_thread.assert_called_once_with(
-            service._read_compose_attachments_unlocked,
+        helper_call.assert_called_once_with(
+            "read_compose_attachment_payloads",
             "acct-1",
-            "INBOX",
-            "1",
+            ["acct-1", "INBOX", "1"],
+            timeout=MESSAGE_READ_MAX_SECONDS + 60.0,
         )
-        self.assertEqual(result, [])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].filename, "notes.txt")
+        self.assertEqual(result[0].mime_type, "text/plain")
+        self.assertEqual(result[0].data, b"hello")
+        self.assertIn("read_compose_attachment_payloads", ALLOWED_METHODS)
+        self.assertIn(
+            "read_compose_attachment_payloads", _INTERACTIVE_HELPER_METHODS
+        )
 
     def test_read_attachment_data_uses_camel_helper(self) -> None:
         service = MailService(registry=mock.Mock())
