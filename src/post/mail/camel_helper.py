@@ -41,6 +41,7 @@ ALLOWED_METHODS = frozenset(
         "get_folder_messages",
         "read_message",
         "read_attachment_data",
+        "read_compose_attachment_payloads",
         "save_draft",
         "delete_draft",
         "empty_folder",
