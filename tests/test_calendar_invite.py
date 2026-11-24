@@ -11,6 +11,7 @@ import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from xml.etree import ElementTree
 
 from post.mail.calendar_invite import (
     build_vevent_ics,
@@ -25,6 +26,7 @@ from post.mail.calendar_invite import (
     is_calendar_mime,
     is_join_url,
     looks_like_calendar_attachment,
+    markup_safe_notes,
     merge_invite_details,
     parse_ics_invite,
     strip_join_urls,
@@ -51,6 +53,37 @@ def fixed_timezone(tz_name: str):
         else:
             os.environ["TZ"] = old
         time.tzset()
+
+
+def _ics_description(ics: str) -> str:
+    """Return the unescaped DESCRIPTION text of a built VEVENT ('' if absent)."""
+    for line in ics.split("\r\n"):
+        if line.startswith("DESCRIPTION:"):
+            raw = line[len("DESCRIPTION:") :]
+            return (
+                raw.replace("\\n", "\n")
+                .replace("\\,", ",")
+                .replace("\\;", ";")
+                .replace("\\\\", "\\")
+            )
+    return ""
+
+
+def _ics_prop(ics: str, name: str) -> str | None:
+    """Return the raw value of the first *name* property line, or None."""
+    for line in ics.split("\r\n"):
+        if line.startswith(f"{name}:"):
+            return line[len(name) + 1 :]
+    return None
+
+
+def _notes_before_block(notes: str) -> str:
+    """Notes text before the first Teams delimiter line.
+
+    GNOME Calendar renders only this part as markup; the block after it is only
+    scanned for the Join URL.
+    """
+    return notes.split(_TEAMS_DELIMITER, 1)[0]
 
 
 _SAMPLE_ICS = """BEGIN:VCALENDAR
@@ -872,12 +905,13 @@ class BuildVeventTests(unittest.TestCase):
         self.assertIn("UID:test-uid-123", ics)
         self.assertIn("DTSTAMP:", ics)
         self.assertIn("SUMMARY:Sync", ics)
-        self.assertIn("LOCATION:https://zoom.us/j/1", ics)
         self.assertIn("URL:https://zoom.us/j/1", ics)
         self.assertIn("DTSTART:20260730T120000Z", ics)
-        self.assertNotIn("DESCRIPTION:", ics)
+        # Links never go into LOCATION (#534): Google Calendar strips them.
+        self.assertIsNone(_ics_prop(ics, "LOCATION"))
+        self.assertEqual(_ics_description(ics), "Link: https://zoom.us/j/1")
 
-    def test_teams_label_location_uses_meeting_url(self) -> None:
+    def test_teams_label_stays_location_and_link_goes_to_notes(self) -> None:
         with fixed_timezone("Europe/Zurich"):
             ics = build_vevent_ics(
                 {
@@ -890,17 +924,18 @@ class BuildVeventTests(unittest.TestCase):
                     "uid": "teams-uid-1",
                 }
             )
-        self.assertIn(
-            "LOCATION:https://teams.microsoft.com/l/meetup-join/abc", ics
-        )
+        # The organiser's own non-URL location text is kept as LOCATION.
+        self.assertEqual(_ics_prop(ics, "LOCATION"), "Microsoft Teams Meeting")
         self.assertIn("URL:https://teams.microsoft.com/l/meetup-join/abc", ics)
-        self.assertNotIn("LOCATION:Microsoft Teams Meeting", ics)
-        self.assertIn("Microsoft Teams Meeting", ics)
-        self.assertIn("Agenda item one", ics)
-        description = ics.split("DESCRIPTION:", 1)[-1] if "DESCRIPTION:" in ics else ""
-        self.assertNotIn("meetup-join", description)
+        self.assertEqual(
+            _ics_description(ics),
+            "Agenda item one\n"
+            f"{_TEAMS_DELIMITER}\n"
+            "Join: https://teams.microsoft.com/l/meetup-join/abc\n"
+            f"{_TEAMS_DELIMITER}",
+        )
 
-    def test_room_and_meeting_url_keeps_room_in_notes(self) -> None:
+    def test_room_and_meeting_url_puts_room_in_location(self) -> None:
         with fixed_timezone("Europe/Zurich"):
             ics = build_vevent_ics(
                 {
@@ -911,12 +946,33 @@ class BuildVeventTests(unittest.TestCase):
                     "uid": "hybrid-uid-1",
                 }
             )
-        self.assertIn("LOCATION:https://zoom.us/j/1", ics)
+        # #534: the room is the place; the link is in the notes (and URL).
+        self.assertEqual(_ics_prop(ics, "LOCATION"), "Conference Room B")
         self.assertIn("URL:https://zoom.us/j/1", ics)
-        self.assertIn("Conference Room B", ics)
-        description = ics.split("DESCRIPTION:", 1)[-1] if "DESCRIPTION:" in ics else ""
-        self.assertIn("Conference Room B", description)
-        self.assertNotIn("zoom.us", description)
+        self.assertEqual(_ics_description(ics), "Link: https://zoom.us/j/1")
+
+    def test_location_never_holds_a_join_url(self) -> None:
+        cases = [
+            {"meeting_url": "https://zoom.us/j/1"},
+            {"meeting_url": _TEAMS_MEET_URL, "location": "Microsoft Teams Meeting"},
+            {"meeting_url": _TEAMS_MEET_URL, "location": _TEAMS_MEET_URL},
+            {"meeting_url": "https://meet.google.com/abc-defg-hij"},
+            {"meeting_url": "https://zoom.us/j/1", "location": "https://zoom.us/j/1"},
+        ]
+        for extra in cases:
+            with self.subTest(extra=extra):
+                with fixed_timezone("Europe/Zurich"):
+                    ics = build_vevent_ics(
+                        {
+                            "title": "X",
+                            "start": "2026-08-07T10:00:00",
+                            "uid": "nj-1",
+                            **extra,
+                        }
+                    )
+                location = _ics_prop(ics, "LOCATION") or ""
+                self.assertNotIn("http", location)
+                self.assertIn(extra["meeting_url"], _ics_description(ics))
 
     def test_dual_teams_urls_write_single_meet_join(self) -> None:
         invite = parse_ics_invite(_TEAMS_DUAL_ICS)
@@ -924,20 +980,26 @@ class BuildVeventTests(unittest.TestCase):
         invite["uid"] = "dual-teams-1"
         with fixed_timezone("Europe/Zurich"):
             ics = build_vevent_ics(invite)
-        self.assertIn(f"LOCATION:{_TEAMS_MEET_URL}", ics)
+        self.assertEqual(_ics_prop(ics, "LOCATION"), "Microsoft Teams Meeting")
         self.assertIn(f"URL:{_TEAMS_MEET_URL}", ics)
-        self.assertNotIn("LOCATION:Microsoft Teams Meeting", ics)
-        description = ics.split("DESCRIPTION:", 1)[-1] if "DESCRIPTION:" in ics else ""
-        self.assertIn("Meeting ID: 390 576 036 169 085", description)
-        self.assertIn("Passcode: PassCode1", description)
-        self.assertIn("aka.ms/JoinTeamsMeeting", description)
-        self.assertIn("dialin.teams.cloud.microsoft", description)
-        self.assertIn("meetingOptions", description)
-        self.assertNotIn("/meet/", description)
+        description = _ics_description(ics)
+        # Exactly one join URL in the notes, inside one delimited block (#382).
+        self.assertEqual(description.count("teams.microsoft.com/meet/"), 1)
+        self.assertEqual(description.count(_TEAMS_DELIMITER), 2)
+        self.assertTrue(
+            description.endswith(
+                f"{_TEAMS_DELIMITER}\nJoin: {_TEAMS_MEET_URL}\n{_TEAMS_DELIMITER}"
+            )
+        )
+        before_block = _notes_before_block(description)
+        self.assertIn("Meeting ID: 390 576 036 169 085", before_block)
+        self.assertIn("Passcode: PassCode1", before_block)
+        self.assertIn("aka.ms/JoinTeamsMeeting", before_block)
+        self.assertIn("dialin.teams.cloud.microsoft", before_block)
+        self.assertIn("meetingOptions", before_block)
         self.assertNotIn("meetup-join", description)
-        self.assertNotIn(_TEAMS_DELIMITER, description)
-        self.assertNotIn("Join:", description)
         self.assertNotIn("System reference", description)
+        self.assertNotIn("<", description)
 
     def test_meetup_join_only_not_copied_into_notes(self) -> None:
         with fixed_timezone("Europe/Zurich"):
@@ -950,9 +1012,13 @@ class BuildVeventTests(unittest.TestCase):
                     "uid": "legacy-teams-1",
                 }
             )
-        self.assertIn(f"LOCATION:{_TEAMS_JOIN_URL}", ics)
-        description = ics.split("DESCRIPTION:", 1)[-1] if "DESCRIPTION:" in ics else ""
-        self.assertNotIn("meetup-join", description)
+        self.assertIsNone(_ics_prop(ics, "LOCATION"))
+        # The body's "System reference<url>" is stripped; the block carries the
+        # single join URL.
+        self.assertEqual(
+            _ics_description(ics),
+            f"{_TEAMS_DELIMITER}\nJoin: {_TEAMS_JOIN_URL}\n{_TEAMS_DELIMITER}",
+        )
 
     def test_room_only_location_without_meeting_url(self) -> None:
         with fixed_timezone("Europe/Zurich"):
@@ -966,6 +1032,140 @@ class BuildVeventTests(unittest.TestCase):
             )
         self.assertIn("LOCATION:Conference Room B", ics)
         self.assertNotIn("URL:", ics)
+        self.assertNotIn("DESCRIPTION:", ics)
+
+    def test_hybrid_teams_notes_are_valid_markup_with_room(self) -> None:
+        # #534: GNOME Calendar renders notes as markup; Teams "Need help?<url>"
+        # made them invalid, which blanked the notes.
+        invite = parse_ics_invite(_TEAMS_DUAL_ICS)
+        assert invite is not None
+        invite["location"] = "Conference Room B"
+        invite["uid"] = "hybrid-teams-1"
+        with fixed_timezone("Europe/Zurich"):
+            ics = build_vevent_ics(invite)
+        notes = _ics_description(ics)
+        before_block = _notes_before_block(notes)
+        self.assertEqual(_ics_prop(ics, "LOCATION"), "Conference Room B")
+        self.assertIn("Meeting ID: 390 576 036 169 085", before_block)
+        self.assertIn("Passcode: PassCode1", before_block)
+        self.assertIn("Need help? https://aka.ms/JoinTeamsMeeting", before_block)
+        self.assertIn("https://dialin.teams.cloud.microsoft/example", before_block)
+        self.assertNotIn("<", before_block)
+        self.assertNotIn(">", before_block)
+        self.assertEqual(notes.count("/meet/"), 1)
+        self.assertMarkupValid(before_block)
+        self.assertIn(f"URL:{_TEAMS_MEET_URL}", ics)
+
+    def test_ampersand_in_notes_and_room_is_escaped(self) -> None:
+        with fixed_timezone("Europe/Zurich"):
+            ics = build_vevent_ics(
+                {
+                    "title": "Hybrid",
+                    "start": "2026-08-07T10:00:00",
+                    "location": "R&D Room",
+                    "meeting_url": "https://zoom.us/j/1",
+                    "description": (
+                        "Options: https://example.com/opts?a=1&b=2 "
+                        "(Tom & Jerry)"
+                    ),
+                    "uid": "amp-uid-1",
+                }
+            )
+        notes = _ics_description(ics)
+        # The room is LOCATION, rendered as markup by GNOME Calendar too.
+        # (ICS text escaping turns the entity's ";" into "\;"; parsers undo it.)
+        self.assertIn("LOCATION:R&amp\\;D Room", ics)
+        self.assertIn("https://example.com/opts?a=1&amp;b=2", notes)
+        self.assertIn("Tom &amp; Jerry", notes)
+        self.assertMarkupValid(_notes_before_block(notes))
+
+    def test_link_url_with_ampersand_stays_raw_in_url_property(self) -> None:
+        url = "https://example.webex.com/meet/room?pwd=abc&mtid=123"
+        with fixed_timezone("Europe/Zurich"):
+            ics = build_vevent_ics(
+                {
+                    "title": "Webex",
+                    "start": "2026-08-07T10:00:00",
+                    "location": "Webex Meeting",
+                    "meeting_url": url,
+                    "description": f"Join: {url}\nAgenda & notes",
+                    "uid": "webex-amp-1",
+                }
+            )
+        self.assertIn(f"URL:{url}", ics)
+        self.assertEqual(_ics_prop(ics, "LOCATION"), "Webex Meeting")
+        notes = _ics_description(ics)
+        # The visible link text is escaped for the markup label, once.
+        self.assertEqual(notes.count("mtid"), 1)
+        self.assertIn(
+            "Link: https://example.webex.com/meet/room?pwd=abc&amp;mtid=123", notes
+        )
+        self.assertIn("Agenda &amp; notes", notes)
+        self.assertMarkupValid(_notes_before_block(notes))
+
+    def test_teams_block_url_is_not_markup_escaped(self) -> None:
+        # GNOME Calendar reads the Join URL from the raw notes text between the
+        # delimiter lines; "&amp;" there would break the Join button.
+        url = "https://teams.microsoft.com/meet/1?p=a&b=2"
+        with fixed_timezone("Europe/Zurich"):
+            ics = build_vevent_ics(
+                {
+                    "title": "Teams",
+                    "start": "2026-08-07T10:00:00",
+                    "meeting_url": url,
+                    "description": "Agenda & more",
+                    "uid": "teams-amp-1",
+                }
+            )
+        notes = _ics_description(ics)
+        self.assertTrue(
+            notes.endswith(f"{_TEAMS_DELIMITER}\nJoin: {url}\n{_TEAMS_DELIMITER}")
+        )
+        self.assertIn("Agenda &amp; more", notes)
+        self.assertIn(f"URL:{url}", ics)
+
+    def assertMarkupValid(self, notes: str) -> None:
+        # Pure-Python stand-in for Pango markup parsing (no GTK in tests).
+        try:
+            ElementTree.fromstring(f"<notes>{notes}</notes>")
+        except ElementTree.ParseError as exc:  # pragma: no cover - failure path
+            self.fail(f"notes are not valid markup: {exc}\n{notes!r}")
+
+
+class MarkupSafeNotesTests(unittest.TestCase):
+    def test_unwraps_angle_bracketed_urls(self) -> None:
+        self.assertEqual(
+            markup_safe_notes("Need help?<https://aka.ms/JoinTeamsMeeting> ok"),
+            "Need help? https://aka.ms/JoinTeamsMeeting ok",
+        )
+
+    def test_unwrapped_url_is_separated_from_preceding_label(self) -> None:
+        self.assertEqual(
+            markup_safe_notes("Meeting options<https://x.example/o?a=1>"),
+            "Meeting options https://x.example/o?a=1".replace("&", "&amp;"),
+        )
+        # Already separated, or at the start of the text/line: no extra space.
+        self.assertEqual(markup_safe_notes("<https://x.example/a>"), "https://x.example/a")
+        self.assertEqual(
+            markup_safe_notes("a\n<https://x.example/a>"), "a\nhttps://x.example/a"
+        )
+        self.assertEqual(
+            markup_safe_notes("Help <https://x.example/a>"), "Help https://x.example/a"
+        )
+
+    def test_unwraps_addresses_and_drops_stray_brackets(self) -> None:
+        self.assertEqual(
+            markup_safe_notes("Tom <tom@example.com>"), "Tom tom@example.com"
+        )
+        self.assertEqual(markup_safe_notes("a < b > c <"), "a  b  c ")
+
+    def test_escapes_ampersand(self) -> None:
+        self.assertEqual(markup_safe_notes("R&D & more"), "R&amp;D &amp; more")
+
+    def test_plain_text_unchanged_and_empty(self) -> None:
+        self.assertEqual(markup_safe_notes("Plain\ntext: 1, 2; 3"), "Plain\ntext: 1, 2; 3")
+        self.assertEqual(markup_safe_notes(""), "")
+        self.assertEqual(markup_safe_notes(None), "")
 
 
 class WritableCalendarFilterTests(unittest.TestCase):

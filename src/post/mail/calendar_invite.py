@@ -67,6 +67,15 @@ _STRIP_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# GNOME Calendar (gcal_util_extract_teams_section) makes a Join button from the
+# first "https://teams.microsoft.com" URL between two of these delimiter lines
+# in the event notes.
+_TEAMS_NOTES_DELIMITER = "_" * 80
+_GCAL_TEAMS_JOIN_PREFIX = "https://teams.microsoft.com"
+
+# "<token>" with no whitespace or nested brackets, e.g. "<https://…>", "<a@b.c>".
+_ANGLE_WRAPPED_RE = re.compile(r"<([^\s<>]+)>")
+
 # GNOME Calendar's gcal_utils_extract_teams_section looks for this line, then
 # treats the first https://teams.microsoft.com URL in the block as a Join link.
 _TEAMS_DELIMITER_LINE_RE = re.compile(
@@ -547,6 +556,31 @@ def strip_join_urls(text: str | None) -> str:
     return stripped.strip()
 
 
+def markup_safe_notes(text: str | None) -> str:
+    """Make event notes safe for GNOME Calendar's markup-rendered notes label.
+
+    GNOME Calendar passes DESCRIPTION to ``gtk_label_set_markup``
+    (``set_up_description_label`` in ``gcal-event-popover.c``). If the text is
+    not valid Pango markup, GTK leaves the label empty, so one stray ``<…>``
+    (Teams: ``Need help?<https://aka.ms/JoinTeamsMeeting>``) or bare ``&``
+    blanks all notes, including the room (#534).
+
+    Unwraps ``<token>`` to ``token``, drops any remaining ``<`` / ``>``, and
+    writes ``&`` as ``&amp;``. Only for DESCRIPTION: LOCATION and URL must stay
+    raw because the calendar launches the Join button from them verbatim.
+    """
+    if not text:
+        return ""
+    # "Need help?<url>" -> "Need help? url": keep the label and URL apart.
+    unwrapped = _ANGLE_WRAPPED_RE.sub(
+        lambda m: (" " if m.start() > 0 and not text[m.start() - 1].isspace() else "")
+        + m.group(1),
+        text,
+    )
+    unwrapped = unwrapped.replace("<", "").replace(">", "")
+    return unwrapped.replace("&", "&amp;")
+
+
 def find_meeting_url(text: str | None) -> str | None:
     """Return the first Teams/Zoom/Meet/Webex-style URL in *text*."""
     if not text:
@@ -970,31 +1004,51 @@ def build_vevent_ics(invite: dict[str, Any]) -> str:
     meeting_url = invite.get("meeting_url")
     location_text = str(location).strip() if location else ""
     meeting_url_text = str(meeting_url).strip() if meeting_url else ""
-    # Prefer the join URL in LOCATION so calendar apps show a Join button.
-    # Keep any non-URL place label for DESCRIPTION when it would otherwise be lost.
-    preserved_location = ""
+    # LOCATION is for places only: the invite's room (or its own non-URL label,
+    # e.g. "Microsoft Teams Meeting"). A join link never goes there: Google
+    # Calendar strips Teams/Zoom links from LOCATION, which left the field empty
+    # (#534). Links live in the description instead.
+    place = ""
+    if (
+        location_text
+        and not location_text.lower().startswith(("https://", "http://"))
+        and location_text.rstrip("/") != meeting_url_text.rstrip("/")
+    ):
+        place = location_text
     if meeting_url_text:
-        lines.append(f"LOCATION:{esc(meeting_url_text)}")
         lines.append(f"URL:{esc(meeting_url_text)}")
-        if (
-            location_text
-            and not location_text.lower().startswith(("https://", "http://"))
-            and location_text.rstrip("/") != meeting_url_text.rstrip("/")
-        ):
-            preserved_location = location_text
-    elif location_text:
-        lines.append(f"LOCATION:{esc(location_text)}")
-    # Join URLs belong only in LOCATION/URL (#259, #382). Never copy them into
-    # DESCRIPTION — calendar apps harvest both fields as Join links.
+    if place:
+        # GNOME Calendar renders LOCATION as markup too.
+        lines.append(f"LOCATION:{esc(markup_safe_notes(place))}")
+
     description = invite.get("description")
+    notes_parts: list[str] = []
+    notes_tail = ""
+    if meeting_url_text:
+        if meeting_url_text.lower().startswith(_GCAL_TEAMS_JOIN_PREFIX):
+            # GNOME Calendar builds its Join button from the first Teams URL
+            # between two delimiter lines in the notes. It reads the URL from
+            # the raw text, so this block is not markup-escaped (and GNOME
+            # Calendar does not render it as markup).
+            notes_tail = (
+                f"{_TEAMS_NOTES_DELIMITER}\n"
+                f"Join: {meeting_url_text}\n"
+                f"{_TEAMS_NOTES_DELIMITER}"
+            )
+        else:
+            notes_parts.append(f"Link: {meeting_url_text}")
+    # The invite body's own join URLs and delimiter lines are stripped (#382)
+    # so exactly one join URL ends up in the notes.
     desc_text = strip_join_urls(str(description) if description else "")
-    desc_parts: list[str] = []
-    if preserved_location and preserved_location not in desc_text:
-        desc_parts.append(preserved_location)
     if desc_text:
-        desc_parts.append(desc_text)
-    if desc_parts:
-        lines.append(f"DESCRIPTION:{esc(chr(10).join(desc_parts))}")
+        notes_parts.append(desc_text)
+    # GNOME Calendar renders notes as markup; invalid markup blanks them all
+    # (#534).
+    notes = markup_safe_notes("\n".join(notes_parts))
+    if notes_tail:
+        notes = f"{notes}\n{notes_tail}" if notes else notes_tail
+    if notes:
+        lines.append(f"DESCRIPTION:{esc(notes)}")
     organizer = invite.get("organizer")
     if organizer:
         lines.append(f"ORGANIZER:MAILTO:{esc(str(organizer))}")
