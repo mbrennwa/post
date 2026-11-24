@@ -20,7 +20,7 @@ Requires:       gtk4
 Requires:       libadwaita
 Requires:       glib2
 Requires:       webkitgtk6.0
-Requires:       evolution-data-server
+Requires:       evolution-data-server >= 3.62
 Requires:       libecal2.0
 Requires:       evolution-ews
 Requires:       librsvg2-tools
@@ -86,6 +86,10 @@ python3 -m venv --system-site-packages "$VENV"
   --find-links "$WHEELS" \
   --no-deps \
   post
+
+# Post needs Evolution Data Server 3.62 or newer (#535). The Requires line
+# already says so; this catches a forced install on an older system.
+"$VENV/bin/python" -m post.mail.camel_compat
 
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
   gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || true

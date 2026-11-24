@@ -25,8 +25,8 @@ Big-picture capabilities for the current tree (refresh on every release — see
 - Live folder sync; create / rename / delete folders; Empty Trash
 - Desktop mailto: handling
 - Unsubscribe from mailing lists
-- .DEB installer package (Debian 12+ and derived distros)
-- .RPM installer package (Fedora)
+- .DEB installer package (Debian and derived distros that ship Evolution Data Server 3.62 or newer)
+- .RPM installer package (Fedora releases that ship Evolution Data Server 3.62 or newer)
 
 **Not yet**
 
@@ -40,7 +40,17 @@ Big-picture capabilities for the current tree (refresh on every release — see
 
 ## Install
 
-On Debian 12+, Ubuntu 24.04+, or similar DEB-based distros:
+**Platform requirement:** Post needs **Evolution Data Server (EDS) 3.62 or
+newer**. EDS 3.62 removed the Camel search call that older Post versions used, and
+the old and new calls do not exist together in any release, so there is no fallback.
+Distros that ship an older EDS cannot install Post: this includes Debian stable
+(Debian 13 "trixie" ships EDS 3.56) and any Ubuntu or Fedora release whose EDS
+is older than 3.62. Debian testing/unstable (forky/sid) ships 3.62. Check
+`apt policy evolution-data-server` or `dnf info evolution-data-server` before
+installing. The installers and Post itself check the version and stop with a
+clear message on an older system.
+
+On a DEB-based distro with EDS 3.62 or newer (for example Debian testing):
 
 **From a release `.deb`** (see [GitHub Releases](https://github.com/mbrennwa/post/releases)):
 
@@ -49,7 +59,7 @@ sudo apt install ./dist/post_1.0.0a2_all.deb
 post
 ```
 
-On Fedora:
+On Fedora with EDS 3.62 or newer:
 
 **From a release `.rpm`** (see [GitHub Releases](https://github.com/mbrennwa/post/releases)):
 

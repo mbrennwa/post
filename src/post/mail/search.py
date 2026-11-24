@@ -19,6 +19,10 @@ SEARCH_MATCH_BATCH_SIZE = 25
 SearchProgressCallback = Callable[["SearchFilterProgress"], None]
 SearchMatchCallback = Callable[[list[dict]], None]
 SearchCompleteCallback = Callable[[tuple[list[dict], int, int, str]], None]
+# A search that could not run (not "no matches"): the UI must show an error (#535).
+SearchErrorCallback = Callable[[BaseException], None]
+# Some folders failed but others returned hits. Argument: user-facing summary.
+SearchPartialFailureCallback = Callable[[str], None]
 
 
 @dataclass(frozen=True)

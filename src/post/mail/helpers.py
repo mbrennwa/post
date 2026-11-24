@@ -22,7 +22,11 @@ _BLOCKQUOTE_RE = re.compile(r"<blockquote\b", re.IGNORECASE)
 
 
 class _CamelFolderInfoC(ctypes.Structure):
-    """C layout of CamelFolderInfo (PyGObject exposes child/next as raw pointers)."""
+    """C layout of CamelFolderInfo (PyGObject exposes child/next as raw pointers).
+
+    Checked against the typelib at startup and in tests by
+    ``camel_compat.folder_info_layout_problems`` (#535).
+    """
 
     pass
 

@@ -344,6 +344,198 @@ class SearchFolderMessagesTests(unittest.TestCase):
         self.assertEqual(source, "local")
 
 
+class SearchFailureReportingTests(unittest.TestCase):
+    """A search that cannot run is an error, never "No Matches" (#535)."""
+
+    def _query(self) -> MessageSearchQuery:
+        return MessageSearchQuery(terms=(SearchTerm(field="text", value="invoice"),))
+
+    def _start_folder_search(self, service, helper_call, **callbacks):
+        with (
+            mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True),
+            mock.patch.object(service, "cancel_account_heavy_folder_index"),
+            mock.patch.object(service, "_camel_helper_call", side_effect=helper_call),
+        ):
+            service.start_search_folder_messages(
+                "acct-1", "INBOX", self._query(), **callbacks
+            )
+
+    def test_every_helper_call_failing_reports_error_not_empty_result(self) -> None:
+        service = MailService(registry=mock.Mock())
+        errors: list[BaseException] = []
+        completed: list[tuple] = []
+        partial: list[str] = []
+        failure = RuntimeError("undefined symbol: camel_folder_search_sync")
+
+        def helper_call(method, account, args, kwargs):
+            raise failure
+
+        self._start_folder_search(
+            service,
+            helper_call,
+            on_complete=completed.append,
+            on_error=errors.append,
+            on_partial_failure=partial.append,
+        )
+
+        self.assertEqual(errors, [failure])
+        self.assertEqual(completed, [])
+        self.assertEqual(partial, [])
+
+    def test_header_hits_survive_a_failed_body_scan_and_are_flagged(self) -> None:
+        service = MailService(registry=mock.Mock())
+        errors: list[BaseException] = []
+        completed: list[tuple] = []
+        partial: list[str] = []
+
+        def helper_call(method, account, args, kwargs):
+            if kwargs["part"] == "header":
+                return ([{"uid": "9", "subject": "Invoice"}],)
+            raise RuntimeError("body scan timed out")
+
+        self._start_folder_search(
+            service,
+            helper_call,
+            on_complete=completed.append,
+            on_error=errors.append,
+            on_partial_failure=partial.append,
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0][0][0]["uid"], "9")
+        self.assertEqual(len(partial), 1)
+        self.assertIn("Search incomplete", partial[0])
+
+    def test_clean_search_with_no_hits_is_still_a_normal_empty_result(self) -> None:
+        service = MailService(registry=mock.Mock())
+        errors: list[BaseException] = []
+        completed: list[tuple] = []
+        partial: list[str] = []
+
+        self._start_folder_search(
+            service,
+            lambda method, account, args, kwargs: ([],),
+            on_complete=completed.append,
+            on_error=errors.append,
+            on_partial_failure=partial.append,
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(partial, [])
+        self.assertEqual(completed, [([], 0, 0, "local")])
+
+    def test_folder_list_failure_in_account_search_reports_error(self) -> None:
+        service = MailService(registry=mock.Mock())
+        errors: list[BaseException] = []
+        completed: list[tuple] = []
+        failure = RuntimeError("helper not responding")
+
+        with (
+            mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True),
+            mock.patch.object(service, "cancel_account_heavy_folder_index"),
+            mock.patch.object(service, "list_folders", side_effect=failure),
+            mock.patch.object(service, "_camel_helper_call") as helper_call,
+        ):
+            service.start_search_account_messages(
+                "acct-1",
+                self._query(),
+                on_complete=completed.append,
+                on_error=errors.append,
+            )
+
+        self.assertEqual(errors, [failure])
+        self.assertEqual(completed, [])
+        helper_call.assert_not_called()
+
+    def test_one_account_failing_keeps_the_others_hits(self) -> None:
+        service = MailService(registry=mock.Mock())
+        errors: list[BaseException] = []
+        completed: list[tuple] = []
+        partial: list[str] = []
+
+        def list_folders(account_uid):
+            if account_uid == "bad":
+                raise RuntimeError("helper not responding")
+            return [{"full_name": "INBOX", "display_name": "Inbox", "flags": 0}]
+
+        with (
+            mock.patch("post.mail.eds.camel_helpers_enabled", return_value=True),
+            mock.patch("post.mail.eds.folder_can_contain_messages", return_value=True),
+            mock.patch.object(service, "cancel_account_heavy_folder_index"),
+            mock.patch.object(service, "list_folders", side_effect=list_folders),
+            mock.patch.object(
+                service,
+                "list_accounts",
+                return_value=[mock.Mock(uid="bad"), mock.Mock(uid="good")],
+            ),
+            mock.patch.object(
+                service,
+                "get_account",
+                return_value=mock.Mock(display_label="Good"),
+            ),
+            mock.patch.object(
+                service,
+                "_camel_helper_call",
+                return_value=([{"uid": "5", "subject": "Invoice"}],),
+            ),
+        ):
+            service.start_search_all_messages(
+                self._query(),
+                on_complete=completed.append,
+                on_error=errors.append,
+                on_partial_failure=partial.append,
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(partial), 1)
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0][0][0]["uid"], "5")
+
+    def _run_in_process_folder_job(self, service, failure, **callbacks):
+        cancellable = Gio.Cancellable()
+        with (
+            mock.patch("post.mail.eds.is_mail_io_thread", return_value=True),
+            mock.patch.object(
+                service, "_begin_folder_search_unlocked", return_value=cancellable
+            ),
+            mock.patch.object(
+                service,
+                "get_account",
+                return_value=mock.Mock(display_label="Test Account"),
+            ),
+            mock.patch.object(
+                service, "_search_single_folder_index_unlocked", side_effect=failure
+            ),
+        ):
+            service._start_search_folder_jobs(
+                [("acct-1", "INBOX", "Inbox")], self._query(), **callbacks
+            )
+        return cancellable
+
+    def test_in_process_folder_search_failure_reports_error(self) -> None:
+        service = MailService(registry=mock.Mock())
+        errors: list[BaseException] = []
+        completed: list[tuple] = []
+        failure = RuntimeError("search failed")
+
+        self._run_in_process_folder_job(
+            service, failure, on_complete=completed.append, on_error=errors.append
+        )
+
+        self.assertEqual(errors, [failure])
+        self.assertEqual(completed, [])
+        self.assertIsNone(service._folder_search_cancellable)
+
+    def test_in_process_folder_search_failure_without_handler_is_raised(self) -> None:
+        service = MailService(registry=mock.Mock())
+
+        with self.assertRaises(RuntimeError):
+            self._run_in_process_folder_job(service, RuntimeError("search failed"))
+
+        self.assertIsNone(service._folder_search_cancellable)
+
+
 class SearchAllMessagesTests(unittest.TestCase):
     def test_merges_and_annotates_matches_from_multiple_folders(self) -> None:
         inbox_messages = [

@@ -10,6 +10,7 @@ import ctypes
 import ctypes.util
 import logging
 import re
+import threading
 from typing import Any
 
 
@@ -60,9 +61,22 @@ class _GError(ctypes.Structure):
 _glib_error_free: Any | None = None
 
 
+class CamelSearchError(RuntimeError):
+    """A Camel folder search could not run or failed.
+
+    Never mapped to "no matches": callers must show it as an error (#535).
+    """
+
+
 _libcamel_lib: ctypes.CDLL | None = None
+_libcamel_lock = threading.Lock()
+# Symbol groups already bound on ``_libcamel_lib``. Each group binds on first
+# use and independently, so one missing symbol breaks only its own feature
+# (#535). A failed bind is not cached; the next call raises again.
+_libcamel_bound: set[str] = set()
 # Bound ctypes symbol for listing folder UIDs (name differs across EDS versions).
 _libcamel_folder_uids: Any | None = None
+_glib_ptr_array_unref: Any | None = None
 
 
 def _bind_libcamel_folder_uids(lib: ctypes.CDLL) -> Any:
@@ -80,36 +94,66 @@ def _bind_libcamel_folder_uids(lib: ctypes.CDLL) -> Any:
     )
 
 
-def _get_libcamel() -> ctypes.CDLL:
-    global _libcamel_lib, _libcamel_folder_uids
-    if _libcamel_lib is None:
-        path = ctypes.util.find_library("camel-1.2")
-        if not path:
-            raise OSError("libcamel-1.2 not found")
-        lib = ctypes.CDLL(path)
-        _libcamel_folder_uids = _bind_libcamel_folder_uids(lib)
-        lib.camel_folder_get_message_info.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_char_p,
-        ]
-        lib.camel_folder_get_message_info.restype = ctypes.c_void_p
-        # camel_folder_search_by_expression(folder, expression, cancellable, error).
-        # A UID array is not an argument; passing the cancellable as GError**
-        # makes GLib reject the call and every search comes back empty.
-        lib.camel_folder_search_by_expression.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_char_p,
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.POINTER(_GError)),
-        ]
-        lib.camel_folder_search_by_expression.restype = ctypes.POINTER(_GPtrArray)
-        lib.camel_folder_search_free.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(_GPtrArray),
-        ]
-        lib.camel_folder_search_free.restype = None
-        _libcamel_lib = lib
-    return _libcamel_lib
+def _bind_libcamel_folder_uids_group(lib: ctypes.CDLL) -> None:
+    global _libcamel_folder_uids
+    _libcamel_folder_uids = _bind_libcamel_folder_uids(lib)
+
+
+def _bind_libcamel_message_info_group(lib: ctypes.CDLL) -> None:
+    lib.camel_folder_get_message_info.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+    ]
+    lib.camel_folder_get_message_info.restype = ctypes.c_void_p
+
+
+def _bind_libcamel_search_group(lib: ctypes.CDLL) -> None:
+    # gboolean camel_folder_search_sync (folder, expression,
+    #     GPtrArray **out_uids, cancellable, GError **error)  (EDS >= 3.62)
+    # The caller owns *out_uids (free with g_ptr_array_unref). The old
+    # camel_folder_search_by_expression / camel_folder_search_free pair is gone.
+    lib.camel_folder_search_sync.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.POINTER(_GPtrArray)),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.POINTER(_GError)),
+    ]
+    lib.camel_folder_search_sync.restype = ctypes.c_int
+
+
+_LIBCAMEL_GROUPS: dict[str, Any] = {
+    "folder_uids": _bind_libcamel_folder_uids_group,
+    "message_info": _bind_libcamel_message_info_group,
+    "search": _bind_libcamel_search_group,
+}
+
+
+def _get_libcamel(group: str | None = None) -> ctypes.CDLL:
+    """Return libcamel with ``group`` (see ``_LIBCAMEL_GROUPS``) bound.
+
+    With no group, only the library handle is returned. Groups bind lazily
+    and independently, so a symbol missing from this EDS version raises on
+    the feature that needs it and nowhere else.
+    """
+    global _libcamel_lib
+    with _libcamel_lock:
+        if _libcamel_lib is None:
+            path = ctypes.util.find_library("camel-1.2")
+            if not path:
+                raise OSError("libcamel-1.2 not found")
+            _libcamel_lib = ctypes.CDLL(path)
+        lib = _libcamel_lib
+        if group is not None and group not in _libcamel_bound:
+            binder = _LIBCAMEL_GROUPS[group]
+            try:
+                binder(lib)
+            except AttributeError as exc:
+                raise OSError(
+                    f"libcamel-1.2 lacks symbols for {group}: {exc}"
+                ) from exc
+            _libcamel_bound.add(group)
+    return lib
 
 
 def _gobject_pointer(value: Any) -> ctypes.c_void_p:
@@ -183,7 +227,7 @@ def _wrap_camel_message_info(ptr: int) -> Any:
 
 
 def _folder_get_message_info_via_ctypes(folder: Any, uid_bytes: bytes) -> Any:
-    ptr = _get_libcamel().camel_folder_get_message_info(
+    ptr = _get_libcamel("message_info").camel_folder_get_message_info(
         _gobject_pointer(folder), uid_bytes
     )
     if not ptr:
@@ -208,7 +252,7 @@ def _folder_list_uids_gi(folder: Any) -> Any:
 
 
 def _folder_uids_via_ctypes(folder: Any) -> list[str]:
-    _get_libcamel()
+    _get_libcamel("folder_uids")
     assert _libcamel_folder_uids is not None
     array = _libcamel_folder_uids(_gobject_pointer(folder))
     if not array:
@@ -337,33 +381,113 @@ def _g_error_free(error: ctypes.POINTER(_GError)) -> None:
     _glib_error_free(ctypes.cast(error, ctypes.c_void_p))
 
 
-def _folder_search_by_expression(
-    lib: Any,
-    folder_ptr: ctypes.c_void_p,
-    expression: str,
-    cancel_ptr: ctypes.c_void_p,
-) -> Any:
-    """Call ``camel_folder_search_by_expression`` with a real ``GError **``."""
+def _g_ptr_array_unref(array: Any) -> None:
+    global _glib_ptr_array_unref
+    if _glib_ptr_array_unref is None:
+        path = ctypes.util.find_library("glib-2.0")
+        if not path:
+            return
+        glib = ctypes.CDLL(path)
+        glib.g_ptr_array_unref.argtypes = [ctypes.c_void_p]
+        glib.g_ptr_array_unref.restype = None
+        _glib_ptr_array_unref = glib.g_ptr_array_unref
+    _glib_ptr_array_unref(ctypes.cast(array, ctypes.c_void_p))
+
+
+_SEARCH_SYNC_MISSING = (
+    "Camel.Folder.search_sync is not available. Post needs "
+    "evolution-data-server 3.62 or newer."
+)
+
+
+def _folder_search_sync_via_gi(
+    folder: Any, expression: str, cancellable: Any | None
+) -> list[str]:
+    """``camel_folder_search_sync`` through PyGObject.
+
+    Raises ``UnicodeDecodeError`` when a UID is not valid UTF-8; the caller
+    then retries through ``ctypes``, as ``folder_get_uids`` does.
+    """
+    import gi
+
+    gi.require_version("GLib", "2.0")
+    from gi.repository import GLib
+
+    if not callable(getattr(type(folder), "search_sync", None)):
+        raise CamelSearchError(_SEARCH_SYNC_MISSING)
+    try:
+        ok, out_uids = folder.search_sync(expression, cancellable)
+    except GLib.Error as exc:
+        if cancellable is not None and cancellable.is_cancelled():
+            return []
+        raise CamelSearchError(
+            f"Camel folder search failed: {exc.message}"
+        ) from exc
+    if not ok:
+        raise CamelSearchError("Camel folder search failed")
+    uids: list[str] = []
+    for value in out_uids or []:
+        uid = normalize_camel_uid(value)
+        if uid is not None:
+            uids.append(uid)
+    return uids
+
+
+def _folder_search_sync_via_ctypes(
+    folder: Any, expression: str, cancellable: Any | None
+) -> list[str]:
+    """``camel_folder_search_sync`` through ``ctypes`` (non-UTF-8 UIDs)."""
+    try:
+        lib = _get_libcamel("search")
+    except OSError as exc:
+        raise CamelSearchError(f"{_SEARCH_SYNC_MISSING} ({exc})") from exc
+    folder_ptr = _gobject_pointer(folder)
+    cancel_ptr = (
+        _gobject_pointer(cancellable)
+        if cancellable is not None
+        else ctypes.c_void_p()
+    )
+    out = ctypes.POINTER(_GPtrArray)()
     error = ctypes.POINTER(_GError)()
-    array = lib.camel_folder_search_by_expression(
+    ok = lib.camel_folder_search_sync(
         folder_ptr,
         expression.encode("utf-8"),
+        ctypes.byref(out),
         cancel_ptr,
         ctypes.byref(error),
     )
-    if error:
-        message = error.contents.message
-        text = (
-            message.decode("utf-8", "replace")
-            if message
-            else "camel folder search failed"
-        )
-        log.warning("Camel folder search failed: %s", text)
-        _g_error_free(error)
-        if array:
-            lib.camel_folder_search_free(folder_ptr, array)
-        return None
-    return array
+    try:
+        if error:
+            message = error.contents.message
+            text = (
+                message.decode("utf-8", "replace")
+                if message
+                else "camel folder search failed"
+            )
+            _g_error_free(error)
+            if cancellable is not None and cancellable.is_cancelled():
+                return []
+            raise CamelSearchError(f"Camel folder search failed: {text}")
+        if not ok:
+            raise CamelSearchError("Camel folder search failed")
+        return _read_ptr_array_uids(out)
+    finally:
+        if out:
+            _g_ptr_array_unref(out)
+
+
+def _folder_search_sync(
+    folder: Any, expression: str, cancellable: Any | None
+) -> list[str]:
+    """Run Camel folder search (EDS >= 3.62) and return UID strings.
+
+    Raises ``CamelSearchError`` on failure. An empty list means "no match",
+    never "search failed".
+    """
+    try:
+        return _folder_search_sync_via_gi(folder, expression, cancellable)
+    except UnicodeDecodeError:
+        return _folder_search_sync_via_ctypes(folder, expression, cancellable)
 
 
 def folder_search_uids(
@@ -375,35 +499,18 @@ def folder_search_uids(
 ) -> list[str]:
     """Run Camel folder search and return matching UID strings.
 
-    Uses libcamel directly because PyGObject's conversion of search results
-  corrupts Camel's pooled UID strings: the first search works, later searches
-    return empty and Camel logs camel_pstring_free warnings.
+    Uses ``camel_folder_search_sync`` (EDS >= 3.62), which hands the caller
+    an owned UID array; PyGObject converts it safely. Raises
+    ``CamelSearchError`` when the search fails (#535).
     """
     if not scope_uids:
         return []
     if cancellable is not None and cancellable.is_cancelled():
         return []
-    lib = _get_libcamel()
-    folder_ptr = _gobject_pointer(folder)
-    cancel_ptr = (
-        _gobject_pointer(cancellable)
-        if cancellable is not None
-        else ctypes.c_void_p()
-    )
-    array = _folder_search_by_expression(
-        lib, folder_ptr, expression, cancel_ptr
-    )
+    matches = _folder_search_sync(folder, expression, cancellable)
     if cancellable is not None and cancellable.is_cancelled():
-        if array:
-            lib.camel_folder_search_free(folder_ptr, array)
         return []
-    try:
-        matches = _read_ptr_array_uids(array)
-    finally:
-        if array:
-            lib.camel_folder_search_free(folder_ptr, array)
-    aligned = _align_uids_to_scope(matches, scope_uids)
-    return aligned
+    return _align_uids_to_scope(matches, scope_uids)
 
 
 def folder_search_all_uids(
@@ -416,29 +523,15 @@ def folder_search_all_uids(
 
     Used to discover IMAP UIDs that are not yet in the local summary so the
     heavy-folder indexer can fetch headers toward STATUS. Returns an empty
-    list when cancelled or when Camel yields nothing.
+    list when cancelled or when Camel yields nothing. Raises
+    ``CamelSearchError`` when the search fails (#535).
     """
     if cancellable is not None and cancellable.is_cancelled():
         return []
-    lib = _get_libcamel()
-    folder_ptr = _gobject_pointer(folder)
-    cancel_ptr = (
-        _gobject_pointer(cancellable)
-        if cancellable is not None
-        else ctypes.c_void_p()
-    )
-    array = _folder_search_by_expression(
-        lib, folder_ptr, expression, cancel_ptr
-    )
+    matches = _folder_search_sync(folder, expression, cancellable)
     if cancellable is not None and cancellable.is_cancelled():
-        if array:
-            lib.camel_folder_search_free(folder_ptr, array)
         return []
-    try:
-        return _read_ptr_array_uids(array)
-    finally:
-        if array:
-            lib.camel_folder_search_free(folder_ptr, array)
+    return matches
 
 
 def normalize_camel_uid(value: Any) -> str | None:

@@ -96,4 +96,8 @@ if [[ "${POST_INSTALL_DESKTOP:-}" == "1" ]]; then
   install_desktop_integration
 fi
 
+# Post needs Evolution Data Server 3.62 or newer (#535). Stop with a clear
+# message here instead of letting every search fail later.
+.venv/bin/python3 "$ROOT/src/post/mail/camel_compat.py"
+
 exec .venv/bin/post "$@"

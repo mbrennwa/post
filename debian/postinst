@@ -16,6 +16,10 @@ python3 -m venv --system-site-packages "$VENV"
   --no-deps \
   post
 
+# Post needs Evolution Data Server 3.62 or newer (#535). The Depends line
+# already says so; this catches a forced install on an older system.
+"$VENV/bin/python" -m post.mail.camel_compat
+
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
   gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || true
 fi

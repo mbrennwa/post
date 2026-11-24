@@ -250,6 +250,24 @@ def format_folder_load_error(
     return "Could not load folders for this account."
 
 
+SEARCH_FAILED_MESSAGE = "Search failed. The search could not be run."
+SEARCH_NEEDS_NEWER_EDS_MESSAGE = (
+    "Search failed. Post needs evolution-data-server 3.62 or newer."
+)
+
+
+def format_search_error(exc: BaseException) -> str:
+    """User-facing text for a search that could not run (never "No Matches")."""
+    lowered = _error_text(exc).lower()
+    if (
+        "evolution-data-server 3.62" in lowered
+        or "search_sync" in lowered
+        or "undefined symbol" in lowered
+    ):
+        return SEARCH_NEEDS_NEWER_EDS_MESSAGE
+    return SEARCH_FAILED_MESSAGE
+
+
 def format_sign_in_required_log(exc: BaseException) -> str:
     """Short log detail for expected auth failures (no AADSTS / GOA dumps)."""
     text = _error_text(exc)

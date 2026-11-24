@@ -19,6 +19,7 @@ from gi.repository import Adw, Gio, GLib, Gtk
 
 from post.icon_utils import APP_ICON_NAME, register_bundled_icons
 from post.mail import MailService
+from post.mail.camel_compat import MIN_EDS_TEXT, check_camel_compat, format_problems
 from post.window import MainWindow
 
 log = logging.getLogger("post.app")
@@ -93,6 +94,22 @@ def _ensure_main_window(application: Adw.Application) -> MainWindow | None:
         if isinstance(win, MainWindow):
             win.present()
             return win
+
+    # Post needs EDS >= 3.62. Say so once at start instead of letting each
+    # search fail later (#535).
+    problems = check_camel_compat()
+    if problems:
+        message = (
+            f"Post needs Evolution Data Server {MIN_EDS_TEXT} or newer, "
+            "and this system does not provide it:\n\n"
+            f"{format_problems(problems)}\n\n"
+            "Upgrade evolution-data-server (and gir1.2-camel-1.2 / "
+            "gir1.2-edataserver-1.2), then start Post again."
+        )
+        log.error("EDS compatibility check failed: %s", "; ".join(problems))
+        _show_startup_failure(application, message)
+        application.quit()
+        return None
 
     # Avoid overlapping EDS connects when activate + command-line race (#443).
     connecting = getattr(application, "_post_mail_connecting", False)

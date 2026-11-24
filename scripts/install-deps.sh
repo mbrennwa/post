@@ -48,5 +48,17 @@ if ! command -v apt-get >/dev/null; then
   exit 1
 fi
 
-sudo apt-get update
-sudo apt-get install -y "${apt_depends[@]}" "${extra[@]}"
+# CI containers run as root and have no sudo.
+SUDO=()
+if [[ $EUID -ne 0 ]]; then
+  SUDO=(sudo)
+fi
+
+"${SUDO[@]}" apt-get update
+"${SUDO[@]}" apt-get install -y "${apt_depends[@]}" "${extra[@]}"
+
+# apt-get above got package names only (version constraints are stripped), so
+# an older distro can still install a too-old Evolution Data Server. Post needs
+# 3.62 or newer (#535); stop here with a clear message instead of failing at the
+# first search.
+python3 src/post/mail/camel_compat.py
