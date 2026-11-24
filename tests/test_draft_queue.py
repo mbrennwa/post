@@ -504,7 +504,7 @@ class CorrespondentsCacheOnlyTests(unittest.TestCase):
             "INBOX",
             _FolderMessageIndex(
                 messages=[
-                    {"uid": "1", "from": "Alice <alice@gmail.com>", "sort_date": 10}
+                    {"uid": "1", "from": "Alice <alice@mail.example.com>", "sort_date": 10}
                 ],
                 unread=0,
                 total=1,
@@ -512,7 +512,7 @@ class CorrespondentsCacheOnlyTests(unittest.TestCase):
         )
         self.assertEqual(
             {item.email for item in service.get_correspondents_cached("acct-1")},
-            {"alice@gmail.com"},
+            {"alice@mail.example.com"},
         )
         service._store_folder_index(
             "acct-1",
@@ -521,8 +521,8 @@ class CorrespondentsCacheOnlyTests(unittest.TestCase):
                 messages=[
                     {
                         "uid": "2",
-                        "from": "Me <me@gmail.com>",
-                        "to": "Bob <bob@gmail.com>",
+                        "from": "Me <me@mail.example.com>",
+                        "to": "Bob <bob@mail.example.com>",
                         "sort_date": 20,
                     }
                 ],
@@ -534,9 +534,9 @@ class CorrespondentsCacheOnlyTests(unittest.TestCase):
             item.email: item for item in service.get_correspondents_cached("acct-1")
         }
         self.assertEqual(
-            set(by_email), {"alice@gmail.com", "me@gmail.com", "bob@gmail.com"}
+            set(by_email), {"alice@mail.example.com", "me@mail.example.com", "bob@mail.example.com"}
         )
-        self.assertEqual(by_email["bob@gmail.com"].sent_count, 1)
+        self.assertEqual(by_email["bob@mail.example.com"].sent_count, 1)
 
     def test_incremental_merge_after_bootstrap(self) -> None:
         from post.mail.eds import _FolderMessageIndex
