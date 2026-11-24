@@ -26,6 +26,11 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Trust the checkout
+        # The container user differs from the checkout owner; without this git
+        # (and so reuse lint) ignores the repository and its .gitignore.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install system dependencies
         run: ./scripts/install-deps.sh xvfb dbus-daemon file
 
