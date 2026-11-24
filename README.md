@@ -44,13 +44,14 @@ Big-picture capabilities for the current tree (refresh on every release — see
 newer**. EDS 3.62 removed the Camel search call that older Post versions used, and
 the old and new calls do not exist together in any release, so there is no fallback.
 Distros that ship an older EDS cannot install Post: this includes Debian stable
-(Debian 13 "trixie" ships EDS 3.56) and any Ubuntu or Fedora release whose EDS
-is older than 3.62. Debian testing/unstable (forky/sid) ships 3.62. Check
+(Debian 13 "trixie" ships EDS 3.56), Debian testing (also 3.56 when this was
+written) and any Ubuntu or Fedora release whose EDS is older than 3.62. Debian
+unstable (sid) ships 3.62. Check
 `apt policy evolution-data-server` or `dnf info evolution-data-server` before
 installing. The installers and Post itself check the version and stop with a
 clear message on an older system.
 
-On a DEB-based distro with EDS 3.62 or newer (for example Debian testing):
+On a DEB-based distro with EDS 3.62 or newer (for example Debian unstable):
 
 **From a release `.deb`** (see [GitHub Releases](https://github.com/mbrennwa/post/releases)):
 

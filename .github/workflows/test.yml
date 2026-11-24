@@ -9,12 +9,12 @@ on:
 
 jobs:
   test:
-    # Post needs Evolution Data Server 3.62 or newer (#535). ubuntu-latest
-    # ships an older one and cannot exercise the Camel calls Post makes, so the
-    # suite runs on Debian testing, which tracks current EDS.
+    # Post needs Evolution Data Server 3.62 or newer (#535). ubuntu-latest and
+    # Debian testing ship 3.56 and cannot exercise the Camel calls Post makes,
+    # so the suite runs on Debian unstable, which has 3.62.
     runs-on: ubuntu-latest
     container:
-      image: debian:testing
+      image: debian:unstable
     steps:
       - name: Install bootstrap packages
         run: |
