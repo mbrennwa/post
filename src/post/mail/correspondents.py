@@ -5,7 +5,10 @@
 
 from __future__ import annotations
 
+import math
 import re
+import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,12 +27,35 @@ _BARE_EMAIL = re.compile(r"^[^,;<>\s]+@[^,;<>\s]+$")
 _CORRESPONDENT_HEADERS = ("from", "to", "cc", "bcc")
 
 
+# Ranking weights (#544). Sent evidence (mail written to an address) counts for
+# much more than received evidence; counts are log-damped and received counts are
+# capped so one chatty sender cannot outrank an address that was written to.
+SENT_WEIGHT = 5.0
+RECEIVED_WEIGHT = 1.0
+RECEIVED_COUNT_CAP = 20
+RECENCY_HALF_LIFE_SECONDS = 180 * 24 * 3600
+RECENCY_FLOOR = 0.05
+
+
 @dataclass(frozen=True)
 class Correspondent:
+    """One address seen in mail headers.
+
+    ``sent_count`` counts messages in Sent folders addressed to the address.
+    ``received_count`` counts messages from the address in other folders.
+    Appearances that carry no ranking evidence (e.g. Cc recipients of received
+    mail, or the sender header of Sent mail) only update ``last_seen`` so the
+    address stays suggestible. ``last_seen`` is the newest appearance of any kind.
+    """
+
     display: str
     email: str
     name: str
     last_seen: int = 0
+    sent_count: int = 0
+    received_count: int = 0
+    last_sent: int = 0
+    last_received: int = 0
 
 
 def _name_from_display(display: str) -> str:
@@ -86,18 +112,33 @@ def folder_feeds_correspondents(folder_name: str | None) -> bool:
     return True
 
 
-def merge_correspondents(
-    existing: list[Correspondent],
-    incoming: list[Correspondent],
+def aggregate_correspondents(
+    groups: Iterable[Iterable[Correspondent]],
 ) -> list[Correspondent]:
-    """Dedupe by email, keeping the newest last_seen display string."""
+    """Combine per-folder contributions into one account-wide index.
+
+    Counts are summed and timestamps take the maximum. Display and name come from
+    the contribution with the newest ``last_seen`` (first one wins on ties).
+    The result is newest-first by ``last_seen``.
+    """
     by_email: dict[str, Correspondent] = {}
-    for item in existing:
-        by_email[item.email] = item
-    for item in incoming:
-        previous = by_email.get(item.email)
-        if previous is None or item.last_seen > previous.last_seen:
-            by_email[item.email] = item
+    for group in groups:
+        for item in group:
+            previous = by_email.get(item.email)
+            if previous is None:
+                by_email[item.email] = item
+                continue
+            newer = item if item.last_seen > previous.last_seen else previous
+            by_email[item.email] = Correspondent(
+                display=newer.display,
+                email=item.email,
+                name=newer.name,
+                last_seen=max(previous.last_seen, item.last_seen),
+                sent_count=previous.sent_count + item.sent_count,
+                received_count=previous.received_count + item.received_count,
+                last_sent=max(previous.last_sent, item.last_sent),
+                last_received=max(previous.last_received, item.last_received),
+            )
     return sorted(
         by_email.values(),
         key=lambda item: item.last_seen,
@@ -105,45 +146,110 @@ def merge_correspondents(
     )
 
 
+class _Accumulator:
+    __slots__ = (
+        "display",
+        "name",
+        "last_seen",
+        "sent_count",
+        "received_count",
+        "last_sent",
+        "last_received",
+    )
+
+    def __init__(self, display: str, name: str, last_seen: int) -> None:
+        self.display = display
+        self.name = name
+        self.last_seen = last_seen
+        self.sent_count = 0
+        self.received_count = 0
+        self.last_sent = 0
+        self.last_received = 0
+
+
+def _message_timestamp(message: dict[str, Any]) -> int:
+    value = message.get("sort_date") or 0
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def collect_correspondents(
     messages: list[dict[str, Any]],
     *,
     exclude_emails: set[str] | None = None,
+    is_sent_folder: bool = False,
 ) -> list[Correspondent]:
-    """Collect unique correspondents from message headers.
+    """Collect unique correspondents with usage counts from message headers.
+
+    Counts are recomputed from ``messages`` on every call, so collecting the
+    same folder twice yields the same result (callers replace a folder's
+    contribution instead of adding to it).
+
+    In a Sent folder, ``to``/``cc``/``bcc`` count as sent evidence and ``from``
+    (normally the user) is presence-only. In other folders ``from`` counts as
+    received evidence and ``to``/``cc``/``bcc`` are presence-only, so the user's
+    own address does not accumulate a count from every received message.
+    An address counts at most once per message and direction.
 
     Prefers the display string from the newest ``sort_date``. Same-timestamp
     duplicates keep the first-seen display.
     """
     excluded = {email.casefold() for email in (exclude_emails or set()) if email}
-    by_email: dict[str, Correspondent] = {}
+    # Mutable accumulators keep the hot harvest path cheap; the frozen
+    # Correspondent objects are built once at the end.
+    by_email: dict[str, _Accumulator] = {}
 
     for message in messages:
-        last_seen = message.get("sort_date") or 0
-        if not isinstance(last_seen, int):
-            try:
-                last_seen = int(last_seen)
-            except (TypeError, ValueError):
-                last_seen = 0
+        timestamp = _message_timestamp(message)
+        counted: set[str] = set()
         for header in _CORRESPONDENT_HEADERS:
             raw = message.get(header) or ""
             if not raw:
                 continue
+            counts_as_sent = is_sent_folder and header != "from"
+            counts_as_received = not is_sent_folder and header == "from"
             for display in _ADDRESS_SPLIT.split(raw):
-                correspondent = _correspondent_from_display(
-                    display, last_seen=last_seen
-                )
-                if correspondent is None:
+                email, name = _email_and_name_from_display(display)
+                if not email or "@" not in email or email in excluded:
                     continue
-                if correspondent.email in excluded:
+                acc = by_email.get(email)
+                if acc is None:
+                    acc = by_email[email] = _Accumulator(
+                        display.strip(), name, timestamp
+                    )
+                elif timestamp > acc.last_seen:
+                    acc.display = display.strip()
+                    acc.name = name
+                    acc.last_seen = timestamp
+                if email in counted:
                     continue
-                previous = by_email.get(correspondent.email)
-                if previous is not None and correspondent.last_seen <= previous.last_seen:
-                    continue
-                by_email[correspondent.email] = correspondent
+                if counts_as_sent:
+                    acc.sent_count += 1
+                    acc.last_sent = max(acc.last_sent, timestamp)
+                    counted.add(email)
+                elif counts_as_received:
+                    acc.received_count += 1
+                    acc.last_received = max(acc.last_received, timestamp)
+                    counted.add(email)
 
     return sorted(
-        by_email.values(),
+        (
+            Correspondent(
+                display=acc.display,
+                email=email,
+                name=acc.name,
+                last_seen=acc.last_seen,
+                sent_count=acc.sent_count,
+                received_count=acc.received_count,
+                last_sent=acc.last_sent,
+                last_received=acc.last_received,
+            )
+            for email, acc in by_email.items()
+        ),
         key=lambda item: item.last_seen,
         reverse=True,
     )
@@ -191,31 +297,69 @@ def correspondent_matches_prefix(correspondent: Correspondent, prefix: str) -> b
     return _matches_prefix(correspondent.display, prefix)
 
 
+def _recency_factor(timestamp: int, now: float) -> float:
+    """Half-life decay in [RECENCY_FLOOR, 1]; future or missing dates are clamped."""
+    if timestamp <= 0:
+        return RECENCY_FLOOR
+    age = max(0.0, now - timestamp)
+    return max(RECENCY_FLOOR, 0.5 ** (age / RECENCY_HALF_LIFE_SECONDS))
+
+
+def correspondent_score(correspondent: Correspondent, now: float) -> float:
+    """Recency-weighted frequency score; sent mail outweighs received mail."""
+    sent = SENT_WEIGHT * math.log1p(correspondent.sent_count) * _recency_factor(
+        correspondent.last_sent, now
+    )
+    received = (
+        RECEIVED_WEIGHT
+        * math.log1p(min(correspondent.received_count, RECEIVED_COUNT_CAP))
+        * _recency_factor(correspondent.last_received, now)
+    )
+    return sent + received
+
+
 def match_correspondents(
     candidates: list[Correspondent],
     prefix: str,
     *,
     limit: int = 10,
+    now: float | None = None,
 ) -> list[Correspondent]:
-    """Return prefix matches on name, email, or display string."""
+    """Return prefix matches on name, email, or display string.
+
+    Matches are ranked by :func:`correspondent_score` (frequency weighted by
+    recency, sent over received). The match type (name, then email, then
+    display) only breaks ties, followed by recency of any appearance (#544).
+    """
     prefix = prefix.strip()
     if not prefix:
         return []
+    if now is None:
+        now = time.time()
 
-    name_matches: list[Correspondent] = []
-    email_matches: list[Correspondent] = []
-    display_matches: list[Correspondent] = []
+    ranked: list[tuple[float, int, float, str, Correspondent]] = []
 
     for candidate in candidates:
         if candidate.name and _matches_prefix(candidate.name, prefix):
-            name_matches.append(candidate)
+            tier = 0
         elif _matches_email_prefix(candidate.email, prefix):
-            email_matches.append(candidate)
+            tier = 1
         elif _matches_prefix(candidate.display, prefix):
-            display_matches.append(candidate)
+            tier = 2
+        else:
+            continue
+        ranked.append(
+            (
+                -correspondent_score(candidate, now),
+                tier,
+                -min(float(candidate.last_seen), now),
+                candidate.email,
+                candidate,
+            )
+        )
 
-    ranked = name_matches + email_matches + display_matches
-    return ranked[:limit]
+    ranked.sort(key=lambda entry: entry[:4])
+    return [entry[4] for entry in ranked[:limit]]
 
 
 def apply_address_completion(full_text: str, selected_display: str) -> str:

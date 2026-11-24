@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,11 +34,79 @@ class CorrespondentCacheTests(unittest.TestCase):
                 email="alice@example.com",
                 name="Alice",
                 last_seen=42,
+                sent_count=3,
+                received_count=5,
+                last_sent=40,
+                last_received=42,
             )
         ]
         correspondent_cache.save("acct-1", items)
         loaded = correspondent_cache.load("acct-1")
         self.assertEqual(loaded, items)
+
+    def test_folder_contributions_round_trip(self) -> None:
+        item = Correspondent(
+            display="Alice <alice@example.com>",
+            email="alice@example.com",
+            name="Alice",
+            last_seen=9,
+            sent_count=1,
+            last_sent=9,
+        )
+        folders = {"Sent": [item], "INBOX": []}
+        correspondent_cache.save("acct-1", [item], folders=folders)
+        self.assertEqual(correspondent_cache.load_folders("acct-1"), folders)
+
+    def test_load_folders_none_without_folders(self) -> None:
+        correspondent_cache.save(
+            "acct-1",
+            [Correspondent(display="a@example.com", email="a@example.com", name="")],
+        )
+        self.assertIsNone(correspondent_cache.load_folders("acct-1"))
+
+    def _write_v1(self) -> None:
+        path = correspondent_cache._cache_path("acct-1")
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "correspondents": [
+                        {
+                            "display": "Alice <alice@example.com>",
+                            "email": "alice@example.com",
+                            "name": "Alice",
+                            "last_seen": 1,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_v1_cache_is_still_readable(self) -> None:
+        self._write_v1()
+        loaded = correspondent_cache.load("acct-1")
+        self.assertEqual([item.email for item in loaded], ["alice@example.com"])
+        self.assertEqual(loaded[0].sent_count, 0)
+        self.assertEqual(loaded[0].received_count, 0)
+
+    def test_v1_cache_becomes_legacy_folder(self) -> None:
+        self._write_v1()
+        folders = correspondent_cache.load_folders("acct-1")
+        self.assertEqual(
+            list(folders), [correspondent_cache.LEGACY_FOLDER_KEY]
+        )
+        self.assertEqual(folders[correspondent_cache.LEGACY_FOLDER_KEY][0].last_seen, 1)
+
+    def test_unknown_cache_version_is_discarded(self) -> None:
+        path = correspondent_cache._cache_path("acct-1")
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({"version": 99, "correspondents": []}), encoding="utf-8"
+        )
+        self.assertIsNone(correspondent_cache.load("acct-1"))
+        self.assertIsNone(correspondent_cache.load_folders("acct-1"))
 
     def test_does_not_save_empty(self) -> None:
         correspondent_cache.save("acct-1", [])

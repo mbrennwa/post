@@ -492,6 +492,52 @@ class CorrespondentsCacheOnlyTests(unittest.TestCase):
         self.assertEqual({item.email for item in result}, {"alice@example.com"})
         self.assertIn("acct-1", service._correspondent_indexes)
 
+    def test_first_folder_store_bootstraps_without_prior_get(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = self._service()
+        # No get_correspondents() call, no disk cache: the composer may have
+        # been opened before this account's folders were indexed.
+        self.assertEqual(service.get_correspondents_cached("acct-1"), [])
+        service._store_folder_index(
+            "acct-1",
+            "INBOX",
+            _FolderMessageIndex(
+                messages=[
+                    {"uid": "1", "from": "Alice <alice@gmail.com>", "sort_date": 10}
+                ],
+                unread=0,
+                total=1,
+            ),
+        )
+        self.assertEqual(
+            {item.email for item in service.get_correspondents_cached("acct-1")},
+            {"alice@gmail.com"},
+        )
+        service._store_folder_index(
+            "acct-1",
+            "[Gmail]/Sent Mail",
+            _FolderMessageIndex(
+                messages=[
+                    {
+                        "uid": "2",
+                        "from": "Me <me@gmail.com>",
+                        "to": "Bob <bob@gmail.com>",
+                        "sort_date": 20,
+                    }
+                ],
+                unread=0,
+                total=1,
+            ),
+        )
+        by_email = {
+            item.email: item for item in service.get_correspondents_cached("acct-1")
+        }
+        self.assertEqual(
+            set(by_email), {"alice@gmail.com", "me@gmail.com", "bob@gmail.com"}
+        )
+        self.assertEqual(by_email["bob@gmail.com"].sent_count, 1)
+
     def test_incremental_merge_after_bootstrap(self) -> None:
         from post.mail.eds import _FolderMessageIndex
 
@@ -533,6 +579,189 @@ class CorrespondentsCacheOnlyTests(unittest.TestCase):
         self.assertEqual(
             {item.email for item in cached},
             {"alice@example.com", "bob@example.com"},
+        )
+
+    def test_restoring_same_folder_does_not_inflate_counts(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = self._service()
+        service._folder_tree_cache = {
+            "acct-1": [{"full_name": "Sent", "display_name": "Sent", "flags": 5120}]
+        }
+        sent_messages = [
+            {
+                "uid": "1",
+                "from": "Me <me@example.com>",
+                "to": "Alice <alice@example.com>",
+                "sort_date": 10,
+            },
+            {
+                "uid": "2",
+                "from": "Me <me@example.com>",
+                "to": "Alice <alice@example.com>",
+                "sort_date": 20,
+            },
+        ]
+        inbox_messages = [
+            {"uid": "5", "from": "Alice <alice@example.com>", "sort_date": 30}
+        ]
+        service._store_folder_index(
+            "acct-1",
+            "INBOX",
+            _FolderMessageIndex(messages=inbox_messages, unread=0, total=1),
+        )
+        service._get_correspondents_unlocked("acct-1")
+        for _ in range(3):
+            service._store_folder_index(
+                "acct-1",
+                "Sent",
+                _FolderMessageIndex(messages=list(sent_messages), unread=0, total=2),
+            )
+            service._store_folder_index(
+                "acct-1",
+                "INBOX",
+                _FolderMessageIndex(messages=list(inbox_messages), unread=0, total=1),
+            )
+
+        by_email = {
+            item.email: item for item in service.get_correspondents_cached("acct-1")
+        }
+        self.assertEqual(by_email["alice@example.com"].sent_count, 2)
+        self.assertEqual(by_email["alice@example.com"].received_count, 1)
+        self.assertEqual(by_email["alice@example.com"].last_sent, 20)
+        # Own address stays suggestible but earns no count from From of Sent mail.
+        self.assertEqual(by_email["me@example.com"].sent_count, 0)
+
+    def test_folder_contribution_is_replaced_not_added(self) -> None:
+        from post.mail.eds import _FolderMessageIndex
+
+        service = self._service()
+        service._store_folder_index(
+            "acct-1",
+            "INBOX",
+            _FolderMessageIndex(
+                messages=[
+                    {"uid": "1", "from": "Alice <alice@example.com>", "sort_date": 1},
+                    {"uid": "2", "from": "Alice <alice@example.com>", "sort_date": 2},
+                ],
+                unread=0,
+                total=2,
+            ),
+        )
+        service._get_correspondents_unlocked("acct-1")
+        service._store_folder_index(
+            "acct-1",
+            "INBOX",
+            _FolderMessageIndex(
+                messages=[
+                    {"uid": "2", "from": "Alice <alice@example.com>", "sort_date": 2},
+                ],
+                unread=0,
+                total=1,
+            ),
+        )
+        cached = service.get_correspondents_cached("acct-1")
+        self.assertEqual(cached[0].received_count, 1)
+
+    def test_folder_contributions_survive_restart(self) -> None:
+        from post.mail import correspondent_cache
+        from post.mail.eds import _FolderMessageIndex
+
+        service = self._service()
+        service._store_folder_index(
+            "acct-1",
+            "INBOX",
+            _FolderMessageIndex(
+                messages=[
+                    {"uid": "1", "from": "Alice <alice@example.com>", "sort_date": 1}
+                ],
+                unread=0,
+                total=1,
+            ),
+        )
+        service._get_correspondents_unlocked("acct-1")
+        self.assertIn("INBOX", correspondent_cache.load_folders("acct-1") or {})
+
+        restarted = self._service()
+        restarted._get_correspondents_unlocked("acct-1")
+        restarted._store_folder_index(
+            "acct-1",
+            "Archive",
+            _FolderMessageIndex(
+                messages=[
+                    {"uid": "2", "from": "Alice <alice@example.com>", "sort_date": 2}
+                ],
+                unread=0,
+                total=1,
+            ),
+        )
+        merged = restarted.get_correspondents_cached("acct-1")
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].received_count, 2)
+
+    def test_v1_disk_cache_keeps_history_and_gains_counts(self) -> None:
+        import json
+
+        from post.mail import correspondent_cache
+        from post.mail.eds import _FolderMessageIndex
+
+        path = correspondent_cache._cache_path("acct-1")
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "correspondents": [
+                        {
+                            "display": "Old <old@example.com>",
+                            "email": "old@example.com",
+                            "name": "Old",
+                            "last_seen": 5,
+                        },
+                        {
+                            "display": "Alice <alice@example.com>",
+                            "email": "alice@example.com",
+                            "name": "Alice",
+                            "last_seen": 6,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        service = self._service()
+        first = service._get_correspondents_unlocked("acct-1")
+        self.assertEqual(
+            {item.email for item in first}, {"old@example.com", "alice@example.com"}
+        )
+
+        for _ in range(2):
+            service._store_folder_index(
+                "acct-1",
+                "INBOX",
+                _FolderMessageIndex(
+                    messages=[
+                        {
+                            "uid": "1",
+                            "from": "Alice <alice@example.com>",
+                            "sort_date": 50,
+                        }
+                    ],
+                    unread=0,
+                    total=1,
+                ),
+            )
+        by_email = {
+            item.email: item for item in service.get_correspondents_cached("acct-1")
+        }
+        self.assertEqual(set(by_email), {"old@example.com", "alice@example.com"})
+        self.assertEqual(by_email["alice@example.com"].received_count, 1)
+
+        # Persisted as v2 and still loadable after a restart.
+        restarted = self._service()
+        again = restarted._get_correspondents_unlocked("acct-1")
+        self.assertEqual(
+            {item.email for item in again}, {"old@example.com", "alice@example.com"}
         )
 
     def test_more_than_five_hundred_unique_addresses(self) -> None:
