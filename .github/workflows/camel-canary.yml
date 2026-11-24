@@ -1,0 +1,55 @@
+name: Camel canary
+
+# EDS 3.62 removed a Camel call Post depended on and search silently broke
+# (#535). This job runs the real-library contract tests and the unit suite
+# every week on a rolling distro (Debian unstable), so the next Camel or EDS
+# change fails here before it reaches users.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:unstable
+    steps:
+      - name: Install bootstrap packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git python3
+
+      - uses: actions/checkout@v4
+
+      - name: Trust the checkout
+        # The container user differs from the checkout owner; without this git
+        # (and so reuse lint) ignores the repository and its .gitignore.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install system dependencies
+        run: ./scripts/install-deps.sh xvfb dbus-daemon file
+
+      - name: Show Evolution Data Server version
+        run: dpkg-query -W evolution-data-server libcamel-1.2-68 gir1.2-camel-1.2 || dpkg-query -W 'libcamel*' evolution-data-server
+
+      - name: Contract tests (real Camel library)
+        env:
+          GTK_A11Y: none
+        run: |
+          python3 -m venv .venv --system-site-packages
+          .venv/bin/pip install -q -e ".[dev]"
+          .venv/bin/python -m unittest discover -s tests -p "test_camel_contract.py" -v
+
+      - name: Unit suite
+        env:
+          # See test.yml: the WebKitGTK sandbox needs user namespaces.
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
+          GTK_A11Y: none
+          SKIP_PIP_INSTALL: "1"
+          USER: runner
+        run: xvfb-run -a dbus-run-session -- ./scripts/check.sh

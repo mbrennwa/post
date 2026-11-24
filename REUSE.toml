@@ -56,6 +56,7 @@ path = [
     "scripts/redact-issue-privacy.local.json.example",
     "run.sh",
     ".github/workflows/test.yml",
+    ".github/workflows/camel-canary.yml",
     ".github/workflows/release-deb.yml",
     ".github/workflows/pages.yml",
     ".github/workflows/cleanup-pass.yml",

@@ -116,6 +116,7 @@ from post.mail.network_errors import (
     format_attachment_error,
     format_folder_load_error,
     format_message_read_error,
+    format_search_error,
     is_network_unavailable_error,
     is_sign_in_required_error,
     log_mail_error,
@@ -5931,11 +5932,19 @@ class MainWindow(Adw.ApplicationWindow):
                 None,
             )
 
+        def on_error(error: BaseException) -> None:
+            GLib.idle_add(self._on_search_failed, load_id, error)
+
+        def on_partial_failure(message: str) -> None:
+            GLib.idle_add(self._on_search_partial_failure, load_id, message)
+
         self._stop_heavy_index_for_search(account_uid, folder_name, scope)
         kwargs = {
             "on_progress": on_progress,
             "on_matches": on_matches,
             "on_complete": on_complete,
+            "on_error": on_error,
+            "on_partial_failure": on_partial_failure,
         }
         if scope.kind == SEARCH_SCOPE_ALL:
             self._mail.start_search_all_messages(query, **kwargs)
@@ -6521,6 +6530,37 @@ class MainWindow(Adw.ApplicationWindow):
             return False
         if account is not None and folder is not None:
             self._update_message_status(account, folder)
+        return False
+
+    def _on_search_failed(self, load_id: int, error: BaseException) -> bool:
+        """A search could not run. Show an error, never "No Matches" (#535)."""
+        if load_id != self._messages_load_generation:
+            search_trace(
+                "search_failed_drop",
+                load_id=load_id,
+                generation=self._messages_load_generation,
+                reason="stale_load_id",
+            )
+            self._stop_superseded_message_loading(load_id)
+            return False
+        if self._search_query is None:
+            return False
+        log.warning("Search failed: %s", error)
+        self._message_loading_spinner.stop()
+        self._reset_search_progress_ui()
+        text = format_search_error(error)
+        self._message_error_label.set_label(text)
+        self._message_stack.set_visible_child_name("error")
+        self._set_status(text)
+        show_error_toast(self, "Search failed")
+        self._release_offline_sync_for_folder_work(load_id)
+        return False
+
+    def _on_search_partial_failure(self, load_id: int, message: str) -> bool:
+        """Some folders could not be searched; the hits found are still shown."""
+        if load_id != self._messages_load_generation:
+            return False
+        show_error_toast(self, message)
         return False
 
     def _stop_superseded_message_loading(self, load_id: int) -> bool:

@@ -231,8 +231,10 @@ from .offline_sync import (
 from .search import (
     MessageSearchQuery,
     SearchCompleteCallback,
+    SearchErrorCallback,
     SearchFilterProgress,
     SearchMatchCallback,
+    SearchPartialFailureCallback,
     SearchProgressCallback,
     SEARCH_MATCH_BATCH_SIZE,
     SearchTerm,
@@ -7226,8 +7228,13 @@ class MailService:
         on_progress: SearchProgressCallback | None = None,
         on_matches: SearchMatchCallback | None = None,
         on_complete: SearchCompleteCallback | None = None,
+        on_error: SearchErrorCallback | None = None,
     ) -> None:
-        """Search one folder per mail-I/O task so interactive reads can interleave."""
+        """Search one folder per mail-I/O task so interactive reads can interleave.
+
+        A folder search that fails ends the search with ``on_error``; it is
+        never reported as an empty result (#535).
+        """
         cancellable = self._begin_folder_search_unlocked()
         matched: list[dict] = []
         folders_total = len(folder_jobs)
@@ -7305,20 +7312,36 @@ class MailService:
                 matched.extend(annotated)
                 on_matches(annotated)
 
-            _filtered, _unread, _source = self._search_single_folder_index_unlocked(
-                account_uid,
-                folder_name,
-                query,
-                cancellable=cancellable,
-                on_progress=lambda progress, al=account_label, fl=folder_label, fd=folders_done, mbf=matched_before_folder: report_folder_progress(
-                    progress,
-                    account_label=al,
-                    folder_label=fl,
-                    folders_done=fd,
-                    matched_before_folder=mbf,
-                ),
-                on_matches=folder_on_matches,
-            )
+            try:
+                _filtered, _unread, _source = (
+                    self._search_single_folder_index_unlocked(
+                        account_uid,
+                        folder_name,
+                        query,
+                        cancellable=cancellable,
+                        on_progress=lambda progress, al=account_label, fl=folder_label, fd=folders_done, mbf=matched_before_folder: report_folder_progress(
+                            progress,
+                            account_label=al,
+                            folder_label=fl,
+                            folders_done=fd,
+                            matched_before_folder=mbf,
+                        ),
+                        on_matches=folder_on_matches,
+                    )
+                )
+            except Exception as exc:
+                log.warning(
+                    "Search failed for %s/%s: %s", account_uid, folder_name, exc
+                )
+                log.debug("Search failure detail", exc_info=True)
+                try:
+                    if on_error is None:
+                        raise
+                    if not cancellable.is_cancelled():
+                        on_error(exc)
+                finally:
+                    self._end_folder_search_unlocked(cancellable)
+                return
             if cancellable.is_cancelled():
                 finish(cancelled=True)
                 return
@@ -7338,19 +7361,28 @@ class MailService:
         ]
 
     def _helper_search_folder_jobs(
-        self, account_uids: list[str]
+        self,
+        account_uids: list[str],
+        failures: list[Exception] | None = None,
     ) -> list[tuple[str, str, str]]:
-        """Folders to search, from the helper folder list. No folder-index."""
+        """Folders to search, from the helper folder list. No folder-index.
+
+        A folder list that fails is appended to ``failures`` so the search
+        reports it instead of finishing with nothing to search (#535).
+        """
         jobs: list[tuple[str, str, str]] = []
         for account_uid in account_uids:
             try:
                 folders = self.list_folders(account_uid)
-            except Exception:
-                log.debug(
-                    "Could not list folders for search on %s",
+            except Exception as exc:
+                log.warning(
+                    "Could not list folders for search on %s: %s",
                     account_uid,
-                    exc_info=True,
+                    exc,
                 )
+                log.debug("Folder list failure detail", exc_info=True)
+                if failures is not None:
+                    failures.append(exc)
                 continue
             searchable = [
                 folder
@@ -7393,11 +7425,20 @@ class MailService:
         on_progress: SearchProgressCallback | None = None,
         on_matches: SearchMatchCallback | None = None,
         on_complete: SearchCompleteCallback | None = None,
+        on_error: SearchErrorCallback | None = None,
+        on_partial_failure: SearchPartialFailureCallback | None = None,
     ) -> None:
-        """Run Camel folder search in each account helper and stream hits."""
+        """Run Camel folder search in each account helper and stream hits.
+
+        A helper call that fails is never read as "no matches" (#535). If
+        every call failed, ``on_error`` gets the first failure and
+        ``on_complete`` is not called. If only some failed, their hits are
+        kept, ``on_partial_failure`` is told, and ``on_complete`` runs.
+        """
         terms = self._search_terms_payload(query)
 
         def run() -> None:
+            failures: list[Exception] = []
             # Header fetch holds this account's helper. Search has to take
             # the lock, including when the folder being searched is the one
             # still fetching headers.
@@ -7416,7 +7457,7 @@ class MailService:
             if folder_name is not None and len(account_uids) == 1:
                 jobs = [(account_uids[0], folder_name, folder_name)]
             else:
-                jobs = self._helper_search_folder_jobs(account_uids)
+                jobs = self._helper_search_folder_jobs(account_uids, failures)
                 if folder_name is not None:
                     jobs = [job for job in jobs if job[1] == folder_name]
                     if not jobs and account_uids:
@@ -7428,6 +7469,7 @@ class MailService:
                 parts.append("body")
             matched: list[dict] = []
             seen: set[tuple[str, str, str]] = set()
+            calls_ok = 0
             folders_total = len(jobs)
             for index, (job_account, job_folder, folder_label) in enumerate(
                 jobs, start=1
@@ -7440,15 +7482,18 @@ class MailService:
                             [job_account, job_folder],
                             {"terms": terms, "sync": False, "part": part},
                         )
-                    except Exception:
-                        log.debug(
-                            "Helper search failed for %s/%s part=%s",
+                    except Exception as exc:
+                        log.warning(
+                            "Helper search failed for %s/%s part=%s: %s",
                             job_account,
                             job_folder,
                             part,
-                            exc_info=True,
+                            exc,
                         )
+                        log.debug("Helper search failure detail", exc_info=True)
+                        failures.append(exc)
                         continue
+                    calls_ok += 1
                     messages: list[dict] = []
                     if isinstance(result, (list, tuple)) and result:
                         raw_messages = result[0]
@@ -7492,6 +7537,17 @@ class MailService:
                             folders_total=folders_total,
                         )
                     )
+            if failures and calls_ok == 0:
+                # Nothing could be searched. Report the failure; an empty
+                # result list would read as "No Matches".
+                if on_error is not None:
+                    on_error(failures[0])
+                return
+            if failures and on_partial_failure is not None:
+                on_partial_failure(
+                    f"Search incomplete: {len(failures)} search "
+                    f"{'step' if len(failures) == 1 else 'steps'} failed."
+                )
             if on_complete is not None:
                 ordered = sort_messages_newest_first(matched)
                 on_complete((ordered, 0, len(ordered), "local"))
@@ -7512,6 +7568,8 @@ class MailService:
         on_progress: SearchProgressCallback | None = None,
         on_matches: SearchMatchCallback | None = None,
         on_complete: SearchCompleteCallback | None = None,
+        on_error: SearchErrorCallback | None = None,
+        on_partial_failure: SearchPartialFailureCallback | None = None,
     ) -> None:
         if camel_helpers_enabled():
             self._start_helper_search(
@@ -7520,6 +7578,8 @@ class MailService:
                 on_progress=on_progress,
                 on_matches=on_matches,
                 on_complete=on_complete,
+                on_error=on_error,
+                on_partial_failure=on_partial_failure,
             )
             return
         if is_mail_io_thread():
@@ -7530,6 +7590,7 @@ class MailService:
                 on_progress=on_progress,
                 on_matches=on_matches,
                 on_complete=on_complete,
+                on_error=on_error,
             )
             return
         get_mail_io_thread().submit_front(
@@ -7538,6 +7599,8 @@ class MailService:
             on_progress=on_progress,
             on_matches=on_matches,
             on_complete=on_complete,
+            on_error=on_error,
+            on_partial_failure=on_partial_failure,
         )
 
     def start_search_account_messages(
@@ -7548,6 +7611,8 @@ class MailService:
         on_progress: SearchProgressCallback | None = None,
         on_matches: SearchMatchCallback | None = None,
         on_complete: SearchCompleteCallback | None = None,
+        on_error: SearchErrorCallback | None = None,
+        on_partial_failure: SearchPartialFailureCallback | None = None,
     ) -> None:
         if camel_helpers_enabled():
             self._start_helper_search(
@@ -7556,6 +7621,8 @@ class MailService:
                 on_progress=on_progress,
                 on_matches=on_matches,
                 on_complete=on_complete,
+                on_error=on_error,
+                on_partial_failure=on_partial_failure,
             )
             return
         if is_mail_io_thread():
@@ -7566,6 +7633,7 @@ class MailService:
                 on_progress=on_progress,
                 on_matches=on_matches,
                 on_complete=on_complete,
+                on_error=on_error,
             )
             return
         get_mail_io_thread().submit_front(
@@ -7575,6 +7643,8 @@ class MailService:
             on_progress=on_progress,
             on_matches=on_matches,
             on_complete=on_complete,
+            on_error=on_error,
+            on_partial_failure=on_partial_failure,
         )
 
     def start_search_folder_messages(
@@ -7586,6 +7656,8 @@ class MailService:
         on_progress: SearchProgressCallback | None = None,
         on_matches: SearchMatchCallback | None = None,
         on_complete: SearchCompleteCallback | None = None,
+        on_error: SearchErrorCallback | None = None,
+        on_partial_failure: SearchPartialFailureCallback | None = None,
     ) -> None:
         if camel_helpers_enabled():
             self._start_helper_search(
@@ -7595,6 +7667,8 @@ class MailService:
                 on_progress=on_progress,
                 on_matches=on_matches,
                 on_complete=on_complete,
+                on_error=on_error,
+                on_partial_failure=on_partial_failure,
             )
             return
         if is_mail_io_thread():
@@ -7609,6 +7683,7 @@ class MailService:
                 on_progress=on_progress,
                 on_matches=on_matches,
                 on_complete=on_complete,
+                on_error=on_error,
             )
             return
         get_mail_io_thread().submit_front(
@@ -7619,6 +7694,8 @@ class MailService:
             on_progress=on_progress,
             on_matches=on_matches,
             on_complete=on_complete,
+            on_error=on_error,
+            on_partial_failure=on_partial_failure,
         )
 
     def _search_all_messages_unlocked(
@@ -9364,14 +9441,17 @@ class MailService:
                 folder,
                 "(match-all #t)",
             )
-        except Exception:
+        except Exception as exc:
+            # Background indexing has no result list to put an error in, so
+            # this is a warning (it was a debug line that hid #535).
             session["did_server_uid_search"] = True
-            log.debug(
-                "Heavy-folder IMAP SEARCH failed for %s/%s",
+            log.warning(
+                "Heavy-folder UID search failed for %s/%s: %s",
                 account_uid,
                 folder_name,
-                exc_info=True,
+                exc,
             )
+            log.debug("Heavy-folder UID search failure detail", exc_info=True)
             return []
         found_n = len([uid for uid in found if uid])
         # Lock in server size from SEARCH when STATUS was wiped (#441).
