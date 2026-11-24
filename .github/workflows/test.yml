@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
-        run: ./scripts/install-deps.sh xvfb dbus-daemon
+        run: ./scripts/install-deps.sh xvfb dbus-daemon file
 
       - name: Run checks
         env:

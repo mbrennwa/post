@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
-        run: ./scripts/install-deps.sh xvfb dbus-daemon
+        run: ./scripts/install-deps.sh xvfb dbus-daemon file
 
       - name: Show Evolution Data Server version
         run: dpkg-query -W evolution-data-server libcamel-1.2-68 gir1.2-camel-1.2 || dpkg-query -W 'libcamel*' evolution-data-server
