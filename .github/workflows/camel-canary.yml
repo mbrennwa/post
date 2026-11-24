@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
-        run: ./scripts/install-deps.sh xvfb
+        run: ./scripts/install-deps.sh xvfb dbus-daemon
 
       - name: Show Evolution Data Server version
         run: dpkg-query -W evolution-data-server libcamel-1.2-68 gir1.2-camel-1.2 || dpkg-query -W 'libcamel*' evolution-data-server
@@ -46,4 +46,5 @@ jobs:
           WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
           GTK_A11Y: none
           SKIP_PIP_INSTALL: "1"
-        run: xvfb-run -a ./scripts/check.sh
+          USER: runner
+        run: xvfb-run -a dbus-run-session -- ./scripts/check.sh
