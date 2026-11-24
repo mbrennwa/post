@@ -180,9 +180,9 @@ from .compose import (
 )
 from .correspondents import (
     Correspondent,
+    aggregate_correspondents,
     collect_correspondents,
     folder_feeds_correspondents,
-    merge_correspondents,
 )
 from .folders import (
     find_folder_by_type,
@@ -191,6 +191,7 @@ from .folders import (
     folder_name_from_uri,
     guess_inbox_name,
     is_post_outbox_folder,
+    is_sent_folder_name,
     is_virtual_folder,
     validate_folder_display_name,
 )
@@ -871,6 +872,11 @@ class MailService:
     # Set when Graph RestId recovery fetches a live sibling UID (#294).
     _recovered_read_uid: str | None = field(default=None, init=False, repr=False)
     _correspondent_indexes: dict[str, list[Correspondent]] = field(
+        default_factory=dict, init=False
+    )
+    # Per-folder correspondent contributions backing ``_correspondent_indexes``
+    # (#544). Only trusted while the account has an in-memory index.
+    _correspondent_folder_stats: dict[str, dict[str, list[Correspondent]]] = field(
         default_factory=dict, init=False
     )
     _folder_tree_cache: dict[str, list[dict]] = field(default_factory=dict, init=False)
@@ -5644,11 +5650,19 @@ class MailService:
                 return list(cached)
         loaded = correspondent_cache.load(account_uid)
         if loaded:
-            self._remember_correspondents(account_uid, loaded, persist=False)
+            self._remember_correspondents(
+                account_uid,
+                loaded,
+                persist=False,
+                folders=correspondent_cache.load_folders(account_uid),
+            )
             return list(loaded)
-        correspondents = self._build_correspondents_index_unlocked(account_uid)
+        folders = self._build_correspondent_folders_unlocked(account_uid)
+        correspondents = aggregate_correspondents(folders.values())
         if correspondents:
-            self._remember_correspondents(account_uid, correspondents, persist=True)
+            self._remember_correspondents(
+                account_uid, correspondents, persist=True, folders=folders
+            )
         return correspondents
 
     def _store_folder_index(
@@ -5676,13 +5690,37 @@ class MailService:
         correspondents: list[Correspondent],
         *,
         persist: bool,
+        folders: dict[str, list[Correspondent]] | None = None,
     ) -> None:
         if not correspondents:
             return
         with self._lock:
             self._correspondent_indexes[account_uid] = correspondents
+            if folders is not None:
+                self._correspondent_folder_stats[account_uid] = folders
+            else:
+                self._correspondent_folder_stats.pop(account_uid, None)
         if persist:
-            correspondent_cache.save(account_uid, correspondents)
+            correspondent_cache.save(account_uid, correspondents, folders=folders)
+
+    def _correspondent_folders_if_bootstrapped(
+        self, account_uid: str
+    ) -> dict[str, list[Correspondent]] | None:
+        """Per-folder contributions of an already-built index, else None."""
+        with self._lock:
+            indexed = account_uid in self._correspondent_indexes
+            folders = self._correspondent_folder_stats.get(account_uid)
+        if indexed and folders is not None:
+            return dict(folders)
+        # Not bootstrapped in memory (or invalidated): fall back to the disk cache.
+        return correspondent_cache.load_folders(account_uid)
+
+    def _is_sent_folder_for_correspondents(
+        self, account_uid: str, folder_name: str
+    ) -> bool:
+        with self._lock:
+            tree = list(self._folder_tree_cache.get(account_uid) or [])
+        return is_sent_folder_name(tree, folder_name)
 
     def _merge_correspondents_from_folder(
         self,
@@ -5690,21 +5728,34 @@ class MailService:
         folder_name: str,
         messages: list[dict],
     ) -> None:
+        """Replace one folder's correspondent contribution and re-aggregate.
+
+        ``messages`` must be the folder's full message list: counts are
+        recomputed from it and replace the previous contribution, so repeated
+        stores of the same folder never inflate counts (#544).
+        """
         if not folder_feeds_correspondents(folder_name) or not messages:
             return
-        incoming = collect_correspondents(messages)
-        if not incoming:
-            return
-        with self._lock:
-            existing = self._correspondent_indexes.get(account_uid)
-        if existing is None:
-            existing = correspondent_cache.load(account_uid)
-        if existing is None:
-            # Not bootstrapped yet — next get_correspondents() harvests all
-            # folder indexes. Do not persist a single-folder partial.
-            return
-        merged = merge_correspondents(existing, incoming)
-        self._remember_correspondents(account_uid, merged, persist=True)
+        folders = self._correspondent_folders_if_bootstrapped(account_uid)
+        if folders is None:
+            # First folder seen for this account (no memory index, no disk
+            # cache): start the index from this folder. Other folders join as
+            # they are stored. Contributions are per folder, so a partial index
+            # is exact for the folders it covers and never needs a full
+            # re-harvest. Waiting for get_correspondents() instead left
+            # accounts whose folders were indexed after the composer opened
+            # without any suggestions.
+            folders = {}
+        folders[folder_name] = collect_correspondents(
+            messages,
+            is_sent_folder=self._is_sent_folder_for_correspondents(
+                account_uid, folder_name
+            ),
+        )
+        merged = aggregate_correspondents(folders.values())
+        self._remember_correspondents(
+            account_uid, merged, persist=True, folders=folders
+        )
 
     def _correspondent_folder_names_unlocked(self, account_uid: str) -> list[str]:
         """Folder names that may feed autocomplete (cached tree / indexes only)."""
@@ -5733,20 +5784,32 @@ class MailService:
             return []
         return list(cached[0])
 
+    def _build_correspondent_folders_unlocked(
+        self, account_uid: str
+    ) -> dict[str, list[Correspondent]]:
+        """Per-folder contributions from in-memory / disk folder indexes only."""
+        folders: dict[str, list[Correspondent]] = {}
+        for folder_name in self._correspondent_folder_names_unlocked(account_uid):
+            messages = self._messages_for_correspondent_folder(
+                account_uid, folder_name
+            )
+            if not messages:
+                continue
+            folders[folder_name] = collect_correspondents(
+                messages,
+                is_sent_folder=self._is_sent_folder_for_correspondents(
+                    account_uid, folder_name
+                ),
+            )
+        return folders
+
     def _build_correspondents_index_unlocked(
         self, account_uid: str
     ) -> list[Correspondent]:
         """Build autocomplete from in-memory / disk folder indexes only (#156, #240, #313)."""
-        loaded = correspondent_cache.load(account_uid)
-        messages: list[dict] = []
-        for folder_name in self._correspondent_folder_names_unlocked(account_uid):
-            messages.extend(
-                self._messages_for_correspondent_folder(account_uid, folder_name)
-            )
-        harvested = collect_correspondents(messages)
-        if loaded is None:
-            return harvested
-        return merge_correspondents(loaded, harvested)
+        return aggregate_correspondents(
+            self._build_correspondent_folders_unlocked(account_uid).values()
+        )
 
     def list_folders(
         self,
@@ -14775,8 +14838,10 @@ class MailService:
                 index.total += len(prepend)
             else:
                 index.total = len(index.messages)
+            # Full list, not just ``prepend``: the merge replaces the folder's
+            # contribution so counts stay idempotent (#544).
             self._merge_correspondents_from_folder(
-                account_uid, dest_name, prepend
+                account_uid, dest_name, index.messages
             )
 
         folder_index_cache.save(
