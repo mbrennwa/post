@@ -251,7 +251,7 @@ class CorrespondentSoak(unittest.TestCase):
         # Old, long-quiet contacts remain reachable.
         self.assertTrue(self._order(service, "acct-gmail", "friend"))
 
-    def test_v1_cache_migration_keeps_every_address_through_cycles(self) -> None:
+    def test_v1_cache_is_ignored_and_replaced_by_rebuilt_index(self) -> None:
         legacy = [
             {
                 "display": f"Legacy {i} <legacy{i}@old.example>",
@@ -268,26 +268,19 @@ class CorrespondentSoak(unittest.TestCase):
         )
 
         service = self._service("acct-gmail")
-        first = service._get_correspondents_unlocked("acct-gmail")
-        self.assertEqual(len(first), 600)
-        for cycle in range(60):
-            if cycle % 15 == 14:
-                service = self._service("acct-gmail")
-                service._get_correspondents_unlocked("acct-gmail")
+        self.assertEqual(service._get_correspondents_unlocked("acct-gmail"), [])
+        for _ in range(3):
             self._store(service, "acct-gmail", "INBOX", _inbox())
             self._store(service, "acct-gmail", "[Gmail]/Sent Mail", _sent())
         by_email = self._by_email(service, "acct-gmail")
-        self.assertTrue(
-            all(f"legacy{i}@old.example" in by_email for i in range(600))
-        )
-        self.assertEqual(by_email["legacy5@old.example"].sent_count, 0)
-        self.assertEqual(by_email["legacy5@old.example"].received_count, 0)
+        self.assertFalse(any(email.endswith("@old.example") for email in by_email))
         self.assertEqual(by_email["nina@work.example"].sent_count, 25)
         self.assertEqual(by_email["nina@work.example"].received_count, 60)
-        # Persisted file is v2 and keeps the legacy block.
         saved = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(saved["version"], 2)
-        self.assertIn(correspondent_cache.LEGACY_FOLDER_KEY, saved["folders"])
+        self.assertEqual(
+            set(saved["folders"]), {"INBOX", "[Gmail]/Sent Mail"}
+        )
 
     def test_large_folder_restores_stay_cheap(self) -> None:
         big = [

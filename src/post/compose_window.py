@@ -510,6 +510,9 @@ _FORWARD_ATTACHMENTS_INCOMPLETE = (
 )
 _COMPLETION_MATCH_LIMIT = 20
 _COMPLETION_DEBOUNCE_MS = 500
+# Stand-in for "no correspondent load started yet". None cannot serve: it is a
+# real stamp meaning "the cache file does not exist".
+_CORRESPONDENTS_NOT_LOADED = object()
 
 
 @dataclass
@@ -655,6 +658,8 @@ class ComposeWindow(Adw.Window):
 
         self._correspondents: list[Correspondent] = []
         self._correspondents_generation = 0
+        # Cache-file stamp seen when the last load started (#547).
+        self._correspondents_stamp: object = _CORRESPONDENTS_NOT_LOADED
         self._completion_timeout_ids: dict[int, int] = {}
         self._address_completions: dict[int, _AddressCompletionUi] = {}
         self._applying_completion = False
@@ -1340,10 +1345,27 @@ class ComposeWindow(Adw.Window):
     def _run_completion(self, entry: Gtk.Entry) -> None:
         if not entry.get_mapped() or not self._address_entry_is_focused(entry):
             return
-        peeked = self._mail.get_correspondents_cached(self._selected_account().uid)
+        uid = self._selected_account().uid
+        peeked = self._mail.get_correspondents_cached(uid)
         if peeked:
             self._correspondents = peeked
+        self._reload_correspondents_if_cache_changed(uid)
         self._sync_completion_model(entry)
+
+    def _reload_correspondents_if_cache_changed(self, account_uid: str) -> None:
+        """Reload in the background when the helper has updated the cache (#547).
+
+        The helper keeps writing the correspondent cache after the composer
+        opened: it may only appear now (first run, new account) or have gained
+        entries. A ``stat`` tells whether anything changed since the last load,
+        so an unchanged or still-missing file never triggers a reload (and a
+        reload that finds nothing cannot retrigger itself).
+        """
+        if (
+            self._mail.correspondents_stamp(account_uid)
+            != self._correspondents_stamp
+        ):
+            self._load_correspondents()
 
     def _sync_completion_model(self, entry: Gtk.Entry) -> None:
         ui = self._address_completions.get(id(entry))
@@ -1497,6 +1519,9 @@ class ComposeWindow(Adw.Window):
         account = self._selected_account()
         generation = self._correspondents_generation + 1
         self._correspondents_generation = generation
+        # Taken before the load starts: a write landing during the load then
+        # shows up as a changed stamp and triggers another reload.
+        self._correspondents_stamp = self._mail.correspondents_stamp(account.uid)
 
         def worker() -> None:
             try:
@@ -1507,12 +1532,19 @@ class ComposeWindow(Adw.Window):
                     account.uid,
                     exc_info=True,
                 )
+                GLib.idle_add(self._on_correspondents_load_failed, generation)
                 return
             GLib.idle_add(
                 self._on_correspondents_loaded, generation, correspondents
             )
 
         self._mail.submit_interactive("load_correspondents", worker)
+
+    def _on_correspondents_load_failed(self, generation: int) -> bool:
+        # Forget the stamp so the next completion attempt retries the load.
+        if generation == self._correspondents_generation:
+            self._correspondents_stamp = _CORRESPONDENTS_NOT_LOADED
+        return False
 
     def _on_correspondents_loaded(
         self, generation: int, correspondents: list[Correspondent]

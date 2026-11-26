@@ -92,6 +92,7 @@ class HeavyFolderIncompleteDeltaTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         mail._lock = mock.MagicMock()
         mail._accounts_by_uid = {"acct": mock.Mock(backend="microsoft365")}
@@ -200,6 +201,7 @@ class HeavyFolderIncompleteDeltaTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         mail._lock = mock.MagicMock()
         mail._accounts_by_uid = {"acct": mock.Mock(backend="imapx")}
@@ -289,6 +291,7 @@ class HeavyFolderIncompleteDeltaTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         mail._lock = mock.MagicMock()
         mail._accounts_by_uid = {"acct": mock.Mock(backend="imapx")}
@@ -369,6 +372,7 @@ class HeavyFolderSmallEmptySummaryTests(unittest.TestCase):
             mail = MailService.__new__(MailService)
             mail._correspondent_indexes = {}
             mail._correspondent_folder_stats = {}
+            mail._correspondent_stamps = {}
             mail._folder_tree_cache = {}
             mail._lock = mock.MagicMock()
             mail._accounts_by_uid = {"acct": mock.Mock(backend=backend)}
@@ -480,6 +484,7 @@ class HeavyFolderIndexInteractiveYieldTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         mail._lock = mock.MagicMock()
         mail._accounts_by_uid = {"acct": mock.Mock(backend="imapx")}
@@ -554,6 +559,7 @@ class HeavyFolderPrepareSkipTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         mail._lock = mock.MagicMock()
         mail._accounts_by_uid = {"acct": mock.Mock(backend="imapx")}
@@ -635,6 +641,7 @@ class HeavyFolderInvalidateTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         mail._folder_indexes = {
             ("acct", "Archive"): _FolderMessageIndex(
@@ -673,6 +680,7 @@ def _heavy_mail_stub(
 
     mail = MailService.__new__(MailService)
     mail._correspondent_folder_stats = {}
+    mail._correspondent_stamps = {}
     mail._folder_tree_cache = {}
     mail._lock = mock.MagicMock()
     mail._accounts_by_uid = {"acct": mock.Mock(backend=backend)}
@@ -1044,6 +1052,7 @@ class HeavyFolderImapPrepareThrashTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         mail._lock = mock.MagicMock()
         mail._accounts_by_uid = {"acct": mock.Mock(backend="imapx")}
@@ -1103,6 +1112,7 @@ class ImapGhostFolderIndexTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         mail._accounts_by_uid = {"acct": mock.Mock(backend="imapx")}
         mail._folder_indexes = {
@@ -1134,6 +1144,7 @@ class ImapGhostFolderIndexTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         mail._accounts_by_uid = {"acct": mock.Mock(backend="microsoft365")}
         ghosts = [{"uid": "1", "subject": "ghost"}]
@@ -1172,6 +1183,7 @@ class ImapGhostFolderIndexTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         # Helpers often never call list_accounts(); backend must resolve via EDS.
         mail._accounts_by_uid = {}
@@ -1208,6 +1220,7 @@ class ImapGhostFolderIndexTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         mail._accounts_by_uid = {}
         source = mock.Mock()
@@ -1236,6 +1249,7 @@ class ImapGhostFolderIndexTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         mail._accounts_by_uid = {"acct": mock.Mock(backend="microsoft365")}
         mail._folder_indexes = {}
@@ -1276,6 +1290,7 @@ class ImapGhostFolderIndexTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
         mail._accounts_by_uid = {"acct": mock.Mock(backend="microsoft365")}
         mail._folder_indexes = {}
@@ -1312,6 +1327,7 @@ class ImapGhostFolderIndexTests(unittest.TestCase):
         mail = MailService.__new__(MailService)
         mail._correspondent_indexes = {}
         mail._correspondent_folder_stats = {}
+        mail._correspondent_stamps = {}
         mail._folder_tree_cache = {}
 
         class _Lock:
