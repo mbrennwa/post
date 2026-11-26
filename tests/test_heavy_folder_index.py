@@ -328,6 +328,137 @@ class HeavyFolderIncompleteDeltaTests(unittest.TestCase):
         folder.refresh_info_sync.assert_called_once()
 
 
+class HeavyFolderSmallEmptySummaryTests(unittest.TestCase):
+    """Trash/Junk with an empty Camel summary under the 100-UID gap (#536)."""
+
+    def _run_trash_slice(
+        self,
+        *,
+        backend: str,
+        camel_uids: list[str],
+        server_total: int,
+        slices: int = 1,
+    ):
+        from post.mail.eds import MailService, _FolderMessageIndex
+
+        with (
+            mock.patch("post.mail.eds.folder_index_cache") as index_cache,
+            mock.patch("post.mail.eds.folder_search_all_uids", return_value=[]),
+            mock.patch("post.mail.eds.folder_status_cache") as status_cache,
+            mock.patch("post.mail.eds.get_mail_io_thread") as get_io,
+            mock.patch(
+                "post.mail.eds.folder_get_uids", return_value=list(camel_uids)
+            ),
+        ):
+            io_thread = mock.Mock()
+            io_thread.has_interactive_work_pending.return_value = False
+            io_thread.pump_until.return_value = True
+            get_io.return_value = io_thread
+            status_cache.load.return_value = (server_total, server_total)
+            status_cache.index_caught_up.return_value = False
+            index_cache.load.return_value = None
+
+            folder = mock.Mock()
+            folder.get_message_count.return_value = len(camel_uids)
+
+            def _refresh(_prio, _canc, callback, _data):
+                callback(folder, mock.Mock(), None)
+
+            folder.refresh_info.side_effect = _refresh
+
+            mail = MailService.__new__(MailService)
+            mail._correspondent_indexes = {}
+            mail._correspondent_folder_stats = {}
+            mail._folder_tree_cache = {}
+            mail._lock = mock.MagicMock()
+            mail._accounts_by_uid = {"acct": mock.Mock(backend=backend)}
+            mail._heavy_index_sessions = {}
+            mail._folder_indexes = {
+                ("acct", "Trash"): _FolderMessageIndex(
+                    messages=[
+                        {"uid": uid, "subject": f"m{uid}"}
+                        for uid in camel_uids
+                    ],
+                    unread=0,
+                    total=server_total,
+                )
+            }
+            mail._open_folder_unlocked = mock.Mock(return_value=folder)
+            mail._cached_folder_stats_unlocked = mock.Mock(
+                return_value=(server_total, server_total)
+            )
+            mail._register_heavy_index_refresh_cancellable = mock.Mock()
+            mail._unregister_heavy_index_refresh_cancellable = mock.Mock()
+
+            cursor = {"pending_server_refresh": True, "status_seeded": True}
+            progress = None
+            for _ in range(slices):
+                progress = mail._continue_heavy_folder_index_unlocked(
+                    "acct", "Trash", cursor=cursor, allow_refresh=True
+                )
+                cursor = progress.cursor
+                if progress.done:
+                    break
+            return mail, folder, progress
+
+    def test_empty_summary_is_behind_for_any_positive_total(self) -> None:
+        self.assertTrue(_heavy_folder_camel_behind_server(0, 36))
+        self.assertTrue(_heavy_folder_camel_behind_server(0, 1))
+        self.assertFalse(_heavy_folder_camel_behind_server(0, 0))
+        # A partial but non-empty summary still needs the full gap.
+        self.assertFalse(_heavy_folder_camel_behind_server(50, 120))
+        self.assertFalse(_heavy_folder_camel_behind_server(5900, 5950))
+
+    def test_imap_trash_36_empty_summary_takes_one_shot_rebuild(self) -> None:
+        for server_total in (36, 99):
+            with self.subTest(server_total=server_total):
+                mail, folder, progress = self._run_trash_slice(
+                    backend="imapx", camel_uids=[], server_total=server_total
+                )
+                folder.prepare_content_refresh.assert_called_once()
+                folder.refresh_info_sync.assert_called_once()
+                # Abandoned after the one-shot rebuild: no retry loop.
+                self.assertTrue(progress.done)
+                self.assertTrue(
+                    mail._heavy_index_sessions[("acct", "Trash")].get(
+                        "incomplete_delta_abandoned"
+                    )
+                )
+
+    def test_imap_trash_partial_summary_under_gap_is_not_rebuilt(self) -> None:
+        """A non-empty summary within the gap must not trigger a prepare."""
+        uids = [str(i) for i in range(1, 51)]
+        _mail, folder, _progress = self._run_trash_slice(
+            backend="imapx", camel_uids=uids, server_total=120
+        )
+        folder.prepare_content_refresh.assert_not_called()
+        folder.refresh_info_sync.assert_not_called()
+
+    def test_microsoft365_small_empty_folder_is_capped(self) -> None:
+        """Graph keep-alive on a small empty folder must stop, not spin."""
+        # The small folder must settle exactly like an already-behind large
+        # one: bounded prepares, then abandoned (#208).
+        _m, big_folder, big = self._run_trash_slice(
+            backend="microsoft365",
+            camel_uids=[],
+            server_total=28268,
+            slices=12,
+        )
+        _m, small_folder, small = self._run_trash_slice(
+            backend="microsoft365",
+            camel_uids=[],
+            server_total=36,
+            slices=12,
+        )
+        self.assertTrue(big.done)
+        self.assertTrue(small.done)
+        self.assertEqual(
+            small_folder.prepare_content_refresh.call_count,
+            big_folder.prepare_content_refresh.call_count,
+        )
+        self.assertGreater(small_folder.prepare_content_refresh.call_count, 0)
+
+
 class HeavyFolderIndexInteractiveYieldTests(unittest.TestCase):
     @mock.patch("post.mail.eds.folder_index_cache")
     @mock.patch("post.mail.eds.get_mail_io_thread")

@@ -5215,6 +5215,33 @@ class MainWindow(Adw.ApplicationWindow):
             progress.cursor,
         )
 
+    def _heavy_fetch_pending(
+        self, account_uid: str, folder_name: str, sync_pending: bool
+    ) -> bool:
+        """True while a heavy folder's empty list is still being fetched (#536).
+
+        The Camel summary can be empty while the server (STATUS) already
+        reports messages. That is a pending fetch, not an empty folder.
+        """
+        if not sync_pending or not is_heavy_folder_name(folder_name):
+            return False
+        from post.mail.folder_status_cache import status_total_is_trusted
+
+        status = self._mail.get_folder_status_totals(account_uid, folder_name)
+        if status is None:
+            return False
+        server_total = status[1]
+        return server_total > 0 and status_total_is_trusted(
+            folder_name, server_total
+        )
+
+    def _show_heavy_fetch_loading(self, folder_name: str) -> None:
+        self._message_loading_label.set_label(
+            f"Fetching {folder_name} Headers…"
+        )
+        self._message_loading_spinner.start()
+        self._message_stack.set_visible_child_name("loading")
+
     def _on_heavy_folder_index_progress(
         self,
         load_id: int,
@@ -5441,8 +5468,16 @@ class MainWindow(Adw.ApplicationWindow):
         self._message_total = summary_total
         self._message_list_source = "local"
         if not messages:
-            self._message_empty_label.set_label(f"No Messages in {folder_name}")
-            self._message_stack.set_visible_child_name("empty")
+            if keep_indexing and self._heavy_fetch_pending(
+                account_uid, folder_name, True
+            ):
+                # Rebuild still running and the server has mail (#536).
+                self._show_heavy_fetch_loading(folder_name)
+            else:
+                self._message_empty_label.set_label(
+                    f"No Messages in {folder_name}"
+                )
+                self._message_stack.set_visible_child_name("empty")
             if not keep_indexing:
                 self._update_message_status(account, folder_name)
                 GLib.idle_add(self._on_messages_sync_finished, load_id, False)
@@ -6750,15 +6785,27 @@ class MainWindow(Adw.ApplicationWindow):
             self._message_list_source = source
             self._message_sync_in_progress = sync_pending
             folder_label = "Outbox" if is_post_outbox_folder(folder_name) else folder_name
-            if is_post_outbox_folder(folder_name):
-                self._message_empty_label.set_label("No Queued Messages")
-            elif self._search_query is not None:
-                self._message_empty_label.set_label(
-                    self._search_empty_label(folder_label)
+            if (
+                self._search_query is None
+                and not is_post_outbox_folder(folder_name)
+                and self._heavy_fetch_pending(
+                    account_uid, folder_name, sync_pending
                 )
+            ):
+                # Server has messages and the fetch is still running (#536).
+                self._show_heavy_fetch_loading(folder_name)
             else:
-                self._message_empty_label.set_label(f"No Messages in {folder_label}")
-            self._message_stack.set_visible_child_name("empty")
+                if is_post_outbox_folder(folder_name):
+                    self._message_empty_label.set_label("No Queued Messages")
+                elif self._search_query is not None:
+                    self._message_empty_label.set_label(
+                        self._search_empty_label(folder_label)
+                    )
+                else:
+                    self._message_empty_label.set_label(
+                        f"No Messages in {folder_label}"
+                    )
+                self._message_stack.set_visible_child_name("empty")
             self._update_message_status(account, folder_name)
             search_trace(
                 "search_loaded_complete",
