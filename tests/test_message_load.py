@@ -48,6 +48,7 @@ class EmptyFolderLoadCallbackTests(unittest.TestCase):
         window._message_list_source = "disk_cache"
         window._message_sync_in_progress = False
         window._message_list_view.item_count.return_value = 0
+        window._heavy_fetch_pending.return_value = False
         window._apply_pending_flag_overlay.side_effect = (
             lambda _account, _folder, messages, unread: (messages, unread)
         )
@@ -125,6 +126,87 @@ class EmptyFolderLoadCallbackTests(unittest.TestCase):
         after_list.assert_called_once_with()
         window._message_stack.set_visible_child_name.assert_called_with("list")
         window._release_offline_sync_for_folder_work.assert_not_called()
+
+
+class HeavyFolderEmptyLoadingTests(unittest.TestCase):
+    """Empty Trash/Junk summary while the server has mail is loading (#536)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not Gtk.is_initialized():
+            Gtk.init()
+
+    def _mail_window(self, status: tuple[int, int] | None) -> mock.Mock:
+        window = mock.Mock()
+        window._mail.get_folder_status_totals.return_value = status
+        return window
+
+    def test_pending_when_server_has_mail_and_sync_running(self) -> None:
+        window = self._mail_window((36, 36))
+        self.assertTrue(
+            MainWindow._heavy_fetch_pending(window, "acct-1", "Trash", True)
+        )
+        self.assertTrue(
+            MainWindow._heavy_fetch_pending(window, "acct-1", "Junk", True)
+        )
+
+    def test_not_pending_without_sync_or_server_mail(self) -> None:
+        self.assertFalse(
+            MainWindow._heavy_fetch_pending(
+                self._mail_window((36, 36)), "acct-1", "Trash", False
+            )
+        )
+        self.assertFalse(
+            MainWindow._heavy_fetch_pending(
+                self._mail_window((0, 0)), "acct-1", "Trash", True
+            )
+        )
+        self.assertFalse(
+            MainWindow._heavy_fetch_pending(
+                self._mail_window(None), "acct-1", "Trash", True
+            )
+        )
+
+    def test_not_pending_for_light_folder(self) -> None:
+        self.assertFalse(
+            MainWindow._heavy_fetch_pending(
+                self._mail_window((36, 36)), "acct-1", "Inbox", True
+            )
+        )
+
+    def _loaded_window(self, *, pending: bool) -> mock.Mock:
+        window = mock.Mock()
+        window._messages_load_generation = 7
+        window._messages_load_expects_search = False
+        window._search_query = None
+        window._search_results_streamed = False
+        window._current_account = _account()
+        window._current_folder = "Trash"
+        window._message_list_view.item_count.return_value = 0
+        window._heavy_fetch_pending.return_value = pending
+        window._apply_pending_flag_overlay.side_effect = (
+            lambda _account, _folder, messages, unread: (messages, unread)
+        )
+        return window
+
+    def test_empty_list_shows_loading_while_fetch_pending(self) -> None:
+        window = self._loaded_window(pending=True)
+        MainWindow._on_messages_loaded(
+            window, 7, "acct-1", "Trash", [], 0, 0, "local", True, None, None
+        )
+        window._show_heavy_fetch_loading.assert_called_once_with("Trash")
+        window._message_stack.set_visible_child_name.assert_not_called()
+
+    def test_empty_list_shows_no_messages_when_nothing_pending(self) -> None:
+        window = self._loaded_window(pending=False)
+        MainWindow._on_messages_loaded(
+            window, 7, "acct-1", "Trash", [], 0, 0, "local", False, None, None
+        )
+        window._show_heavy_fetch_loading.assert_not_called()
+        window._message_empty_label.set_label.assert_called_with(
+            "No Messages in Trash"
+        )
+        window._message_stack.set_visible_child_name.assert_called_with("empty")
 
 
 class HeavyFolderOfflineHoldTests(unittest.TestCase):

@@ -628,10 +628,17 @@ def _heavy_folder_camel_behind_server(camel_uids: int, known_total: int) -> bool
     or stale delta link, and Graph ``totalItemCount`` still much larger. A full
     ``refresh_info`` then rewalks known headers with ``new=0`` for a long time
     before UID count grows again.
+
+    An empty summary against any positive server total is always behind
+    (#536). Trash/Junk with under 100 server messages sat below the gap, so the
+    one-shot rebuild never ran and the list stayed empty. The gap only guards
+    a non-empty summary from refreshing forever.
     """
     if known_total <= 0:
         return False
-    return (known_total - max(0, camel_uids)) >= _HEAVY_FOLDER_INCOMPLETE_CAMEL_GAP
+    if camel_uids <= 0:
+        return True
+    return (known_total - camel_uids) >= _HEAVY_FOLDER_INCOMPLETE_CAMEL_GAP
 
 
 def _heavy_folder_catastrophic_camel_wipe(
