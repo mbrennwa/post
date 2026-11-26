@@ -21,9 +21,11 @@ gi.require_version("Graphene", "1.0")
 
 from gi.repository import Gdk, Gio, GLib, Graphene, Gtk, Pango, WebKit
 
+from post.attachment_menu import dismiss_popover
 from post.attachment_open import open_attachment
 from post.mail.helpers import (
     ReaderHeaderRow,
+    bare_email_from_address,
     format_attachment_size,
     mailto_primary_email,
     reader_header_rows,
@@ -58,6 +60,18 @@ from post.wrap_label import (
 _RECIPIENT_HEADER_LABELS = frozenset({"To", "Cc", "Bcc"})
 RECIPIENT_HEADER_SCROLL_LINES = 3
 RECIPIENT_HEADER_FALLBACK_LINE_PX = 20
+
+# Address links stay the same dim color as the field name. GTK gives each
+# <a> its own link CSS node, which would otherwise be underlined and blue.
+_READER_ADDRESS_CSS = """
+label.reader-address link,
+label.reader-address link:hover,
+label.reader-address link:visited {
+  color: inherit;
+  text-decoration-line: none;
+}
+"""
+_reader_address_provider: Gtk.CssProvider | None = None
 
 # Browser chrome — meaningless for HTML loaded into the reading pane.
 _READER_CONTEXT_MENU_BLOCKLIST = frozenset(
@@ -257,6 +271,63 @@ def reader_link_hover_origin(
     return (x, y)
 
 
+def address_menu_labels(email: str) -> tuple[str, str, str]:
+    """New Message, Search, and Copy labels for one bare *email*."""
+    return (
+        f"New Message to {email}…",
+        f"Search Messages from {email}",
+        "Copy address",
+    )
+
+
+def address_context_menu(email: str) -> Gio.Menu:
+    """Popover menu for a header address. Labels match the body mailto menu."""
+    new_label, search_label, copy_label = address_menu_labels(email)
+    menu = Gio.Menu()
+    menu.append(new_label, "reader.address-new-message")
+    menu.append(search_label, "reader.address-search-from")
+    menu.append(copy_label, "reader.address-copy")
+    return menu
+
+
+def header_address_markup(label: str, addresses: tuple[str, ...]) -> str:
+    """Field name plus one mailto link per address.
+
+    The field name and the ``", "`` between addresses sit outside the anchors,
+    so a right-click there is not an address. A comma inside a display name
+    stays inside that address's anchor. An address with no bare email is plain
+    text.
+    """
+    parts: list[str] = []
+    for display in addresses:
+        escaped = GLib.markup_escape_text(display)
+        email = bare_email_from_address(display)
+        if not email:
+            parts.append(escaped)
+            continue
+        href = GLib.markup_escape_text(f"mailto:{email}").replace('"', "&quot;")
+        parts.append(f'<a href="{href}">{escaped}</a>')
+    return f"{GLib.markup_escape_text(label)}: {', '.join(parts)}"
+
+
+def _install_reader_address_style() -> None:
+    """Keep header address links dim and without underlines, once per display."""
+    global _reader_address_provider
+    if _reader_address_provider is not None:
+        return
+    display = Gdk.Display.get_default()
+    if display is None:
+        return
+    provider = Gtk.CssProvider()
+    provider.load_from_string(_READER_ADDRESS_CSS)
+    Gtk.StyleContext.add_provider_for_display(
+        display,
+        provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+    )
+    _reader_address_provider = provider
+
+
 def prepend_address_context_menu_items(
     menu: WebKit.ContextMenu,
     *,
@@ -266,6 +337,7 @@ def prepend_address_context_menu_items(
     email: str,
 ) -> None:
     """Prepend New Message / Search / Copy address actions for *email*."""
+    new_label, search_label, copy_label = address_menu_labels(email)
     had_items = bool(list(menu.get_items()))
     if had_items:
         menu.prepend(WebKit.ContextMenuItem.new_separator())
@@ -273,19 +345,19 @@ def prepend_address_context_menu_items(
     menu.prepend(
         WebKit.ContextMenuItem.new_from_gaction(
             copy_address_action,
-            "Copy address",
+            copy_label,
         )
     )
     menu.prepend(
         WebKit.ContextMenuItem.new_from_gaction(
             search_from_action,
-            f"Search Messages from {email}",
+            search_label,
         )
     )
     menu.prepend(
         WebKit.ContextMenuItem.new_from_gaction(
             new_message_action,
-            f"New Message to {email}…",
+            new_label,
         )
     )
 
@@ -337,6 +409,7 @@ class MessageReaderPane(Gtk.Box):
         can_search_messages: Callable[[], bool],
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        _install_reader_address_style()
         layout = _ClampingBoxLayout(orientation=Gtk.Orientation.VERTICAL)
         layout.set_spacing(8)
         self.set_layout_manager(layout)
@@ -361,6 +434,7 @@ class MessageReaderPane(Gtk.Box):
         self._message_appearance: MessageAppearance = get_message_appearance()
         self._dark = False
         self._context_address: str | None = None
+        self._address_popover: Gtk.PopoverMenu | None = None
         self._context_image_uri: str | None = None
         self._context_link_uri: str | None = None
         self._image_clipboard_text = ""
@@ -889,6 +963,8 @@ class MessageReaderPane(Gtk.Box):
         self._toolbar_add_calendar_btn.set_visible(True)
 
     def _clear_address_rows(self) -> None:
+        dismiss_popover(self._address_popover)
+        self._address_popover = None
         sibling = self._reader_meta.get_next_sibling()
         while sibling is not None:
             nxt = sibling.get_next_sibling()
@@ -910,17 +986,28 @@ class MessageReaderPane(Gtk.Box):
     def _build_header_row(self, row: ReaderHeaderRow) -> Gtk.Widget:
         # Same construction for From / To / Date / Cc / …: one Label so the
         # field name and value share a single Pango baseline (#469).
-        if row.addresses:
-            body = ", ".join(row.addresses)
-        else:
-            body = row.plain or ""
-        text = f"{row.label}: {body}".rstrip()
-        value = Gtk.Label(label=text, xalign=0, wrap=True)
+        value = Gtk.Label(xalign=0, wrap=True)
         set_label_wrap_mode(value, Gtk.WrapMode.WORD_CHAR)
         value.add_css_class("dim-label")
         value.set_width_chars(1)
         value.set_hexpand(True)
         value.set_halign(Gtk.Align.FILL)
+        if row.addresses:
+            value.add_css_class("reader-address")
+            value.set_markup(header_address_markup(row.label, row.addresses))
+            value.connect("activate-link", self._on_header_address_activate)
+            # Capture, and exclusive: a label with links claims every button
+            # and opens its own grabbing menu (gtk_label_do_popup). That menu
+            # keeps the pointer, so a click outside never dismisses ours.
+            menu_gesture = Gtk.GestureClick()
+            menu_gesture.set_button(Gdk.BUTTON_SECONDARY)
+            menu_gesture.set_exclusive(True)
+            menu_gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            menu_gesture.connect("pressed", self._on_address_menu_pressed)
+            value.add_controller(menu_gesture)
+        else:
+            text = f"{row.label}: {row.plain or ''}".rstrip()
+            value.set_label(text)
         if row.label in _RECIPIENT_HEADER_LABELS:
             return self._scroll_recipient_header(value)
         return value
@@ -959,6 +1046,56 @@ class MessageReaderPane(Gtk.Box):
             return False
         scroll.set_max_content_height(height)
         return False
+
+    def _on_header_address_activate(self, _label: Gtk.Label, _uri: str) -> bool:
+        """Keep a left click from launching an external mailer."""
+        return True
+
+    def _on_address_menu_pressed(
+        self,
+        gesture: Gtk.GestureClick,
+        _n_press: int,
+        x: float,
+        y: float,
+    ) -> None:
+        widget = gesture.get_widget()
+        if not isinstance(widget, Gtk.Label):
+            return
+        uri = widget.get_current_uri()
+        email = mailto_primary_email(uri) if uri else ""
+        if not email:
+            return
+        # Claim before the label's own click gesture runs, so it does not
+        # open a second menu. Then show ours as the only grabbing popover.
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self._popup_address_menu(widget, x, y, email)
+
+    def _popup_address_menu(
+        self, widget: Gtk.Widget, x: float, y: float, email: str
+    ) -> None:
+        self._context_address = email
+        self._sync_address_search_action()
+        dismiss_popover(self._address_popover)
+        popover = Gtk.PopoverMenu.new_from_model(address_context_menu(email))
+        # Popovers are not always in the action widget tree.
+        popover.insert_action_group("reader", self._reader_action_group)
+        # Parent to the header box, not the address label. A modal popover on
+        # the widget that owns the click shares that grab and outside clicks
+        # never dismiss it (#517).
+        anchor: Gtk.Widget = self._reader_meta_box
+        origin = widget.translate_coordinates(anchor, x, y)
+        if origin is None:
+            anchor = widget
+            origin = (x, y)
+        popover.set_parent(anchor)
+        rect = Gdk.Rectangle()
+        rect.x = int(origin[0])
+        rect.y = int(origin[1])
+        rect.width = 1
+        rect.height = 1
+        popover.set_pointing_to(rect)
+        self._address_popover = popover
+        popover.popup()
 
     def _sync_address_search_action(self) -> None:
         self._address_search_action.set_enabled(bool(self._can_search_messages()))

@@ -31,7 +31,10 @@ from post.reader.pane import (
     RECIPIENT_HEADER_FALLBACK_LINE_PX,
     RECIPIENT_HEADER_SCROLL_LINES,
     MessageReaderPane,
+    address_context_menu,
+    address_menu_labels,
     apply_reader_link_hover,
+    header_address_markup,
     prepend_address_context_menu_items,
     reader_link_hover_origin,
     reader_link_tooltip_text,
@@ -97,6 +100,16 @@ def _header_row_named(pane: MessageReaderPane, name: str) -> Gtk.Widget:
         if label is not None and label.get_label().startswith(f"{name}:"):
             return row
     raise AssertionError(f"missing header row {name}")
+
+
+def _click_gestures(label: Gtk.Label) -> list[Gtk.GestureClick]:
+    model = label.observe_controllers()
+    gestures: list[Gtk.GestureClick] = []
+    for index in range(model.get_n_items()):
+        controller = model.get_item(index)
+        if isinstance(controller, Gtk.GestureClick):
+            gestures.append(controller)
+    return gestures
 
 
 def _header_label(row: Gtk.Widget) -> Gtk.Label | None:
@@ -171,6 +184,104 @@ class MessageReaderPaneTests(unittest.TestCase):
         self.assertTrue(any(lab.startswith("From:") for lab in labels))
         self.assertTrue(any(lab.startswith("To:") for lab in labels))
         self.assertTrue(any(lab.startswith("Date:") for lab in labels))
+
+    def test_header_address_markup_one_address(self) -> None:
+        markup = header_address_markup("From", ("Alice <alice@example.com>",))
+        self.assertTrue(markup.startswith("From: <a "))
+        self.assertNotIn("<a", markup.split("<a", 1)[0])
+        self.assertIn('href="mailto:alice@example.com"', markup)
+        self.assertIn(">Alice &lt;alice@example.com&gt;</a>", markup)
+
+    def test_header_address_markup_separator_is_outside_anchors(self) -> None:
+        # Quoted form is what the address parser stores when the name has a comma.
+        markup = header_address_markup(
+            "To",
+            (
+                '"Last, First" <last@example.com>',
+                "Carol <carol@example.com>",
+            ),
+        )
+        self.assertIn(
+            "&quot;Last, First&quot; &lt;last@example.com&gt;</a>, <a ",
+            markup,
+        )
+        self.assertIn('href="mailto:last@example.com"', markup)
+        self.assertIn('href="mailto:carol@example.com"', markup)
+        self.assertEqual(markup.count("<a "), 2)
+
+    def test_header_address_markup_escapes_and_skips_blank(self) -> None:
+        markup = header_address_markup(
+            "Cc",
+            ("A & B <ab@example.com>", "   "),
+        )
+        self.assertEqual(
+            markup,
+            'Cc: <a href="mailto:ab@example.com">'
+            "A &amp; B &lt;ab@example.com&gt;</a>,    ",
+        )
+
+    def test_address_menu_labels_name_the_address(self) -> None:
+        self.assertEqual(
+            address_menu_labels("alice@example.com"),
+            (
+                "New Message to alice@example.com…",
+                "Search Messages from alice@example.com",
+                "Copy address",
+            ),
+        )
+        menu = address_context_menu("alice@example.com")
+        labels = [
+            menu.get_item_attribute_value(index, "label").get_string()
+            for index in range(menu.get_n_items())
+        ]
+        self.assertEqual(labels, list(address_menu_labels("alice@example.com")))
+
+    def test_header_address_left_click_is_swallowed(self) -> None:
+        self.pane.show_message(
+            _sample_message(),
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        from_label = _header_label(_header_row_named(self.pane, "From"))
+        date_label = _header_label(_header_row_named(self.pane, "Date"))
+        assert from_label is not None and date_label is not None
+        self.assertIn("reader-address", from_label.get_css_classes())
+        self.assertNotIn("reader-address", date_label.get_css_classes())
+        self.assertIn("mailto:sender@example.com", from_label.get_label())
+        self.assertNotIn("<a ", date_label.get_label())
+        self.assertTrue(
+            any(
+                controller.get_button() == 3
+                and controller.get_propagation_phase()
+                == Gtk.PropagationPhase.CAPTURE
+                and controller.get_exclusive()
+                for controller in _click_gestures(from_label)
+            )
+        )
+        self.assertTrue(
+            self.pane._on_header_address_activate(
+                from_label, "mailto:sender@example.com"
+            )
+        )
+
+    def test_address_menu_ignores_click_off_a_link(self) -> None:
+        self.pane.show_message(
+            _sample_message(),
+            body={"plain": "Body text", "html": None},
+            allow_remote=False,
+            dark=False,
+            message_appearance=MESSAGE_APPEARANCE_ADAPT_TEXT,
+        )
+        from_label = _header_label(_header_row_named(self.pane, "From"))
+        assert from_label is not None
+        self.assertIsNone(from_label.get_current_uri())
+        gesture = MagicMock()
+        gesture.get_widget.return_value = from_label
+        self.pane._on_address_menu_pressed(gesture, 1, 0.0, 0.0)
+        gesture.set_state.assert_not_called()
+        self.assertIsNone(self.pane._address_popover)
 
     def test_recipient_header_scroll_max_height_is_three_lines(self) -> None:
         self.assertEqual(recipient_header_scroll_max_height(20), 60)
