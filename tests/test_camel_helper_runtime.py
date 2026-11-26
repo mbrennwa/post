@@ -17,6 +17,7 @@ from post.mail.camel_ipc import read_message, write_message
 from post.mail.camel_helper import attach_ipc_goa_ensure
 from post.mail.camel_runtime import (
     AccountCamelRuntime,
+    CamelHelperBusy,
     CamelHelperTimeout,
     CamelRuntimePool,
     camel_helpers_enabled,
@@ -62,6 +63,22 @@ _FAKE_HELPER = textwrap.dedent(
                         "id": msg.get("id"),
                         "ok": True,
                         "result": [[{"uid": "older"}], 0, 20, "memory"],
+                    },
+                )
+                continue
+            if msg.get("type") == "read_cached":
+                cached = (
+                    None
+                    if msg.get("folder_name") == "Uncached"
+                    else {"uid": msg.get("message_uid"), "cached": True}
+                )
+                write_message(
+                    stdout,
+                    {
+                        "type": "result",
+                        "id": msg.get("id"),
+                        "ok": True,
+                        "result": cached,
                     },
                 )
                 continue
@@ -518,6 +535,84 @@ class FakeHelperRuntimeTests(unittest.TestCase):
         finally:
             runtime.kill()
 
+    def test_cached_read_returns_while_a_call_is_in_flight(self) -> None:
+        """A cached read must not queue behind a long helper call (#549)."""
+        import threading
+        import time
+
+        runtime = self._patch_runtime(AccountCamelRuntime(account_uid="acct-a"))
+        try:
+            runtime.call("ping", ["acct-a"], timeout=10.0)
+
+            def long_call() -> None:
+                runtime.call("sleep_for_test", [5.0], timeout=10.0)
+
+            worker = threading.Thread(target=long_call, daemon=True)
+            worker.start()
+            time.sleep(0.2)
+            started = time.monotonic()
+            result = runtime.peek_cached_message("INBOX", "42", mark_seen=True)
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertEqual(result, {"uid": "42", "cached": True})
+            self.assertTrue(worker.is_alive())
+            runtime.request_cancel()
+            worker.join(timeout=3.0)
+        finally:
+            runtime.kill()
+
+    def test_cached_read_miss_is_none(self) -> None:
+        runtime = self._patch_runtime(AccountCamelRuntime(account_uid="acct-a"))
+        try:
+            runtime.call("ping", ["acct-a"], timeout=10.0)
+            self.assertIsNone(
+                runtime.peek_cached_message("Uncached", "42", mark_seen=True)
+            )
+        finally:
+            runtime.kill()
+
+    def test_cached_read_does_not_start_a_helper(self) -> None:
+        runtime = AccountCamelRuntime(account_uid="acct-a")
+        self.assertIsNone(
+            runtime.peek_cached_message("INBOX", "42", mark_seen=True)
+        )
+        self.assertFalse(runtime.is_running())
+        pool = CamelRuntimePool()
+        self.assertIsNone(
+            pool.peek_cached_message("acct-a", "INBOX", "42", mark_seen=True)
+        )
+        self.assertIsNone(pool.runtime_if_any("acct-a"))
+
+    def test_wait_notice_fires_once_for_a_long_wait(self) -> None:
+        import threading
+        import time
+
+        runtime = self._patch_runtime(AccountCamelRuntime(account_uid="acct-a"))
+        try:
+            def long_call() -> None:
+                runtime.call("sleep_for_test", [3.0], timeout=10.0)
+
+            worker = threading.Thread(target=long_call, daemon=True)
+            worker.start()
+            time.sleep(0.2)
+            notices: list[tuple[str | None, float]] = []
+            with mock.patch("post.mail.camel_runtime._WAIT_NOTICE_AFTER", 0.3):
+                with self.assertRaises(CamelHelperBusy):
+                    runtime.call(
+                        "ping",
+                        ["acct-a"],
+                        timeout=10.0,
+                        wait_timeout=1.0,
+                        on_wait=lambda method, busy_for: notices.append(
+                            (method, busy_for)
+                        ),
+                    )
+            self.assertEqual(len(notices), 1)
+            self.assertEqual(notices[0][0], "sleep_for_test")
+            runtime.request_cancel()
+            worker.join(timeout=4.0)
+        finally:
+            runtime.kill()
+
     def test_interactive_wait_timeout_leaves_holder_running(self) -> None:
         """Giving up on the lock must not kill the helper (#494)."""
         import threading
@@ -533,8 +628,11 @@ class FakeHelperRuntimeTests(unittest.TestCase):
             time.sleep(0.2)
             pid = runtime._proc.pid if runtime._proc is not None else None
             self.assertIsNotNone(pid)
-            with self.assertRaises(CamelHelperTimeout):
+            with self.assertRaises(CamelHelperBusy) as raised:
                 runtime.call("ping", ["acct-a"], timeout=10.0, wait_timeout=0.4)
+            # Nothing was sent: this must never read as a server timeout (#549).
+            self.assertNotIsInstance(raised.exception, CamelHelperTimeout)
+            self.assertEqual(raised.exception.busy_method, "sleep_for_test")
             self.assertTrue(worker.is_alive())
             self.assertEqual(runtime._proc.pid if runtime._proc else None, pid)
             worker.join(timeout=4.0)

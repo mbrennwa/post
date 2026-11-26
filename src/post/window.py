@@ -340,6 +340,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._mail.set_password_prompt(self._prompt_account_password)
         self._mail.set_account_health_changed_callback(self._on_account_health_changed)
         self._mail.set_message_download_listener(self._on_message_download)
+        self._mail.set_message_wait_listener(self._on_message_wait)
         self._mail.set_visible_attachments_changed_callback(
             self._on_visible_attachments_classified
         )
@@ -4243,6 +4244,18 @@ class MainWindow(Adw.ApplicationWindow):
             folder_name,
             message_uid,
             note,
+        )
+
+    def _on_message_wait(
+        self, account_uid: str, folder_name: str, message_uid: str
+    ) -> None:
+        """A read is queued behind other mail work for this account (any thread, #549)."""
+        GLib.idle_add(
+            self._show_message_download_note,
+            account_uid,
+            folder_name,
+            message_uid,
+            "Waiting for pending mail changes to sync…",
         )
 
     def _show_message_download_note(
@@ -9247,8 +9260,12 @@ class MainWindow(Adw.ApplicationWindow):
                     )
             self._displayed_message_id = None
             self._show_message_unavailable_reader(error.user_message())
-            if error.reason == MessageUnavailableReason.READ_TIMEOUT:
-                # Slow server, not offline: offer a retry (#537).
+            if error.reason in (
+                MessageUnavailableReason.READ_TIMEOUT,
+                MessageUnavailableReason.HELPER_BUSY,
+            ):
+                # Slow server or busy account helper, not offline: offer a
+                # retry (#537, #549).
                 toast = show_error_toast(self, error.user_message())
                 if toast is not None:
                     toast.set_button_label("Retry")
@@ -9394,6 +9411,10 @@ class MainWindow(Adw.ApplicationWindow):
         )
         if (msg.get("flags") or {}).get("seen"):
             self._mark_message_read(uid)
+        elif msg.get("needs_mark_seen"):
+            # A cached read does not mutate; mark it through the normal
+            # local-first flag path (#549).
+            self._mark_message_read_on_click_if_unread(uid)
         return False
 
     def _app_prefers_dark(self) -> bool:

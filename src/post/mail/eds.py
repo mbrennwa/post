@@ -24,7 +24,9 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from collections.abc import Iterable, Iterator
 from typing import Any, Literal, NoReturn, Sequence, Callable
 
 FolderIndexSource = Literal["memory", "disk_cache", "local", "server"]
@@ -50,6 +52,7 @@ from .lane_dispatch import (
 )
 from .camel_runtime import (
     AccountCamelRuntime,
+    CamelHelperBusy,
     CamelHelperError,
     CamelRuntimePool,
     camel_helpers_enabled,
@@ -134,6 +137,7 @@ from .operation_queue import (
 )
 from . import pending_removals as pending_removals_store
 from .network_errors import (
+    HELPER_BUSY_MESSAGE,
     MESSAGE_NOT_CACHED_SIGN_IN,
     TOKEN_EXPIRED_FOLDER_MESSAGE,
     is_network_unavailable_error,
@@ -272,9 +276,19 @@ HELPER_OP_READ = "read"
 CANCEL_SCOPE_ALL = "all"
 CANCEL_SCOPE_BACKGROUND = "background"
 # Interactive read waits this long for the helper lock, then the reader shows
-# an error. The call that holds the lock keeps running (#494).
-_INTERACTIVE_HELPER_WAIT_SECONDS = 10.0
+# an error. The call that holds the lock keeps running (#494). The holder is
+# one queued operation at most (#549), so this matches a single body read.
+_INTERACTIVE_HELPER_WAIT_SECONDS = float(_MESSAGE_READ_TIMEOUT_SECONDS)
+# The queue flush waits at most this long for interactive helper work before it
+# takes the lock for its next operation (#549).
+_FLUSH_YIELD_MAX_SECONDS = 30.0
+_FLUSH_YIELD_POLL_SECONDS = 0.1
 # Helper RPCs that must preempt offline downsync and count as interactive (#482).
+# A local-only folder list waits this long for a busy helper before it is
+# answered from the local copy (#549). Long enough that an idle helper answers
+# normally, short enough that Loading never lingers.
+_LOCAL_LIST_WAIT_SECONDS = 3.0
+_LOCAL_LIST_PEEK_SECONDS = 3.0
 _INTERACTIVE_HELPER_METHODS = frozenset(
     {
         "read_message",
@@ -294,6 +308,14 @@ _TRANSFER_MESSAGE_BATCH_SIZE = 50
 _TRANSFER_DEST_REFRESH_TIMEOUT_SECONDS = 8
 _TRANSFER_DEST_RESOLVE_MAX = 20
 _TRANSFER_DEST_SYNC_MAX = 20
+# Everything after a successful move (summary prune, learning destination UIDs,
+# fetching their bodies) is best-effort. It shares this one budget and is
+# cancellable by foreground work, so a stalled server cannot hold the account
+# helper long after the move itself finished (#549).
+_TRANSFER_TAIL_TIMEOUT_SECONDS = 15
+# A pending-removal marker with no queued operation behind it is dropped once
+# it is this old (#549).
+_ORPHAN_PENDING_MIN_AGE_SECONDS = 120.0
 
 
 def _run_on_gtk_thread(callback: Callable[[], None]) -> bool:
@@ -321,6 +343,9 @@ class MessageUnavailableReason:
     READ_TIMEOUT = "read_timeout"
     # A newer interactive read took over the helper; the result is stale.
     SUPERSEDED = "superseded"
+    # The helper stayed busy with another call (for example a queue flush) for
+    # the whole wait. The server was not contacted, so this is not a timeout (#549).
+    HELPER_BUSY = "helper_busy"
 
 
 class MessageNotAvailableError(LookupError):
@@ -348,6 +373,8 @@ class MessageNotAvailableError(LookupError):
                 f"The server did not deliver this message{detail} in time. "
                 "Select it again to retry."
             )
+        if self.reason == MessageUnavailableReason.HELPER_BUSY:
+            return HELPER_BUSY_MESSAGE
         if self.reason == MessageUnavailableReason.SUPERSEDED:
             return "Loading was interrupted. Select the message again."
         if self.reason == MessageUnavailableReason.NOT_CACHED_OFFLINE:
@@ -865,6 +892,35 @@ def _compose_attachments_from_payloads(result: Any) -> list[ComposeAttachment]:
 
 
 @dataclass
+class _FlushStep:
+    """Outcome of flushing one queued operation (#549).
+
+    ``attempted_id`` is ``None`` when nothing was left to try. ``stop`` ends the
+    pass (network deferred, hard failure); ``skip_account`` leaves the rest of
+    that account's queue for later (sign-in needed, cannot contact the server).
+    """
+
+    attempted_id: str | None = None
+    account_uid: str | None = None
+    flushed: int = 0
+    hard_failures: list[dict[str, Any]] = field(default_factory=list)
+    undo_events: list[dict[str, Any]] = field(default_factory=list)
+    skip_account: bool = False
+    stop: bool = False
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "attempted_id": self.attempted_id,
+            "account_uid": self.account_uid,
+            "flushed": self.flushed,
+            "hard_failures": self.hard_failures,
+            "undo_events": self.undo_events,
+            "skip_account": self.skip_account,
+            "stop": self.stop,
+        }
+
+
+@dataclass
 class MailService:
     """Facade around EDS + Camel; blocking I/O is routed to the mail I/O thread."""
 
@@ -1016,7 +1072,19 @@ class MailService:
     _message_download_listener: Callable[[str, str, str, int | None], None] | None = (
         field(default=None, init=False, repr=False)
     )
+    _message_wait_listener: Callable[[str, str, str], None] | None = field(
+        default=None, init=False, repr=False
+    )
     _helper_op_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    # Folders this process has opened, with the store that served them. The
+    # lock-free cached read uses these instead of opening a folder through the
+    # (possibly busy) mail I/O thread (#549).
+    _open_folders: dict[tuple[str, str], tuple[Any, Camel.Folder]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _open_folders_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
     # UI-side count of interactive helper RPCs waiting on or holding _serial (#482).
@@ -1774,6 +1842,34 @@ class MailService:
             self._helper_op_cancellable = cancellable
             self._helper_op_kind = kind
 
+    @contextmanager
+    def _best_effort_scope(
+        self, timeout: float, *, preemptible: bool = True
+    ) -> Iterator[Gio.Cancellable]:
+        """A deadline-bounded cancellable, optionally preemptible by foreground work.
+
+        With ``preemptible`` it is registered as the helper's cancellable
+        (background kind), so foreground work that calls
+        ``preempt_background_op`` cancels it. Use that only for work whose
+        early stop is harmless, such as learning destination UIDs after a
+        completed move. A step that must finish (the post-move commit that
+        expunges on IMAP) gets only the deadline.
+        """
+        cancellable = Gio.Cancellable()
+        timer = threading.Timer(timeout, cancellable.cancel)
+        timer.daemon = True
+        if preemptible:
+            self._register_helper_op_cancellable(
+                cancellable, HELPER_OP_BACKGROUND
+            )
+        timer.start()
+        try:
+            yield cancellable
+        finally:
+            timer.cancel()
+            if preemptible:
+                self._clear_helper_op_cancellable(cancellable)
+
     def _clear_helper_op_cancellable(
         self, cancellable: Gio.Cancellable | None = None
     ) -> None:
@@ -2017,12 +2113,25 @@ class MailService:
         kwargs: dict[str, Any] | None = None,
         *,
         timeout: float | None = 120.0,
+        wait_timeout: float | None = None,
     ) -> Any:
-        """Invoke ``method`` in the per-account Camel helper (#437)."""
+        """Invoke ``method`` in the per-account Camel helper (#437).
+
+        ``wait_timeout`` bounds the wait for the helper lock and raises
+        ``CamelHelperBusy`` when it expires. Interactive reads always get a
+        bound; other callers opt in when they have a local answer to fall back
+        on.
+        """
         interactive = method in _INTERACTIVE_HELPER_METHODS
-        wait_timeout = (
-            _INTERACTIVE_HELPER_WAIT_SECONDS if interactive else None
-        )
+        if interactive and wait_timeout is None:
+            wait_timeout = _INTERACTIVE_HELPER_WAIT_SECONDS
+        on_wait = None
+        if method == "read_message" and len(args) >= 3:
+            read_key = (str(args[0]), str(args[1]), str(args[2]))
+
+            def on_wait(_busy_method: str | None, _busy_for: float) -> None:
+                self._notify_message_wait(*read_key)
+
         if interactive:
             self._enter_helper_interactive()
             self.preempt_interactive_read(account_uid)
@@ -2034,6 +2143,7 @@ class MailService:
                 kwargs,
                 timeout=timeout,
                 wait_timeout=wait_timeout,
+                on_wait=on_wait,
             )
         finally:
             if interactive:
@@ -2048,6 +2158,7 @@ class MailService:
         *,
         timeout: float | None = 120.0,
         wait_timeout: float | None = None,
+        on_wait: Callable[[str | None, float], None] | None = None,
     ) -> Any:
         goa_out: list[str] = []
         try:
@@ -2059,8 +2170,18 @@ class MailService:
                     kwargs or {},
                     timeout=timeout,
                     wait_timeout=wait_timeout,
+                    on_wait=on_wait,
                     goa_ensure_out=goa_out,
                 )
+            except CamelHelperBusy as exc:
+                if method == "read_message" and len(args) >= 3:
+                    # The server was never contacted; do not report a timeout.
+                    raise MessageNotAvailableError(
+                        str(args[2]),
+                        str(args[1]),
+                        reason=MessageUnavailableReason.HELPER_BUSY,
+                    ) from exc
+                raise
             except CamelHelperError as exc:
                 text = str(exc)
                 err_type = getattr(exc, "error_type", None) or ""
@@ -2105,6 +2226,7 @@ class MailService:
                         kwargs or {},
                         timeout=timeout,
                         wait_timeout=wait_timeout,
+                        on_wait=on_wait,
                         goa_ensure_out=goa_out,
                     )
                 raise
@@ -2605,6 +2727,23 @@ class MailService:
             str(event.get("message_uid") or ""),
             int(raw_size) if isinstance(raw_size, (int, float)) else None,
         )
+
+    def set_message_wait_listener(
+        self, callback: Callable[[str, str, str], None] | None
+    ) -> None:
+        """UI callback when a read has waited on a busy helper (any thread, #549)."""
+        self._message_wait_listener = callback
+
+    def _notify_message_wait(
+        self, account_uid: str, folder_name: str, message_uid: str
+    ) -> None:
+        listener = self._message_wait_listener
+        if listener is None:
+            return
+        try:
+            listener(account_uid, folder_name, message_uid)
+        except Exception:
+            log.debug("message wait listener failed", exc_info=True)
 
     def _notify_message_download(
         self,
@@ -4148,24 +4287,12 @@ class MailService:
                         account_uid,
                     )
                     continue
-                try:
-                    result = self._camel_helper_call(
-                        "flush_account_operation_queue",
-                        account_uid,
-                        [account_uid],
-                        timeout=helper_timeout,
-                    )
-                    count, failures, undo_events = (
-                        self._normalize_flush_operation_result(result)
-                    )
-                    flushed += count
-                    self._last_flush_hard_failures.extend(failures)
-                    self._last_flush_undo_events.extend(undo_events)
-                except Exception:
-                    log.exception(
-                        "Failed to flush operation queue via helper for %s",
-                        account_uid,
-                    )
+                flushed += self._flush_account_operations_via_helper(
+                    account_uid, helper_timeout=helper_timeout
+                )
+            # Runs even with an empty queue: a marker left behind by an
+            # operation that no longer exists is what hides messages (#549).
+            self._prune_orphaned_pending_removals()
             # Helper cleared durable pending on disk; refresh UI RAM (#503).
             self._reload_pending_local_removals_from_disk()
             self._notify_operation_flush_done(flushed)
@@ -4174,19 +4301,98 @@ class MailService:
             result = self._flush_operation_queue_unlocked()
         else:
             result = get_mail_io_thread().run_sync(self._flush_operation_queue_unlocked)
+        self._prune_orphaned_pending_removals()
         count, failures, undo_events = self._normalize_flush_operation_result(result)
         self._last_flush_hard_failures.extend(failures)
         self._last_flush_undo_events.extend(undo_events)
         self._notify_operation_flush_done(count)
         return count
 
-    def flush_account_operation_queue(self, account_uid: str) -> dict[str, Any]:
-        """Flush queued mutations for one account (helper entry point, #462)."""
-        if is_mail_io_thread():
-            return self._flush_operation_queue_unlocked(account_uid=account_uid)
-        return get_mail_io_thread().run_sync(
-            self._flush_operation_queue_unlocked, account_uid=account_uid
+    def _flush_account_operations_via_helper(
+        self, account_uid: str, *, helper_timeout: float
+    ) -> int:
+        """Flush one account's queue, one operation per helper call (#549).
+
+        The helper runs one call at a time. Flushing the whole queue in one
+        call held it for as long as the queue was long, so a message read had
+        to wait for every queued move. One call per operation releases the
+        lock in between, and the loop pauses while an interactive call waits.
+        A failed call ends this account's pass; operations already flushed count.
+        """
+        flushed = 0
+        attempted: list[str] = []
+        while True:
+            self._yield_to_interactive_helper_work()
+            try:
+                result = self._camel_helper_call(
+                    "flush_next_account_operation",
+                    account_uid,
+                    [account_uid, list(attempted)],
+                    timeout=helper_timeout,
+                )
+            except Exception:
+                log.exception(
+                    "Failed to flush operation queue via helper for %s",
+                    account_uid,
+                )
+                break
+            step = result if isinstance(result, dict) else {}
+            attempted_id = step.get("attempted_id")
+            if not attempted_id:
+                break
+            attempted.append(str(attempted_id))
+            flushed += int(step.get("flushed") or 0)
+            failures, undo_events = self._flush_step_events(step)
+            self._last_flush_hard_failures.extend(failures)
+            self._last_flush_undo_events.extend(undo_events)
+            if step.get("stop") or step.get("skip_account"):
+                break
+        return flushed
+
+    @staticmethod
+    def _flush_step_events(
+        step: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        failures = step.get("hard_failures") or []
+        undo_events = step.get("undo_events") or []
+        return (
+            [item for item in failures if isinstance(item, dict)],
+            [item for item in undo_events if isinstance(item, dict)],
         )
+
+    def _yield_to_interactive_helper_work(self) -> None:
+        """Let a waiting read or list load take the helper before the next op.
+
+        The helper lock is not fair: without this pause the flush would take it
+        again before a reader polling for it. Bounded so a stuck interactive
+        job cannot stall the flush forever.
+        """
+        deadline = time.monotonic() + _FLUSH_YIELD_MAX_SECONDS
+        while self.has_interactive_work_pending():
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(_FLUSH_YIELD_POLL_SECONDS)
+
+    def flush_next_account_operation(
+        self, account_uid: str, exclude_queue_ids: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Flush the next queued mutation for one account (helper entry point).
+
+        Runs exactly one operation (#462, #549). ``attempted_id`` is ``None``
+        when nothing was left to try.
+        """
+        excluded = list(exclude_queue_ids or [])
+        if is_mail_io_thread():
+            step = self._flush_next_operation_unlocked(
+                account_uid, exclude_queue_ids=excluded
+            )
+        else:
+            step = get_mail_io_thread().run_sync(
+                self._flush_next_operation_unlocked,
+                account_uid,
+                exclude_queue_ids=excluded,
+            )
+        return step.as_payload()
 
     @staticmethod
     def _normalize_flush_operation_result(
@@ -4830,171 +5036,261 @@ class MailService:
     def _flush_operation_queue_unlocked(
         self, account_uid: str | None = None
     ) -> dict[str, Any]:
+        """Flush every queued operation, one at a time (in-process path).
+
+        With helpers the UI drives the same single-operation step through
+        ``flush_next_account_operation`` so the helper lock is released
+        between operations (#549).
+        """
         flushed = 0
         hard_failures: list[dict[str, Any]] = []
         undo_events: list[dict[str, Any]] = []
-        skip_accounts: set[str] = set()
-        self._flushing_operation_queue = True
-        try:
-            for queue_id, operation in list_queued_operations():
-                if account_uid is not None and operation.account_uid != account_uid:
-                    continue
-                if operation.account_uid in skip_accounts:
-                    continue
-                if not self.account_may_contact_server(operation.account_uid):
-                    log.warning(
-                        "Queued operation %s (%s) deferred: account cannot "
-                        "contact the server (%s)",
-                        queue_id,
-                        operation.op_type,
-                        operation.account_uid,
-                    )
-                    skip_accounts.add(operation.account_uid)
-                    if not self._network_available:
-                        break
-                    continue
-                self._flushing_queue_ids.add(queue_id)
-                acquire_flush_lease(queue_id)
-                try:
-                    result = self._execute_queued_operation_unlocked(operation)
-                except Exception as exc:
-                    if is_sign_in_required_error(exc):
-                        self.set_account_connect_health(
-                            operation.account_uid, "needs_sign_in"
-                        )
-                        log.warning(
-                            "Queued operation %s (%s) waiting for sign-in (%s)",
-                            queue_id,
-                            operation.op_type,
-                            operation.account_uid,
-                        )
-                        skip_accounts.add(operation.account_uid)
-                        continue
-                    if is_queueable_network_error(exc):
-                        log.warning(
-                            "Queued operation %s (%s) deferred: network unavailable",
-                            queue_id,
-                            operation.op_type,
-                        )
-                        break
-                    # Stale UID already gone from Graph/Camel — drop and continue
-                    # so one dead set_seen does not block Archive flush (#503).
-                    if isinstance(exc, GLib.Error) and (
-                        self._is_missing_message_error(exc)
-                        or self._is_graph_item_not_found_error(exc)
-                    ):
-                        log.info(
-                            "Queued operation %s (%s): message already gone; "
-                            "dropping (#503)",
-                            queue_id,
-                            operation.op_type,
-                        )
-                        if operation.op_type in {
-                            "archive",
-                            "move_to_trash",
-                            "move_to_folder",
-                        }:
-                            self._clear_pending_local_removals(
-                                operation.account_uid,
-                                operation.folder_name,
-                                list(operation.message_uids),
-                            )
-                        remove_queued_operation(queue_id)
-                        flushed += 1
-                        continue
-                    log.exception(
-                        "Failed to flush queued operation %s (%s)",
-                        queue_id,
-                        operation.op_type,
-                    )
-                    # Hard failure: keep the op, clear pending so the list can
-                    # show the rows again, and tell the UI to reload (#503).
-                    if operation.op_type in {
-                        "archive",
-                        "move_to_trash",
-                        "move_to_folder",
-                    }:
-                        self._clear_pending_local_removals(
-                            operation.account_uid,
-                            operation.folder_name,
-                            list(operation.message_uids),
-                        )
-                    hard_failures.append(
-                        {
-                            "account_uid": operation.account_uid,
-                            "folder_name": operation.folder_name,
-                            "message_uids": list(operation.message_uids),
-                            "op_type": operation.op_type,
-                            "error": str(exc),
-                        }
-                    )
-                    break
-                else:
-                    if operation.op_type in {
-                        "archive",
-                        "move_to_trash",
-                        "move_to_folder",
-                    }:
-                        requested = [str(uid) for uid in operation.message_uids if uid]
-                        moved = [
-                            str(uid)
-                            for uid in (result or {}).get("moved_uids") or requested
-                            if uid
-                        ]
-                        moved_set = set(moved)
-                        remaining = [
-                            uid for uid in requested if uid not in moved_set
-                        ]
-                        if moved:
-                            self._clear_pending_local_removals(
-                                operation.account_uid,
-                                operation.folder_name,
-                                moved,
-                            )
-                            dest_folder = (result or {}).get("destination_folder")
-                            dest_uids = [
-                                str(uid)
-                                for uid in (result or {}).get("destination_uids")
-                                or []
-                                if uid
-                            ]
-                            undo_events.append(
-                                {
-                                    "account_uid": operation.account_uid,
-                                    "source_folder": operation.folder_name,
-                                    "moved_uids": moved,
-                                    "destination_folder": dest_folder,
-                                    "destination_uids": dest_uids,
-                                    "op_type": operation.op_type,
-                                }
-                            )
-                        if remaining:
-                            # Partial soft-succeed: keep the remainder queued (#503).
-                            log.warning(
-                                "Queued operation %s partially flushed "
-                                "(%d moved, %d remaining)",
-                                queue_id,
-                                len(moved),
-                                len(remaining),
-                            )
-                            operation.message_uids = remaining
-                            enqueue_operation(operation, queue_id=queue_id)
-                        else:
-                            remove_queued_operation(queue_id)
-                            flushed += 1
-                    else:
-                        remove_queued_operation(queue_id)
-                        flushed += 1
-                finally:
-                    self._flushing_queue_ids.discard(queue_id)
-                    release_flush_lease(queue_id)
-        finally:
-            self._flushing_operation_queue = False
+        attempted: set[str] = set()
+        skipped_accounts: set[str] = set()
+        while True:
+            step = self._flush_next_operation_unlocked(
+                account_uid,
+                exclude_queue_ids=attempted,
+                exclude_account_uids=skipped_accounts,
+            )
+            if step.attempted_id is None:
+                break
+            attempted.add(step.attempted_id)
+            flushed += step.flushed
+            hard_failures.extend(step.hard_failures)
+            undo_events.extend(step.undo_events)
+            if step.skip_account and step.account_uid is not None:
+                skipped_accounts.add(step.account_uid)
+            if step.stop:
+                break
         return {
             "flushed": flushed,
             "hard_failures": hard_failures,
             "undo_events": undo_events,
         }
+
+    def _flush_next_operation_unlocked(
+        self,
+        account_uid: str | None,
+        *,
+        exclude_queue_ids: Iterable[str] = (),
+        exclude_account_uids: Iterable[str] = (),
+    ) -> _FlushStep:
+        """Run the first queued operation that was not tried yet in this pass."""
+        step = _FlushStep()
+        excluded_ids = set(exclude_queue_ids)
+        excluded_accounts = set(exclude_account_uids)
+        for queue_id, operation in list_queued_operations():
+            if account_uid is not None and operation.account_uid != account_uid:
+                continue
+            if queue_id in excluded_ids or operation.account_uid in excluded_accounts:
+                continue
+            step.attempted_id = queue_id
+            step.account_uid = operation.account_uid
+            self._flushing_operation_queue = True
+            try:
+                self._flush_queued_operation_unlocked(queue_id, operation, step)
+            finally:
+                self._flushing_operation_queue = False
+            break
+        return step
+
+    def _prune_orphaned_pending_removals(
+        self,
+        account_uid: str | None = None,
+        *,
+        min_age_seconds: float = _ORPHAN_PENDING_MIN_AGE_SECONDS,
+    ) -> None:
+        """Un-hide messages whose queued move no longer exists (#549).
+
+        Pure file work, so it runs in the UI process and does not need the
+        helper. ``account_uid=None`` covers every account.
+
+        A pending-removal marker hides UIDs until their queued MOVE finishes.
+        If the queue holds nothing for those UIDs, the marker can only hide
+        messages that are still where they were. Markers younger than
+        ``min_age_seconds`` are left alone: one may have been written an
+        instant before its operation was queued.
+        """
+        queued: dict[tuple[str, str], set[str]] = {}
+        for _queue_id, operation in list_queued_operations():
+            queued.setdefault(
+                (operation.account_uid, operation.folder_name), set()
+            ).update(str(uid) for uid in operation.message_uids if uid)
+        for (account, folder_name), uids in (
+            pending_removals_store.load_all_pending_removals().items()
+        ):
+            if account_uid is not None and account != account_uid:
+                continue
+            orphans = uids - queued.get((account, folder_name), set())
+            if not orphans:
+                continue
+            age = pending_removals_store.pending_age_seconds(account, folder_name)
+            if age is None or age < min_age_seconds:
+                continue
+            log.warning(
+                "Dropping %d orphaned pending removal(s) in %s/%s: no queued "
+                "operation covers them (#549)",
+                len(orphans),
+                account,
+                folder_name,
+            )
+            self._clear_pending_local_removals(
+                account, folder_name, sorted(orphans)
+            )
+
+    def _flush_queued_operation_unlocked(
+        self, queue_id: str, operation: QueuedOperation, step: _FlushStep
+    ) -> None:
+        """Execute one queued operation and record the outcome in *step*."""
+        if not self.account_may_contact_server(operation.account_uid):
+            log.warning(
+                "Queued operation %s (%s) deferred: account cannot "
+                "contact the server (%s)",
+                queue_id,
+                operation.op_type,
+                operation.account_uid,
+            )
+            step.skip_account = True
+            step.stop = not self._network_available
+            return
+        self._flushing_queue_ids.add(queue_id)
+        acquire_flush_lease(queue_id)
+        try:
+            result = self._execute_queued_operation_unlocked(operation)
+        except Exception as exc:
+            if is_sign_in_required_error(exc):
+                self.set_account_connect_health(
+                    operation.account_uid, "needs_sign_in"
+                )
+                log.warning(
+                    "Queued operation %s (%s) waiting for sign-in (%s)",
+                    queue_id,
+                    operation.op_type,
+                    operation.account_uid,
+                )
+                step.skip_account = True
+                return
+            if is_queueable_network_error(exc):
+                log.warning(
+                    "Queued operation %s (%s) deferred: network unavailable",
+                    queue_id,
+                    operation.op_type,
+                )
+                step.stop = True
+                return
+            # Stale UID already gone from Graph/Camel — drop and continue
+            # so one dead set_seen does not block Archive flush (#503).
+            if isinstance(exc, GLib.Error) and (
+                self._is_missing_message_error(exc)
+                or self._is_graph_item_not_found_error(exc)
+            ):
+                log.info(
+                    "Queued operation %s (%s): message already gone; "
+                    "dropping (#503)",
+                    queue_id,
+                    operation.op_type,
+                )
+                if operation.op_type in {
+                    "archive",
+                    "move_to_trash",
+                    "move_to_folder",
+                }:
+                    self._clear_pending_local_removals(
+                        operation.account_uid,
+                        operation.folder_name,
+                        list(operation.message_uids),
+                    )
+                remove_queued_operation(queue_id)
+                step.flushed += 1
+                return
+            log.exception(
+                "Failed to flush queued operation %s (%s)",
+                queue_id,
+                operation.op_type,
+            )
+            # Hard failure: keep the op, clear pending so the list can
+            # show the rows again, and tell the UI to reload (#503).
+            if operation.op_type in {
+                "archive",
+                "move_to_trash",
+                "move_to_folder",
+            }:
+                self._clear_pending_local_removals(
+                    operation.account_uid,
+                    operation.folder_name,
+                    list(operation.message_uids),
+                )
+            step.hard_failures.append(
+                {
+                    "account_uid": operation.account_uid,
+                    "folder_name": operation.folder_name,
+                    "message_uids": list(operation.message_uids),
+                    "op_type": operation.op_type,
+                    "error": str(exc),
+                }
+            )
+            step.stop = True
+            return
+        else:
+            if operation.op_type in {
+                "archive",
+                "move_to_trash",
+                "move_to_folder",
+            }:
+                requested = [str(uid) for uid in operation.message_uids if uid]
+                moved = [
+                    str(uid)
+                    for uid in (result or {}).get("moved_uids") or requested
+                    if uid
+                ]
+                moved_set = set(moved)
+                remaining = [
+                    uid for uid in requested if uid not in moved_set
+                ]
+                if moved:
+                    self._clear_pending_local_removals(
+                        operation.account_uid,
+                        operation.folder_name,
+                        moved,
+                    )
+                    dest_folder = (result or {}).get("destination_folder")
+                    dest_uids = [
+                        str(uid)
+                        for uid in (result or {}).get("destination_uids")
+                        or []
+                        if uid
+                    ]
+                    step.undo_events.append(
+                        {
+                            "account_uid": operation.account_uid,
+                            "source_folder": operation.folder_name,
+                            "moved_uids": moved,
+                            "destination_folder": dest_folder,
+                            "destination_uids": dest_uids,
+                            "op_type": operation.op_type,
+                        }
+                    )
+                if remaining:
+                    # Partial soft-succeed: keep the remainder queued (#503).
+                    log.warning(
+                        "Queued operation %s partially flushed "
+                        "(%d moved, %d remaining)",
+                        queue_id,
+                        len(moved),
+                        len(remaining),
+                    )
+                    operation.message_uids = remaining
+                    enqueue_operation(operation, queue_id=queue_id)
+                else:
+                    remove_queued_operation(queue_id)
+                    step.flushed += 1
+            else:
+                remove_queued_operation(queue_id)
+                step.flushed += 1
+        finally:
+            self._flushing_queue_ids.discard(queue_id)
+            release_flush_lease(queue_id)
 
     def _flush_draft_queue_unlocked(self) -> int:
         flushed = 0
@@ -6865,12 +7161,46 @@ class MailService:
             }
             if limit is not None:
                 kwargs["limit"] = limit
-            result = self._camel_helper_call(
-                "get_folder_messages",
-                account_uid,
-                [account_uid, folder_name],
-                kwargs,
-            )
+            # A local-only list (``sync=False``) asks for what this machine
+            # already has. If the helper is tied up in something long, answer
+            # from the local copy instead of showing Loading for minutes (#549).
+            local_only = not sync
+            try:
+                result = self._camel_helper_call(
+                    "get_folder_messages",
+                    account_uid,
+                    [account_uid, folder_name],
+                    kwargs,
+                    wait_timeout=(
+                        _LOCAL_LIST_WAIT_SECONDS if local_only else None
+                    ),
+                )
+            except CamelHelperBusy:
+                # Whatever holds the helper may be cancellable background work
+                # (downsync, post-move cleanup); ask it to stop so the next
+                # call finds the helper free.
+                log.warning(
+                    "Helper busy; serving local list from local copy "
+                    "account=%s folder=%s",
+                    account_uid,
+                    folder_name,
+                )
+                self.preempt_background_op(account_uid)
+                result = self._local_folder_page_while_busy(
+                    account_uid,
+                    folder_name,
+                    full=full,
+                    offset=offset,
+                    limit=limit,
+                )
+                if result is None:
+                    # Nothing local to show; wait for the helper as before.
+                    result = self._camel_helper_call(
+                        "get_folder_messages",
+                        account_uid,
+                        [account_uid, folder_name],
+                        kwargs,
+                    )
             if isinstance(result, (list, tuple)) and len(result) == 4:
                 messages, unread, total, source = result
                 filtered = self._filter_pending_local_removals(
@@ -6900,6 +7230,63 @@ class MailService:
             full=full,
             offset=offset,
             limit=limit,
+        )
+
+    def _local_folder_page_while_busy(
+        self,
+        account_uid: str,
+        folder_name: str,
+        *,
+        full: bool,
+        offset: int,
+        limit: int | None,
+    ) -> tuple[list[dict], int, int, FolderIndexSource] | None:
+        """Serve a local-only list page without taking the helper lock (#549).
+
+        Prefer the helper's in-memory summary (answered on the side channel
+        while another call runs); otherwise use Post's on-disk folder index.
+        Returns ``None`` when neither has rows, so the caller waits for the
+        helper instead of showing an empty folder.
+        """
+        size = MESSAGE_LIST_UI_BIND_CAP if limit is None else max(0, int(limit))
+        try:
+            peeked = self._camel_pool.peek_summary_page(
+                account_uid,
+                folder_name,
+                offset=max(0, int(offset)),
+                limit=size if not full else MESSAGE_LIST_UI_BIND_CAP,
+                timeout=_LOCAL_LIST_PEEK_SECONDS,
+            )
+        except Exception:
+            log.debug("Side-channel summary peek failed", exc_info=True)
+            peeked = None
+        if (
+            not full
+            and isinstance(peeked, (list, tuple))
+            and len(peeked) == 4
+            and peeked[0]
+        ):
+            messages, unread, total, _source = peeked
+            return list(messages), int(unread), int(total), "memory"
+
+        cached = folder_index_cache.load(account_uid, folder_name)
+        if cached is None:
+            return None
+        messages, unread, total = cached
+        messages = exclude_moved_provisional_messages(list(messages))
+        if not messages:
+            return None
+        summary_count = len(messages)
+        if full:
+            page = messages
+        else:
+            start = max(0, int(offset))
+            page = messages[start : start + size]
+        return (
+            page,
+            unread,
+            total if total >= summary_count else summary_count,
+            "disk_cache",
         )
 
     def _ordered_searchable_folders_unlocked(self, account_uid: str) -> list[dict]:
@@ -9227,7 +9614,7 @@ class MailService:
                 account_uid, cancellable=cancellable, allow_online=False
             )
         try:
-            return self._get_named_folder_unlocked(
+            folder = self._get_named_folder_unlocked(
                 store, folder_name, cancellable
             )
         except GLib.Error as exc:
@@ -9237,9 +9624,29 @@ class MailService:
             store = self._get_store_unlocked(
                 account_uid, cancellable=cancellable, allow_online=False
             )
-            return self._get_named_folder_unlocked(
+            folder = self._get_named_folder_unlocked(
                 store, folder_name, cancellable
             )
+        if folder is not None:
+            with self._open_folders_lock:
+                self._open_folders[(account_uid, folder_name)] = (store, folder)
+        return folder
+
+    def _registered_open_folder(
+        self, account_uid: str, folder_name: str
+    ) -> Camel.Folder | None:
+        """A folder opened earlier by this process, if its store is still current."""
+        with self._open_folders_lock:
+            entry = self._open_folders.get((account_uid, folder_name))
+        if entry is None:
+            return None
+        store, folder = entry
+        if self._stores.get(account_uid) is not store:
+            with self._open_folders_lock:
+                if self._open_folders.get((account_uid, folder_name)) is entry:
+                    del self._open_folders[(account_uid, folder_name)]
+            return None
+        return folder
 
     def _open_folder_for_message_read_unlocked(
         self,
@@ -11568,6 +11975,11 @@ class MailService:
     ) -> dict:
         def _once() -> dict:
             if camel_helpers_enabled():
+                cached = self._read_cached_in_helper(
+                    account_uid, folder_name, message_uid, mark_seen=mark_seen
+                )
+                if cached is not None:
+                    return cached
                 return self._camel_helper_call(
                     "read_message",
                     account_uid,
@@ -11613,6 +12025,34 @@ class MailService:
                     exc_info=True,
                 )
             return _once()
+
+    def _read_cached_in_helper(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        mark_seen: bool,
+    ) -> dict | None:
+        """Ask the helper for a locally cached message without taking its lock.
+
+        ``None`` means "not available this way" (no helper yet, folder not open
+        in the helper, no local copy, or the helper did not answer); the caller
+        then does the serialized read, which can also download (#549).
+        """
+        try:
+            result = self._camel_pool.peek_cached_message(
+                account_uid, folder_name, message_uid, mark_seen=mark_seen
+            )
+        except CamelHelperError:
+            log.debug(
+                "Cached read via helper unavailable for %s in %r",
+                message_uid,
+                folder_name,
+                exc_info=True,
+            )
+            return None
+        return result if isinstance(result, dict) else None
 
     def read_attachment_data(
         self,
@@ -12339,14 +12779,23 @@ class MailService:
             return list(cached)
         return self._list_folders_from_local_store_unlocked(account_uid) or []
 
-    def _read_message_unlocked(
+    def _message_result_from_mime(
         self,
         account_uid: str,
         folder_name: str,
-        message_uid: str,
+        folder: Camel.Folder,
+        mime: Any,
         *,
-        mark_seen: bool = True,
+        actual_uid: str,
+        requested_uid: str,
+        info: Any,
     ) -> dict:
+        """Reader result dict for *mime*: headers, bodies, attachments, invite.
+
+        Shared by the serialized read and the lock-free cached read (#549), so
+        both produce the same dict for the same message. Reads local state
+        only; it never contacts the server.
+        """
         from .helpers import (
             enrich_message_dict_from_mime,
             extract_attachments,
@@ -12354,37 +12803,6 @@ class MailService:
             extract_message_bodies,
             has_visible_attachments,
         )
-
-        allow_network = self._allow_network_unlocked(account_uid)
-        folder = self._open_folder_for_message_read_unlocked(
-            account_uid,
-            folder_name,
-            message_uid,
-            allow_online=allow_network,
-        )
-        if not self.account_may_contact_server(account_uid):
-            allow_network = False
-
-        info = folder_get_message_info(folder,message_uid)
-        was_unread = info is not None and not (
-            info.get_flags() & Camel.MessageFlags.SEEN
-        )
-
-        mime = self._get_message_mime_sync(
-            folder,
-            account_uid,
-            folder_name,
-            message_uid,
-            allow_network=allow_network,
-        )
-        actual_uid = self._recovered_read_uid or message_uid
-        if actual_uid != message_uid:
-            remapped_info = folder_get_message_info(folder, actual_uid)
-            if remapped_info is not None:
-                info = remapped_info
-                was_unread = not (
-                    info.get_flags() & Camel.MessageFlags.SEEN
-                )
 
         if info:
             result = message_info_to_dict(
@@ -12394,16 +12812,16 @@ class MailService:
             index_row = self._folder_index_row(
                 account_uid, folder_name, actual_uid
             )
-            if index_row is None and actual_uid != message_uid:
+            if index_row is None and actual_uid != requested_uid:
                 index_row = self._folder_index_row(
-                    account_uid, folder_name, message_uid
+                    account_uid, folder_name, requested_uid
                 )
             result = (
                 dict(index_row) if index_row is not None else {"uid": actual_uid}
             )
         result["uid"] = actual_uid
-        if actual_uid != message_uid:
-            result["_previous_uid"] = message_uid
+        if actual_uid != requested_uid:
+            result["_previous_uid"] = requested_uid
         enrich_message_dict_from_mime(result, mime)
         bodies = extract_message_bodies(mime)
         if not (bodies.get("plain") or bodies.get("html")):
@@ -12453,6 +12871,97 @@ class MailService:
             references = mime.get_header("References")
             if references:
                 result["references"] = normalize_references_header(references)
+        return result
+
+    def read_cached_message(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        mark_seen: bool = True,
+    ) -> dict | None:
+        """Read a message from the local cache only, or ``None`` (#549).
+
+        Runs in the helper on a side-channel request, without the helper's
+        call lock and without the mail I/O thread, so a cached message opens
+        while a long server call (queue flush, folder refresh) is running. It
+        needs a folder this process already opened, uses Camel's on-disk copy
+        only, never contacts the server, and never changes state: when the
+        message is unread it sets ``needs_mark_seen`` and the UI marks it
+        through the normal local-first flag path.
+        """
+        folder = self._registered_open_folder(account_uid, folder_name)
+        if folder is None:
+            return None
+        mime = self._try_message_cached(folder, camel_uid_to_api(message_uid))
+        if mime is None:
+            return None
+        info = folder_get_message_info(folder, message_uid)
+        was_unread = info is not None and not (
+            info.get_flags() & Camel.MessageFlags.SEEN
+        )
+        result = self._message_result_from_mime(
+            account_uid,
+            folder_name,
+            folder,
+            mime,
+            actual_uid=message_uid,
+            requested_uid=message_uid,
+            info=info,
+        )
+        if was_unread and mark_seen:
+            result["needs_mark_seen"] = True
+        return result
+
+    def _read_message_unlocked(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        mark_seen: bool = True,
+    ) -> dict:
+        allow_network = self._allow_network_unlocked(account_uid)
+        folder = self._open_folder_for_message_read_unlocked(
+            account_uid,
+            folder_name,
+            message_uid,
+            allow_online=allow_network,
+        )
+        if not self.account_may_contact_server(account_uid):
+            allow_network = False
+
+        info = folder_get_message_info(folder,message_uid)
+        was_unread = info is not None and not (
+            info.get_flags() & Camel.MessageFlags.SEEN
+        )
+
+        mime = self._get_message_mime_sync(
+            folder,
+            account_uid,
+            folder_name,
+            message_uid,
+            allow_network=allow_network,
+        )
+        actual_uid = self._recovered_read_uid or message_uid
+        if actual_uid != message_uid:
+            remapped_info = folder_get_message_info(folder, actual_uid)
+            if remapped_info is not None:
+                info = remapped_info
+                was_unread = not (
+                    info.get_flags() & Camel.MessageFlags.SEEN
+                )
+
+        result = self._message_result_from_mime(
+            account_uid,
+            folder_name,
+            folder,
+            mime,
+            actual_uid=actual_uid,
+            requested_uid=message_uid,
+            info=info,
+        )
 
         # Empty extracted body still displays in the reader (#377); #341 stubs already raised.
         # Flag persistence queues instead of calling the server while the gate
@@ -13925,8 +14434,7 @@ class MailService:
                 destination_folder=dest_name,
             )
 
-        account = self._accounts_by_uid.get(account_uid)
-        backend = (account.backend or "").lower() if account is not None else ""
+        backend = self._transfer_backend_unlocked(account_uid)
         # Fail-fast while a previous Graph move is still pinning the mail thread
         # or the UI already marked the account not-responding (#189).
         if backend in {"microsoft365", "ews"}:
@@ -14063,22 +14571,31 @@ class MailService:
             # folder matches Post's cache without a hung Graph refresh (#189).
             self._prune_folder_summary_uids_unlocked(source_folder, moved_uids)
 
-            if not destination_uids:
-                # Full Archive fingerprint scans are costly / can hang on Graph.
-                # For a small interactive move, bound dest refresh so Camel can
-                # learn dest RestIds without a 29k-folder sync (#404).
-                destination_uids = self._resolve_and_sync_moved_destination_uids_unlocked(
-                    destination_folder,
-                    source_messages,
-                    destination_uids,
-                    moved_count=len(moved_uids),
-                    backend=backend or "",
-                )
-            else:
-                destination_uids = self._sync_moved_destination_uids_unlocked(
-                    destination_folder,
-                    destination_uids,
-                )
+            # Learning destination UIDs and prefetching their bodies is
+            # best-effort: the move is done. One shared, preemptible budget
+            # keeps it from holding the account helper (#549).
+            with self._best_effort_scope(_TRANSFER_TAIL_TIMEOUT_SECONDS) as tail:
+                if not destination_uids:
+                    # Full Archive fingerprint scans are costly / can hang on
+                    # Graph. For a small interactive move, bound dest refresh so
+                    # Camel can learn dest RestIds without a 29k-folder sync
+                    # (#404).
+                    destination_uids = (
+                        self._resolve_and_sync_moved_destination_uids_unlocked(
+                            destination_folder,
+                            source_messages,
+                            destination_uids,
+                            moved_count=len(moved_uids),
+                            backend=backend or "",
+                            cancellable=tail,
+                        )
+                    )
+                else:
+                    destination_uids = self._sync_moved_destination_uids_unlocked(
+                        destination_folder,
+                        destination_uids,
+                        tail,
+                    )
 
             source_unread = folder_get_unread_count(source_folder)
             source_total = source_folder.get_message_count()
@@ -14271,8 +14788,7 @@ class MailService:
         Graph/M365 often completes ``transfer_messages_to_sync`` then hangs in
         synchronize/refresh. The move already succeeded; do not block the UI.
         """
-        account = self._accounts_by_uid.get(account_uid)
-        backend = (account.backend or "").lower() if account is not None else ""
+        backend = self._transfer_backend_unlocked(account_uid)
         # Graph/EWS already applied the move server-side. Local summary is
         # updated via cache; synchronize/refresh_info often hang (#189).
         if backend in {"microsoft365", "ews"}:
@@ -14285,11 +14801,30 @@ class MailService:
             )
             return
 
-        cancellable = Gio.Cancellable()
-        timer = threading.Timer(
-            _TRANSFER_POST_TIMEOUT_SECONDS, cancellable.cancel
-        )
-        timer.start()
+        # Deadline only: foreground work must not cancel the commit, which
+        # expunges the moved messages on IMAP.
+        with self._best_effort_scope(
+            _TRANSFER_POST_TIMEOUT_SECONDS, preemptible=False
+        ) as cancellable:
+            self._finalize_folder_transfer_in_scope_unlocked(
+                account_uid,
+                source_folder,
+                destination_folder,
+                cancellable,
+                source_folder_name=source_folder_name,
+                dest_name=dest_name,
+            )
+
+    def _finalize_folder_transfer_in_scope_unlocked(
+        self,
+        account_uid: str,
+        source_folder: Camel.Folder,
+        destination_folder: Camel.Folder,
+        cancellable: Gio.Cancellable,
+        *,
+        source_folder_name: str,
+        dest_name: str | None,
+    ) -> None:
         try:
             self._commit_folder_transfer_unlocked(
                 source_folder, destination_folder, cancellable
@@ -14343,8 +14878,6 @@ class MailService:
                 )
                 return
             raise
-        finally:
-            timer.cancel()
 
     def _message_dicts_for_uids_unlocked(
         self,
@@ -14365,16 +14898,25 @@ class MailService:
         destination_folder: Camel.Folder,
         *,
         timeout: float,
+        parent: Gio.Cancellable | None = None,
     ) -> None:
         """Best-effort dest ``refresh_info`` after a small move (#404).
 
         Must not pin the mail thread the way unbounded Graph Archive refresh
-        does (#189).
+        does (#189). Also stops when ``parent`` is cancelled.
         """
         cancellable = Gio.Cancellable()
         timer = threading.Timer(timeout, cancellable.cancel)
+        timer.daemon = True
+        handler = (
+            parent.connect(lambda *_args: cancellable.cancel())
+            if parent is not None
+            else None
+        )
         timer.start()
         try:
+            if parent is not None and parent.is_cancelled():
+                return
             destination_folder.refresh_info_sync(cancellable)
         except Exception:
             log.debug(
@@ -14383,18 +14925,31 @@ class MailService:
             )
         finally:
             timer.cancel()
+            if parent is not None and handler:
+                parent.disconnect(handler)
 
     def _sync_moved_destination_uids_unlocked(
         self,
         destination_folder: Camel.Folder,
         destination_uids: list[str],
+        cancellable: Gio.Cancellable | None = None,
     ) -> list[str]:
-        """Fetch MIME for dest RestIds after a move (#404). Failures are ignored."""
+        """Fetch MIME for dest RestIds after a move (#404). Failures are ignored.
+
+        Stops early when ``cancellable`` fires; the UIDs are still returned,
+        because they are already known and only the body prefetch is skipped.
+        """
         dest_uids = [uid for uid in destination_uids if uid]
         for uid in dest_uids[:_TRANSFER_DEST_SYNC_MAX]:
+            if cancellable is not None and cancellable.is_cancelled():
+                log.warning(
+                    "Skipping remaining destination body prefetch after move "
+                    "(cancelled or out of time)"
+                )
+                break
             try:
                 destination_folder.synchronize_message_sync(
-                    camel_uid_to_api(uid), None
+                    camel_uid_to_api(uid), cancellable
                 )
             except Exception:
                 log.debug(
@@ -14412,14 +14967,29 @@ class MailService:
         *,
         moved_count: int,
         backend: str,
+        cancellable: Gio.Cancellable | None = None,
     ) -> list[str]:
         """Learn dest RestIds after Graph omitted ``transferred_uids`` (#404)."""
         dest_uids = [uid for uid in destination_uids if uid]
         graph_like = backend in {"microsoft365", "ews"}
+        if not dest_uids and is_heavy_folder_name(destination_folder.get_full_name()):
+            # ``refresh_info_sync`` of a large folder ignores its cancellable
+            # when the connection is stalled (seen in a stack dump: the helper
+            # sat in it for minutes after an Inbox → Archive move, #549). Its
+            # only purpose here is to learn destination UIDs for a later
+            # reverse-MOVE Undo, which is not worth wedging the account
+            # helper. The server did not report the UIDs, so Undo falls back to
+            # the queued-op path only.
+            log.info(
+                "Not refreshing heavy destination %s to learn moved UIDs",
+                destination_folder.get_full_name(),
+            )
+            return []
         if not dest_uids and 0 < moved_count <= _TRANSFER_DEST_RESOLVE_MAX:
             self._refresh_destination_folder_bounded_unlocked(
                 destination_folder,
                 timeout=_TRANSFER_DEST_REFRESH_TIMEOUT_SECONDS,
+                parent=cancellable,
             )
             try:
                 dest_uids = self._find_moved_uids_in_folder_unlocked(
@@ -14427,6 +14997,7 @@ class MailService:
                     source_messages,
                     uid_limit=None if not graph_like else max(moved_count * 25, 100),
                     backend=backend or None,
+                    cancellable=cancellable,
                 )
             except Exception:
                 log.debug(
@@ -14441,6 +15012,7 @@ class MailService:
                     source_messages,
                     uid_limit=(500 if graph_like else None),
                     backend=backend or None,
+                    cancellable=cancellable,
                 )
             except Exception:
                 log.debug(
@@ -14449,7 +15021,7 @@ class MailService:
                 )
                 dest_uids = []
         return self._sync_moved_destination_uids_unlocked(
-            destination_folder, dest_uids
+            destination_folder, dest_uids, cancellable
         )
 
     def _find_moved_uids_in_folder_unlocked(
@@ -14459,6 +15031,7 @@ class MailService:
         *,
         uid_limit: int | None = None,
         backend: str | None = None,
+        cancellable: Gio.Cancellable | None = None,
     ) -> list[str]:
         if not source_messages:
             return []
@@ -14476,8 +15049,13 @@ class MailService:
         if not uids:
             return []
 
+        def stopped() -> bool:
+            return cancellable is not None and cancellable.is_cancelled()
+
         if uid_limit is None:
             for uid in uids:
+                if stopped():
+                    break
                 info = folder_get_message_info(folder, uid)
                 if info is None:
                     continue
@@ -14497,6 +15075,8 @@ class MailService:
         # match only among the newest *uid_limit* headers (#189/#261).
         dated: list[tuple[float, str, dict[str, Any]]] = []
         for uid in uids:
+            if stopped():
+                return []
             info = folder_get_message_info(folder, uid)
             if info is None:
                 continue
@@ -14516,6 +15096,17 @@ class MailService:
                 if len(found) >= len(fingerprints):
                     break
         return found
+
+    def _transfer_backend_unlocked(self, account_uid: str) -> str:
+        """Lower-case backend name for transfer decisions.
+
+        Must use ``_backend_for_account``: a helper process never lists accounts,
+        so ``_accounts_by_uid`` is empty there and an empty backend would make a
+        Microsoft 365 move run the post-transfer sync/refresh that is skipped
+        for Graph because it hangs (#189, #549).
+        """
+        resolved = self._backend_for_account(account_uid)
+        return resolved.lower() if isinstance(resolved, str) else ""
 
     def _backend_for_account(self, account_uid: str) -> str | None:
         """Return Camel/EDS backend name for ``account_uid``.

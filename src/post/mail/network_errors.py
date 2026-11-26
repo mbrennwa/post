@@ -13,6 +13,7 @@ gi.require_version("GLib", "2.0")
 
 from gi.repository import GLib
 
+from .camel_runtime import CamelHelperBusy
 from .send_errors import _is_localhost_refused
 
 OFFLINE_FOLDER_MESSAGE = "Offline — folders unavailable until you reconnect."
@@ -21,6 +22,12 @@ OFFLINE_MESSAGE_READ_MESSAGE = (
 )
 MESSAGE_READ_TIMEOUT_MESSAGE = (
     "The mail server did not respond in time. Select the message again to retry."
+)
+# The account's helper was busy with another call (for example a queue flush)
+# for the whole wait. The server was never contacted (#549).
+HELPER_BUSY_MESSAGE = (
+    "Mail is still busy syncing this account. "
+    "Select the message again in a moment."
 )
 SERVER_TIMEOUT_FOLDER_MESSAGE = (
     "The mail server did not respond in time. Try again in a moment."
@@ -125,6 +132,8 @@ def is_connectivity_error(exc: BaseException) -> bool:
 
 def is_timeout_error(exc: BaseException) -> bool:
     """True when a request was cut off or went silent (not proof of offline)."""
+    if isinstance(exc, CamelHelperBusy):
+        return False
     if isinstance(exc, TimeoutError):
         return True
     if is_connectivity_error(exc):
@@ -207,6 +216,8 @@ def format_message_read_error(
             text = None
         if text:
             return str(text)
+    if isinstance(exc, CamelHelperBusy):
+        return HELPER_BUSY_MESSAGE
     if network_available is False or is_connectivity_error(exc):
         return OFFLINE_MESSAGE_READ_MESSAGE
     if is_timeout_error(exc):
@@ -230,6 +241,8 @@ def format_attachment_error(exc: BaseException) -> str:
             text = None
         if text:
             return str(text)
+    if isinstance(exc, CamelHelperBusy):
+        return HELPER_BUSY_MESSAGE
     if is_sign_in_required_error(exc):
         return format_message_read_error(exc, cached=False)
     return f"Attachment error: {exc}"

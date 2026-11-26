@@ -226,11 +226,12 @@ class ServiceLockReleaseTests(unittest.TestCase):
             "offline_downsync_folder",
             "synchronize_folder_message",
             "apply_local_mutation",
-            "flush_account_operation_queue",
+            "flush_next_account_operation",
         ):
             self.assertIn(name, ALLOWED_METHODS)
 
     def test_flush_operation_queue_routes_through_helper(self) -> None:
+        """The helper flushes one operation per call (#549)."""
         service = MailService(registry=mock.Mock())
         enqueue_operation(
             QueuedOperation(
@@ -240,17 +241,185 @@ class ServiceLockReleaseTests(unittest.TestCase):
                 message_uids=["1"],
             )
         )
-        with mock.patch.object(
-            service, "_camel_helper_call", return_value=1
-        ) as helper_call:
+        steps = [
+            {"attempted_id": "q1", "account_uid": "acct-1", "flushed": 1},
+            {"attempted_id": None},
+        ]
+        with (
+            mock.patch.object(service, "_camel_helper_call", side_effect=steps)
+            as helper_call,
+            mock.patch.object(
+                service, "has_interactive_work_pending", return_value=False
+            ),
+        ):
             flushed = service.flush_operation_queue()
         self.assertEqual(flushed, 1)
-        helper_call.assert_called_once_with(
-            "flush_account_operation_queue",
-            "acct-1",
-            ["acct-1"],
-            timeout=180.0,
+        self.assertEqual(
+            helper_call.call_args_list,
+            [
+                mock.call(
+                    "flush_next_account_operation",
+                    "acct-1",
+                    ["acct-1", []],
+                    timeout=180.0,
+                ),
+                mock.call(
+                    "flush_next_account_operation",
+                    "acct-1",
+                    ["acct-1", ["q1"]],
+                    timeout=180.0,
+                ),
+            ],
         )
+
+    def test_helper_flush_stops_after_a_hard_failure(self) -> None:
+        service = MailService(registry=mock.Mock())
+        enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["1"],
+            )
+        )
+        failure = {"account_uid": "acct-1", "op_type": "archive"}
+        steps = [
+            {
+                "attempted_id": "q1",
+                "flushed": 0,
+                "hard_failures": [failure],
+                "stop": True,
+            },
+        ]
+        with (
+            mock.patch.object(service, "_camel_helper_call", side_effect=steps)
+            as helper_call,
+            mock.patch.object(
+                service, "has_interactive_work_pending", return_value=False
+            ),
+        ):
+            flushed = service.flush_operation_queue()
+        self.assertEqual(flushed, 0)
+        helper_call.assert_called_once()
+        self.assertEqual(service.consume_operation_flush_hard_failures(), [failure])
+
+    def test_helper_flush_leaves_the_account_after_skip(self) -> None:
+        service = MailService(registry=mock.Mock())
+        enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["1"],
+            )
+        )
+        steps = [{"attempted_id": "q1", "flushed": 0, "skip_account": True}]
+        with (
+            mock.patch.object(service, "_camel_helper_call", side_effect=steps)
+            as helper_call,
+            mock.patch.object(
+                service, "has_interactive_work_pending", return_value=False
+            ),
+        ):
+            service.flush_operation_queue()
+        helper_call.assert_called_once()
+
+    def test_helper_flush_keeps_count_when_a_later_call_fails(self) -> None:
+        service = MailService(registry=mock.Mock())
+        enqueue_operation(
+            QueuedOperation(
+                op_type="archive",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["1"],
+            )
+        )
+        steps = [
+            {"attempted_id": "q1", "flushed": 1},
+            RuntimeError("helper died"),
+        ]
+        with (
+            mock.patch.object(service, "_camel_helper_call", side_effect=steps),
+            mock.patch.object(
+                service, "has_interactive_work_pending", return_value=False
+            ),
+        ):
+            self.assertEqual(service.flush_operation_queue(), 1)
+
+    def test_flush_waits_for_a_waiting_read_between_operations(self) -> None:
+        """The flush must not retake the helper before a reader gets it (#549)."""
+        service = MailService(registry=mock.Mock())
+        pending = iter([True, True, False])
+        with (
+            mock.patch.object(
+                service,
+                "has_interactive_work_pending",
+                side_effect=lambda: next(pending),
+            ),
+            mock.patch("post.mail.eds.time.sleep") as sleep,
+        ):
+            service._yield_to_interactive_helper_work()
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_flush_yield_is_bounded(self) -> None:
+        service = MailService(registry=mock.Mock())
+        clock = iter([0.0, 1.0, 1000.0])
+        with (
+            mock.patch.object(
+                service, "has_interactive_work_pending", return_value=True
+            ),
+            mock.patch("post.mail.eds.time.sleep"),
+            mock.patch(
+                "post.mail.eds.time.monotonic", side_effect=lambda: next(clock)
+            ),
+        ):
+            service._yield_to_interactive_helper_work()
+
+    def test_flush_next_account_operation_runs_exactly_one(self) -> None:
+        service = MailService(registry=mock.Mock())
+        first = enqueue_operation(
+            QueuedOperation(
+                op_type="move_to_trash",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["1"],
+            )
+        )
+        second = enqueue_operation(
+            QueuedOperation(
+                op_type="move_to_trash",
+                account_uid="acct-1",
+                folder_name="INBOX",
+                message_uids=["2"],
+            )
+        )
+        executed: list[str] = []
+
+        def _execute(operation: QueuedOperation) -> dict:
+            executed.append(operation.message_uids[0])
+            return {}
+
+        with (
+            mock.patch("post.mail.eds.is_mail_io_thread", return_value=True),
+            mock.patch.object(
+                service, "_execute_queued_operation_unlocked", side_effect=_execute
+            ),
+            mock.patch.object(
+                service, "account_may_contact_server", return_value=True
+            ),
+        ):
+            one = service.flush_next_account_operation("acct-1")
+            self.assertEqual(executed, ["1"])
+            self.assertEqual(one["attempted_id"], first)
+            self.assertEqual(one["flushed"], 1)
+            self.assertFalse(service._flushing_operation_queue)
+
+            two = service.flush_next_account_operation("acct-1", [first])
+            self.assertEqual(two["attempted_id"], second)
+            none = service.flush_next_account_operation("acct-1", [first, second])
+            self.assertIsNone(none["attempted_id"])
+        self.assertEqual(executed, ["1", "2"])
+        self.assertEqual(count_queued_operations(), 0)
 
     def test_local_first_transfer_enqueues_and_schedules_flush(self) -> None:
         service = MailService(registry=mock.Mock())

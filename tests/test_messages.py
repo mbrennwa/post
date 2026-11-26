@@ -7,6 +7,7 @@ import os
 import time
 import unittest
 from contextlib import contextmanager
+from unittest import mock
 from unittest.mock import MagicMock
 
 from post.mail.folders import is_sent_folder_name
@@ -759,6 +760,89 @@ class SearchSelectionReaderSyncTests(unittest.TestCase):
         window._show_message_unavailable_reader.assert_called_once()
         self.assertIsNone(window._displayed_message_id)
         window._reader_pane.show_message.assert_not_called()
+
+    def _read_window(self):
+        """Stub with the attributes the success path of _on_message_read needs."""
+        hit = annotate_search_match(
+            {"uid": "100", "subject": "Apollon"},
+            account_uid="acct-1",
+            folder_name="INBOX",
+        )
+        window = self._window_stub(messages=[hit], sidebar_folder="INBOX")
+        list_key = hit["_search_row_key"]
+        window._current_message_uid = list_key
+        window._message_read_generation = 1
+        window._remap_folder_message_uids = MagicMock()
+        window._remap_list_key = MagicMock()
+        window._reconcile_folder_index_headers_after_read = MagicMock()
+        window._upsert_message_in_folder_cache = MagicMock()
+        window._mark_message_read = MagicMock()
+        window._sidebar.update_folder_row = MagicMock()
+        window._load_remote_content = False
+        window._message_appearance = None
+        window._restore_message_folder = None
+        window._app_prefers_dark = lambda: False
+        return window, list_key
+
+    def _complete_read(self, window, list_key, msg):
+        from post.window import MainWindow
+
+        msg = {"uid": "100", "subject": "Apollon", "body_plain": "hi", **msg}
+        with (
+            mock.patch("post.window.set_active_message_uid"),
+            mock.patch("post.window.body_matches_message_id", return_value=True),
+        ):
+            MainWindow._on_message_read(window, 1, list_key, msg, None)
+
+    def test_cached_read_marks_an_unread_message_seen_through_the_flag_path(
+        self,
+    ) -> None:
+        window, list_key = self._read_window()
+        self._complete_read(
+            window,
+            list_key,
+            {"flags": {"seen": False}, "needs_mark_seen": True},
+        )
+        window._mark_message_read_on_click_if_unread.assert_called_once_with(
+            list_key
+        )
+
+    def test_serialized_read_does_not_mark_seen_a_second_time(self) -> None:
+        window, list_key = self._read_window()
+        self._complete_read(window, list_key, {"flags": {"seen": True}})
+        window._mark_message_read_on_click_if_unread.assert_not_called()
+        window._mark_message_read.assert_called_once_with(list_key)
+
+    def test_busy_helper_offers_retry_and_a_non_timeout_text(self) -> None:
+        from post.mail.eds import MessageNotAvailableError, MessageUnavailableReason
+        from post.window import MainWindow
+
+        window, list_key = self._read_window()
+        window._show_message_unavailable_reader = MagicMock()
+        error = MessageNotAvailableError(
+            "100", "INBOX", reason=MessageUnavailableReason.HELPER_BUSY
+        )
+        with mock.patch("post.window.show_error_toast") as toast:
+            MainWindow._on_message_read(window, 1, list_key, None, error)
+        text = toast.call_args.args[1]
+        self.assertNotIn("did not respond", text)
+        toast.return_value.set_button_label.assert_called_once_with("Retry")
+
+    def test_message_wait_shows_a_loading_note_for_the_selected_read(self) -> None:
+        from post.window import MainWindow
+
+        window, list_key = self._read_window()
+        window._pending_message_read_uid = list_key
+        window._inflight_message_read_id = 1
+        window._show_message_download_note = (
+            lambda *args: MainWindow._show_message_download_note(window, *args)
+        )
+        with mock.patch("post.window.GLib.idle_add") as idle_add:
+            MainWindow._on_message_wait(window, "acct-1", "INBOX", "100")
+        callback, *args = idle_add.call_args.args
+        callback(*args)
+        window._reader_pane.show_loading.assert_called_once()
+        self.assertIn("sync", window._reader_pane.show_loading.call_args.args[0])
 
     def test_set_selected_message_click_a_then_b_loads_only_b(self) -> None:
         from post.window import MainWindow

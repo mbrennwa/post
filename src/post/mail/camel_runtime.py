@@ -26,6 +26,12 @@ _DEFAULT_JOB_TIMEOUT = 120.0
 # Repeat while it is still waiting so a stall shows up in the log (#422).
 _BLOCKED_LOG_AFTER = 1.0
 _BLOCKED_LOG_REPEAT = 10.0
+# A caller that opted in is told once it has waited this long on a busy helper,
+# so the reader can say why it is still loading (#549).
+_WAIT_NOTICE_AFTER = 2.0
+# A cached read answers from disk in milliseconds; past this the helper is
+# treated as unable to serve it and the caller takes the serialized read (#549).
+_CACHED_READ_PEEK_SECONDS = 5.0
 
 
 def camel_helpers_enabled() -> bool:
@@ -56,6 +62,26 @@ class CamelHelperError(RuntimeError):
 
 class CamelHelperTimeout(CamelHelperError):
     """Raised when a helper job exceeds the watchdog timeout."""
+
+
+class CamelHelperBusy(CamelHelperError):
+    """Raised when a call gave up waiting for the helper to finish another call.
+
+    Deliberately not a ``CamelHelperTimeout``: nothing was sent, the server was
+    never contacted, and the holder keeps running. Treating it as a timeout made
+    the reader claim "the server did not respond" (#549).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        busy_method: str | None = None,
+        busy_for: float = 0.0,
+    ) -> None:
+        super().__init__(message, error_type="CamelHelperBusy")
+        self.busy_method = busy_method
+        self.busy_for = busy_for
 
 
 def ipc_goa_ensure(msg: dict[str, Any] | None) -> str | None:
@@ -351,6 +377,7 @@ class AccountCamelRuntime:
         *,
         timeout: float | None = _DEFAULT_JOB_TIMEOUT,
         wait_timeout: float | None = None,
+        on_wait: Callable[[str | None, float], None] | None = None,
         goa_ensure_out: list[str] | None = None,
     ) -> Any:
         """Run ``method`` in the helper; raise on failure / timeout / kill.
@@ -360,8 +387,12 @@ class AccountCamelRuntime:
 
         ``wait_timeout`` bounds how long this call waits for ``_serial``. On
         expiry the holding call keeps running and this helper is not killed.
+        ``on_wait(busy_method, busy_for)`` is called once if the wait lasts
+        ``_WAIT_NOTICE_AFTER`` seconds.
         """
-        self._acquire_serial_for(method, wait_timeout=wait_timeout)
+        self._acquire_serial_for(
+            method, wait_timeout=wait_timeout, on_wait=on_wait
+        )
         try:
             self._set_busy(method)
             try:
@@ -378,11 +409,15 @@ class AccountCamelRuntime:
             self._serial.release()
 
     def _acquire_serial_for(
-        self, method: str, *, wait_timeout: float | None = None
+        self,
+        method: str,
+        *,
+        wait_timeout: float | None = None,
+        on_wait: Callable[[str | None, float], None] | None = None,
     ) -> None:
         """Take ``_serial``, logging when this call waits on a busy helper.
 
-        ``wait_timeout`` raises ``CamelHelperTimeout`` without killing the
+        ``wait_timeout`` raises ``CamelHelperBusy`` without killing the
         helper. Interactive reads use it so the reader can leave
         "Loading message…" (#494).
         """
@@ -396,15 +431,25 @@ class AccountCamelRuntime:
         )
         next_log = wait_started + _BLOCKED_LOG_AFTER
         logged = False
+        notified = on_wait is None
         while True:
             now = time.monotonic()
+            if not notified and now - wait_started >= _WAIT_NOTICE_AFTER:
+                notified = True
+                busy_method, busy_for = self._busy_snapshot()
+                try:
+                    on_wait(busy_method, busy_for)
+                except Exception:
+                    log.debug("helper wait notice failed", exc_info=True)
             if deadline is not None and now >= deadline:
                 busy_method, busy_for = self._busy_snapshot()
-                raise CamelHelperTimeout(
-                    "timed out waiting for camel helper lock "
+                raise CamelHelperBusy(
+                    "gave up waiting for camel helper lock "
                     f"account={self.account_uid} method={method} "
                     f"behind={busy_method or 'unknown'} "
-                    f"busy_for={busy_for:.1f}s wait={wait_timeout:.0f}s"
+                    f"busy_for={busy_for:.1f}s wait={wait_timeout:.0f}s",
+                    busy_method=busy_method,
+                    busy_for=busy_for,
                 )
             if now >= next_log:
                 busy_method, busy_for = self._busy_snapshot()
@@ -477,6 +522,53 @@ class AccountCamelRuntime:
         list must still reach rows already in the helper summary.
         """
         self.ensure_started()
+        return self._side_request(
+            {
+                "type": "summary_page",
+                "folder_name": folder_name,
+                "offset": offset,
+                "limit": limit,
+            },
+            timeout=timeout,
+            label="summary page",
+        )
+
+    def peek_cached_message(
+        self,
+        folder_name: str,
+        message_uid: str,
+        *,
+        mark_seen: bool,
+        timeout: float = _CACHED_READ_PEEK_SECONDS,
+    ) -> Any:
+        """Read a message from the local cache without waiting for ``_serial``.
+
+        Returns ``None`` when no helper is running or the helper has no local
+        copy it can serve right now; the caller then takes the serialized read.
+        A cached read needs no server, so it must not queue behind a long
+        helper call such as a queue flush (#549).
+        """
+        if not self.is_running():
+            return None
+        return self._side_request(
+            {
+                "type": "read_cached",
+                "folder_name": folder_name,
+                "message_uid": message_uid,
+                "mark_seen": mark_seen,
+            },
+            timeout=timeout,
+            label="cached read",
+        )
+
+    def _side_request(
+        self, payload: dict[str, Any], *, timeout: float, label: str
+    ) -> Any:
+        """Send a request the helper answers while another call is running.
+
+        These bypass ``_serial``: the helper reads stdin while a call runs and
+        answers them from memory or the local cache.
+        """
         req_id = uuid.uuid4().hex
         event = threading.Event()
         pending: dict[str, Any] = {"event": event, "msg": None}
@@ -486,26 +578,17 @@ class AccountCamelRuntime:
                     f"camel helper not running for {self.account_uid}"
                 )
             self._pending[req_id] = pending
-            write_message(
-                self._proc.stdin,
-                {
-                    "type": "summary_page",
-                    "id": req_id,
-                    "folder_name": folder_name,
-                    "offset": offset,
-                    "limit": limit,
-                },
-            )
+            write_message(self._proc.stdin, {**payload, "id": req_id})
         finished = event.wait(timeout=max(0.1, timeout))
         if not finished:
             with self._lock:
                 self._pending.pop(req_id, None)
             raise CamelHelperTimeout(
-                f"camel helper summary page timed out for {self.account_uid}"
+                f"camel helper {label} timed out for {self.account_uid}"
             )
         msg = pending.get("msg") or {}
         if not msg.get("ok"):
-            err = str(msg.get("error") or "camel helper summary page failed")
+            err = str(msg.get("error") or f"camel helper {label} failed")
             raise CamelHelperError(err, error_type=str(msg.get("error_type") or ""))
         return msg.get("result")
 
@@ -778,6 +861,7 @@ class CamelRuntimePool:
         *,
         timeout: float | None = _DEFAULT_JOB_TIMEOUT,
         wait_timeout: float | None = None,
+        on_wait: Callable[[str | None, float], None] | None = None,
         goa_ensure_out: list[str] | None = None,
     ) -> Any:
         return self.get(account_uid).call(
@@ -786,6 +870,7 @@ class CamelRuntimePool:
             kwargs,
             timeout=timeout,
             wait_timeout=wait_timeout,
+            on_wait=on_wait,
             goa_ensure_out=goa_ensure_out,
         )
 
@@ -817,9 +902,27 @@ class CamelRuntimePool:
         *,
         offset: int,
         limit: int,
+        timeout: float = 30.0,
     ) -> Any:
         return self.get(account_uid).peek_summary_page(
-            folder_name, offset=offset, limit=limit
+            folder_name, offset=offset, limit=limit, timeout=timeout
+        )
+
+    def peek_cached_message(
+        self,
+        account_uid: str,
+        folder_name: str,
+        message_uid: str,
+        *,
+        mark_seen: bool,
+    ) -> Any:
+        """Local-cache read that does not wait for the helper's call lock (#549)."""
+        with self._lock:
+            runtime = self._runtimes.get(account_uid)
+        if runtime is None:
+            return None
+        return runtime.peek_cached_message(
+            folder_name, message_uid, mark_seen=mark_seen
         )
 
     def submit_worker(self, account_uid: str, func: Callable[[], None]) -> None:
