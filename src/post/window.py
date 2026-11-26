@@ -413,6 +413,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._search_progress_last_ui_time = 0
         self._search_results_streamed = False
         self._status_progress_pulse_id: int | None = None
+        # Search progress owns both the status label and the bar (#476).
+        self._search_progress_active = False
+        self._search_status = ""
+        self._search_progress_fraction: float | None = None
         self._offline_download_status = ""
         self._status_hint = ""
         self._send_delay_status = ""
@@ -3488,6 +3492,13 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _refresh_status_display(self) -> None:
         self._clear_stale_queued_status_hint()
+        # Online search progress wins over hints and the send-delay countdown.
+        # Offline keeps its own label and must not leave the search bar up.
+        if self._network_available and self._search_progress_active:
+            self._status.set_label(self._search_status)
+            self._apply_status_search_bar(visible=True)
+            return
+        self._apply_status_search_bar(visible=False)
         draft_queued = self._mail.count_queued_drafts()
         if not self._network_available:
             send_queued = len(list_queued_outbound_messages())
@@ -5651,12 +5662,11 @@ class MainWindow(Adw.ApplicationWindow):
         self._hide_status_search_progress()
 
     def _hide_status_search_progress(self) -> None:
-        if self._status_progress_pulse_id is not None:
-            GLib.source_remove(self._status_progress_pulse_id)
-            self._status_progress_pulse_id = None
-        self._status_progress.remove_css_class("status-search-progress-indeterminate")
-        self._status_progress.set_visible(False)
-        self._status_progress.set_fraction(0.0)
+        """Drop the search channel. Refresh hides the bar."""
+        self._search_progress_active = False
+        self._search_status = ""
+        self._search_progress_fraction = None
+        self._refresh_status_display()
 
     def _status_search_progress_pulse(self) -> bool:
         if not self._status_progress.get_visible():
@@ -5668,8 +5678,25 @@ class MainWindow(Adw.ApplicationWindow):
     def _show_status_search_progress(
         self, *, fraction: float = 0.0, indeterminate: bool = False
     ) -> None:
+        """Record search progress. Refresh paints the bar when search wins."""
+        self._search_progress_active = True
+        self._search_progress_fraction = None if indeterminate else fraction
+        self._refresh_status_display()
+
+    def _apply_status_search_bar(self, *, visible: bool) -> None:
+        """Paint the status progress bar. Does not refresh (avoids recursion)."""
+        if not visible:
+            if self._status_progress_pulse_id is not None:
+                GLib.source_remove(self._status_progress_pulse_id)
+                self._status_progress_pulse_id = None
+            self._status_progress.remove_css_class(
+                "status-search-progress-indeterminate"
+            )
+            self._status_progress.set_visible(False)
+            self._status_progress.set_fraction(0.0)
+            return
         self._status_progress.set_visible(True)
-        if indeterminate:
+        if self._search_progress_fraction is None:
             if self._status_progress_pulse_id is None:
                 self._status_progress_pulse_id = GLib.timeout_add(
                     80, self._status_search_progress_pulse
@@ -5681,16 +5708,15 @@ class MainWindow(Adw.ApplicationWindow):
             GLib.source_remove(self._status_progress_pulse_id)
             self._status_progress_pulse_id = None
         self._status_progress.remove_css_class("status-search-progress-indeterminate")
-        self._status_progress.set_fraction(fraction)
+        self._status_progress.set_fraction(self._search_progress_fraction)
 
     def _show_search_index_loading_ui(self, load_id: int, display_folder: str) -> None:
         if load_id != self._messages_load_generation:
             return
         if self._search_query is None:
             return
-        label = f"Loading Index for {display_folder}…"
+        self._search_status = f"Loading Index for {display_folder}…"
         self._show_status_search_progress(indeterminate=True)
-        self._set_status(label)
 
     def _report_search_progress(
         self, load_id: int, progress: SearchFilterProgress
@@ -5714,10 +5740,10 @@ class MainWindow(Adw.ApplicationWindow):
         ):
             return False
         self._search_progress_last_ui_time = now
-        progress_text = format_search_filter_progress(progress)
-        fraction = search_filter_progress_fraction(progress)
-        self._show_status_search_progress(fraction=fraction)
-        self._set_status(progress_text)
+        self._search_status = format_search_filter_progress(progress)
+        self._show_status_search_progress(
+            fraction=search_filter_progress_fraction(progress)
+        )
         return False
 
     def _report_search_matches(self, load_id: int, batch: list[dict]) -> None:
@@ -6199,7 +6225,9 @@ class MainWindow(Adw.ApplicationWindow):
                 searching=search_query is not None,
                 source=initial_source,
             )
-        self._set_status(loading_label)
+        # Search copy is applied after reset, on the search channel (#476).
+        if search_query is None:
+            self._set_status(loading_label)
         if (
             not self._pending_restore_message_uid
             and self._current_message_uid
@@ -6248,6 +6276,7 @@ class MainWindow(Adw.ApplicationWindow):
             if self._mail.get_folder_index_snapshot(account_uid, folder_name) is None:
                 self._show_search_index_loading_ui(load_id, display_folder)
             else:
+                self._search_status = loading_label
                 self._show_status_search_progress(fraction=0.0)
         else:
             self._message_loading_spinner.start()
@@ -7547,12 +7576,23 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self._move_outbox_to_drafts(self._context_message_uids[0])
 
+    def _announce_send_now(self, count: int) -> None:
+        """Confirm send-now without stealing an active search status (#476)."""
+        if count == 1:
+            text = "Sending message…"
+        else:
+            text = f"Sending {count} messages…"
+        if self._search_progress_active:
+            show_toast(self, text)
+            return
+        self._set_status(text)
+
     def _on_message_menu_outbox_send_now(self, *_args) -> None:
         if len(self._context_message_uids) != 1:
             return
         queue_id = self._context_message_uids[0]
         self._send_delay_scheduler.send_now(queue_id)
-        self._set_status("Sending message…")
+        self._announce_send_now(1)
 
     def _open_compose_from_outbox(self, queue_id: str) -> None:
         if not self._current_account:
@@ -7636,10 +7676,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
         for queue_id in pending:
             self._send_delay_scheduler.send_now(queue_id)
-        if len(pending) == 1:
-            self._set_status("Sending message…")
-        else:
-            self._set_status(f"Sending {len(pending)} messages…")
+        self._announce_send_now(len(pending))
 
     def _on_stop_sending_clicked(self, *_args) -> None:
         if self._stop_sending_in_flight:
