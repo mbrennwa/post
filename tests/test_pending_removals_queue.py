@@ -134,6 +134,8 @@ class PendingRemovalMailServiceTests(unittest.TestCase):
         self.service._folder_indexes = {}
         self.service._lock = __import__("threading").RLock()
         self.service._correspondent_indexes = {}
+        self.service._correspondent_stamps = {}
+        self.service._correspondent_folder_stats = {}
 
     def tearDown(self) -> None:
         for patch in self._patches:

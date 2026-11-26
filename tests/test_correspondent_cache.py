@@ -4,13 +4,31 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from post.mail import correspondent_cache
-from post.mail.correspondents import Correspondent
+from post.mail.correspondents import Correspondent, aggregate_correspondents
+
+
+def _person(email: str, *, received: int = 0) -> Correspondent:
+    return Correspondent(
+        display=email, email=email, name="", last_seen=1, received_count=received
+    )
+
+
+def _hammer_folder(cache_root: str, folder: str, rounds: int) -> None:
+    """Child process: repeatedly replace ``folder``'s contribution."""
+    correspondent_cache._CACHE_ROOT = Path(cache_root)
+    item = _person(f"{folder}@example.com")
+    for _ in range(rounds):
+        correspondent_cache.update_folder(
+            "acct-1", folder, [item], aggregate_correspondents
+        )
 
 
 class CorrespondentCacheTests(unittest.TestCase):
@@ -129,6 +147,155 @@ class CorrespondentCacheTests(unittest.TestCase):
         )
         correspondent_cache.invalidate("acct-1")
         self.assertIsNone(correspondent_cache.load("acct-1"))
+
+    # --- stamp / update_folder / locking (#547) ---
+
+    def test_stamp_is_none_without_file(self) -> None:
+        self.assertIsNone(correspondent_cache.stamp("acct-1"))
+
+    def test_stamp_changes_with_every_write_even_at_equal_size(self) -> None:
+        a = _person("a@example.com")
+        b = _person("b@example.com")  # same length as a: same file size
+        correspondent_cache.save("acct-1", [a])
+        first = correspondent_cache.stamp("acct-1")
+        correspondent_cache.save("acct-1", [b])
+        second = correspondent_cache.stamp("acct-1")
+        self.assertIsNotNone(first)
+        self.assertNotEqual(first, second)
+
+    def test_load_snapshot_stamp_matches_file(self) -> None:
+        correspondent_cache.save("acct-1", [_person("a@example.com")])
+        snapshot = correspondent_cache.load_snapshot("acct-1")
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.stamp, correspondent_cache.stamp("acct-1"))
+
+    def test_save_returns_stamp_and_if_absent_keeps_existing_file(self) -> None:
+        a = _person("a@example.com")
+        b = _person("b@example.com")
+        written = correspondent_cache.save("acct-1", [a], if_absent=True)
+        self.assertEqual(written, correspondent_cache.stamp("acct-1"))
+        self.assertIsNone(correspondent_cache.save("acct-1", [b], if_absent=True))
+        self.assertEqual(correspondent_cache.load("acct-1"), [a])
+
+    def test_update_folder_replaces_one_contribution(self) -> None:
+        a = _person("a@example.com", received=2)
+        b = _person("b@example.com", received=1)
+        correspondent_cache.update_folder("acct-1", "INBOX", [a], aggregate_correspondents)
+        correspondent_cache.update_folder("acct-1", "Sent", [b], aggregate_correspondents)
+        a2 = _person("a@example.com", received=5)
+        merged, folders, file_stamp = correspondent_cache.update_folder(
+            "acct-1", "INBOX", [a2], aggregate_correspondents
+        )
+        self.assertEqual(set(folders), {"INBOX", "Sent"})
+        # Replaced, not added: 5 rather than 2 + 5.
+        by_email = {item.email: item for item in merged}
+        self.assertEqual(by_email["a@example.com"].received_count, 5)
+        self.assertEqual(by_email["b@example.com"].received_count, 1)
+        self.assertEqual(file_stamp, correspondent_cache.stamp("acct-1"))
+        self.assertEqual(correspondent_cache.load("acct-1"), merged)
+
+    def test_update_folder_starts_from_scratch_without_file(self) -> None:
+        a = _person("a@example.com")
+        merged, folders, file_stamp = correspondent_cache.update_folder(
+            "acct-1", "INBOX", [a], aggregate_correspondents
+        )
+        self.assertEqual(merged, [a])
+        self.assertEqual(folders, {"INBOX": [a]})
+        self.assertIsNotNone(file_stamp)
+
+    def test_update_folder_without_addresses_writes_nothing(self) -> None:
+        merged, _folders, file_stamp = correspondent_cache.update_folder(
+            "acct-1", "INBOX", [], aggregate_correspondents
+        )
+        self.assertEqual(merged, [])
+        self.assertIsNone(file_stamp)
+        self.assertIsNone(correspondent_cache.stamp("acct-1"))
+
+    def test_update_folder_keeps_other_writers_contribution(self) -> None:
+        """A stale ``known`` base must not overwrite what another writer saved."""
+        a = _person("a@example.com")
+        helper = _person("helper@example.com")
+        _merged, folders, stale_stamp = correspondent_cache.update_folder(
+            "acct-1", "INBOX", [a], aggregate_correspondents
+        )
+        # The other process adds a folder; ``folders`` / ``stale_stamp`` are
+        # now stale.
+        correspondent_cache.update_folder(
+            "acct-1", "Sent", [helper], aggregate_correspondents
+        )
+        merged, folders, _stamp = correspondent_cache.update_folder(
+            "acct-1",
+            "INBOX",
+            [a],
+            aggregate_correspondents,
+            known=(stale_stamp, folders),
+        )
+        self.assertEqual(set(folders), {"INBOX", "Sent"})
+        self.assertEqual({item.email for item in merged}, {a.email, helper.email})
+
+    def test_update_folder_skips_parsing_when_known_stamp_is_current(self) -> None:
+        a = _person("a@example.com")
+        b = _person("b@example.com")
+        _merged, folders, file_stamp = correspondent_cache.update_folder(
+            "acct-1", "INBOX", [a], aggregate_correspondents
+        )
+        with patch.object(
+            correspondent_cache,
+            "_read_payload",
+            side_effect=AssertionError("file must not be parsed"),
+        ):
+            merged, folders, _stamp = correspondent_cache.update_folder(
+                "acct-1",
+                "Sent",
+                [b],
+                aggregate_correspondents,
+                known=(file_stamp, folders),
+            )
+        self.assertEqual(set(folders), {"INBOX", "Sent"})
+        self.assertEqual({item.email for item in merged}, {a.email, b.email})
+
+    def test_update_folder_waits_for_the_cross_process_lock(self) -> None:
+        """A writer blocks while another holds the lock, then proceeds."""
+        done = threading.Event()
+
+        def write() -> None:
+            correspondent_cache.update_folder(
+                "acct-1", "INBOX", [_person("a@example.com")], aggregate_correspondents
+            )
+            done.set()
+
+        with correspondent_cache._locked("acct-1"):
+            writer = threading.Thread(target=write)
+            writer.start()
+            self.assertFalse(done.wait(timeout=0.3))
+            self.assertIsNone(correspondent_cache.stamp("acct-1"))
+        self.assertTrue(done.wait(timeout=10))
+        writer.join(timeout=10)
+        self.assertIsNotNone(correspondent_cache.stamp("acct-1"))
+
+    def test_concurrent_writers_do_not_lose_each_others_folders(self) -> None:
+        """Two processes updating different folders both survive."""
+        context = multiprocessing.get_context("fork")
+        root = str(correspondent_cache._CACHE_ROOT)
+        workers = [
+            context.Process(target=_hammer_folder, args=(root, name, 40))
+            for name in ("INBOX", "Sent")
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=60)
+            self.assertEqual(worker.exitcode, 0)
+        folders = correspondent_cache.load_folders("acct-1")
+        self.assertEqual(set(folders), {"INBOX", "Sent"})
+        self.assertEqual(
+            {item.email for item in correspondent_cache.load("acct-1")},
+            {"INBOX@example.com", "Sent@example.com"},
+        )
+
+    def test_invalidate_without_cache_creates_nothing(self) -> None:
+        correspondent_cache.invalidate("acct-1")
+        self.assertFalse((Path(self._tmpdir.name) / "acct-1").exists())
 
     def test_invalidate_account_removes_directory(self) -> None:
         items = [

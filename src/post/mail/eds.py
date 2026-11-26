@@ -938,8 +938,15 @@ class MailService:
         default_factory=dict, init=False
     )
     # Per-folder correspondent contributions backing ``_correspondent_indexes``
-    # (#544). Only trusted while the account has an in-memory index.
+    # (#544).
     _correspondent_folder_stats: dict[str, dict[str, list[Correspondent]]] = field(
+        default_factory=dict, init=False
+    )
+    # Stamp of the cache file the two maps above were loaded from or last
+    # written to (#547). The file is the source of truth (the helper writes it
+    # too): memory is only valid while the file still has this stamp. A key
+    # with value None means "the file did not exist".
+    _correspondent_stamps: dict[str, correspondent_cache.Stamp | None] = field(
         default_factory=dict, init=False
     )
     _folder_tree_cache: dict[str, list[dict]] = field(default_factory=dict, init=False)
@@ -3326,6 +3333,8 @@ class MailService:
             self._transports.clear()
             self._folder_indexes.clear()
             self._correspondent_indexes.clear()
+            self._correspondent_folder_stats.clear()
+            self._correspondent_stamps.clear()
             self._folder_tree_cache.clear()
             self._accounts_by_uid.clear()
             self._session = None
@@ -3691,9 +3700,15 @@ class MailService:
             self._invalidate_folder_index(account_uid, folder_name)
 
     def invalidate_correspondent_index(self, account_uid: str) -> None:
+        self._forget_correspondent_index(account_uid)
+        correspondent_cache.invalidate(account_uid)
+
+    def _forget_correspondent_index(self, account_uid: str) -> None:
+        """Drop the in-memory correspondent index and everything tied to it."""
         with self._lock:
             self._correspondent_indexes.pop(account_uid, None)
-        correspondent_cache.invalidate(account_uid)
+            self._correspondent_folder_stats.pop(account_uid, None)
+            self._correspondent_stamps.pop(account_uid, None)
 
     def invalidate_account_connection(self, account_uid: str) -> None:
         """Drop cached Camel store/transport so the next open uses fresh credentials.
@@ -3726,7 +3741,7 @@ class MailService:
                 for key in list(self._folder_indexes):
                     if key[0] == account_uid:
                         self._folder_indexes.pop(key, None)
-                self._correspondent_indexes.pop(account_uid, None)
+                self._forget_correspondent_index(account_uid)
             return
         run_on_mail_thread(self._invalidate_account_connection_unlocked, account_uid)
 
@@ -3750,7 +3765,7 @@ class MailService:
             for key in list(self._folder_indexes):
                 if key[0] == account_uid:
                     self._folder_indexes.pop(key, None)
-            self._correspondent_indexes.pop(account_uid, None)
+            self._forget_correspondent_index(account_uid)
             session = self._session
 
         if session is None:
@@ -4720,7 +4735,7 @@ class MailService:
                     for key in list(self._folder_indexes):
                         if key[0] == account_uid:
                             self._folder_indexes.pop(key, None)
-                    self._correspondent_indexes.pop(account_uid, None)
+                    self._forget_correspondent_index(account_uid)
                     self._mark_outbound_submitted(queue_id)
                     self._append_sent_copy_and_finish_queue_item(
                         account_uid,
@@ -5946,27 +5961,60 @@ class MailService:
                 return []
             return list(cached)
 
+    def correspondents_stamp(
+        self, account_uid: str
+    ) -> correspondent_cache.Stamp | None:
+        """Change token of the correspondent cache file (a single ``stat``).
+
+        The composer compares it with the token it last loaded at to decide
+        whether a reload can bring anything new (#547).
+        """
+        return correspondent_cache.stamp(account_uid)
+
     def _get_correspondents_unlocked(self, account_uid: str) -> list[Correspondent]:
+        """Return the correspondents, re-reading the cache file if it changed.
+
+        The cache file is the source of truth (#547): the camel helper keeps
+        writing it, so the in-memory index is only trusted while the file still
+        has the stamp it was loaded at. An unchanged file costs one ``stat``.
+        """
+        current = correspondent_cache.stamp(account_uid)
         with self._lock:
             cached = self._correspondent_indexes.get(account_uid)
-            if cached is not None:
+            if cached is not None and self._correspondent_stamps.get(
+                account_uid, False
+            ) == current:
                 return list(cached)
-        loaded = correspondent_cache.load(account_uid)
-        if loaded:
-            self._remember_correspondents(
-                account_uid,
-                loaded,
-                persist=False,
-                folders=correspondent_cache.load_folders(account_uid),
+        snapshot = correspondent_cache.load_snapshot(account_uid)
+        if snapshot is None:
+            # No usable file yet: build from local folder indexes and persist,
+            # unless another process wrote the file in the meantime (its file
+            # wins). An empty result is not remembered, so a file that appears
+            # later is picked up by the next call.
+            folders = self._build_correspondent_folders_unlocked(account_uid)
+            correspondents = aggregate_correspondents(folders.values())
+            if not correspondents:
+                return []
+            correspondent_cache.save(
+                account_uid, correspondents, folders=folders, if_absent=True
             )
-            return list(loaded)
-        folders = self._build_correspondent_folders_unlocked(account_uid)
-        correspondents = aggregate_correspondents(folders.values())
-        if correspondents:
-            self._remember_correspondents(
-                account_uid, correspondents, persist=True, folders=folders
-            )
-        return correspondents
+            snapshot = correspondent_cache.load_snapshot(account_uid)
+            if snapshot is None:
+                # The file could not be written: keep the built index in memory.
+                self._remember_correspondents(
+                    account_uid,
+                    correspondents,
+                    folders=folders,
+                    file_stamp=correspondent_cache.stamp(account_uid),
+                )
+                return list(correspondents)
+        self._remember_correspondents(
+            account_uid,
+            snapshot.correspondents,
+            folders=snapshot.folders,
+            file_stamp=snapshot.stamp,
+        )
+        return list(snapshot.correspondents)
 
     def _store_folder_index(
         self,
@@ -5992,31 +6040,19 @@ class MailService:
         account_uid: str,
         correspondents: list[Correspondent],
         *,
-        persist: bool,
-        folders: dict[str, list[Correspondent]] | None = None,
+        folders: dict[str, list[Correspondent]] | None,
+        file_stamp: correspondent_cache.Stamp | None,
     ) -> None:
+        """Keep an index in memory, tagged with the file stamp it matches."""
         if not correspondents:
             return
         with self._lock:
             self._correspondent_indexes[account_uid] = correspondents
+            self._correspondent_stamps[account_uid] = file_stamp
             if folders is not None:
                 self._correspondent_folder_stats[account_uid] = folders
             else:
                 self._correspondent_folder_stats.pop(account_uid, None)
-        if persist:
-            correspondent_cache.save(account_uid, correspondents, folders=folders)
-
-    def _correspondent_folders_if_bootstrapped(
-        self, account_uid: str
-    ) -> dict[str, list[Correspondent]] | None:
-        """Per-folder contributions of an already-built index, else None."""
-        with self._lock:
-            indexed = account_uid in self._correspondent_indexes
-            folders = self._correspondent_folder_stats.get(account_uid)
-        if indexed and folders is not None:
-            return dict(folders)
-        # Not bootstrapped in memory (or invalidated): fall back to the disk cache.
-        return correspondent_cache.load_folders(account_uid)
 
     def _is_sent_folder_for_correspondents(
         self, account_uid: str, folder_name: str
@@ -6039,25 +6075,34 @@ class MailService:
         """
         if not folder_feeds_correspondents(folder_name) or not messages:
             return
-        folders = self._correspondent_folders_if_bootstrapped(account_uid)
-        if folders is None:
-            # First folder seen for this account (no memory index, no disk
-            # cache): start the index from this folder. Other folders join as
-            # they are stored. Contributions are per folder, so a partial index
-            # is exact for the folders it covers and never needs a full
-            # re-harvest. Waiting for get_correspondents() instead left
-            # accounts whose folders were indexed after the composer opened
-            # without any suggestions.
-            folders = {}
-        folders[folder_name] = collect_correspondents(
+        items = collect_correspondents(
             messages,
             is_sent_folder=self._is_sent_folder_for_correspondents(
                 account_uid, folder_name
             ),
         )
-        merged = aggregate_correspondents(folders.values())
+        # The write is based on the cache file, not on this process's memory:
+        # the helper writes the same file, and a stale in-memory map would
+        # overwrite its contributions (#547). An account's first folder starts
+        # the file from scratch; contributions are per folder, so a partial
+        # index is exact for the folders it covers and other folders join as
+        # they are stored (#544). Memory only saves re-parsing the file, and
+        # only while the file still has the stamp memory was derived from.
+        with self._lock:
+            known = None
+            if account_uid in self._correspondent_stamps:
+                known_folders = self._correspondent_folder_stats.get(account_uid)
+                if known_folders is not None:
+                    known = (self._correspondent_stamps[account_uid], known_folders)
+        merged, folders, file_stamp = correspondent_cache.update_folder(
+            account_uid,
+            folder_name,
+            items,
+            aggregate_correspondents,
+            known=known,
+        )
         self._remember_correspondents(
-            account_uid, merged, persist=True, folders=folders
+            account_uid, merged, folders=folders, file_stamp=file_stamp
         )
 
     def _correspondent_folder_names_unlocked(self, account_uid: str) -> list[str]:
@@ -6683,7 +6728,7 @@ class MailService:
                 self._folder_indexes.pop(key, None)
         for old_name in old_folder_names:
             self._folder_indexes.pop((account_uid, old_name), None)
-        self._correspondent_indexes.pop(account_uid, None)
+        self._forget_correspondent_index(account_uid)
         folder_index_cache.invalidate_account(account_uid)
         correspondent_cache.invalidate(account_uid)
 
