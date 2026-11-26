@@ -84,20 +84,20 @@ class CorrespondentCacheTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def test_v1_cache_is_still_readable(self) -> None:
+    def test_v1_cache_is_ignored(self) -> None:
         self._write_v1()
-        loaded = correspondent_cache.load("acct-1")
-        self.assertEqual([item.email for item in loaded], ["alice@example.com"])
-        self.assertEqual(loaded[0].sent_count, 0)
-        self.assertEqual(loaded[0].received_count, 0)
+        self.assertIsNone(correspondent_cache.load("acct-1"))
+        self.assertIsNone(correspondent_cache.load_folders("acct-1"))
 
-    def test_v1_cache_becomes_legacy_folder(self) -> None:
+    def test_v1_cache_is_replaced_by_first_save(self) -> None:
         self._write_v1()
-        folders = correspondent_cache.load_folders("acct-1")
+        bob = Correspondent(display="bob@example.com", email="bob@example.com", name="")
+        correspondent_cache.save("acct-1", [bob], folders={"INBOX": [bob]})
         self.assertEqual(
-            list(folders), [correspondent_cache.LEGACY_FOLDER_KEY]
+            [item.email for item in correspondent_cache.load("acct-1")],
+            ["bob@example.com"],
         )
-        self.assertEqual(folders[correspondent_cache.LEGACY_FOLDER_KEY][0].last_seen, 1)
+        self.assertEqual(list(correspondent_cache.load_folders("acct-1")), ["INBOX"])
 
     def test_unknown_cache_version_is_discarded(self) -> None:
         path = correspondent_cache._cache_path("acct-1")

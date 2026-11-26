@@ -18,14 +18,9 @@ log = logging.getLogger(__name__)
 
 # v2 (#544): usage counts per address and per-folder contributions.
 _CACHE_VERSION = 2
-# v1 files hold only the address list. They are still read: folder indexes are
-# no longer persisted (#513), so this file is the only copy of the history and
-# dropping it would leave autocomplete empty until folders are re-indexed.
-_LEGACY_VERSION = 1
-# Pseudo-folder key under which a v1 address list lives in the per-folder map.
-# Its entries carry no counts, so summing them with live folders adds only
-# presence/recency and cannot inflate ranking.
-LEGACY_FOLDER_KEY = "\x00legacy"
+# v1 files (address list only) are ignored (#547). The index is rebuilt from
+# the helper's Camel summary as folders are stored, and the first v2 write
+# replaces the old file.
 _CACHE_ROOT = Path.home() / ".cache" / "post" / "correspondents"
 
 
@@ -138,7 +133,7 @@ def _load_payload(account_uid: str) -> dict[str, Any] | None:
         return None
     if not isinstance(payload, dict):
         return None
-    if payload.get("version") not in (_CACHE_VERSION, _LEGACY_VERSION):
+    if payload.get("version") != _CACHE_VERSION:
         return None
     return payload
 
@@ -156,9 +151,6 @@ def load_folders(account_uid: str) -> dict[str, list[Correspondent]] | None:
     payload = _load_payload(account_uid)
     if payload is None:
         return None
-    if payload.get("version") == _LEGACY_VERSION:
-        legacy = _correspondents_from_payload(payload.get("correspondents"))
-        return {LEGACY_FOLDER_KEY: legacy} if legacy else None
     raw_folders = payload.get("folders")
     if not isinstance(raw_folders, dict):
         return None
