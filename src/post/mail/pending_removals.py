@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from typing import Iterable
 
 log = logging.getLogger(__name__)
@@ -99,6 +100,14 @@ def _write_uids(account_uid: str, folder_name: str, uids: set[str]) -> None:
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+def pending_age_seconds(account_uid: str, folder_name: str) -> float | None:
+    """Seconds since the folder's marker was last written, or None if absent."""
+    try:
+        return max(0.0, time.time() - os.path.getmtime(_path(account_uid, folder_name)))
+    except OSError:
+        return None
 
 
 def note_pending_uids(

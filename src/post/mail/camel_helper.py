@@ -52,7 +52,7 @@ ALLOWED_METHODS = frozenset(
         "move_messages_to_trash",
         "apply_local_mutation",
         "restore_cancelled_transfer_messages",
-        "flush_account_operation_queue",
+        "flush_next_account_operation",
         "toggle_message_seen",
         "toggle_message_flagged",
         "toggle_messages_seen",
@@ -266,6 +266,36 @@ def _write_summary_page(
         write_message(stdout, _error_payload(msg.get("id"), exc))
 
 
+def _write_cached_read(
+    mail: Any, msg: dict[str, Any], stdout: Any, account_uid: str
+) -> None:
+    """Answer a read from the local cache while another helper call runs (#549).
+
+    Runs on its own thread: it must not block the loop that drains ``cancel``
+    while a call is in flight, and it never goes through the mail I/O thread
+    (the thread a long call occupies). A result of ``None`` means "no local
+    copy to serve right now"; the UI then takes the serialized read.
+    """
+    from post.mail.camel_ipc import write_message
+
+    def _answer() -> None:
+        try:
+            result = mail.read_cached_message(
+                account_uid,
+                str(msg.get("folder_name") or ""),
+                str(msg.get("message_uid") or ""),
+                mark_seen=bool(msg.get("mark_seen", True)),
+            )
+            write_message(stdout, _result_payload(msg.get("id"), result))
+        except Exception as exc:
+            log.debug("cached read failed", exc_info=True)
+            write_message(stdout, _error_payload(msg.get("id"), exc))
+
+    threading.Thread(
+        target=_answer, name="camel-helper-cached-read", daemon=True
+    ).start()
+
+
 def _error_payload(req_id: Any, exc: BaseException) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": "result",
@@ -302,6 +332,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # Mark this process as a helper so nested code does not spawn helpers.
     os.environ["POST_MAIL_CAMEL_HELPER_PROCESS"] = "1"
+
+    # ``kill -USR1 <helper pid>`` dumps every thread's Python stack to stderr
+    # (which the UI forwards to post.log), so a wedged helper can be diagnosed
+    # without attaching a debugger (#549).
+    try:
+        import faulthandler
+        import signal
+
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+    except Exception:
+        log.debug("faulthandler SIGUSR1 not available", exc_info=True)
 
     from post.mail.camel_paths import configure_helper_camel_dirs
 
@@ -392,6 +433,9 @@ def main(argv: list[str] | None = None) -> int:
         if msg_type == "summary_page":
             _write_summary_page(mail, msg, stdout, account_uid)
             continue
+        if msg_type == "read_cached":
+            _write_cached_read(mail, msg, stdout, account_uid)
+            continue
         if msg_type != "call":
             write_message(
                 stdout,
@@ -477,6 +521,8 @@ def main(argv: list[str] | None = None) -> int:
                     cancel_refresh()
             elif extra_type == "summary_page":
                 _write_summary_page(mail, extra, stdout, account_uid)
+            elif extra_type == "read_cached":
+                _write_cached_read(mail, extra, stdout, account_uid)
             elif extra_type == "shutdown":
                 cancel_op = getattr(mail, "cancel_helper_op", None)
                 if callable(cancel_op):
