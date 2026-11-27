@@ -880,7 +880,6 @@ class MailSidebar:
         *,
         unread: int,
         total: int,
-        is_unified_inbox: bool = False,
     ) -> dict[str, bool]:
         import gi
 
@@ -913,7 +912,6 @@ class MailSidebar:
             account_user_online=get_account_user_online(account_uid),
             account_offline_toggle_enabled=account_supports_user_offline(backend),
             account_connect_health=self._mail.get_account_connect_health(account_uid),
-            is_unified_inbox=is_unified_inbox,
         )
 
     def _build_context_menu_model(self, state: dict[str, bool]) -> Gio.Menu:
@@ -987,9 +985,10 @@ class MailSidebar:
             return
         account_uid = self._context_target["account_uid"]
         folder_name = self._context_target.get("folder_name")
-        is_unified_inbox = bool(self._context_target.get("is_unified_inbox"))
-        # Account headers (folder_name is None) or unified Inboxes rows.
-        if folder_name is not None and not is_unified_inbox:
+        # Account headers, or either Inbox row (folder list and Inboxes).
+        inbox_name = self.inbox_folder_for_account(account_uid)
+        is_inbox = bool(inbox_name and folder_name == inbox_name)
+        if folder_name is not None and not is_inbox:
             return
         account = self._accounts_by_uid.get(account_uid)
         if account is None or not account_supports_user_offline(account.backend):
@@ -1476,7 +1475,6 @@ class MailSidebar:
         *,
         account_uid: str,
         folder_name: str | None,
-        is_unified_inbox: bool = False,
     ) -> None:
         gesture = Gtk.GestureClick()
         gesture.set_button(0)
@@ -1486,7 +1484,6 @@ class MailSidebar:
             self._on_sidebar_context_pressed,
             account_uid,
             folder_name,
-            is_unified_inbox,
         )
         widget.add_controller(gesture)
 
@@ -1498,7 +1495,6 @@ class MailSidebar:
         y: float,
         account_uid: str,
         folder_name: str | None,
-        is_unified_inbox: bool = False,
         *,
         unread: int = -1,
         total: int = -1,
@@ -1519,8 +1515,6 @@ class MailSidebar:
             unread = int(getattr(row, "unread", unread))
             total = int(getattr(row, "total", total))
             display_name = getattr(row, "display_name", display_name)
-            if getattr(row, "is_unified_inbox", False):
-                is_unified_inbox = True
 
         if is_post_outbox_folder(folder_name):
             total = count_queued_for_account(account_uid)
@@ -1531,7 +1525,6 @@ class MailSidebar:
             folder_name,
             unread=unread,
             total=total,
-            is_unified_inbox=is_unified_inbox,
         )
         self._context_target = {
             "account_uid": account_uid,
@@ -1540,7 +1533,6 @@ class MailSidebar:
             "unread": unread,
             "total": total,
             "read_count": state.get("read_count", 0),
-            "is_unified_inbox": is_unified_inbox,
         }
 
         menu = self._build_context_menu_model(state)
@@ -2227,13 +2219,11 @@ class MailSidebar:
         row.display_name = display
         row.unread = unread
         row.total = total
-        row.is_unified_inbox = show_offline_badge
         if row.folder_name:
             self._attach_refresh_menu(
                 row,
                 account_uid=account_uid,
                 folder_name=row.folder_name,
-                is_unified_inbox=show_offline_badge,
             )
             self._setup_folder_row_drop(row)
         return row
