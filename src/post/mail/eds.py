@@ -73,6 +73,7 @@ from .helpers import (
 from .accounts import (
     BUILTIN_LOCAL_UID,
     EDS_LOCAL_DISPLAY_NAME,
+    LOCAL_BACKENDS,
     MailAccount,
     POST_LOCAL_ACCOUNT_UID,
     compose_from_accounts,
@@ -190,6 +191,7 @@ from .correspondents import (
 )
 from .folders import (
     find_folder_by_type,
+    find_sent_folder,
     find_trash_folder,
     folder_can_contain_messages,
     folder_name_from_uri,
@@ -4714,6 +4716,7 @@ class MailService:
                 queue_id,
                 send_start=send_start,
                 from_queue=from_queue,
+                server_saved_copy=queued_item.server_saved_copy,
             )
             return
 
@@ -4764,11 +4767,17 @@ class MailService:
             with self._lock:
                 transport = self._get_transport_unlocked(account_uid, cancellable)
             transport_uid = account.transport_uid or ""
-            ok, _user_stop = transport.send_to_sync(
+            # Check the provider before sending so the result and the queue
+            # submission marker can be recorded together after acceptance.
+            transport_saves_copy = self._transport_saves_sent_copy(transport)
+            ok, sent_copy_saved = transport.send_to_sync(
                 message, sender, recipients, cancellable
             )
+            server_saved_copy = sent_copy_saved or transport_saves_copy
             if ok:
-                self._mark_outbound_submitted(queue_id)
+                self._mark_outbound_submitted(
+                    queue_id, server_saved_copy=server_saved_copy
+                )
         except GLib.Error as exc:
             log.debug(
                 "SMTP send finished in %.2fs cancelled=%s",
@@ -4833,13 +4842,33 @@ class MailService:
             queue_id,
             send_start=send_start,
             from_queue=from_queue,
+            server_saved_copy=server_saved_copy,
         )
 
-    def _mark_outbound_submitted(self, queue_id: str | None) -> None:
+    @staticmethod
+    def _transport_saves_sent_copy(transport: Camel.Transport) -> bool:
+        provider = transport.get_provider()
+        if provider is None:
+            return False
+        if provider.protocol == "microsoft365":
+            # Camel submits MIME through Graph sendMail, which saves to Sent Items.
+            return True
+        if provider.protocol != "smtp":
+            return False
+        settings = transport.ref_settings()
+        if not isinstance(settings, Camel.NetworkSettings):
+            return False
+        # Gmail saves SMTP submissions even when Camel cannot report the copy.
+        host = (settings.get_host() or "").lower().rstrip(".")
+        return host in {"smtp.gmail.com", "smtp.googlemail.com"}
+
+    def _mark_outbound_submitted(
+        self, queue_id: str | None, *, server_saved_copy: bool = False
+    ) -> None:
         if not queue_id:
             return
         try:
-            mark_outbound_submitted(queue_id)
+            mark_outbound_submitted(queue_id, server_saved_copy=server_saved_copy)
         except FileNotFoundError:
             log.debug(
                 "Outbox item %s vanished before it was marked submitted",
@@ -4854,9 +4883,12 @@ class MailService:
         *,
         send_start: float,
         from_queue: bool = False,
+        server_saved_copy: bool = False,
     ) -> None:
         try:
-            stored = self._append_to_sent_folder_unlocked(account_uid, sent_message)
+            stored = self._append_to_sent_folder_unlocked(
+                account_uid, sent_message, server_saved_copy=server_saved_copy
+            )
         except Exception:
             log.exception(
                 "Failed to save a copy to Sent for account %s", account_uid
@@ -5386,7 +5418,9 @@ class MailService:
             )
         raise ValueError(f"Unknown queued operation: {operation.op_type}")
 
-    def _sent_folder_name_unlocked(self, account_uid: str) -> str | None:
+    def _sent_folder_name_unlocked(
+        self, account_uid: str, *, server_saved_copy: bool = False
+    ) -> str | None:
         account = self.get_account(account_uid)
         if not account.identity_uid:
             return None
@@ -5399,38 +5433,41 @@ class MailService:
         if not submission.get_use_sent_folder():
             return None
 
-        folder_name = folder_name_from_uri(submission.get_sent_folder())
-        if folder_name:
-            return folder_name
+        uri = submission.get_sent_folder()
+        configured = folder_name_from_uri(uri, store_uid=account_uid)
+        if not configured and (
+            account_uid == POST_LOCAL_ACCOUNT_UID or account.backend in LOCAL_BACKENDS
+        ):
+            configured = folder_name_from_uri(uri, store_uid=BUILTIN_LOCAL_UID)
 
-        with self._lock:
-            cached = self._folder_tree_cache.get(account_uid)
-        if cached is not None:
-            sent_info = find_folder_by_type(
-                cached,
-                Camel.FolderInfoFlags.TYPE_SENT,
-                type_mask=Camel.FOLDER_TYPE_MASK,
-                name_fallbacks=frozenset({"sent", "sent mail", "sent messages"}),
-            )
-            if sent_info is not None:
-                return sent_info.get("full_name")
-
-        folders = self._list_folders_unlocked(account_uid)
-        sent_info = find_folder_by_type(
-            folders,
-            Camel.FolderInfoFlags.TYPE_SENT,
-            type_mask=Camel.FOLDER_TYPE_MASK,
-            name_fallbacks=frozenset({"sent", "sent mail", "sent messages"}),
-        )
-        if sent_info is None:
+        if configured and not server_saved_copy:
+            return configured
+        if server_saved_copy and not configured:
             return None
-        return sent_info.get("full_name")
+
+        # A cached name match can be the legacy Sent folder. Look for the
+        # server role in an updated tree before falling back to a name.
+        with self._lock:
+            cached = self._folder_tree_cache.get(account_uid) or []
+        sent_info = find_sent_folder(cached, allow_name_fallback=False)
+        if sent_info is None:
+            sent_info = find_sent_folder(self._list_folders_unlocked(account_uid))
+        server_folder = sent_info["full_name"] if sent_info is not None else None
+        if server_saved_copy:
+            return configured if configured != server_folder else None
+        return server_folder
 
     def _append_to_sent_folder_unlocked(
-        self, account_uid: str, message: Camel.MimeMessage
+        self,
+        account_uid: str,
+        message: Camel.MimeMessage,
+        *,
+        server_saved_copy: bool = False,
     ) -> bool:
         """Return True when the Sent copy is stored, or when none is required."""
-        folder_name = self._sent_folder_name_unlocked(account_uid)
+        folder_name = self._sent_folder_name_unlocked(
+            account_uid, server_saved_copy=server_saved_copy
+        )
         if not folder_name:
             return True
 

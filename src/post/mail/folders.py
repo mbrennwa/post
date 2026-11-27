@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import unquote
+
 
 def format_folder_label(
     display: str,
@@ -105,16 +107,18 @@ def folder_matches_type(folder: dict, folder_type: int, *, type_mask: int) -> bo
     return (flags & type_mask) == folder_type
 
 
-def folder_name_from_uri(uri: str | None) -> str | None:
-    """Return a Camel folder full name from an EDS folder:// URI."""
+def folder_name_from_uri(
+    uri: str | None, *, store_uid: str | None = None
+) -> str | None:
+    """Return the Camel folder path, optionally requiring a particular store."""
     if not uri:
         return None
     uri = uri.strip()
-    if uri.startswith("folder://local/"):
-        return uri.removeprefix("folder://local/")
     if uri.startswith("folder://"):
-        parts = uri.split("/", 3)
-        return parts[3] if len(parts) > 3 else None
+        store, _, path = uri.removeprefix("folder://").partition("/")
+        if store_uid is not None and unquote(store) != store_uid:
+            return None
+        return unquote(path) or None
     return uri or None
 
 
@@ -304,7 +308,7 @@ def find_folder_by_type(
 _TYPE_SENT = 5120  # Camel.FolderInfoFlags.TYPE_SENT
 _TYPE_DRAFTS = 12288  # Camel.FolderInfoFlags.TYPE_DRAFTS
 _DRAFTS_NAME_FALLBACKS = frozenset({"drafts", "draft"})
-_SENT_NAME_FALLBACKS = frozenset({"sent", "sent mail", "sent messages"})
+_SENT_NAME_FALLBACKS = frozenset({"sent", "sent items", "sent mail", "sent messages"})
 _JUNK_NAME_FALLBACKS = frozenset({"junk", "spam"})
 
 
@@ -355,6 +359,39 @@ def is_sent_folder(folder: dict, *, type_mask: int = 64512) -> bool:
     if folder_matches_type(folder, _TYPE_SENT, type_mask=type_mask):
         return True
     return _folder_matches_name_fallbacks(folder, _SENT_NAME_FALLBACKS)
+
+
+# When the account has not marked a folder, a provider name beats a plain "Sent".
+_SENT_NAME_PREFERENCE = ("sent items", "sent mail", "sent messages", "sent")
+
+
+def find_sent_folder(
+    folders: list[dict], *, allow_name_fallback: bool = True
+) -> dict | None:
+    """Find the account's selectable Sent folder, preferring its server role."""
+    selectable = [
+        folder
+        for folder in folders
+        if folder.get("full_name") and folder_can_contain_messages(folder)
+    ]
+    marked = find_folder_by_type(
+        selectable,
+        _TYPE_SENT,
+        type_mask=64512,
+        name_fallbacks=None,
+    )
+    if marked is not None or not allow_name_fallback:
+        return marked
+    for name in _SENT_NAME_PREFERENCE:
+        found = find_folder_by_type(
+            selectable,
+            _TYPE_SENT,
+            type_mask=64512,
+            name_fallbacks=frozenset({name}),
+        )
+        if found is not None:
+            return found
+    return None
 
 
 def is_sent_folder_name(
