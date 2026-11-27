@@ -9026,6 +9026,20 @@ class MainWindow(Adw.ApplicationWindow):
                         account_uid=account.uid,
                         from_label=from_label,
                     )
+                elif is_queued_draft_id(message_uid):
+                    # A failed save lives only in the local draft file. Camel
+                    # never stored it (#489).
+                    draft_from = (
+                        account.from_label
+                        or account.email
+                        or account.display_label
+                        or ""
+                    )
+                    msg = read_queued_draft(
+                        message_uid,
+                        account_uid=account.uid,
+                        from_label=draft_from,
+                    )
                 else:
                     msg = self._mail.read_message(
                         account.uid,
