@@ -454,7 +454,6 @@ def resolve_sidebar_context_menu(
     account_user_online: bool = True,
     account_offline_toggle_enabled: bool = False,
     account_connect_health: str = "ok",
-    is_unified_inbox: bool = False,
 ) -> dict[str, bool]:
     """Return show/enabled flags for sidebar folder context menu actions."""
     is_account = folder_name is None
@@ -502,14 +501,11 @@ def resolve_sidebar_context_menu(
     show_empty_trash = is_trash and account_effectively_online
     # Refresh when the account can talk to the network. Allow retry while
     # degraded (needs_sign_in / not_connected) so GOA re-auth + Refresh works.
-    show_refresh = (
-        not is_unified_inbox
-        and account_user_online
-        and network_available
-    )
-    # Account online toggle: account headers and unified Inboxes rows.
+    # The account Inbox and the row under Inboxes are the same folder.
+    show_refresh = account_user_online and network_available
+    # Account online toggle: account headers and either Inbox row.
     allow_online_toggle = account_offline_toggle_enabled and (
-        is_account or is_unified_inbox
+        is_account or is_inbox
     )
     show_take_offline = allow_online_toggle and account_effectively_online
     show_take_online = allow_online_toggle and not account_effectively_online

@@ -482,7 +482,7 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
         self.assertFalse(state["show_take_offline"])
         self.assertTrue(state["show_take_online"])
 
-    def test_unified_inbox_offline_shows_take_online(self) -> None:
+    def test_inbox_degraded_shows_take_online_and_refresh(self) -> None:
         state = resolve_sidebar_context_menu(
             folders=self._folders(),
             folder_name="INBOX",
@@ -496,13 +496,12 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
             network_available=True,
             account_connect_health="needs_sign_in",
             account_offline_toggle_enabled=True,
-            is_unified_inbox=True,
         )
         self.assertTrue(state["show_take_online"])
         self.assertFalse(state["show_take_offline"])
-        self.assertFalse(state["show_refresh"])
+        self.assertTrue(state["show_refresh"])
 
-    def test_unified_inbox_online_shows_take_offline(self) -> None:
+    def test_inbox_online_shows_take_offline_and_refresh(self) -> None:
         state = resolve_sidebar_context_menu(
             folders=self._folders(),
             folder_name="INBOX",
@@ -517,10 +516,30 @@ class ResolveSidebarContextMenuTests(unittest.TestCase):
             account_user_online=True,
             account_connect_health="ok",
             account_offline_toggle_enabled=True,
-            is_unified_inbox=True,
         )
         self.assertTrue(state["show_take_offline"])
         self.assertFalse(state["show_take_online"])
+        self.assertTrue(state["show_refresh"])
+
+    def test_non_inbox_folder_hides_online_toggle(self) -> None:
+        state = resolve_sidebar_context_menu(
+            folders=self._folders(),
+            folder_name="Sent",
+            inbox_name="INBOX",
+            trash_name="Trash",
+            archive_name="Archive",
+            unread=0,
+            total=3,
+            outbox_count=0,
+            folder_crud_enabled=True,
+            network_available=True,
+            account_user_online=True,
+            account_connect_health="ok",
+            account_offline_toggle_enabled=True,
+        )
+        self.assertFalse(state["show_take_offline"])
+        self.assertFalse(state["show_take_online"])
+        self.assertTrue(state["show_refresh"])
 
     def test_take_offline_hidden_when_not_connected(self) -> None:
         state = resolve_sidebar_context_menu(
