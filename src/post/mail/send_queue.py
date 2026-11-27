@@ -39,6 +39,7 @@ class QueuedOutboundMessage:
     message_date: str | None = None
     submitted: bool = False
     sent_copy_error: str | None = None
+    server_saved_copy: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -97,6 +98,7 @@ class QueuedOutboundMessage:
                 if data.get("sent_copy_error")
                 else None
             ),
+            server_saved_copy=bool(data.get("server_saved_copy")),
         )
 
 
@@ -406,11 +408,12 @@ def remember_outbound_mime_identifiers(
     _rewrite_queued_outbound_message(queue_id, message)
 
 
-def mark_outbound_submitted(queue_id: str) -> None:
-    """Record that SMTP accepted this item. A later attempt only files Sent."""
+def mark_outbound_submitted(queue_id: str, *, server_saved_copy: bool = False) -> None:
+    """Record acceptance and server-side filing together for later retries."""
     message = load_queued_outbound_message(queue_id)
     message.submitted = True
     message.sent_copy_error = None
+    message.server_saved_copy = server_saved_copy
     _rewrite_queued_outbound_message(queue_id, message)
 
 

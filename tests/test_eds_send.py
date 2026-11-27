@@ -368,6 +368,44 @@ class SentCopyAfterSendTests(unittest.TestCase):
 
         transport.send_to_sync.assert_called_once()
 
+    def test_server_saved_copy_is_remembered_when_queue_cleanup_is_interrupted(self) -> None:
+        for protocol, host, camel_saved in (
+            ("smtp", "smtp.gmail.com", False),
+            ("microsoft365", None, False),
+            ("ews", None, True),
+        ):
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as tmp:
+                service, transport = self._service()
+                transport.get_provider.return_value.protocol = protocol
+                settings = mock.Mock(spec=Camel.NetworkSettings)
+                settings.get_host.return_value = host
+                transport.ref_settings.return_value = settings
+                transport.send_to_sync.return_value = (True, camel_saved)
+                service.get_account.return_value.identity_uid = "ident-1"
+                identity = service.registry.ref_source.return_value
+                submission = identity.get_extension.return_value
+                submission.get_use_sent_folder.return_value = True
+                submission.get_sent_folder.return_value = "folder://local/Sent"
+                service._open_folder_unlocked = mock.Mock()
+
+                with mock.patch("post.mail.send_queue.outbox_dir", return_value=tmp):
+                    queue_id = self._enqueue()
+                    with mock.patch(
+                        "post.mail.eds.remove_queued_outbound_message",
+                        side_effect=OSError("interrupted cleanup"),
+                    ):
+                        with self.assertRaisesRegex(OSError, "interrupted cleanup"):
+                            service._deliver_outbound_queue_item_impl(queue_id)
+                    kept = load_queued_outbound_message(queue_id)
+                    self.assertTrue(kept.submitted)
+                    self.assertTrue(kept.server_saved_copy)
+
+                    service._deliver_outbound_queue_item_impl(queue_id)
+                    self.assertFalse(os.path.exists(os.path.join(tmp, f"{queue_id}.json")))
+
+                service._open_folder_unlocked.assert_not_called()
+                transport.send_to_sync.assert_called_once()
+
     def test_deliver_runs_in_the_account_helper(self) -> None:
         service = MailService(registry=mock.Mock())
         queued = QueuedOutboundMessage(
@@ -458,32 +496,86 @@ class SentCopyAfterSendTests(unittest.TestCase):
         unlocked.assert_not_called()
         self.assertEqual(result.sent, 1)
 
-    def test_empty_sent_uri_uses_type_sent(self) -> None:
+    def _sent_folder_service(self, uri: str) -> tuple[MailService, mock.Mock]:
         service = MailService(registry=mock.Mock())
         account = mock.Mock()
         account.identity_uid = "ident-1"
+        account.backend = "imapx"
         service.get_account = mock.Mock(return_value=account)
         submission = mock.Mock()
         submission.get_use_sent_folder.return_value = True
-        submission.get_sent_folder.return_value = ""
+        submission.get_sent_folder.return_value = uri
         identity = mock.Mock()
         identity.has_extension.return_value = True
         identity.get_extension.return_value = submission
         service.registry.ref_source.return_value = identity
+        return service, submission
+
+    def test_remote_defaults_use_server_sent_folder_over_legacy_sent(self) -> None:
+        legacy_sent = {"full_name": "Sent", "flags": 0}
+        for uri in ("", "folder://local/Sent", "folder://other-account/Sent"):
+            for name in ("[Google Mail]/Sent Mail", "Sent Items"):
+                with self.subTest(uri=uri, name=name):
+                    service, _ = self._sent_folder_service(uri)
+                    service._folder_tree_cache["acct-1"] = [legacy_sent]
+                    service._list_folders_unlocked = mock.Mock(return_value=[
+                        legacy_sent,
+                        {"full_name": name, "flags": int(Camel.FolderInfoFlags.TYPE_SENT)},
+                    ])
+                    folder = mock.Mock()
+                    folder.append_message_sync.return_value = (True, None)
+                    service._open_folder_unlocked = mock.Mock(return_value=folder)
+                    service._invalidate_folder_index = mock.Mock()
+
+                    self.assertTrue(
+                        service._append_to_sent_folder_unlocked("acct-1", mock.Mock())
+                    )
+                    service._list_folders_unlocked.assert_called_once_with("acct-1")
+                    service._open_folder_unlocked.assert_called_once_with("acct-1", name)
+
+    def test_explicit_same_store_override_is_preserved(self) -> None:
+        service, _ = self._sent_folder_service("folder://acct-1/Custom%20Sent")
         service._folder_tree_cache["acct-1"] = [
             {
-                "full_name": "Outbox",
-                "display_name": "Outbox",
-                "flags": int(Camel.FolderInfoFlags.TYPE_OUTBOX),
-            },
-            {
-                "full_name": "Sent",
-                "display_name": "Sent",
+                "full_name": "Sent Items",
                 "flags": int(Camel.FolderInfoFlags.TYPE_SENT),
             },
         ]
+        self.assertEqual(service._sent_folder_name_unlocked("acct-1"), "Custom Sent")
+        self.assertEqual(
+            service._sent_folder_name_unlocked("acct-1", server_saved_copy=True),
+            "Custom Sent",
+        )
 
+    def test_server_saved_copy_also_satisfies_explicit_server_sent_setting(self) -> None:
+        service, _ = self._sent_folder_service("folder://acct-1/Sent%20Items")
+        service._folder_tree_cache["acct-1"] = [
+            {"full_name": "Sent Items", "flags": int(Camel.FolderInfoFlags.TYPE_SENT)},
+        ]
+        self.assertIsNone(
+            service._sent_folder_name_unlocked("acct-1", server_saved_copy=True)
+        )
+
+    def test_unmarked_sent_items_wins_over_legacy_sent(self) -> None:
+        service, _ = self._sent_folder_service("folder://local/Sent")
+        service._folder_tree_cache["acct-1"] = []
+        service._list_folders_unlocked = mock.Mock(
+            return_value=[
+                {"full_name": "Sent", "flags": 0},
+                {"full_name": "Sent Items", "flags": 0},
+            ]
+        )
+        self.assertEqual(
+            service._sent_folder_name_unlocked("acct-1"), "Sent Items"
+        )
+
+    def test_local_sent_setting_and_disabled_filing(self) -> None:
+        service, submission = self._sent_folder_service("folder://local/Sent")
+        service.get_account.return_value.backend = "maildir"
         self.assertEqual(service._sent_folder_name_unlocked("acct-1"), "Sent")
+
+        submission.get_use_sent_folder.return_value = False
+        self.assertIsNone(service._sent_folder_name_unlocked("acct-1"))
 
 
 if __name__ == "__main__":
