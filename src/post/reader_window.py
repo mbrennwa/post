@@ -27,6 +27,7 @@ from post.folder_dialogs import confirm_action
 from post.header_bar import add_end_window_controls
 from post.icon_utils import apply_window_icon
 from post.mail import MailService
+from post.mail.draft_queue import is_queued_draft_id, read_queued_draft
 from post.mail.eds import (
     MailAccount,
     MessageNotAvailableError,
@@ -264,12 +265,26 @@ class ReaderWindow(Adw.ApplicationWindow):
             error: Exception | None = None
             msg: dict[str, Any] | None = None
             try:
-                msg = self._mail.read_message(
-                    account_uid,
-                    folder_name,
-                    uid,
-                    mark_seen=mark_seen,
-                )
+                if is_queued_draft_id(uid):
+                    # Same local file the editor opens. Camel never stored it (#489).
+                    draft_from = (
+                        self._account.from_label
+                        or self._account.email
+                        or self._account.display_label
+                        or ""
+                    )
+                    msg = read_queued_draft(
+                        uid,
+                        account_uid=account_uid,
+                        from_label=draft_from,
+                    )
+                else:
+                    msg = self._mail.read_message(
+                        account_uid,
+                        folder_name,
+                        uid,
+                        mark_seen=mark_seen,
+                    )
             except MessageNotAvailableError as exc:
                 log.warning(
                     "Message %s no longer available in %r",

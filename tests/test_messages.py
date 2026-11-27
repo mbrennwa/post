@@ -1587,6 +1587,247 @@ class MarkSeenClickIntentTests(unittest.TestCase):
         )
 
 
+class LocalDraftReadTests(unittest.TestCase):
+    """A draft that never reached the server is read from its local file (#489)."""
+
+    def _window_stub(self, *, uid: str, sidebar_folder: str):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        account = SimpleNamespace(
+            uid="acct-1",
+            email="ada@example.com",
+            display_label="ada@example.com",
+            from_label="Ada <ada@example.com>",
+        )
+        message = {
+            "uid": uid,
+            "subject": "Draft",
+            "flags": {"seen": True, "draft": True},
+        }
+        window = SimpleNamespace(
+            _current_account=account,
+            _current_folder=sidebar_folder,
+            _current_folder_messages=[message],
+            _current_message_uid=uid,
+            _current_message=None,
+            _displayed_message_id=None,
+            _pending_message_read_uid=None,
+            _inflight_message_read_id=None,
+            _message_read_generation=0,
+            _user_message_click_pending=False,
+            _mark_seen_intent_list_key=None,
+            _mail=mock.Mock(),
+            _reader_pane=mock.Mock(),
+            _sidebar=SimpleNamespace(
+                folder_is_drafts=lambda _account_uid, folder: folder == "Drafts",
+            ),
+        )
+        window._message_list_key = lambda msg: MainWindow._message_list_key(window, msg)
+        window._message_location_for_list_key = (
+            lambda list_key: MainWindow._message_location_for_list_key(window, list_key)
+        )
+        window._message_id_key_for_list_key = (
+            lambda list_key: MainWindow._message_id_key_for_list_key(window, list_key)
+        )
+        window._mark_seen_when_reading_uid = (
+            lambda list_key: MainWindow._mark_seen_when_reading_uid(window, list_key)
+        )
+        return window
+
+    def _run_load(
+        self,
+        window,
+        uid: str,
+        *,
+        mark_seen: bool,
+        camel_message: dict | None = None,
+    ) -> list[tuple]:
+        from unittest import mock
+
+        from post.window import MainWindow
+
+        delivered: list[tuple] = []
+
+        def run_front(_name, worker, /, *args, **kwargs) -> None:
+            worker()
+
+        def capture_idle(*args, **_kwargs):
+            delivered.append(args)
+            return False
+
+        window._mail.get_account = mock.Mock(return_value=window._current_account)
+        window._mail.read_message = mock.Mock(return_value=camel_message)
+        window._on_message_read = mock.Mock(return_value=False)
+        window._on_message_read_worker_stale = mock.Mock(return_value=False)
+        window._mail.submit_front.side_effect = run_front
+        with mock.patch("post.window.GLib.idle_add", side_effect=capture_idle):
+            MainWindow._load_message_body_for_uid(window, uid, mark_seen=mark_seen)
+        return delivered
+
+    def test_local_draft_opens_the_file_and_skips_camel(self) -> None:
+        from unittest import mock
+
+        uid = "1700000000000000-abc"
+        window = self._window_stub(uid=uid, sidebar_folder="Drafts")
+        body = {
+            "uid": uid,
+            "subject": "Notes",
+            "from": "Ada <ada@example.com>",
+            "to": "Bo <bo@example.com>",
+            "body_plain": "Hello",
+            "flags": {"seen": True, "draft": True, "queued": True},
+        }
+
+        with (
+            mock.patch("post.window.is_queued_draft_id", return_value=True),
+            mock.patch("post.window.read_queued_draft", return_value=body) as read_file,
+        ):
+            delivered = self._run_load(window, uid, mark_seen=True)
+
+        read_file.assert_called_once_with(
+            uid,
+            account_uid="acct-1",
+            from_label="Ada <ada@example.com>",
+        )
+        window._mail.read_message.assert_not_called()
+        self.assertEqual(len(delivered), 1)
+        _callback, read_id, delivered_uid, msg, error = delivered[0]
+        self.assertEqual(read_id, 1)
+        self.assertEqual(delivered_uid, uid)
+        self.assertIsNone(error)
+        self.assertEqual(msg["subject"], "Notes")
+        self.assertEqual(msg["body_plain"], "Hello")
+        self.assertEqual(msg["to"], "Bo <bo@example.com>")
+
+    def test_server_draft_still_asks_camel(self) -> None:
+        from unittest import mock
+
+        window = self._window_stub(uid="42", sidebar_folder="Drafts")
+
+        with mock.patch("post.window.is_queued_draft_id", return_value=False):
+            delivered = self._run_load(
+                window,
+                "42",
+                mark_seen=True,
+                camel_message={
+                    "uid": "42",
+                    "subject": "On the server",
+                    "body_plain": "Stored",
+                },
+            )
+
+        window._mail.read_message.assert_called_once_with(
+            "acct-1",
+            "Drafts",
+            "42",
+            mark_seen=False,
+        )
+        _callback, _read_id, delivered_uid, msg, error = delivered[0]
+        self.assertEqual(delivered_uid, "42")
+        self.assertIsNone(error)
+        self.assertEqual(msg["body_plain"], "Stored")
+
+    def test_separate_window_opens_the_local_file(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.reader_window import ReaderWindow
+
+        uid = "1700000000000000-abc"
+        account = SimpleNamespace(
+            uid="acct-1",
+            email="ada@example.com",
+            display_label="ada@example.com",
+            from_label="Ada <ada@example.com>",
+        )
+        body = {
+            "uid": uid,
+            "subject": "Notes",
+            "body_plain": "Hello",
+        }
+        window = SimpleNamespace(
+            _read_generation=0,
+            _account=account,
+            _folder_name="Drafts",
+            _message_uid=uid,
+            _viewing_drafts=True,
+            _mail=mock.Mock(),
+            _on_message_read=mock.Mock(return_value=False),
+        )
+        delivered: list[tuple] = []
+
+        def run_front(_name, worker, /, *args, **kwargs) -> None:
+            worker()
+
+        def capture_idle(*args, **_kwargs):
+            delivered.append(args)
+            return False
+
+        window._mail.submit_front.side_effect = run_front
+        with (
+            mock.patch("post.reader_window.is_queued_draft_id", return_value=True),
+            mock.patch(
+                "post.reader_window.read_queued_draft", return_value=body
+            ) as read_file,
+            mock.patch("post.reader_window.GLib.idle_add", side_effect=capture_idle),
+        ):
+            ReaderWindow._load_message(window)
+
+        read_file.assert_called_once_with(
+            uid,
+            account_uid="acct-1",
+            from_label="Ada <ada@example.com>",
+        )
+        window._mail.read_message.assert_not_called()
+        _callback, _read_id, msg, error = delivered[0]
+        self.assertIsNone(error)
+        self.assertEqual(msg["body_plain"], "Hello")
+
+    def test_separate_window_server_draft_still_asks_camel(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from post.reader_window import ReaderWindow
+
+        account = SimpleNamespace(uid="acct-1")
+        window = SimpleNamespace(
+            _read_generation=0,
+            _account=account,
+            _folder_name="Drafts",
+            _message_uid="42",
+            _viewing_drafts=True,
+            _mail=mock.Mock(),
+            _on_message_read=mock.Mock(return_value=False),
+        )
+        window._mail.read_message.return_value = {
+            "uid": "42",
+            "body_plain": "Stored",
+        }
+
+        def run_front(_name, worker, /, *args, **kwargs) -> None:
+            worker()
+
+        window._mail.submit_front.side_effect = run_front
+        with (
+            mock.patch("post.reader_window.is_queued_draft_id", return_value=False),
+            mock.patch(
+                "post.reader_window.GLib.idle_add",
+                side_effect=lambda *_a, **_k: False,
+            ),
+        ):
+            ReaderWindow._load_message(window)
+
+        window._mail.read_message.assert_called_once_with(
+            "acct-1",
+            "Drafts",
+            "42",
+            mark_seen=False,
+        )
+
+
 class ReaderListSyncTests(unittest.TestCase):
     """Reader must not treat bare IMAP uids as globally unique (#377)."""
 
