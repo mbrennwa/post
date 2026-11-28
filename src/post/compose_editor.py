@@ -302,6 +302,7 @@ __ADAPT_TEXT_CSS__
         selection.addRange(range);
       }
       notify();
+      committed = historySnapshot();
     } finally {
       historyMuted = false;
       lastInputType = "";
@@ -559,11 +560,11 @@ __ADAPT_TEXT_CSS__
   }
   editor.addEventListener("paste", function (e) {
     const clip = e.clipboardData;
+    e.preventDefault();
     if (!clip) return;
     const imageFile = clipboardImageFile(clip);
     const pastedHtml = (clip.getData("text/html") || "").trim();
     if (imageFile && htmlIsOnlyImage(pastedHtml)) {
-      e.preventDefault();
       const reader = new FileReader();
       reader.onload = function () {
         insertInlineImageSrc(String(reader.result || ""), null, null, "");
@@ -571,15 +572,16 @@ __ADAPT_TEXT_CSS__
       reader.readAsDataURL(imageFile);
       return;
     }
-    if (editor.getAttribute("contenteditable") !== "plaintext-only") return;
-    if (!pastedHtml) return;
-    e.preventDefault();
+    const useHtml = window.__postCompose.pasteWithFormatting && pastedHtml;
+    const content = useHtml ? pastedHtml : clip.getData("text/plain");
+    if (!content) return;
     pushUndo();
     historyMuted = true;
     try {
-      promoteToRich();
-      document.execCommand("insertHTML", false, pastedHtml);
+      if (useHtml) promoteToRich();
+      document.execCommand(useHtml ? "insertHTML" : "insertText", false, content);
       notify();
+      committed = historySnapshot();
     } finally {
       historyMuted = false;
       lastInputType = "";
@@ -641,6 +643,7 @@ __ADAPT_TEXT_CSS__
   editor.addEventListener("dragover", function (e) { e.preventDefault(); });
   editor.addEventListener("drop", function (e) { e.preventDefault(); });
   window.__postCompose = {
+    pasteWithFormatting: false,
     getPlain: function () { return editor.innerText; },
     getHtml: function () { return editor.innerHTML; },
     setPlain: function (text) {
@@ -943,7 +946,17 @@ class ComposeBodyEditor(Gtk.Box):
         self._unlink_action.connect("activate", lambda *_a: self.remove_link())
         format_actions = Gio.SimpleActionGroup.new()
         format_actions.add_action(self._unlink_action)
+        self._formatted_paste = Gio.SimpleAction.new("paste-with-formatting", None)
+        self._formatted_paste.connect("activate", self._paste_with_formatting)
+        format_actions.add_action(self._formatted_paste)
         self._web_view.insert_action_group("compose-format", format_actions)
+        shortcuts = Gtk.ShortcutController()
+        shortcuts.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        shortcuts.add_shortcut(Gtk.Shortcut.new(
+            Gtk.ShortcutTrigger.parse_string("<Control><Shift>v"),
+            Gtk.NamedAction.new("compose-format.paste-with-formatting"),
+        ))
+        self._web_view.add_controller(shortcuts)
         self._hover_link_uri: str | None = None
         self._opened_uri_time = 0
         self._style_manager = Adw.StyleManager.get_default()
@@ -1540,6 +1553,13 @@ class ComposeBodyEditor(Gtk.Box):
             )
         )
 
+    def _paste_with_formatting(self, _action: Gio.SimpleAction, _parameter: object) -> None:
+        # Queue these in order on the same WebView. A regular native Paste
+        # exposes HTML to the paste event even in a plaintext-only editor.
+        self._run_js("window.__postCompose.pasteWithFormatting = true")
+        self._web_view.execute_editing_command(WebKit.EDITING_COMMAND_PASTE)
+        self._run_js("window.__postCompose.pasteWithFormatting = false")
+
     def _on_context_menu(
         self,
         _web_view: WebKit.WebView,
@@ -1555,6 +1575,7 @@ class ComposeBodyEditor(Gtk.Box):
             int(WebKit.ContextMenuAction.OPEN_LINK),
             int(WebKit.ContextMenuAction.OPEN_LINK_IN_NEW_WINDOW),
             int(WebKit.ContextMenuAction.DOWNLOAD_LINK_TO_DISK),
+            int(WebKit.ContextMenuAction.PASTE_AS_PLAIN_TEXT),
         }
         for item in list(menu.get_items()):
             try:
@@ -1563,6 +1584,11 @@ class ComposeBodyEditor(Gtk.Box):
                 continue
             if action in remove_actions:
                 menu.remove(item)
+            elif action == int(WebKit.ContextMenuAction.PASTE):
+                position = list(menu.get_items()).index(item) + 1
+                menu.insert(WebKit.ContextMenuItem.new_from_gaction(
+                    self._formatted_paste, "Paste with formatting"
+                ), position)
         if hit_test_result is not None and hit_test_result.context_is_link():
             if list(menu.get_items()):
                 menu.prepend(WebKit.ContextMenuItem.new_separator())
