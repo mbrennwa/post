@@ -75,6 +75,13 @@ class BuildEditorDocumentTests(unittest.TestCase):
         self.assertNotIn('exec("undo")', doc)
         self.assertNotIn('exec("redo")', doc)
 
+    def test_clipboard_html_requires_explicit_formatted_paste(self) -> None:
+        doc = build_editor_document()
+        self.assertIn("pasteWithFormatting: false", doc)
+        self.assertIn("window.__postCompose.pasteWithFormatting && pastedHtml", doc)
+        self.assertIn('useHtml ? pastedHtml : clip.getData("text/plain")', doc)
+        self.assertIn('useHtml ? "insertHTML" : "insertText"', doc)
+
     def test_quoted_html_uses_normal_whitespace(self) -> None:
         doc = build_editor_document()
         self.assertIn("blockquote.post_quote", doc)
