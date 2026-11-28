@@ -22,6 +22,7 @@ from gi.repository import Gio
 from post.preferences import MESSAGE_APPEARANCE_ADAPT_TEXT, MessageAppearance
 from post.reader.html import (
     adapt_html_for_shell,
+    strip_outbound_shell_text_colors,
     strip_sender_style_blocks,
     strip_theme_locked_text_colors,
 )
@@ -1817,6 +1818,8 @@ def build_plain_mime_message(
         message_id=message_id,
         date=date,
     )
+    if body_html:
+        body_html = strip_outbound_shell_text_colors(body_html)
     _set_message_body(message, body, attachments, body_html=body_html)
     return message
 

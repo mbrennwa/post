@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import html
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from html.parser import HTMLParser
 
@@ -659,24 +660,35 @@ def _style_source_has_text_color(source: str) -> bool:
     return False
 
 
-def _parse_style_declarations(style: str) -> dict[str, str]:
-    declarations: dict[str, str] = {}
+def _iter_style_declarations(style: str) -> Iterator[str]:
     depth = 0
-    current: list[str] = []
-    for char in style:
-        if char == "(":
+    start = 0
+    quote = ""
+    escaped = False
+    for index, char in enumerate(style):
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "(":
             depth += 1
-            current.append(char)
         elif char == ")" and depth:
             depth -= 1
-            current.append(char)
         elif char == ";" and depth == 0:
-            _store_style_declaration(declarations, "".join(current))
-            current = []
-        else:
-            current.append(char)
-    if current:
-        _store_style_declaration(declarations, "".join(current))
+            yield style[start:index]
+            start = index + 1
+    yield style[start:]
+
+
+def _parse_style_declarations(style: str) -> dict[str, str]:
+    declarations: dict[str, str] = {}
+    for part in _iter_style_declarations(style):
+        _store_style_declaration(declarations, part)
     return declarations
 
 
@@ -909,7 +921,7 @@ def _parse_css_color_rgb(value: str) -> tuple[int, int, int] | None:
         if len(parts) >= 3:
             try:
                 return int(float(parts[0])), int(float(parts[1])), int(float(parts[2]))
-            except ValueError:
+            except (ValueError, OverflowError):
                 return None
     return None
 
@@ -1525,10 +1537,12 @@ def _remove_style_declaration(
         if attr_name.lower() != "style":
             updated.append((attr_name, attr_value))
             continue
-        declarations = _parse_style_declarations(attr_value or "")
-        declarations.pop(lower, None)
-        if declarations:
-            updated.append(("style", _declarations_to_style(declarations)))
+        style = ";".join(
+            part for part in _iter_style_declarations(attr_value or "")
+            if part.partition(":")[0].strip().lower() != lower
+        ).strip()
+        if style.strip("; \t\r\n"):
+            updated.append(("style", style))
     return updated
 
 
@@ -1619,6 +1633,92 @@ def strip_theme_locked_text_colors(body_html: str) -> str:
     except Exception:
         return body_html
     return stripper.get_result()
+
+
+_SHELL_TEXT_MARKERS = frozenset({"post-adapt-text", "post-on-shell"})
+
+
+class _OutboundShellTextStripper(HTMLParser):
+    """Edit only affected opening tags; preserve the rest of the MIME HTML verbatim."""
+
+    def __init__(self, source: str) -> None:
+        super().__init__(convert_charrefs=False)
+        self.source = source
+        self.line_offsets = [0, *(m.end() for m in re.finditer("\n", source))]
+        self.class_styles, self.tag_styles, self.id_styles = _parse_stylesheet_maps(source)
+        self.stack: list[tuple[str, bool]] = []
+        self.parts: list[str] = []
+        self.cursor = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        painted = self._process_tag(tag, attrs)
+        if tag not in _VOID_HTML_ELEMENTS:
+            self.stack.append((tag, painted))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._process_tag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag:
+                del self.stack[index:]
+                break
+
+    def _process_tag(self, tag: str, attrs: list[tuple[str, str | None]]) -> bool:
+        if self.stack and self.stack[-1][1]:
+            return True
+        values = _attrs_list_to_dict(attrs)
+        merged = _merge_element_declarations(
+            values, self.class_styles, tag=tag, tag_styles=self.tag_styles,
+            id_styles=self.id_styles,
+        )
+        if (
+            _element_painted_background_value(values, merged)
+            or _declarations_have_background_image(merged)
+            or "gradient(" in merged.get("background-image", "").lower()
+            or "gradient(" in merged.get("background", "").lower()
+            or _html_background_attr_is_image(values.get("background", ""))
+        ):
+            return True
+        classes = values.get("class", "").split()
+        if _SHELL_TEXT_MARKERS.isdisjoint(classes) or "post-keep-color" in classes:
+            return False
+        inline = _parse_style_declarations(values.get("style", ""))
+        color = _normalize_css_declaration_value(inline.get("color", ""))
+        if _parse_css_color_rgb(color) not in ((238, 238, 238), (30, 30, 30)):
+            return False
+
+        updated = _remove_style_declaration(attrs, "color")
+        updated = _remove_attr_from_attrs(updated, "class")
+        remaining = " ".join(c for c in classes if c not in _SHELL_TEXT_MARKERS)
+        if remaining:
+            updated.append(("class", remaining))
+        escaped = [
+            (name, html.escape(value, quote=True) if value is not None else None)
+            for name, value in updated
+        ]
+        replacement = _format_start_tag(tag, escaped)
+        raw = self.get_starttag_text()
+        if raw.endswith("/>"):
+            replacement = replacement[:-1] + "/>"
+        line, column = self.getpos()
+        start = self.line_offsets[line - 1] + column
+        self.parts.extend((self.source[self.cursor:start], replacement))
+        self.cursor = start + len(raw)
+        return False
+
+
+def strip_outbound_shell_text_colors(source: str) -> str:
+    """Drop Post's inline shell foreground only where the recipient supplies the canvas."""
+    if not any(marker in source for marker in _SHELL_TEXT_MARKERS):
+        return source
+    parser = _OutboundShellTextStripper(source)
+    try:
+        parser.feed(source)
+        parser.close()
+    except (AssertionError, ValueError):
+        return source
+    return "".join((*parser.parts, source[parser.cursor:]))
 
 
 def mark_adaptation_classes(

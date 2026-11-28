@@ -497,6 +497,51 @@ class BuildDraftMimeMessageTests(unittest.TestCase):
 
 
 class BuildPlainMimeMessageTests(unittest.TestCase):
+    def test_shell_foreground_does_not_leave_editor_or_stored_draft(self) -> None:
+        from post.compose_window import ComposeWindow
+
+        painted = (
+            '<div style="background-color:#222"><span class="post-adapt-text" '
+            'style="color:#eee !important">Authored block</span></div>'
+        )
+        unmarked = '<span style="color:#eee">Authored foreground</span>'
+        fragment = (
+            '<div class="post-on-shell" style="color:#eeeeee"><b>Inherited</b></div>'
+            '<span class="author post-adapt-text" title="A &quot;quote&quot;" '
+            'style="font-family:\'A;B\';font-size:14px; color:rgb(238, 238, 238) !important">'
+            'Ordinary &amp; text</span>'
+            + painted + unmarked
+        )
+        plain = "Inherited\nOrdinary & text\nAuthored block\nAuthored foreground"
+        for mode in ("new", "draft"):
+            with self.subTest(mode=mode):
+                window = mock.Mock(
+                    _mode=mode, _draft_body_plain_snapshot=plain, _draft_body_html=fragment
+                )
+                window._body_view.is_plain_mode.return_value = False
+                # Distinct editor DOM proves the unchanged draft uses stored HTML.
+                window._body_view.get_html.return_value = (
+                    fragment if mode == "new" else "<p>stored separately</p>"
+                )
+                selected = ComposeWindow._resolve_outbound_body_html(window, plain)
+                message = build_plain_mime_message(
+                    from_name=None, from_address="alice@example.com",
+                    to=["bob@example.com"], cc=None, bcc=None, subject="Colors",
+                    body=plain, body_html=selected,
+                )
+                bodies = extract_message_bodies(message)
+                self.assertEqual(bodies["plain"], plain)
+                outbound = bodies["html"]
+                self.assertIn("<div><b>Inherited</b></div>", outbound)
+                self.assertIn('class="author"', outbound)
+                self.assertIn('title="A &quot;quote&quot;"', outbound)
+                self.assertIn("font-size:14px", outbound)
+                self.assertIn("font-family:&#x27;A;B&#x27;", outbound)
+                self.assertIn("Ordinary &amp; text", outbound)
+                self.assertNotIn("rgb(238", outbound)
+                self.assertIn(painted, outbound)
+                self.assertIn(unmarked, outbound)
+
     def test_empty_body_has_valid_content_wrapper(self) -> None:
         message = build_plain_mime_message(
             from_name="Alice",
